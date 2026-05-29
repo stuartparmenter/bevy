@@ -148,22 +148,15 @@ macro_rules! auto_nest_tuple {
 /// A fix is implemented and on track for stabilization. If it is ever implemented, we can remove this.
 pub type PathResolveHelper<T> = T;
 
-/// A counter meant to be stored in a `static` to differentiate multiple evaluations of the expression returned by [`bsn!`](crate::bsn)
-///
-/// Required for named entity references
-pub struct CallCounter(AtomicU64);
+/// Global monotonic counter backing [`next_scope_id`].
+static BSN_SCOPE_ID: AtomicU64 = AtomicU64::new(0);
 
-impl CallCounter {
-    /// Creates a new counter starting at 0
-    #[expect(
-        clippy::new_without_default,
-        reason = "Needs to be a associated const fn for use in static"
-    )]
-    pub const fn new() -> Self {
-        Self(AtomicU64::new(0))
-    }
-    /// Get the current count and then increment this counter by 1
-    pub fn increment(&self) -> u64 {
-        self.0.fetch_add(1, Ordering::Relaxed)
-    }
+/// Returns a fresh, globally-unique scope id.
+///
+/// The [`bsn!`](crate::bsn) macro calls this once per evaluation of a scene that uses named entity
+/// references, so the same `#Name` evaluated many times (e.g. in a loop) resolves to a distinct
+/// entity each time.
+#[inline]
+pub fn next_scope_id() -> u64 {
+    BSN_SCOPE_ID.fetch_add(1, Ordering::Relaxed)
 }

@@ -7,7 +7,7 @@ use bevy_macro_utils::{fq_std::FQDefault, path_to_string};
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote, ToTokens};
 use std::collections::{hash_map::Entry, HashMap, HashSet};
-use syn::{parse::Parse, punctuated::Punctuated, ExprTuple, Ident, Index, Lit, Member, Path};
+use syn::{parse::Parse, punctuated::Punctuated, Ident, Index, Lit, Member, Path};
 
 /// Tracks named entity references and assigns them unique, sequential indices
 /// during the code generation process.
@@ -59,7 +59,6 @@ impl HoistedExpressions {
 pub(crate) struct BsnCodegenCtx<'a> {
     pub bevy_scene: &'a Path,
     pub bevy_ecs: &'a Path,
-    pub invocation_index: ExprTuple,
     pub entity_refs: &'a mut EntityRefs,
     pub hoisted_expressions: &'a mut HoistedExpressions,
     /// Accumulated parsing and validation errors.
@@ -94,10 +93,9 @@ impl BsnTokenStream for BsnRoot {
         let errors = ctx.errors.iter().map(|e| e.to_compile_error());
         let bevy_scene = ctx.bevy_scene;
         let hoisted_exprs = ctx.hoisted_expressions.expressions.drain(..);
-        let call_id = if !ctx.entity_refs.refs.is_empty() {
+        let scope_id = if !ctx.entity_refs.refs.is_empty() {
             quote! {
-                static _CALL_ID: #bevy_scene::macro_utils::CallCounter = #bevy_scene::macro_utils::CallCounter::new();
-                let _call_id = _CALL_ID.increment();
+                let _scope_id = #bevy_scene::macro_utils::next_scope_id();
             }
         } else {
             quote! {}
@@ -109,7 +107,7 @@ impl BsnTokenStream for BsnRoot {
         // e.g. when typing the name of a field but no value yet.
         quote! {
             #bevy_scene::SceneScope({
-                #call_id
+                #scope_id
                 #(#hoisted_exprs)*
                 let _res = #tokens;
                 #(#errors)*
@@ -125,10 +123,9 @@ impl BsnTokenStream for BsnListRoot {
         let errors = ctx.errors.iter().map(|e| e.to_compile_error());
         let bevy_scene = ctx.bevy_scene;
         let hoisted_exprs = ctx.hoisted_expressions.expressions.drain(..);
-        let call_id = if !ctx.entity_refs.refs.is_empty() {
+        let scope_id = if !ctx.entity_refs.refs.is_empty() {
             quote! {
-                static _CALL_ID: #bevy_scene::macro_utils::CallCounter = #bevy_scene::macro_utils::CallCounter::new();
-                let _call_id = _CALL_ID.increment();
+                let _scope_id = #bevy_scene::macro_utils::next_scope_id();
             }
         } else {
             quote! {}
@@ -140,7 +137,7 @@ impl BsnTokenStream for BsnListRoot {
         // e.g. when typing the name of a field but no value yet.
         quote! {
             {
-                #call_id
+                #scope_id
                 #(#hoisted_exprs)*
                 let _res = #bevy_scene::SceneListScope(#tokens);
                 #(#errors)*
@@ -288,9 +285,8 @@ impl BsnEntry {
             BsnEntry::CachedScene(s) => EntryResult::NewSceneImpl(s.to_tokens(ctx)?),
             BsnEntry::Name(ident) => {
                 let (name, index) = ctx.fixed_entity_ref(ident);
-                let invocation = ctx.invocation_index.clone();
                 EntryResult::CombinedSceneFunction(quote! {
-                    #bevy_scene::NameEntityReference { name: #bevy_ecs::name::Name(#name.into()), reference: #bevy_ecs::template::SceneEntityReference::new(#invocation, #index, _call_id,) }.resolve_inline(_context, _scene);
+                    #bevy_scene::NameEntityReference { name: #bevy_ecs::name::Name(#name.into()), reference: #bevy_ecs::template::SceneEntityReference::new(#index, _scope_id) }.resolve_inline(_context, _scene);
                 })
             }
         })
@@ -567,9 +563,8 @@ impl BsnType {
             Some(BsnValue::Name(ident)) => {
                 let index = ctx.entity_refs.get(ident.to_string());
                 let bevy_ecs = ctx.bevy_ecs;
-                let invocation = ctx.invocation_index.clone();
                 assignments.push(quote! {
-                    #(#base_path.)*#member = #bevy_ecs::template::EntityTemplate::from_reference(#invocation, #index,  _call_id);
+                    #(#base_path.)*#member = #bevy_ecs::template::EntityTemplate::from_reference(#index, _scope_id);
                 });
             }
             Some(BsnValue::Type(ty)) if ty.enum_variant.is_some() => {
@@ -655,10 +650,9 @@ impl BsnTokenStream for BsnSceneFnArg {
             BsnSceneFnArg::Expr(expr) => quote! {#expr},
             BsnSceneFnArg::Name(ident) => {
                 let index = ctx.entity_refs.get(ident.to_string());
-                let invocation = ctx.invocation_index.clone();
                 quote! {
                     #bevy_ecs::template::EntityTemplate::SceneEntityReference(
-                        #bevy_ecs::template::SceneEntityReference::new(#invocation, #index, _call_id)
+                        #bevy_ecs::template::SceneEntityReference::new(#index, _scope_id)
                     )
                 }
             }
@@ -763,7 +757,6 @@ mod tests {
                 bevy_scene: &self.bevy_scene,
                 bevy_ecs: &self.bevy_ecs,
                 entity_refs: refs,
-                invocation_index: parse_quote!(("", 0, 0)),
                 hoisted_expressions,
                 errors: Vec::new(),
             }

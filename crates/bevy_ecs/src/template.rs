@@ -134,44 +134,29 @@ impl SceneEntityReferences {
 ///
 /// Hashed here should allow implementing compile-time hashing in the future
 ///
-/// The uniqueness of this is ensured by the following factors:
-/// - macro invocation location: filename, line and column
-/// - the `name_id` should uniquely identify a name in the individual macros scope
-/// - runtime, per-scope counter for each runtime call (usually from a static `AtomicU64`)
+/// Uniqueness comes from two parts: `name_id` identifies a name within one scene scope
+/// (assigned at compile time), and `scope_id` identifies one runtime evaluation of a `bsn!` scene.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct SceneEntityReference(Hashed<InnerSceneEntityReference>);
 
 /// The inner struct actually storing the unique index
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct InnerSceneEntityReference {
-    file: &'static str,
-    line: usize,
-    column: usize,
     name_id: usize,
-    runtime: u64,
+    scope_id: u64,
 }
 impl SceneEntityReference {
-    /// Create a new [`SceneEntityReference`] from the invocation location, runtime time, and a local (per-macro) counter for names
-    pub fn new(
-        (file, line, column): (&'static str, usize, usize),
-        name_id: usize,
-        runtime: u64,
-    ) -> Self {
-        Self(Hashed::new(InnerSceneEntityReference {
-            file,
-            line,
-            column,
-            name_id,
-            runtime,
-        }))
+    /// Create a new [`SceneEntityReference`] from a per-scope `name_id` and a `scope_id`.
+    pub fn new(name_id: usize, scope_id: u64) -> Self {
+        Self(Hashed::new(InnerSceneEntityReference { name_id, scope_id }))
     }
 }
 
 impl core::fmt::Display for SceneEntityReference {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_fmt(format_args!(
-            "global={}:{}:{} name_id={} runtime={:?}",
-            self.file, self.line, self.column, self.name_id, self.runtime
+            "name_id={} scope_id={}",
+            self.name_id, self.scope_id
         ))
     }
 }
@@ -430,12 +415,8 @@ impl Unpin for EntityTemplate where for<'a> [()]: SpecializeFromTemplate {}
 
 impl EntityTemplate {
     /// Create a [`EntityTemplate::SceneEntityReference`] from the data needed for [`SceneEntityReference`]
-    pub fn from_reference(
-        invocation: (&'static str, usize, usize),
-        name_id: usize,
-        runtime: u64,
-    ) -> Self {
-        Self::SceneEntityReference(SceneEntityReference::new(invocation, name_id, runtime))
+    pub fn from_reference(name_id: usize, scope_id: u64) -> Self {
+        Self::SceneEntityReference(SceneEntityReference::new(name_id, scope_id))
     }
 }
 
