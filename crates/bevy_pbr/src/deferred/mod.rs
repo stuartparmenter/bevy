@@ -1,8 +1,8 @@
 use crate::{
-    DistanceFog, ExtractedAtmosphere, MeshPipeline, MeshPipelineKey, MeshPipelineSystems,
-    MeshViewBindGroup, RenderViewLightProbes, ScreenSpaceAmbientOcclusion,
-    ScreenSpaceReflectionsUniform, ScreenSpaceTransmission, TONEMAPPING_LUT_SAMPLER_BINDING_INDEX,
-    TONEMAPPING_LUT_TEXTURE_BINDING_INDEX,
+    contact_shadows::ContactShadows, DistanceFog, ExtractedAtmosphere, MeshPipeline,
+    MeshPipelineKey, MeshPipelineSystems, MeshViewBindGroup, RenderViewLightProbes,
+    ScreenSpaceAmbientOcclusion, ScreenSpaceReflectionsUniform, ScreenSpaceTransmission,
+    TONEMAPPING_LUT_SAMPLER_BINDING_INDEX, TONEMAPPING_LUT_TEXTURE_BINDING_INDEX,
 };
 use bevy_app::prelude::*;
 use bevy_asset::{embedded_asset, load_embedded_asset, AssetServer, Handle};
@@ -292,6 +292,10 @@ impl SpecializedRenderPipeline for DeferredLightingLayout {
             shader_defs.push("SCREEN_SPACE_REFLECTIONS".into());
         }
 
+        if key.contains(MeshPipelineKey::CONTACT_SHADOWS) {
+            shader_defs.push("CONTACT_SHADOWS".into());
+        }
+
         if key.contains(MeshPipelineKey::HAS_PREVIOUS_SKIN) {
             shader_defs.push("HAS_PREVIOUS_SKIN".into());
         }
@@ -419,6 +423,7 @@ pub fn prepare_deferred_lighting_pipelines(
         (
             Has<ScreenSpaceAmbientOcclusion>,
             Has<ScreenSpaceReflectionsUniform>,
+            Has<ContactShadows>,
             Has<DistanceFog>,
         ),
         (
@@ -441,7 +446,7 @@ pub fn prepare_deferred_lighting_pipelines(
         tonemapping,
         dither,
         shadow_filter_method,
-        (ssao, ssr, distance_fog),
+        (ssao, ssr, contact_shadows, distance_fog),
         (normal_prepass, depth_prepass, motion_vector_prepass, deferred_prepass),
         has_environment_maps,
         has_irradiance_volumes,
@@ -525,6 +530,9 @@ pub fn prepare_deferred_lighting_pipelines(
         }
         if ssr {
             view_key |= MeshPipelineKey::SCREEN_SPACE_REFLECTIONS;
+        }
+        if contact_shadows {
+            view_key |= MeshPipelineKey::CONTACT_SHADOWS;
         }
         if distance_fog {
             view_key |= MeshPipelineKey::DISTANCE_FOG;

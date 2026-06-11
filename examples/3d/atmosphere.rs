@@ -5,9 +5,9 @@ use std::f32::consts::PI;
 
 use bevy::{
     anti_alias::taa::TemporalAntiAliasing,
-    camera::Exposure,
+    camera::{Exposure, Hdr},
     color::palettes::css::BLACK,
-    core_pipeline::tonemapping::Tonemapping,
+    core_pipeline::tonemapping::{GranTurismo7Params, Tonemapping},
     image::{
         ImageAddressMode, ImageFilterMode, ImageLoaderSettings, ImageSampler,
         ImageSamplerDescriptor,
@@ -18,13 +18,14 @@ use bevy::{
         FogVolume, SunDisk, VolumetricFog, VolumetricLight,
     },
     pbr::{
-        AtmosphereMode, AtmosphereSettings, DefaultOpaqueRendererMethod, ExtendedMaterial,
-        MaterialExtension, ScreenSpaceReflections,
+        AtmosphereMode, AtmosphereSettings, ContactShadows, DefaultOpaqueRendererMethod,
+        ExtendedMaterial, MaterialExtension, ScreenSpaceAmbientOcclusion, ScreenSpaceReflections,
     },
     post_process::bloom::Bloom,
     prelude::*,
     render::render_resource::{AsBindGroup, ShaderType},
     shader::ShaderRef,
+    window::PrimaryWindow,
 };
 
 #[derive(Resource, Default)]
@@ -45,14 +46,23 @@ fn main() {
         .insert_resource(GameState::default())
         .insert_resource(GlobalAmbientLight::NONE)
         .add_plugins((
-            DefaultPlugins,
+            DefaultPlugins.set(bevy::render::RenderPlugin {
+                // Rec.2020 is GT7's native working space; pairs with HDR output on XDR displays.
+                working_color_space: bevy::render::working_color_space::WorkingColorSpace::Rec2020,
+                ..default()
+            }),
             #[cfg(feature = "free_camera")]
             FreeCameraPlugin,
         ))
         .add_plugins(MaterialPlugin::<ExtendedMaterial<StandardMaterial, Water>>::default())
         .add_systems(
             Startup,
-            (setup_camera_fog, setup_terrain_scene, print_controls),
+            (
+                setup_hdr_display,
+                setup_camera_fog,
+                setup_terrain_scene,
+                print_controls,
+            ),
         )
         .add_systems(Update, (dynamic_scene, atmosphere_controls))
         .run();
@@ -131,6 +141,16 @@ fn atmosphere_controls(
     }
 }
 
+fn setup_hdr_display(mut display_target: Single<&mut DisplayTarget, With<PrimaryWindow>>) {
+    // Match the HDR scRGB setup from `tonemapping.rs`: GT7 only engages its
+    // peak-luminance-aware HDR mode when the display target requests an HDR
+    // transfer and the camera carries `GranTurismo7Params`.
+    **display_target = DisplayTarget::SDR_SRGB
+        .with_paper_white(200.0)
+        .with_peak(1000.0)
+        .with_transfer(DisplayTransfer::ScRgbLinear);
+}
+
 fn setup_camera_fog(
     mut commands: Commands,
     mut scattering_mediums: ResMut<Assets<ScatteringMedium>>,
@@ -148,40 +168,49 @@ fn setup_camera_fog(
     // Spawn earth atmosphere
     commands.spawn(Atmosphere::earth(earth_medium));
 
-    commands.spawn((
-        Camera3d::default(),
-        Transform::from_xyz(-2.8, 0.045, 0.0).looking_at(Vec3::ZERO, Vec3::Y),
-        // Can be adjusted to change the rendering quality
-        AtmosphereSettings::default(),
-        // The directional light illuminance used in this scene
-        // (the one recommended for use with this feature) is
-        // quite bright, so raising the exposure compensation helps
-        // bring the scene to a nicer brightness range.
-        Exposure { ev100: 13.0 },
-        // Tonemapper chosen just because it looked good with the scene, any
-        // tonemapper would be fine :)
-        Tonemapping::AcesFitted,
-        // Bloom gives the sun a much more natural look.
-        Bloom::NATURAL,
-        // Enables the atmosphere to drive reflections and ambient lighting (IBL) for this view
-        AtmosphereEnvironmentMapLight::default(),
-        #[cfg(feature = "free_camera")]
-        FreeCamera::default(),
-        VolumetricFog {
-            ambient_intensity: 0.0,
-            ..default()
-        },
-        Msaa::Off,
-        TemporalAntiAliasing::default(),
-        ScreenSpaceReflections {
-            min_perceptual_roughness: 0.0..0.0,
-            ..default()
-        },
-    ));
+    commands
+        .spawn((
+            Camera3d::default(),
+            Projection::Perspective(PerspectiveProjection {
+                fov: 32.0_f32.to_radians(),
+                ..default()
+            }),
+            Transform::from_translation(Vec3::new(3.5, 1.0, 4.0))
+                .looking_at(Vec3::new(-0.75, 0.25, 0.0), Vec3::Y),
+            // Can be adjusted to change the rendering quality
+            AtmosphereSettings::default(),
+            // The directional light illuminance used in this scene
+            // (the one recommended for use with this feature) is
+            // quite bright, so raising the exposure compensation helps
+            // bring the scene to a nicer brightness range.
+            Exposure { ev100: 13.0 },
+            Hdr,
+            Tonemapping::GranTurismo7,
+            // Required for GT7's HDR mode: plumbs the display target's peak
+            // luminance into the operator.
+            GranTurismo7Params::default(),
+            // Bloom gives the sun a much more natural look.
+            Bloom::NATURAL,
+            // Enables the atmosphere to drive reflections and ambient lighting (IBL) for this view
+            AtmosphereEnvironmentMapLight::default(),
+            #[cfg(feature = "free_camera")]
+            FreeCamera::default(),
+            VolumetricFog {
+                ambient_intensity: 0.0,
+                ..default()
+            },
+            Msaa::Off,
+            TemporalAntiAliasing::default(),
+        ))
+        .insert((
+            ContactShadows::default(),
+            ScreenSpaceReflections {
+                min_perceptual_roughness: 0.0..0.0,
+                ..default()
+            },
+            ScreenSpaceAmbientOcclusion::default(),
+        ));
 }
-
-#[derive(Component)]
-struct Terrain;
 
 /// A custom [`ExtendedMaterial`] that creates animated water ripples.
 #[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
@@ -219,6 +248,7 @@ impl MaterialExtension for Water {
 fn setup_terrain_scene(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
     mut water_materials: ResMut<Assets<ExtendedMaterial<StandardMaterial, Water>>>,
     asset_server: Res<AssetServer>,
 ) {
@@ -226,6 +256,7 @@ fn setup_terrain_scene(
     commands.spawn((
         DirectionalLight {
             shadow_maps_enabled: true,
+            contact_shadows_enabled: true,
             // lux::RAW_SUNLIGHT is recommended for use with this feature, since
             // other values approximate sunlight *post-scattering* in various
             // conditions. RAW_SUNLIGHT in comparison is the illuminance of the
@@ -240,28 +271,36 @@ fn setup_terrain_scene(
     ));
 
     // spawn the fog volume
-    commands.spawn((
-        FogVolume::default(),
-        Transform::from_scale(Vec3::new(10.0, 1.0, 10.0)).with_translation(Vec3::Y * 0.5),
-    ));
+    // commands.spawn((
+    //     FogVolume::default(),
+    //     Transform::from_scale(Vec3::new(10.0, 1.0, 10.0)).with_translation(Vec3::Y * 0.5),
+    // ));
 
-    // Terrain
     commands.spawn((
-        Terrain,
         WorldAssetRoot(
-            asset_server.load(GltfAssetLabel::Scene(0).from_asset("models/terrain/terrain.glb")),
+            asset_server.load(
+                GltfAssetLabel::Scene(0).from_asset("porsche.glb"),
+            ),
         ),
-        Transform::from_xyz(-1.0, 0.0, -0.5)
-            .with_scale(Vec3::splat(0.5))
-            .with_rotation(Quat::from_rotation_y(PI / 2.0)),
     ));
 
-    spawn_water(
-        &mut commands,
-        &asset_server,
-        &mut meshes,
-        &mut water_materials,
-    );
+    // ground plane
+    commands.spawn((
+        Mesh3d(meshes.add(Plane3d::new(Vec3::Y, Vec2::splat(1.0)))),
+        MeshMaterial3d(materials.add(StandardMaterial {
+            base_color: Color::srgb(0.1, 0.1, 0.1),
+            perceptual_roughness: 1.0,
+            ..default()
+        })),
+        Transform::from_scale(Vec3::splat(1000.0)),
+    ));
+
+    // spawn_water(
+    //     &mut commands,
+    //     &asset_server,
+    //     &mut meshes,
+    //     &mut water_materials,
+    // );
 }
 
 // Spawns the water plane.
