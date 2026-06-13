@@ -1444,6 +1444,18 @@ category = "3D Rendering"
 wasm = true
 
 [[example]]
+name = "neon_sign"
+path = "examples/3d/neon_sign.rs"
+doc-scrape-examples = true
+
+[package.metadata.example.neon_sign]
+name = "Neon Sign"
+description = "Cyberpunk street at twilight: HDR neon signage, GT7 tone mapping with lens glare, atmospheric sky, volumetric fog, and an SSR wet street"
+category = "3D Rendering"
+# Uses deferred rendering with SSR/SSAO, which are not supported on the web
+wasm = false
+
+[[example]]
 name = "hdr_calibration"
 path = "examples/3d/hdr_calibration.rs"
 doc-scrape-examples = true
