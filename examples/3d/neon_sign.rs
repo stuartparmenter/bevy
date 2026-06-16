@@ -115,11 +115,18 @@ const EMBLEM_Y: f32 = 12.3;
 // which the deferred G-buffer enforces anyway), so the Up/Down exposure keys swing
 // the street and sky while the neon stays locked at display peak.
 
-/// 7.5: bright enough that the midground road (sodium pools, headlight wash)
-/// reads above ~8/255 in the tonemapped frame -- at 7.75 it crushed to ~4/255 --
-/// while the twilight band core still sits BELOW the emissive windows and neon
-/// on the ladder above (8.25 left ~85% of the frame under 20/255).
-const EV100_DEFAULT: f32 = 7.5;
+/// 8.0: dark, but exposed so the neon REFLECTIONS and the local light POOLS
+/// (sodium, headlights, spill wash) still read. ev100 darkens every lit surface
+/// while emissive (neon, windows, lamp heads) bypasses it and stays pinned. The
+/// earlier ev10 "void" crushed those pools below GT7's ~250-nit diffuse white --
+/// the band where SDR clips and HDR keeps climbing to 1000 -- so the H toggle
+/// barely changed the frame (HDR and SDR are identical below that band). 8.0
+/// lifts the wet-street flood back into the 250-1000 nit band (clips in SDR,
+/// glows in HDR) while the unlit field stays dark via the low ambient floor
+/// below. A half stop darker than the designed 7.5 for mood; the local lumens
+/// were tuned near 7.5, so a higher ev dims the pools with it -- boost their
+/// lumens, do NOT lower ev, if they go too weak.
+const EV100_DEFAULT: f32 = 8.0;
 const EV100_MIN: f32 = 6.0;
 const EV100_MAX: f32 = 11.0;
 
@@ -268,10 +275,13 @@ const SCHEMES: [Scheme; 3] = [
 /// Bloom mix fraction. The `EnergyConserving` composite is `lerp(src, blurred,
 /// intensity)` and the blurred term is Karis-clamped to ~4 fb units, so the mix
 /// SHAVES the tube cores: at 0.35 a core lands near 0.65x its commanded value.
-/// 0.18 keeps >= 82% of source energy at the cores -- the 28-110 emissives still
-/// pin the 1000-nit display peak after haze extinction -- and the halo loss is
-/// bought back with a wider default aperture (f/2.0) instead of a bigger mix.
-const BLOOM_INTENSITY: f32 = 0.18;
+/// 0.30 (not 0.18): the glare HALO is the HDR-area carrier -- it spreads the
+/// 1000-nit neon into a wide skirt of mid-hundred-nit glow that clips in SDR but
+/// climbs in HDR, so the H toggle reads across AREA instead of just the thin
+/// tubes. The cores tolerate the bigger mix: the 28-110 emissives sit ~4x over
+/// the clip point, so even shaved to ~0.65x they stay far past peak and still
+/// pin 1000 nits after haze extinction (f/2.0 default aperture widens the skirt).
+const BLOOM_INTENSITY: f32 = 0.30;
 
 const BLOOM_F_NUMBERS: [f32; 4] = [2.0, 2.8, 5.6, 11.0];
 const BLOOM_MODE_NAMES: [&str; 6] = [
@@ -610,14 +620,16 @@ fn spawn_camera(commands: &mut Commands) {
             // The twilight sky drives IBL and is the env-map fallback that fills sky
             // into SSR misses on the wet street. 512^2: a 256 cubemap undersamples
             // the specular term and reads as white firefly speckle on smooth panes
-            // and the car body under TAA. intensity 1.5, NOT higher: a 2.5 boost
-            // lifted the shadow floor but mirrored a milky env-sky sheen across
-            // the wet road (brighter than the sky band it reflected) and fed the
-            // SSR-miss speckle. Per the owner's directive contrast is king --
-            // crushed blacks are an accepted aesthetic, so the floor stays low
-            // and the env map only rims the facades.
+            // and the car body under TAA. intensity 0.5 (not 1.5): the ambient floor
+            // is the FIELD light -- dark road gaps, unlit walls, the car body. Kept
+            // low so the field stays dark (a uniform 1.5 lift read as flat, milky
+            // midtones and mirrored an env-sky sheen across the wet road), but NOT a
+            // void: the street's FLOOD comes from the motivated local sources (neon
+            // spill + wet-road reflections, sodium pools, headlights), and those want
+            // a little fill under them. Raise toward ~0.8 if the road gaps / SSR
+            // misses go fully black; ceiling ~1.5 (2.5 was the milky-sheen point).
             AtmosphereEnvironmentMapLight {
-                intensity: 1.5,
+                intensity: 0.5,
                 size: UVec2::splat(512),
                 ..default()
             },
@@ -657,7 +669,13 @@ fn spawn_sky(commands: &mut Commands, scattering_mediums: &mut Assets<Scattering
     // full raymarch.
     commands.spawn((
         DirectionalLight {
-            illuminance: lux::RAW_SUNLIGHT,
+            // RAW_SUNLIGHT * 1.4: the sun is below the horizon, so this illuminance
+            // only feeds the sky-view LUT and the generated env map -- it sets the
+            // twilight band brightness. The * 1.4 (= 2^0.5) compensates the half
+            // stop EV100_DEFAULT 8.0 adds over the designed 7.5, so the sunset keeps
+            // the glow it had at 7.5. (Live ev changes via Up/Down do not
+            // re-compensate -- the boost is calibrated for the ev8.0 default.)
+            illuminance: lux::RAW_SUNLIGHT * 1.4,
             shadow_maps_enabled: true,
             contact_shadows_enabled: true,
             ..default()
