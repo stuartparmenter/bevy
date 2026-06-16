@@ -12,8 +12,9 @@
 //! * volumetric fog (street haze, sodium lamp cones, headlights, a steam plume),
 //! * deferred rendering + screen-space reflections: the sign smears across the wet
 //!   asphalt and snaps to a mirror in the gutter puddles,
-//! * an scRGB-linear HDR swapchain via `DisplayTarget`, with the negotiated result
-//!   reported from `WindowResolvedTransfer`.
+//! * an HDR swapchain via `DisplayTarget` -- linear scRGB (the native HDR path) or
+//!   encoded extended-range sRGB in Rec.709 / Display-P3 (the web HDR path), with
+//!   the negotiated result reported from `WindowResolvedTransfer`.
 //!
 //! ## Controls
 //!
@@ -21,7 +22,7 @@
 //! |:----------------|:----------------------------------------------------------------|
 //! | `1` / `2` / `3` | Neon color scheme (Magenta/Cyan, Cyan/Amber, Acid/Violet)       |
 //! | `R`             | Toggle screen-space reflections (the wet street ablation)       |
-//! | `H`             | Toggle HDR (scRGB) vs SDR display output                        |
+//! | `H`             | Cycle display output (SDR -> scRGB -> ext sRGB -> ext Display-P3) |
 //! | `B`             | Cycle bloom (GT7 glare f/2.0 -> f/2.8 -> f/5.6 -> f/11 -> Aesthetic -> off) |
 //! | `G`             | Cycle GT7 tonemapper blend ratio (0.3 / 0.6 / 1.0)              |
 //! | `C`             | Toggle the parked car's headlights                              |
@@ -53,7 +54,9 @@ use bevy::{
     post_process::bloom::{Bloom, BloomScatterModel},
     prelude::*,
     render::{working_color_space::WorkingColorSpace, RenderPlugin},
-    window::{DisplayTarget, DisplayTransfer, PrimaryWindow, WindowResolvedTransfer},
+    window::{
+        DisplayGamut, DisplayTarget, DisplayTransfer, PrimaryWindow, WindowResolvedTransfer,
+    },
     world_serialization::WorldInstanceReady,
 };
 
@@ -416,7 +419,10 @@ struct NeonScene {
     bloom_mode: usize,
     blend_idx: usize,
     ssr_on: bool,
-    hdr_requested: bool,
+    /// Requested display output; the `H` key cycles it. Resolved transfer (which
+    /// may differ when a backend can't fulfil the request) comes from
+    /// `WindowResolvedTransfer`.
+    output: OutputMode,
     headlights_on: bool,
     /// HDR paper-white level in nits ([ / ] keys); peak stays fixed at 1000.
     paper_white_nits: f32,
@@ -438,7 +444,7 @@ impl Default for NeonScene {
             bloom_mode: 0,
             blend_idx: 1,
             ssr_on: true,
-            hdr_requested: false,
+            output: OutputMode::Sdr,
             headlights_on: true,
             paper_white_nits: 200.0,
             primary_mat: Handle::default(),
@@ -482,14 +488,77 @@ impl Lcg {
 
 // --- HDR display -----------------------------------------------------------------
 
-/// Paper white is user-adjustable ([ / ] keys) so the HDR output can be matched
-/// against the desktop's "SDR content brightness" slider; the 1000-nit peak is
-/// fixed, so lowering paper white WIDENS the neon-over-paper-white headroom.
-fn hdr_display_target(paper_white_nits: f32) -> DisplayTarget {
-    DisplayTarget::SDR_SRGB
-        .with_paper_white(paper_white_nits)
-        .with_peak(1000.0)
-        .with_transfer(DisplayTransfer::ScRgbLinear)
+/// The display output modes the `H` key cycles through. SDR is the sRGB
+/// baseline; the three HDR modes differ only in transfer/gamut, so the H toggle
+/// lets a single panel be compared across every encoding Bevy can negotiate:
+///
+/// - `ScRgb` -- linear scRGB (`ScRgbLinear`). The **native** HDR path
+///   (Metal/Vulkan/DX12); browser WebGPU cannot express a linear-transfer canvas,
+///   so this degrades on the web (watch the resolved `Output:` HUD line).
+/// - `ExtendedSrgb` / `ExtendedDisplayP3` -- encoded extended-range sRGB
+///   (`ExtendedSrgb`), the **web** HDR path, in Rec.709 and wide-gamut Display-P3
+///   respectively. Both resolve to the same transfer; only the requested gamut
+///   differs (Display-P3 carries wider primaries where the surface allows it).
+///
+/// Requests that a backend can't fulfil degrade with a warning, so cycling to a
+/// mode the current platform lacks is safe -- the HUD reports what actually
+/// resolved.
+#[derive(Clone, Copy, PartialEq)]
+enum OutputMode {
+    Sdr,
+    ScRgb,
+    ExtendedSrgb,
+    ExtendedDisplayP3,
+}
+
+impl OutputMode {
+    /// H-key cycle order: SDR -> scRGB -> ext sRGB -> ext Display-P3 -> SDR.
+    fn next(self) -> Self {
+        match self {
+            Self::Sdr => Self::ScRgb,
+            Self::ScRgb => Self::ExtendedSrgb,
+            Self::ExtendedSrgb => Self::ExtendedDisplayP3,
+            Self::ExtendedDisplayP3 => Self::Sdr,
+        }
+    }
+
+    fn is_hdr(self) -> bool {
+        !matches!(self, Self::Sdr)
+    }
+
+    /// The `DisplayTarget` to request for this mode.
+    ///
+    /// Paper white is user-adjustable ([ / ] keys) so the HDR output can be
+    /// matched against the desktop's "SDR content brightness" slider; the
+    /// 1000-nit peak is fixed, so lowering paper white WIDENS the
+    /// neon-over-paper-white headroom. SDR ignores both (its target is the plain
+    /// `SDR_SRGB` constant).
+    fn display_target(self, paper_white_nits: f32) -> DisplayTarget {
+        let hdr = |transfer, gamut| {
+            DisplayTarget::SDR_SRGB
+                .with_paper_white(paper_white_nits)
+                .with_peak(1000.0)
+                .with_transfer(transfer)
+                .with_gamut(gamut)
+        };
+        match self {
+            Self::Sdr => DisplayTarget::SDR_SRGB,
+            Self::ScRgb => hdr(DisplayTransfer::ScRgbLinear, DisplayGamut::Rec709),
+            Self::ExtendedSrgb => hdr(DisplayTransfer::ExtendedSrgb, DisplayGamut::Rec709),
+            Self::ExtendedDisplayP3 => hdr(DisplayTransfer::ExtendedSrgb, DisplayGamut::DisplayP3),
+        }
+    }
+
+    /// Label for the "H - HDR output" HUD line: what was REQUESTED (the resolved
+    /// transfer is reported separately on the `Output:` line).
+    fn requested_label(self) -> &'static str {
+        match self {
+            Self::Sdr => "SDR",
+            Self::ScRgb => "scRGB requested",
+            Self::ExtendedSrgb => "ext sRGB requested",
+            Self::ExtendedDisplayP3 => "ext Display-P3 requested",
+        }
+    }
 }
 
 /// Requests an scRGB-linear HDR swapchain.
@@ -503,11 +572,20 @@ fn setup_hdr_display(
     mut state: ResMut<NeonScene>,
 ) {
     if std::env::var("CI_TESTING_CONFIG").is_ok() {
-        state.hdr_requested = false;
+        state.output = OutputMode::Sdr;
         return;
     }
-    state.hdr_requested = true;
-    **display_target = hdr_display_target(state.paper_white_nits);
+    // scRGB is native-only: browser WebGPU has no linear-transfer canvas, so a
+    // web scRGB request downgrades straight to SDR (never to extended sRGB). Pick
+    // each platform's working HDR path as the startup default -- encoded
+    // extended-range sRGB on the web, linear scRGB natively -- so HDR is live on
+    // first load. H still cycles through every mode (including Display-P3).
+    state.output = if cfg!(target_arch = "wasm32") {
+        OutputMode::ExtendedSrgb
+    } else {
+        OutputMode::ScRgb
+    };
+    **display_target = state.output.display_target(state.paper_white_nits);
 }
 
 // --- Setup -----------------------------------------------------------------------
@@ -2458,15 +2536,12 @@ fn handle_input(
         }
     }
 
-    // Live HDR <-> SDR output switch; GT7 re-keys its curve from the RESOLVED
-    // transfer (reported on the HUD with a 1-frame lag).
+    // Live output cycle (SDR -> scRGB -> ext sRGB -> ext Display-P3); GT7 re-keys
+    // its curve from the RESOLVED transfer (reported on the HUD with a 1-frame
+    // lag), so a request the backend downgrades still drives a correct curve.
     if keyboard.just_pressed(KeyCode::KeyH) {
-        state.hdr_requested = !state.hdr_requested;
-        **display_target = if state.hdr_requested {
-            hdr_display_target(state.paper_white_nits)
-        } else {
-            DisplayTarget::SDR_SRGB
-        };
+        state.output = state.output.next();
+        **display_target = state.output.display_target(state.paper_white_nits);
     }
 
     // Paper-white trim in 40-nit steps (peak stays 1000): lets the user match
@@ -2483,8 +2558,8 @@ fn handle_input(
         state.paper_white_nits = (state.paper_white_nits + 40.0).clamp(120.0, 480.0);
         paper_white_changed = true;
     }
-    if paper_white_changed && state.hdr_requested {
-        **display_target = hdr_display_target(state.paper_white_nits);
+    if paper_white_changed && state.output.is_hdr() {
+        **display_target = state.output.display_target(state.paper_white_nits);
     }
 
     if keyboard.just_pressed(KeyCode::KeyB) {
@@ -2573,11 +2648,7 @@ fn update_hud(
          {}",
         SCHEMES[state.scheme].name,
         if state.ssr_on { "on" } else { "off" },
-        if state.hdr_requested {
-            "scRGB requested"
-        } else {
-            "SDR"
-        },
+        state.output.requested_label(),
         BLOOM_MODE_NAMES[state.bloom_mode],
         BLEND_RATIOS[state.blend_idx],
         if state.headlights_on { "on" } else { "off" },
