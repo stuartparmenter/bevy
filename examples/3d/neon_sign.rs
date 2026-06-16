@@ -2537,6 +2537,7 @@ fn update_hud(
     let output = match resolved.map(|resolved| resolved.0) {
         None => "Output: pending",
         Some(DisplayTransfer::ScRgbLinear) => "Output: scRGB HDR (peak 1000 nits)",
+        Some(DisplayTransfer::ExtendedSrgb) => "Output: extended sRGB HDR (encoded)",
         Some(DisplayTransfer::Pq) | Some(DisplayTransfer::Hlg) => "Output: PQ/HLG HDR",
         Some(DisplayTransfer::Srgb) => "Output: SDR sRGB",
     };
