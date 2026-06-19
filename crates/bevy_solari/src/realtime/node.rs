@@ -43,13 +43,10 @@ pub struct SolariLightingPipelines {
     sample_gi_for_world_cache_pipeline: CachedComputePipelineId,
     blend_new_world_cache_samples_pipeline: CachedComputePipelineId,
     presample_light_tiles_pipeline: CachedComputePipelineId,
-    di_initial_and_temporal_pipeline: CachedComputePipelineId,
-    di_spatial_and_shade_pipeline: CachedComputePipelineId,
-    gi_initial_and_temporal_pipeline: CachedComputePipelineId,
-    gi_spatial_and_shade_pipeline: CachedComputePipelineId,
-    specular_gi_pipeline: CachedComputePipelineId,
+    initial_and_temporal_pipeline: CachedComputePipelineId,
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
-    specular_gi_with_psr_pipeline: CachedComputePipelineId,
+    initial_and_temporal_with_psr_pipeline: CachedComputePipelineId,
+    spatial_and_shade_pipeline: CachedComputePipelineId,
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
     resolve_dlss_rr_textures_pipeline: CachedComputePipelineId,
 }
@@ -111,13 +108,15 @@ pub fn solari_lighting(
         return;
     };
 
-    #[cfg(not(all(feature = "dlss", not(feature = "force_disable_dlss"))))]
-    let specular_gi_pipeline = pipelines.specular_gi_pipeline;
+    // The PSR variant additionally writes the DLSS RR guide buffers, so it can only be
+    // used when the view has them.
+    #[cfg(any(not(feature = "dlss"), feature = "force_disable_dlss"))]
+    let initial_and_temporal_pipeline = pipelines.initial_and_temporal_pipeline;
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
-    let specular_gi_pipeline = if view_dlss_rr_textures.is_some() {
-        pipelines.specular_gi_with_psr_pipeline
+    let initial_and_temporal_pipeline = if view_dlss_rr_textures.is_some() {
+        pipelines.initial_and_temporal_with_psr_pipeline
     } else {
-        pipelines.specular_gi_pipeline
+        pipelines.initial_and_temporal_pipeline
     };
 
     let (
@@ -129,11 +128,8 @@ pub fn solari_lighting(
         Some(sample_gi_for_world_cache_pipeline),
         Some(blend_new_world_cache_samples_pipeline),
         Some(presample_light_tiles_pipeline),
-        Some(di_initial_and_temporal_pipeline),
-        Some(di_spatial_and_shade_pipeline),
-        Some(gi_initial_and_temporal_pipeline),
-        Some(gi_spatial_and_shade_pipeline),
-        Some(specular_gi_pipeline),
+        Some(initial_and_temporal_pipeline),
+        Some(spatial_and_shade_pipeline),
         Some(scene_bind_group),
         Some(gbuffer),
         Some(depth_buffer),
@@ -152,11 +148,8 @@ pub fn solari_lighting(
         pipeline_cache.get_compute_pipeline(pipelines.sample_gi_for_world_cache_pipeline),
         pipeline_cache.get_compute_pipeline(pipelines.blend_new_world_cache_samples_pipeline),
         pipeline_cache.get_compute_pipeline(pipelines.presample_light_tiles_pipeline),
-        pipeline_cache.get_compute_pipeline(pipelines.di_initial_and_temporal_pipeline),
-        pipeline_cache.get_compute_pipeline(pipelines.di_spatial_and_shade_pipeline),
-        pipeline_cache.get_compute_pipeline(pipelines.gi_initial_and_temporal_pipeline),
-        pipeline_cache.get_compute_pipeline(pipelines.gi_spatial_and_shade_pipeline),
-        pipeline_cache.get_compute_pipeline(specular_gi_pipeline),
+        pipeline_cache.get_compute_pipeline(initial_and_temporal_pipeline),
+        pipeline_cache.get_compute_pipeline(pipelines.spatial_and_shade_pipeline),
         &scene_bindings.bind_group,
         view_prepass_textures.deferred_view(),
         view_prepass_textures.depth_view(),
@@ -187,10 +180,8 @@ pub fn solari_lighting(
             view_target_attachment.view,
             s.light_tile_samples.as_entire_binding(),
             s.light_tile_resolved_samples.as_entire_binding(),
-            &s.di_reservoirs_a,
-            &s.di_reservoirs_b,
-            s.gi_reservoirs_a.as_entire_binding(),
-            s.gi_reservoirs_b.as_entire_binding(),
+            s.reservoirs_a.as_entire_binding(),
+            s.reservoirs_b.as_entire_binding(),
             gbuffer,
             depth_buffer,
             motion_vectors,
@@ -232,7 +223,8 @@ pub fn solari_lighting(
         )
     });
 
-    // Choice of number here is arbitrary
+    // Mostly arbitrary, but must differ from the tile-id multiplier in
+    // presample_light_tiles.wgsl (see the comment there).
     let frame_index = frame_count.0.wrapping_mul(5782582);
 
     let diagnostics = ctx.diagnostic_recorder();
@@ -332,53 +324,27 @@ pub fn solari_lighting(
 
     d.end(&mut pass);
 
-    let d = diagnostics.time_span(&mut pass, "solari_lighting/direct_lighting");
+    let d = diagnostics.time_span(&mut pass, "solari_lighting/lighting");
 
-    pass.set_pipeline(di_initial_and_temporal_pipeline);
-    pass.set_immediates(
-        0,
-        bytemuck::cast_slice(&[frame_index, solari_lighting.reset as u32]),
-    );
-    pass.dispatch_workgroups(dx, dy, 1);
-
-    pass.set_pipeline(di_spatial_and_shade_pipeline);
-    pass.set_immediates(
-        0,
-        bytemuck::cast_slice(&[frame_index, solari_lighting.reset as u32]),
-    );
-    pass.dispatch_workgroups(dx, dy, 1);
-
-    d.end(&mut pass);
-
-    let d = diagnostics.time_span(&mut pass, "solari_lighting/diffuse_indirect_lighting");
-
-    pass.set_pipeline(gi_initial_and_temporal_pipeline);
-    pass.set_immediates(
-        0,
-        bytemuck::cast_slice(&[frame_index, solari_lighting.reset as u32]),
-    );
-    pass.dispatch_workgroups(dx, dy, 1);
-
-    pass.set_pipeline(gi_spatial_and_shade_pipeline);
-    pass.set_immediates(
-        0,
-        bytemuck::cast_slice(&[frame_index, solari_lighting.reset as u32]),
-    );
-    pass.dispatch_workgroups(dx, dy, 1);
-
-    d.end(&mut pass);
-
-    let d = diagnostics.time_span(&mut pass, "solari_lighting/specular_indirect_lighting");
+    // The PSR pipeline variant writes the DLSS RR guide buffers via bind group 2.
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
     if let Some(bind_group_resolve_dlss_rr_textures) = &bind_group_resolve_dlss_rr_textures {
         pass.set_bind_group(2, bind_group_resolve_dlss_rr_textures, &[]);
     }
-    pass.set_pipeline(specular_gi_pipeline);
+    pass.set_pipeline(initial_and_temporal_pipeline);
     pass.set_immediates(
         0,
         bytemuck::cast_slice(&[frame_index, solari_lighting.reset as u32]),
     );
     pass.dispatch_workgroups(dx, dy, 1);
+
+    pass.set_pipeline(spatial_and_shade_pipeline);
+    pass.set_immediates(
+        0,
+        bytemuck::cast_slice(&[frame_index, solari_lighting.reset as u32]),
+    );
+    pass.dispatch_workgroups(dx, dy, 1);
+
     d.end(&mut pass);
 
     drop(pass);
@@ -405,8 +371,6 @@ pub fn init_solari_lighting_pipelines(
                 texture_storage_2d(TextureFormat::Rgba16Float, StorageTextureAccess::ReadWrite),
                 storage_buffer_sized(false, None),
                 storage_buffer_sized(false, None),
-                texture_storage_2d(TextureFormat::Rgba32Uint, StorageTextureAccess::ReadWrite),
-                texture_storage_2d(TextureFormat::Rgba32Uint, StorageTextureAccess::ReadWrite),
                 storage_buffer_sized(false, None),
                 storage_buffer_sized(false, None),
                 texture_2d(TextureSampleType::Uint),
@@ -542,48 +506,27 @@ pub fn init_solari_lighting_pipelines(
             None,
             vec![],
         ),
-        di_initial_and_temporal_pipeline: create_pipeline(
-            "solari_lighting_di_initial_and_temporal_pipeline",
+        initial_and_temporal_pipeline: create_pipeline(
+            "solari_lighting_initial_and_temporal_pipeline",
             "initial_and_temporal",
-            load_embedded_asset!(asset_server.as_ref(), "restir_di.wgsl"),
+            load_embedded_asset!(asset_server.as_ref(), "restir.wgsl"),
             None,
             vec![],
-        ),
-        di_spatial_and_shade_pipeline: create_pipeline(
-            "solari_lighting_di_spatial_and_shade_pipeline",
-            "spatial_and_shade",
-            load_embedded_asset!(asset_server.as_ref(), "restir_di.wgsl"),
-            None,
-            vec![],
-        ),
-        gi_initial_and_temporal_pipeline: create_pipeline(
-            "solari_lighting_gi_initial_and_temporal_pipeline",
-            "initial_and_temporal",
-            load_embedded_asset!(asset_server.as_ref(), "restir_gi.wgsl"),
-            None,
-            vec![],
-        ),
-        gi_spatial_and_shade_pipeline: create_pipeline(
-            "solari_lighting_gi_spatial_and_shade_pipeline",
-            "spatial_and_shade",
-            load_embedded_asset!(asset_server.as_ref(), "restir_gi.wgsl"),
-            None,
-            vec![],
-        ),
-        specular_gi_pipeline: create_pipeline(
-            "solari_lighting_specular_gi_pipeline",
-            "specular_gi",
-            load_embedded_asset!(asset_server.as_ref(), "specular_gi.wgsl"),
-            None,
-            vec!["JITTER_WORLD_CACHE".into()],
         ),
         #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
-        specular_gi_with_psr_pipeline: create_pipeline(
-            "solari_lighting_specular_gi_with_psr_pipeline",
-            "specular_gi",
-            load_embedded_asset!(asset_server.as_ref(), "specular_gi.wgsl"),
+        initial_and_temporal_with_psr_pipeline: create_pipeline(
+            "solari_lighting_initial_and_temporal_with_psr_pipeline",
+            "initial_and_temporal",
+            load_embedded_asset!(asset_server.as_ref(), "restir.wgsl"),
             Some(&bind_group_layout_resolve_dlss_rr_textures),
             vec!["DLSS_RR_GUIDE_BUFFERS".into()],
+        ),
+        spatial_and_shade_pipeline: create_pipeline(
+            "solari_lighting_spatial_and_shade_pipeline",
+            "spatial_and_shade",
+            load_embedded_asset!(asset_server.as_ref(), "restir.wgsl"),
+            None,
+            vec![],
         ),
         #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
         resolve_dlss_rr_textures_pipeline: create_pipeline(
