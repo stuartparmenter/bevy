@@ -534,7 +534,15 @@ pub fn proc_scene(
             commands
                 .entity(entity)
                 .insert(RaytracingMesh3d(mesh_handle.clone()));
-            if let Some(mut mesh) = meshes.get_mut(mesh_handle) {
+            // Only take `get_mut` (which marks the asset Modified -> BLAS rebuild) when the
+            // shared mesh actually needs fixing, so instanced scenes don't rebuild it per instance.
+            let needs_fixup = meshes.get(mesh_handle).is_some_and(|mesh| {
+                !mesh.contains_attribute(Mesh::ATTRIBUTE_UV_0)
+                    || !mesh.contains_attribute(Mesh::ATTRIBUTE_TANGENT)
+                    || mesh.contains_attribute(Mesh::ATTRIBUTE_UV_1)
+                    || matches!(mesh.indices(), Some(Indices::U16(_)))
+            });
+            if needs_fixup && let Some(mut mesh) = meshes.get_mut(mesh_handle) {
                 if !mesh.contains_attribute(Mesh::ATTRIBUTE_UV_0) {
                     let vertex_count = mesh.count_vertices();
                     mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, vec![[0.0, 0.0]; vertex_count]);
