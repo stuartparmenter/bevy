@@ -11,7 +11,10 @@ use bevy::{
     mesh::{Indices, VertexAttributeValues},
     post_process::bloom::Bloom,
     prelude::*,
-    render::{diagnostic::RenderDiagnosticsPlugin, render_resource::TextureUsages},
+    render::{
+        diagnostic::RenderDiagnosticsPlugin, render_resource::TextureUsages,
+        working_color_space::WorkingColorSpace, RenderPlugin,
+    },
     solari::{
         pathtracer::{Pathtracer, PathtracingPlugin},
         prelude::{RaytracingMesh3d, SolariLighting, SolariPlugins},
@@ -55,8 +58,21 @@ fn main() {
         "5417916c-0291-4e3f-8f65-326c1858ab96" // Don't copy paste this - generate your own UUID!
     )));
 
+    // Under `--hdr`, render in the wide Rec.2020 working space (GT7's native
+    // space) so wide-gamut color survives to the scRGB HDR encoder. Otherwise the
+    // engine warns that an HDR target is gamut-limited to Rec.709. The SDR path
+    // keeps the default working space, so non-HDR runs are unchanged.
+    let working_color_space = if args.hdr == Some(true) {
+        WorkingColorSpace::Rec2020
+    } else {
+        WorkingColorSpace::default()
+    };
+
     app.add_plugins((
-        DefaultPlugins,
+        DefaultPlugins.set(RenderPlugin {
+            working_color_space,
+            ..default()
+        }),
         SolariPlugins,
         FreeCameraPlugin,
         RenderDiagnosticsPlugin,
