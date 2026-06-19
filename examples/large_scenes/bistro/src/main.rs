@@ -18,19 +18,25 @@ use bevy::{
     core_pipeline::tonemapping::{GranTurismo7Params, Tonemapping},
     diagnostic::DiagnosticsStore,
     light::TransmittedShadowReceiver,
+    mesh::Indices,
     pbr::{
         DefaultOpaqueRendererMethod, ScreenSpaceAmbientOcclusion, ScreenSpaceTransmission,
         ScreenSpaceTransmissionQuality,
     },
     post_process::bloom::Bloom,
     render::{
-        batching::NoAutomaticBatching, occlusion_culling::OcclusionCulling, render_resource::Face,
+        batching::NoAutomaticBatching, occlusion_culling::OcclusionCulling,
+        render_resource::{Face, TextureUsages},
         view::NoIndirectDrawing, working_color_space::WorkingColorSpace, RenderPlugin,
+    },
+    solari::{
+        pathtracer::{Pathtracer, PathtracingPlugin},
+        prelude::{RaytracingMesh3d, SolariLighting, SolariPlugins},
     },
     world_serialization::WorldInstanceReady,
 };
 use bevy::{
-    camera::Hdr,
+    camera::{CameraMainTextureUsages, Hdr},
     diagnostic::FrameTimeDiagnosticsPlugin,
     light::CascadeShadowConfigBuilder,
     prelude::*,
@@ -39,6 +45,15 @@ use bevy::{
     },
     winit::WinitSettings,
 };
+
+#[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
+use bevy::{
+    anti_alias::dlss::{
+        Dlss, DlssProjectId, DlssRayReconstructionFeature, DlssRayReconstructionSupported,
+    },
+    render::camera::{MipBias, TemporalJitter},
+};
+
 use mipmap_generator::{
     generate_mipmaps, MipmapGeneratorDebugTextPlugin, MipmapGeneratorPlugin,
     MipmapGeneratorSettings,
@@ -60,6 +75,14 @@ pub struct Args {
     /// request an HDR swapchain and tonemap with GT7 (default: SDR output).
     #[argh(switch)]
     hdr: bool,
+
+    /// use Bevy Solari realtime raytraced lighting (ReSTIR GI).
+    #[argh(switch)]
+    solari: bool,
+
+    /// use the Solari reference pathtracer instead of realtime lighting.
+    #[argh(switch)]
+    pathtracer: bool,
 
     /// compress textures (if they are not already, requires compress feature)
     #[argh(switch)]
@@ -123,6 +146,12 @@ pub fn main() {
     let args: Args = argh::from_env();
 
     let mut app = App::new();
+
+    // Generate your own UUID for a real project; this one identifies the app to DLSS.
+    #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
+    app.insert_resource(DlssProjectId(bevy::asset::uuid::uuid!(
+        "5417916c-0291-4e3f-8f65-326c1858ab96"
+    )));
 
     // Under `--hdr`, render in the wide Rec.2020 working space (GT7's native
     // space) so wide-gamut color survives to the scRGB HDR encoder; otherwise the
@@ -198,6 +227,19 @@ pub fn main() {
         app.add_systems(Startup, setup_hdr_display);
     }
 
+    // Solari realtime raytraced lighting (`--solari`) or reference pathtracer
+    // (`--pathtracer`); both pull in the raytracing scene plugins.
+    if args.solari || args.pathtracer {
+        app.add_plugins(SolariPlugins);
+        #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
+        if args.solari {
+            app.add_systems(Update, toggle_dlss_rr);
+        }
+    }
+    if args.pathtracer {
+        app.add_plugins(PathtracingPlugin);
+    }
+
     app.run();
 }
 
@@ -207,8 +249,17 @@ pub struct Spin;
 #[derive(Component)]
 struct FrameTimeText;
 
-pub fn setup(mut commands: Commands, asset_server: Res<AssetServer>, args: Res<Args>) {
+pub fn setup(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    args: Res<Args>,
+    #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))] dlss_rr_supported: Option<
+        Res<DlssRayReconstructionSupported>,
+    >,
+) {
     println!("Loading models, generating mipmaps");
+
+    let rt = args.solari || args.pathtracer;
 
     let bistro_exterior = asset_server.load("bistro_exterior/BistroExterior.gltf#Scene0");
     commands
@@ -253,7 +304,8 @@ pub fn setup(mut commands: Commands, asset_server: Res<AssetServer>, args: Res<A
         }
     }
 
-    if !args.no_gltf_lights {
+    // Skip the fake-GI light cards under Solari/pathtracer -- they compute real GI.
+    if !args.no_gltf_lights && !rt {
         // In Repo glTF
         commands.spawn((
             WorldAssetRoot(asset_server.load("BistroExteriorFakeGI.gltf#Scene0")),
@@ -268,8 +320,8 @@ pub fn setup(mut commands: Commands, asset_server: Res<AssetServer>, args: Res<A
             DirectionalLight {
                 color: Color::srgb(1.0, 0.87, 0.78),
                 illuminance: lux::FULL_DAYLIGHT,
-                shadow_maps_enabled: !args.minimal,
-                contact_shadows_enabled: !args.minimal,
+                shadow_maps_enabled: !args.minimal && !rt,
+                contact_shadows_enabled: !args.minimal && !rt,
                 shadow_depth_bias: 0.1,
                 shadow_normal_bias: 0.2,
                 ..default()
@@ -321,14 +373,39 @@ pub fn setup(mut commands: Commands, asset_server: Res<AssetServer>, args: Res<A
         .insert_if(NoIndirectDrawing, || args.no_indirect_drawing)
         .insert_if(NoCpuCulling, || args.no_cpu_culling);
     if !args.minimal {
-        cam.insert((
-            Bloom {
-                intensity: 0.02,
-                ..default()
-            },
-            TemporalAntiAliasing::default(),
-        ))
-        .insert(ScreenSpaceAmbientOcclusion::default());
+        cam.insert(Bloom {
+            intensity: 0.02,
+            ..default()
+        });
+        // TAA and SSAO conflict with / are redundant under Solari's raytraced GI.
+        if !rt {
+            cam.insert((
+                TemporalAntiAliasing::default(),
+                ScreenSpaceAmbientOcclusion::default(),
+            ));
+        }
+    }
+
+    // Solari (`--solari`) / pathtracer (`--pathtracer`): a storage-binding main
+    // texture is required, and the base bundle's screen-space transmission /
+    // contact shadows are replaced by raytraced lighting.
+    if rt {
+        cam.insert(CameraMainTextureUsages::default().with(TextureUsages::STORAGE_BINDING));
+        cam.remove::<(ScreenSpaceTransmission, ContactShadows)>();
+        if args.pathtracer {
+            cam.insert(Pathtracer::default());
+        } else {
+            cam.insert(SolariLighting::default());
+        }
+        // DLSS Ray Reconstruction denoises (and upscales) Solari; highly recommended.
+        #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
+        if args.solari && dlss_rr_supported.is_some() {
+            cam.insert(Dlss::<DlssRayReconstructionFeature> {
+                perf_quality_mode: Default::default(),
+                reset: Default::default(),
+                _phantom_data: Default::default(),
+            });
+        }
     }
 
     // HDR display output (`--hdr`): GT7 maps the scene-referred HDR into the
@@ -375,6 +452,32 @@ fn setup_hdr_display(mut display_target: Single<&mut DisplayTarget, With<Primary
         .with_gamut(DisplayGamut::Rec709);
 }
 
+#[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
+fn toggle_dlss_rr(
+    key_input: Res<ButtonInput<KeyCode>>,
+    camera: Single<(Entity, Has<Dlss<DlssRayReconstructionFeature>>), With<SolariLighting>>,
+    dlss_rr_supported: Option<Res<DlssRayReconstructionSupported>>,
+    mut commands: Commands,
+) {
+    // `4` toggles DLSS-RR (1/2/3 are camera positions in this example).
+    if key_input.just_pressed(KeyCode::Digit4) && dlss_rr_supported.is_some() {
+        let (entity, dlss) = *camera;
+        if dlss {
+            commands
+                .entity(entity)
+                .remove::<(Dlss<DlssRayReconstructionFeature>, TemporalJitter, MipBias)>();
+        } else {
+            commands
+                .entity(entity)
+                .insert(Dlss::<DlssRayReconstructionFeature> {
+                    perf_quality_mode: Default::default(),
+                    reset: Default::default(),
+                    _phantom_data: Default::default(),
+                });
+        }
+    }
+}
+
 pub fn all_children<F: FnMut(Entity)>(
     children: &Children,
     children_query: &Query<&Children>,
@@ -397,8 +500,11 @@ pub fn proc_scene(
     mut materials: ResMut<Assets<StandardMaterial>>,
     lights: Query<Entity, Or<(With<PointLight>, With<DirectionalLight>, With<SpotLight>)>>,
     cameras: Query<Entity, With<Camera>>,
+    mesh_handles: Query<&Mesh3d>,
+    mut meshes: ResMut<Assets<Mesh>>,
     args: Res<Args>,
 ) {
+    let rt = args.solari || args.pathtracer;
     for entity in children.iter_descendants(scene_ready.entity) {
         // Sponza needs flipped normals
         if let Ok(mat_h) = has_std_mat.get(entity)
@@ -418,6 +524,40 @@ pub fn proc_scene(
                     mat.cull_mode = Some(Face::Back);
                 }
                 _ => (),
+            }
+        }
+
+        // Solari/pathtracer: give every mesh a BLAS and Solari-compatible attributes.
+        if rt
+            && let Ok(Mesh3d(mesh_handle)) = mesh_handles.get(entity)
+        {
+            commands
+                .entity(entity)
+                .insert(RaytracingMesh3d(mesh_handle.clone()));
+            if let Some(mut mesh) = meshes.get_mut(mesh_handle) {
+                if !mesh.contains_attribute(Mesh::ATTRIBUTE_UV_0) {
+                    let vertex_count = mesh.count_vertices();
+                    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, vec![[0.0, 0.0]; vertex_count]);
+                    mesh.insert_attribute(
+                        Mesh::ATTRIBUTE_TANGENT,
+                        vec![[0.0, 0.0, 0.0, 0.0]; vertex_count],
+                    );
+                }
+                if !mesh.contains_attribute(Mesh::ATTRIBUTE_TANGENT) {
+                    let _ = mesh.generate_tangents();
+                }
+                if mesh.contains_attribute(Mesh::ATTRIBUTE_UV_1) {
+                    mesh.remove_attribute(Mesh::ATTRIBUTE_UV_1);
+                }
+                if let Some(indices) = mesh.indices_mut()
+                    && let Indices::U16(_) = indices
+                {
+                    *indices = Indices::U32(indices.iter().map(|i| i as u32).collect());
+                }
+            }
+            // The pathtracer reads geometry from the BLAS only; drop the raster mesh.
+            if args.pathtracer {
+                commands.entity(entity).remove::<Mesh3d>();
             }
         }
 
