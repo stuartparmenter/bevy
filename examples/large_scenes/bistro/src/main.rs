@@ -335,7 +335,7 @@ pub fn setup(
             }
             .build(),
         ))
-        .insert_if(OcclusionCulling, || !args.no_shadow_occlusion_culling);
+        .insert_if(OcclusionCulling, || !rt && !args.no_shadow_occlusion_culling);
 
     // Camera
     let mut cam = commands.spawn((
@@ -367,7 +367,9 @@ pub fn setup(
     ));
     cam.insert_if(DepthPrepass, || args.deferred)
         .insert_if(DeferredPrepass, || args.deferred)
-        .insert_if(OcclusionCulling, || !args.no_view_occlusion_culling)
+        // GPU occlusion culling is unsupported alongside the deferred prepass SolariLighting
+        // forces (it false-culls visible meshes), so turn it off under raytracing.
+        .insert_if(OcclusionCulling, || !rt && !args.no_view_occlusion_culling)
         .insert_if(NoFrustumCulling, || args.no_frustum_culling)
         .insert_if(NoAutomaticBatching, || args.no_automatic_batching)
         .insert_if(NoIndirectDrawing, || args.no_indirect_drawing)
