@@ -15,6 +15,7 @@ use bevy::{
     camera::visibility::{NoCpuCulling, NoFrustumCulling},
     camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
     core_pipeline::prepass::{DeferredPrepass, DepthPrepass},
+    core_pipeline::tonemapping::{GranTurismo7Params, Tonemapping},
     diagnostic::DiagnosticsStore,
     light::TransmittedShadowReceiver,
     pbr::{
@@ -24,7 +25,7 @@ use bevy::{
     post_process::bloom::Bloom,
     render::{
         batching::NoAutomaticBatching, occlusion_culling::OcclusionCulling, render_resource::Face,
-        view::NoIndirectDrawing,
+        view::NoIndirectDrawing, working_color_space::WorkingColorSpace, RenderPlugin,
     },
     world_serialization::WorldInstanceReady,
 };
@@ -33,7 +34,9 @@ use bevy::{
     diagnostic::FrameTimeDiagnosticsPlugin,
     light::CascadeShadowConfigBuilder,
     prelude::*,
-    window::{PresentMode, WindowResolution},
+    window::{
+        DisplayGamut, DisplayTarget, DisplayTransfer, PresentMode, PrimaryWindow, WindowResolution,
+    },
     winit::WinitSettings,
 };
 use mipmap_generator::{
@@ -53,6 +56,10 @@ pub struct Args {
     /// disable bloom, AO, AA, shadows
     #[argh(switch)]
     minimal: bool,
+
+    /// request an HDR swapchain and tonemap with GT7 (default: SDR output).
+    #[argh(switch)]
+    hdr: bool,
 
     /// compress textures (if they are not already, requires compress feature)
     #[argh(switch)]
@@ -117,6 +124,16 @@ pub fn main() {
 
     let mut app = App::new();
 
+    // Under `--hdr`, render in the wide Rec.2020 working space (GT7's native
+    // space) so wide-gamut color survives to the scRGB HDR encoder; otherwise the
+    // engine warns that an HDR target is gamut-limited to Rec.709. The SDR path
+    // keeps the default working space, so non-HDR runs are unchanged.
+    let working_color_space = if args.hdr {
+        WorkingColorSpace::Rec2020
+    } else {
+        WorkingColorSpace::default()
+    };
+
     app.init_resource::<CameraPositions>()
         .init_resource::<FrameLowHigh>()
         .insert_resource(GlobalAmbientLight::NONE)
@@ -129,6 +146,10 @@ pub fn main() {
                 resolution: WindowResolution::new(1920, 1080).with_scale_factor_override(1.0),
                 ..default()
             }),
+            ..default()
+        })
+        .set(RenderPlugin {
+            working_color_space,
             ..default()
         }))
         .add_plugins((
@@ -168,6 +189,13 @@ pub fn main() {
 
     if args.deferred {
         app.insert_resource(DefaultOpaqueRendererMethod::deferred());
+    }
+
+    // Opt-in HDR (`--hdr`): drive the primary window into an HDR swapchain so the
+    // GT7-tonemapped, scene-referred HDR reaches the display. Without the flag the
+    // window stays SDR and the camera keeps default tonemapping.
+    if args.hdr {
+        app.add_systems(Startup, setup_hdr_display);
     }
 
     app.run();
@@ -303,6 +331,13 @@ pub fn setup(mut commands: Commands, asset_server: Res<AssetServer>, args: Res<A
         .insert(ScreenSpaceAmbientOcclusion::default());
     }
 
+    // HDR display output (`--hdr`): GT7 maps the scene-referred HDR into the
+    // DisplayTarget's nit range. Without it the camera keeps default tonemapping,
+    // which clamps highlights to SDR white.
+    if args.hdr {
+        cam.insert((Tonemapping::GranTurismo7, GranTurismo7Params::default()));
+    }
+
     if !args.hide_frame_time {
         commands
             .spawn((
@@ -320,6 +355,24 @@ pub fn setup(mut commands: Commands, asset_server: Res<AssetServer>, args: Res<A
             parent.spawn((Text::new(""), TextColor(Color::WHITE), FrameTimeText));
         });
     }
+}
+
+/// Requests an scRGB-linear HDR swapchain on the primary window so the
+/// scene-referred HDR reaches the display instead of being clamped to SDR white.
+/// The GT7 tonemapper on the camera maps into this target's nit range.
+///
+/// Gated on CI: the screenshotter reads back the raw swapchain, and an fp16
+/// scRGB readback saved to PNG clips at 80 nits, so CI/iteration screenshots
+/// keep the plain SDR output.
+fn setup_hdr_display(mut display_target: Single<&mut DisplayTarget, With<PrimaryWindow>>) {
+    if std::env::var("CI_TESTING_CONFIG").is_ok() {
+        return;
+    }
+    **display_target = DisplayTarget::SDR_SRGB
+        .with_paper_white(200.0)
+        .with_peak(1000.0)
+        .with_transfer(DisplayTransfer::ScRgbLinear)
+        .with_gamut(DisplayGamut::Rec709);
 }
 
 pub fn all_children<F: FnMut(Entity)>(
