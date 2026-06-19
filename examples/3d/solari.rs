@@ -4,6 +4,7 @@ use argh::FromArgs;
 use bevy::{
     camera::CameraMainTextureUsages,
     camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
+    core_pipeline::tonemapping::{GranTurismo7Params, Tonemapping},
     diagnostic::{Diagnostic, DiagnosticPath, DiagnosticsStore},
     gltf::GltfMaterialName,
     image::{ImageAddressMode, ImageLoaderSettings},
@@ -15,6 +16,7 @@ use bevy::{
         pathtracer::{Pathtracer, PathtracingPlugin},
         prelude::{RaytracingMesh3d, SolariLighting, SolariPlugins},
     },
+    window::{DisplayGamut, DisplayTarget, DisplayTransfer, PrimaryWindow},
     world_serialization::WorldInstanceReady,
 };
 use chacha20::ChaCha8Rng;
@@ -38,6 +40,9 @@ struct Args {
     /// stress test a scene with many lights.
     #[argh(switch)]
     many_lights: Option<bool>,
+    /// request an HDR swapchain and tonemap with GT7 (default: SDR output).
+    #[argh(switch)]
+    hdr: Option<bool>,
 }
 
 fn main() {
@@ -58,6 +63,13 @@ fn main() {
     ))
     .insert_resource(args);
 
+    // Opt-in HDR (`--hdr`): drive the primary window into an HDR swapchain so the
+    // GT7-tonemapped, scene-referred HDR Solari renders reach the display. Without
+    // the flag the window stays SDR and the cameras keep default tonemapping.
+    if args.hdr == Some(true) {
+        app.add_systems(Startup, setup_hdr_display);
+    }
+
     if args.many_lights == Some(true) {
         app.add_systems(Startup, setup_many_lights);
     } else {
@@ -77,6 +89,24 @@ fn main() {
     }
 
     app.run();
+}
+
+/// Requests an scRGB-linear HDR swapchain on the primary window so Solari's
+/// scene-referred HDR reaches the display instead of being clamped to SDR white.
+/// The GT7 tonemapper on the camera maps into this target's nit range.
+///
+/// Gated on CI: the screenshotter reads back the raw swapchain, and an fp16
+/// scRGB readback saved to PNG clips at 80 nits, so CI/iteration screenshots
+/// keep the plain SDR output.
+fn setup_hdr_display(mut display_target: Single<&mut DisplayTarget, With<PrimaryWindow>>) {
+    if std::env::var("CI_TESTING_CONFIG").is_ok() {
+        return;
+    }
+    **display_target = DisplayTarget::SDR_SRGB
+        .with_paper_white(200.0)
+        .with_peak(1000.0)
+        .with_transfer(DisplayTransfer::ScRgbLinear)
+        .with_gamut(DisplayGamut::Rec709);
 }
 
 fn setup_pica_pica(
@@ -159,6 +189,13 @@ fn setup_pica_pica(
         camera.insert(Pathtracer::default());
     } else {
         camera.insert(SolariLighting::default());
+    }
+
+    // HDR display output (`--hdr`): GT7 maps Solari's scene-referred HDR into the
+    // DisplayTarget's nit range. Without it the camera keeps default tonemapping,
+    // which clamps highlights to SDR white.
+    if args.hdr == Some(true) {
+        camera.insert((Tonemapping::GranTurismo7, GranTurismo7Params::default()));
     }
 
     // Using DLSS Ray Reconstruction for denoising (and cheaper rendering via upscaling) is _highly_ recommended when using Solari
@@ -344,6 +381,11 @@ fn setup_many_lights(
         camera.insert(Pathtracer::default());
     } else {
         camera.insert(SolariLighting::default());
+    }
+
+    // HDR display output (`--hdr`): see setup_pica_pica's camera for rationale.
+    if args.hdr == Some(true) {
+        camera.insert((Tonemapping::GranTurismo7, GranTurismo7Params::default()));
     }
 
     // Using DLSS Ray Reconstruction for denoising (and cheaper rendering via upscaling) is _highly_ recommended when using Solari
