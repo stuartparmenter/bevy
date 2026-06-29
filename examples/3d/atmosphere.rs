@@ -28,6 +28,13 @@ use bevy::{
     window::PrimaryWindow,
 };
 
+// Opt-in HDR setup shared with the other HDR examples: picks the best transfer the
+// surface advertises (HDR10/PQ first, then scRGB-linear, then encoded extended sRGB)
+// and keeps the primary window's `DisplayTarget` on it, rather than hardcoding one
+// transfer that might silently downgrade to SDR.
+#[path = "../helpers/hdr.rs"]
+mod hdr;
+
 #[derive(Resource, Default)]
 struct GameState {
     paused: bool,
@@ -55,6 +62,11 @@ fn main() {
             FreeCameraPlugin,
         ))
         .add_plugins(MaterialPlugin::<ExtendedMaterial<StandardMaterial, Water>>::default())
+        // Auto-select the best HDR output the surface can present (HDR10/PQ first,
+        // then scRGB-linear, then encoded extended sRGB; SDR if none). The default
+        // preference is exactly what this scene wants; `setup_hdr_display` only seeds
+        // paper white / peak for whichever transfer the plugin lands on.
+        .add_plugins(hdr::HdrPlugin::default())
         .add_systems(
             Startup,
             (
@@ -141,14 +153,25 @@ fn atmosphere_controls(
     }
 }
 
-fn setup_hdr_display(mut display_target: Single<&mut DisplayTarget, With<PrimaryWindow>>) {
-    // Match the HDR scRGB setup from `tonemapping.rs`: GT7 only engages its
-    // peak-luminance-aware HDR mode when the display target requests an HDR
-    // transfer and the camera carries `GranTurismo7Params`.
-    **display_target = DisplayTarget::SDR_SRGB
-        .with_paper_white(200.0)
-        .with_peak(1000.0)
-        .with_transfer(DisplayTransfer::ScRgbLinear);
+fn setup_hdr_display(
+    mut display_target: Single<&mut DisplayTarget, With<PrimaryWindow>>,
+    mut hdr_preference: ResMut<hdr::HdrPreference>,
+) {
+    // GT7 only engages its peak-luminance-aware HDR mode when the display target
+    // requests an HDR transfer and the camera carries `GranTurismo7Params`. The
+    // transfer itself is `HdrPlugin`'s job (best the surface advertises); this only
+    // seeds the photometric grade -- paper white + a fixed 1000-nit peak -- onto the
+    // SDR baseline, and the plugin overwrites just transfer + gamut, so the grade
+    // survives into whichever HDR path it picks.
+    if std::env::var("CI_TESTING_CONFIG").is_ok() {
+        // CI screenshots read back the raw swapchain, and an fp16 HDR readback saved
+        // to PNG clips at 80 nits, so pin SDR and stop the plugin re-requesting HDR.
+        hdr_preference.manual_override = true;
+        **display_target = DisplayTarget::SDR_SRGB;
+        return;
+    }
+    display_target.paper_white_nits = 200.0;
+    display_target.peak_luminance_nits = 1000.0;
 }
 
 fn setup_camera_fog(
