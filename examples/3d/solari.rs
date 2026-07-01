@@ -4,22 +4,32 @@ use argh::FromArgs;
 use bevy::{
     camera::CameraMainTextureUsages,
     camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
+    core_pipeline::tonemapping::{GranTurismo7Params, Tonemapping},
     diagnostic::{Diagnostic, DiagnosticPath, DiagnosticsStore},
     gltf::GltfMaterialName,
     image::{ImageAddressMode, ImageLoaderSettings},
     mesh::{Indices, VertexAttributeValues},
     post_process::bloom::Bloom,
     prelude::*,
-    render::{diagnostic::RenderDiagnosticsPlugin, render_resource::TextureUsages},
+    render::{
+        diagnostic::RenderDiagnosticsPlugin, render_resource::TextureUsages,
+        working_color_space::WorkingColorSpace, RenderPlugin,
+    },
     solari::{
         pathtracer::{Pathtracer, PathtracingPlugin},
         prelude::{RaytracingMesh3d, SolariLighting, SolariPlugins},
     },
+    window::{AutoField, DisplayCalibrationPolicy, DisplayTarget, PrimaryWindow},
     world_serialization::WorldInstanceReady,
 };
 use chacha20::ChaCha8Rng;
 use rand::{RngExt, SeedableRng};
 use std::f32::consts::PI;
+
+// Opt-in HDR setup shared with the other HDR examples: keeps the primary window's
+// `DisplayTarget` on the best transfer the surface advertises, else SDR.
+#[path = "../helpers/hdr.rs"]
+mod hdr;
 
 #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
 use bevy::{
@@ -51,12 +61,20 @@ fn main() {
     )));
 
     app.add_plugins((
-        DefaultPlugins,
+        DefaultPlugins.set(RenderPlugin {
+            // GT7's native working space; keeps wide-gamut lighting intact to the encoder.
+            working_color_space: WorkingColorSpace::Rec2020,
+            ..default()
+        }),
         SolariPlugins,
         FreeCameraPlugin,
         RenderDiagnosticsPlugin,
+        // Auto-select the best HDR output the surface can present, else SDR.
+        hdr::HdrPlugin::default(),
     ))
     .insert_resource(args);
+
+    app.add_systems(Startup, setup_hdr_calibration);
 
     if args.many_lights == Some(true) {
         app.add_systems(Startup, setup_many_lights);
@@ -77,6 +95,27 @@ fn main() {
     }
 
     app.run();
+}
+
+/// Trusts the calibrated monitor for HDR luminance: hands peak and black level to
+/// the OS so GT7 tone maps against the panel's real headroom, instead of the 100-nit
+/// SDR default that GT7's HDR mode would clamp up to 250.
+///
+/// Paper white and gamut stay manual. Paper white is a viewing preference (seeded to
+/// a 200-nit HDR reference); gamut belongs to `HdrPlugin`, which pairs it with the
+/// transfer -- auto-sensing P3 onto a PQ transfer has no wgpu surface.
+fn setup_hdr_calibration(
+    window: Single<(Entity, &mut DisplayTarget), With<PrimaryWindow>>,
+    mut commands: Commands,
+) {
+    let (window, mut display_target) = window.into_inner();
+    display_target.paper_white_nits = 200.0;
+    commands.entity(window).insert(DisplayCalibrationPolicy {
+        paper_white: AutoField::Keep,
+        peak_luminance: AutoField::Auto,
+        min_luminance: AutoField::Auto,
+        gamut: AutoField::Keep,
+    });
 }
 
 fn setup_pica_pica(
@@ -153,6 +192,10 @@ fn setup_pica_pica(
         // Msaa::Off and CameraMainTextureUsages with STORAGE_BINDING are required for Solari
         CameraMainTextureUsages::default().with(TextureUsages::STORAGE_BINDING),
         Msaa::Off,
+        // Solari already renders HDR (its components require `Hdr`); GT7 tone maps it
+        // to the display, with `GranTurismo7Params` plumbing in the target's peak.
+        Tonemapping::GranTurismo7,
+        GranTurismo7Params::default(),
     ));
 
     if args.pathtracer == Some(true) {
@@ -334,10 +377,15 @@ fn setup_many_lights(
         // Msaa::Off and CameraMainTextureUsages with STORAGE_BINDING are required for Solari
         CameraMainTextureUsages::default().with(TextureUsages::STORAGE_BINDING),
         Msaa::Off,
+        // GT7's physically based veiling glare, the matched pair for the GT7 tonemapper.
         Bloom {
             intensity: 0.1,
-            ..Bloom::NATURAL
+            ..Bloom::GT7_GLARE
         },
+        // Solari already renders HDR (its components require `Hdr`); GT7 tone maps it
+        // to the display, with `GranTurismo7Params` plumbing in the target's peak.
+        Tonemapping::GranTurismo7,
+        GranTurismo7Params::default(),
     ));
 
     if args.pathtracer == Some(true) {
