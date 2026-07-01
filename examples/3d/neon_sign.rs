@@ -2635,7 +2635,6 @@ fn update_hud(
         Some(DisplayTransfer::ScRgbLinear) => "Output: scRGB HDR (peak 1000 nits)",
         Some(DisplayTransfer::ExtendedSrgb) => "Output: extended sRGB HDR (encoded)",
         Some(DisplayTransfer::Pq) => "Output: HDR10 / PQ (peak 1000 nits)",
-        Some(DisplayTransfer::Hlg) => "Output: HLG HDR",
         Some(DisplayTransfer::Srgb) => "Output: SDR sRGB",
     };
 
