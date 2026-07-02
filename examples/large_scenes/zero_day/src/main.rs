@@ -8,10 +8,16 @@
 //! `Bloom::GT7_GLARE`, Rec.2020 working space, HDR swapchain via the shared
 //! `HdrPlugin`).
 //!
-//! It plays the film's ~13.7 s take -- ~550 animated objects plus the original
-//! `DynamicCamera2` flythrough -- and drives the render camera from that camera. The
-//! film's emissive pulsing was procedural in Octane and isn't in the exported asset,
-//! so `animate_emissive` breathes the panels as a stand-in.
+//! It plays the film's take -- ~550 animated objects (baked to ~2337 glTF clips) plus
+//! the film's camera flythrough -- and drives the render camera from that camera. No
+//! ORCA measure ships animated *lights*, though: the film's emissive pulsing was
+//! procedural in Octane, isn't in any exported asset, and couldn't come through glTF
+//! anyway (Bevy doesn't support `KHR_animation_pointer`). So `animate_emissive` fakes
+//! it -- a wave of light sweeping the corridor's emissive panels as a stand-in.
+//!
+//! `--scene` picks the ORCA measure (`measure_one` by default; also `measure_seven` and
+//! `measure_seven_colored_lights`). Each is a separate `.glb` produced by `convert.py`;
+//! they differ in geometry and emissive palette, not in whether the lights animate.
 //!
 //! Requires a ray-tracing capable GPU (Solari currently needs the Vulkan backend in
 //! wgpu). DLSS Ray Reconstruction denoises the output when the `dlss` feature (the
@@ -20,17 +26,24 @@
 //! Controls: `C` toggles the film flythrough vs. free-fly (WASD + mouse), `N` toggles
 //! DLSS Ray Reconstruction, and `B` runs a short benchmark (printed to the console).
 
-use std::collections::HashSet;
-use std::f32::consts::PI;
+// The engine allows these workspace-wide; standalone example crates don't inherit that
+// lint config (they rely on `println!`, which the workspace lints forbid), so allow them
+// here -- ECS systems naturally take many args and complex query types.
+#![allow(clippy::too_many_arguments, clippy::type_complexity)]
+
+use std::collections::{HashMap, HashSet};
+use std::f32::consts::{PI, TAU};
 use std::time::Instant;
 
 use argh::FromArgs;
 use bevy::{
+    asset::LoadState,
     camera::{CameraMainTextureUsages, Hdr},
     camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
     core_pipeline::tonemapping::{GranTurismo7Params, Tonemapping},
     diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin},
     gltf::Gltf,
+    math::ops,
     mesh::Indices,
     post_process::bloom::Bloom,
     prelude::*,
@@ -53,7 +66,8 @@ use bevy::{
 #[cfg(feature = "dlss")]
 use bevy::{
     anti_alias::dlss::{
-        Dlss, DlssProjectId, DlssRayReconstructionFeature, DlssRayReconstructionSupported,
+        Dlss, DlssPerfQualityMode, DlssProjectId, DlssRayReconstructionFeature,
+        DlssRayReconstructionSupported,
     },
     render::camera::{MipBias, TemporalJitter},
 };
@@ -66,24 +80,141 @@ mod hdr;
 /// Config
 #[derive(FromArgs, Resource, Clone)]
 pub struct Args {
-    /// emissive multiplier for the accent panels (they are the scene's only lights, so
-    /// they must be bright to illuminate the corridor). ~150000 reads about right;
-    /// lower it if the scene is blown out.
-    #[argh(option, default = "150000.0")]
-    emissive: f32,
+    /// which ORCA measure to load: measure_one (default), measure_seven, or
+    /// measure_seven_colored_lights. Each is a separate `.glb` built by `convert.py`.
+    #[argh(option, default = "Scene::MeasureOne")]
+    scene: Scene,
 
-    /// disable the synthetic emissive pulse. By default the panels breathe out of sync
+    /// emissive multiplier for the accent panels (they are the scene's only lights, so
+    /// they must be bright to illuminate the space). Defaults per measure (measure_seven is
+    /// a much larger, more open space, so its default is higher); override to taste.
+    #[argh(option)]
+    emissive: Option<f32>,
+
+    /// disable the synthetic emissive pulse. By default a wave of light sweeps the panels
     /// to evoke the film's animated lights (that animation isn't in the exported asset).
     #[argh(switch)]
     no_pulse: bool,
+
+    /// render resolution as `WxH` (default 1920x1080). Solari cost scales with pixel count,
+    /// so lower it (e.g. `1280x720`) to trade sharpness for framerate on the heavy measures.
+    #[argh(option)]
+    resolution: Option<String>,
+
+    /// DLSS quality mode: auto (default), dlaa, quality, balanced, performance, or
+    /// ultra_performance. Lower renders at a smaller internal resolution for more framerate.
+    #[cfg(feature = "dlss")]
+    #[argh(option)]
+    dlss_quality: Option<String>,
 }
 
-/// Depth (fraction of base) and rate (rad/s) of the synthetic emissive pulse.
-const PULSE_AMPLITUDE: f32 = 0.5;
-const PULSE_FREQ: f32 = 2.5;
+/// Which ORCA "Zero-Day" measure to load. Each converts to its own self-contained `.glb`
+/// (see `convert.py` and the README); the flythrough camera and emissive handling are the
+/// same across all three, so only the asset filename changes.
+// The shared `Measure` prefix mirrors the ORCA asset names, so keep it.
+#[allow(clippy::enum_variant_names)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Scene {
+    MeasureOne,
+    MeasureSeven,
+    MeasureSevenColoredLights,
+}
+
+impl Scene {
+    /// The `.glb` file this measure loads from `assets/` (all `.gitignore`d).
+    fn glb(self) -> &'static str {
+        match self {
+            Scene::MeasureOne => "zero_day_measure_one.glb",
+            Scene::MeasureSeven => "zero_day_measure_seven.glb",
+            Scene::MeasureSevenColoredLights => "zero_day_measure_seven_colored_lights.glb",
+        }
+    }
+
+    /// Default emissive multiplier (overridable with `--emissive`). Measure One is a tight
+    /// corridor; Measure Seven is a much larger, more open shaft whose panels must be far
+    /// brighter to carry the space.
+    fn default_emissive(self) -> f32 {
+        match self {
+            Scene::MeasureOne => 150_000.0,
+            Scene::MeasureSeven | Scene::MeasureSevenColoredLights => 600_000.0,
+        }
+    }
+}
+
+impl Args {
+    /// Emissive multiplier: the `--emissive` override, else the measure's default.
+    fn emissive(&self) -> f32 {
+        self.emissive.unwrap_or(self.scene.default_emissive())
+    }
+
+    /// Parsed `--resolution WxH`, else 1920x1080. Falls back to the default (with a warning)
+    /// if the value can't be parsed.
+    fn resolution(&self) -> (u32, u32) {
+        let Some(s) = &self.resolution else {
+            return (1920, 1080);
+        };
+        let parsed = s
+            .split_once(['x', 'X'])
+            .and_then(|(w, h)| Some((w.trim().parse().ok()?, h.trim().parse().ok()?)));
+        parsed.unwrap_or_else(|| {
+            warn!("zero_day: could not parse --resolution `{s}`; using 1920x1080");
+            (1920, 1080)
+        })
+    }
+
+    /// Parsed `--dlss-quality`, else `Auto`. Lower modes render at a smaller internal
+    /// resolution (faster, softer).
+    #[cfg(feature = "dlss")]
+    fn dlss_perf_quality(&self) -> DlssPerfQualityMode {
+        match self.dlss_quality.as_deref() {
+            None | Some("auto") => DlssPerfQualityMode::Auto,
+            Some("dlaa") => DlssPerfQualityMode::Dlaa,
+            Some("quality") => DlssPerfQualityMode::Quality,
+            Some("balanced") => DlssPerfQualityMode::Balanced,
+            Some("performance") => DlssPerfQualityMode::Performance,
+            Some("ultra_performance") => DlssPerfQualityMode::UltraPerformance,
+            Some(other) => {
+                warn!("zero_day: unknown --dlss-quality `{other}`; using auto");
+                DlssPerfQualityMode::Auto
+            }
+        }
+    }
+}
+
+impl argh::FromArgValue for Scene {
+    fn from_arg_value(value: &str) -> Result<Self, String> {
+        match value {
+            "measure_one" => Ok(Scene::MeasureOne),
+            "measure_seven" => Ok(Scene::MeasureSeven),
+            "measure_seven_colored_lights" => Ok(Scene::MeasureSevenColoredLights),
+            other => Err(format!(
+                "unknown scene `{other}`; expected measure_one, measure_seven, or \
+                 measure_seven_colored_lights"
+            )),
+        }
+    }
+}
+
+// Synthetic-pulse tuning (see `animate_emissive`). The real film sequences its lights
+// procedurally; this fakes that with a wave travelling along the corridor. All tunable.
+/// Temporal rate of the wave (rad/s).
+const PULSE_FREQ: f32 = 2.0;
+/// Spatial frequency along the corridor's Z axis (rad/world-unit): sets the wavelength,
+/// so panels at different depths flare at different times instead of all together.
+const PULSE_WAVE_NUMBER: f32 = 0.05;
+/// Exponent that sharpens the sine into discrete flares (higher = snappier "pops").
+const PULSE_SHARPNESS: f32 = 2.0;
+/// Dim/bright bounds (as a fraction of each panel's base emissive). The floor keeps the
+/// corridor lit between flares; the peak overshoots 1.0 so passing panels visibly bloom.
+const PULSE_FLOOR: f32 = 0.4;
+const PULSE_PEAK: f32 = 1.8;
+/// Golden angle (rad): scatters a stable per-panel phase so same-depth panels don't flare
+/// in lockstep.
+const PULSE_PHASE_STRIDE: f32 = 2.399_963_2;
 
 fn main() {
     let args: Args = argh::from_env();
+    let (win_w, win_h) = args.resolution();
 
     let mut app = App::new();
 
@@ -99,14 +230,14 @@ fn main() {
         .insert_resource(args)
         .insert_resource(WinitSettings::continuous())
         .init_resource::<Cinematic>()
-        .init_resource::<EmissiveMaterials>()
+        .init_resource::<FilmLength>()
         .init_resource::<FrameStats>()
         .add_plugins((
             DefaultPlugins
                 .set(WindowPlugin {
                     primary_window: Some(Window {
                         present_mode: PresentMode::Immediate,
-                        resolution: WindowResolution::new(1920, 1080)
+                        resolution: WindowResolution::new(win_w, win_h)
                             .with_scale_factor_override(1.0),
                         ..default()
                     }),
@@ -128,6 +259,8 @@ fn main() {
             },
         ))
         .add_systems(Startup, (setup_hdr_calibration, setup))
+        // Waits for the glTF to fully load, then spawns the scene (see the fn doc).
+        .add_systems(Update, spawn_scene_when_ready)
         .add_systems(
             Update,
             (
@@ -171,8 +304,8 @@ fn setup_hdr_calibration(
 #[derive(Component)]
 struct RenderCamera;
 
-/// The film's imported camera (`DynamicCamera2`), stripped to a transform source that
-/// `drive_flythrough` follows.
+/// The film's imported camera (named per measure -- `DynamicCamera2`, `DynamicCamera`,
+/// ...), stripped to a transform source that `drive_flythrough` follows.
 #[derive(Component)]
 struct FilmCamera;
 
@@ -184,10 +317,23 @@ struct HudText;
 #[derive(Resource)]
 struct SceneGltf(Handle<Gltf>);
 
-/// Emissive materials collected in `proc_scene` (handle + boosted base emissive),
-/// modulated by `animate_emissive`.
+/// One emissive panel instance. `proc_scene` gives every emissive instance its own
+/// material clone (they otherwise share a handful of materials) so `animate_emissive`
+/// can drive each independently -- keyed to its world position for a corridor-length
+/// wave, offset by a stable per-panel `phase` so neighbours don't flare in lockstep.
+#[derive(Component)]
+struct EmissivePanel {
+    /// The boosted base emissive (`proc_scene`'s output); the pulse scales this.
+    base: LinearRgba,
+    /// Stable per-panel phase offset (radians).
+    phase: f32,
+}
+
+/// Length of the loaded film take (seconds), from the longest animation clip. Set in
+/// `start_animation`; used to size the `B` benchmark so it covers exactly one loop
+/// regardless of which measure is loaded (they run to different frame counts).
 #[derive(Resource, Default)]
-struct EmissiveMaterials(Vec<(Handle<StandardMaterial>, LinearRgba)>);
+struct FilmLength(f32);
 
 /// Rolling frame-time stats for the HUD and the `B` benchmark (Solari is heavy, so
 /// these are worth watching). `one_percent_high_ms` is the worst 1% of frames.
@@ -216,31 +362,23 @@ impl Default for Cinematic {
 fn setup(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
+    args: Res<Args>,
     #[cfg(feature = "dlss")] dlss_rr_supported: Option<Res<DlssRayReconstructionSupported>>,
 ) {
-    println!("Loading Zero-Day (this is a large scene; give it a moment)");
+    let glb = args.scene.glb();
+    println!("Loading Zero-Day `{glb}` (this is a large scene; give it a moment)");
 
-    // The whole glTF (not just the scene) so its ~550 animation clips -- and the film
-    // camera's -- stay loaded and reachable in `start_animation`.
-    commands.insert_resource(SceneGltf(asset_server.load("zero_day.glb")));
+    // Load the whole glTF (not just the scene); `spawn_scene_when_ready` spawns the scene
+    // once this finishes loading. Holding the whole `Gltf` also keeps its animation clips
+    // reachable for `start_animation`.
+    commands.insert_resource(SceneGltf(asset_server.load(glb.to_string())));
 
-    commands
-        .spawn(WorldAssetRoot(asset_server.load("zero_day.glb#Scene0")))
-        // Repairs + boosts the emissive materials.
-        .observe(proc_scene)
-        // Turns the film camera into the flythrough source.
-        .observe(setup_flythrough_camera)
-        // Tags every mesh `RaytracingMesh3d` so Solari can trace against it.
-        .observe(setup_raytracing_meshes)
-        // Plays every animation clip once the scene (and its player) exist.
-        .observe(start_animation);
-
-    // Camera. Its projection is overwritten with the film camera's in
-    // `setup_flythrough_camera`; the transform is the fallback view held until the
-    // flythrough is actually driving.
+    // Camera. Its field of view is overwritten with the film camera's in
+    // `setup_flythrough_camera` (near/far are kept); the transform is the fallback view
+    // held until the flythrough is actually driving.
     let mut cam = commands.spawn((
         Camera3d::default(),
-        // The imported `DynamicCamera2` also spawns as an active camera (order 0). A
+        // The imported film camera also spawns as an active camera (order 0). A
         // higher order makes ours always win until it is stripped, so we never flash
         // the film camera's un-animated rest pose.
         Camera {
@@ -279,7 +417,7 @@ fn setup(
     // DLSS Ray Reconstruction denoises the path-traced output when supported.
     #[cfg(feature = "dlss")]
     if dlss_rr_supported.is_some() {
-        cam.insert(dlss_rr());
+        cam.insert(dlss_rr(args.dlss_perf_quality()));
     }
 
     // HUD: rides the single GT7-tonemapped 3D camera (a second 2D camera with
@@ -301,16 +439,74 @@ fn setup(
     ));
 }
 
+/// One-shot latch for `spawn_scene_when_ready`.
+#[derive(Default)]
+struct SceneSpawn {
+    spawned: bool,
+    reported_error: bool,
+}
+
+/// Spawns the scene once its glTF is loaded with all dependencies (materials, meshes,
+/// animation clips), then latches so it runs once. The `WorldInstanceReady` observers read
+/// those sub-assets directly, so the scene must not spawn before they are all present: an
+/// unboosted emissive leaves the emissive-only corridor black, and a missing clip leaves it
+/// frozen. A load failure (usually a not-yet-converted `.glb`) is logged once.
+fn spawn_scene_when_ready(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    args: Res<Args>,
+    scene_gltf: Res<SceneGltf>,
+    mut state: Local<SceneSpawn>,
+) {
+    if state.spawned {
+        return;
+    }
+    if let LoadState::Failed(err) = asset_server.load_state(&scene_gltf.0) {
+        if !state.reported_error {
+            state.reported_error = true;
+            error!(
+                "zero_day: failed to load `{}` ({err}). Convert it first with convert.py \
+                 (see the example README).",
+                args.scene.glb()
+            );
+        }
+        return;
+    }
+    if !asset_server.is_loaded_with_dependencies(&scene_gltf.0) {
+        return;
+    }
+    state.spawned = true;
+    commands
+        .spawn(WorldAssetRoot(
+            asset_server.load(format!("{}#Scene0", args.scene.glb())),
+        ))
+        // Repairs + boosts the emissive materials, one clone per emissive instance.
+        .observe(proc_scene)
+        // Turns the film camera into the flythrough source.
+        .observe(setup_flythrough_camera)
+        // Tags every mesh `RaytracingMesh3d` so Solari can trace against it.
+        .observe(setup_raytracing_meshes)
+        // Plays every animation clip once the scene (and its player) exist.
+        .observe(start_animation);
+}
+
 // --- Scene processing (on load) ----------------------------------------------------
 
 /// Repairs the imported materials and boosts the emissive ones so the panels act as
-/// bright Solari light sources, then drops any imported lights.
+/// bright Solari light sources, drops any imported lights, then gives each emissive
+/// *instance* its own material so the pulse can animate them independently.
 ///
 /// `convert.py` handles most of the FBX quirks at the asset level, but deliberately
 /// leaves the normals DirectX-convention (green flipped vs glTF) for the engine to
-/// flip -- matching how the `bistro` example handles Sponza. Instanced meshes share a
-/// material handle, so each material is processed once (a per-entity pass would
-/// multiply a shared emissive many times, to infinity).
+/// flip -- matching how the `bistro` example handles Sponza.
+///
+/// Two passes over the scene:
+/// 1. Repair + boost each unique material once (instanced meshes share a material handle,
+///    so a per-entity boost would multiply a shared emissive many times, to infinity).
+/// 2. For each *emissive* instance, swap in a clone of its (now boosted) material and tag
+///    it `EmissivePanel`. Only ~230 instances are emissive, so this is cheap -- and Solari
+///    reads emissive per material asset, so distinct clones are what let neighbouring
+///    panels flare at different times (a shared handle can only pulse in lockstep).
 fn proc_scene(
     scene_ready: On<WorldInstanceReady>,
     mut commands: Commands,
@@ -319,9 +515,11 @@ fn proc_scene(
     lights: Query<Entity, Or<(With<PointLight>, With<DirectionalLight>, With<SpotLight>)>>,
     children: Query<&Children>,
     args: Res<Args>,
-    mut emissive_materials: ResMut<EmissiveMaterials>,
     mut processed: Local<HashSet<AssetId<StandardMaterial>>>,
 ) {
+    // Pass 1: repair + boost each unique material; remember the boosted emissive per
+    // material id so pass 2 can seed each instance's `EmissivePanel`.
+    let mut emissive_bases: HashMap<AssetId<StandardMaterial>, LinearRgba> = HashMap::new();
     for entity in children.iter_descendants(scene_ready.entity) {
         if let Ok(mat_h) = has_std_mat.get(entity)
             && processed.insert(mat_h.id())
@@ -336,8 +534,8 @@ fn proc_scene(
                 mat.emissive = LinearRgba::WHITE;
             }
             if mat.emissive != LinearRgba::BLACK {
-                mat.emissive = mat.emissive * args.emissive;
-                emissive_materials.0.push((mat_h.0.clone(), mat.emissive));
+                mat.emissive *= args.emissive();
+                emissive_bases.insert(mat_h.id(), mat.emissive);
             }
         }
 
@@ -346,12 +544,37 @@ fn proc_scene(
             commands.entity(entity).despawn();
         }
     }
+
+    // Pass 2: per-instance material clone + `EmissivePanel` for the emissive instances.
+    for entity in children.iter_descendants(scene_ready.entity) {
+        let Ok(mat_h) = has_std_mat.get(entity) else {
+            continue;
+        };
+        let Some(base) = emissive_bases.get(&mat_h.id()).copied() else {
+            continue;
+        };
+        let Some(material) = materials.get(mat_h.id()).cloned() else {
+            continue;
+        };
+        let handle = materials.add(material);
+        // Stable per-panel seed from the entity bits (its `index()` isn't a primitive).
+        let phase = ((entity.to_bits() & 0xffff) as f32 * PULSE_PHASE_STRIDE) % TAU;
+        commands
+            .entity(entity)
+            .insert((MeshMaterial3d(handle), EmissivePanel { base, phase }));
+    }
 }
 
-/// Repurposes the imported `DynamicCamera2` as the flythrough transform source: copies
-/// its projection to the render camera, then strips its render components so only our
+/// Repurposes the imported film camera as the flythrough transform source: adopts its
+/// field of view on the render camera, then strips its render components so only our
 /// camera draws (it keeps its animated transform, which `drive_flythrough` follows).
 /// The camera entity is present at `WorldInstanceReady`, so this is reliable.
+///
+/// Only the FOV is copied, not the whole `Projection`: the imported camera's clip planes
+/// are authored for the film (`DynamicCamera2` ships near=0.001/far=100), which would
+/// waste the render camera's depth precision and clip the corridor short. Every measure
+/// has exactly one camera, but we still tag only the first as `FilmCamera` (and strip the
+/// rest) so `drive_flythrough`'s `single()` can never go ambiguous.
 fn setup_flythrough_camera(
     scene_ready: On<WorldInstanceReady>,
     children: Query<&Children>,
@@ -359,20 +582,25 @@ fn setup_flythrough_camera(
     mut render_projection: Query<&mut Projection, With<RenderCamera>>,
     mut commands: Commands,
 ) {
-    let mut film_projection = None;
+    let mut film_fov = None;
+    let mut tagged = false;
     for entity in children.iter_descendants(scene_ready.entity) {
         if let Ok((camera, projection)) = film_cameras.get(entity) {
-            film_projection = Some(projection.clone());
-            commands
-                .entity(camera)
-                .remove::<(Camera3d, Camera, Projection)>()
-                .insert(FilmCamera);
+            let mut camera = commands.entity(camera);
+            camera.remove::<(Camera3d, Camera, Projection)>();
+            if !tagged {
+                tagged = true;
+                camera.insert(FilmCamera);
+                if let Projection::Perspective(p) = projection {
+                    film_fov = Some(p.fov);
+                }
+            }
         }
     }
-    if let (Some(projection), Ok(mut render_projection)) =
-        (film_projection, render_projection.single_mut())
+    if let (Some(fov), Ok(mut render_projection)) = (film_fov, render_projection.single_mut())
+        && let Projection::Perspective(p) = &mut *render_projection
     {
-        *render_projection = projection;
+        p.fov = fov;
     }
 }
 
@@ -427,7 +655,9 @@ fn start_animation(
     scene_ready: On<WorldInstanceReady>,
     scene_gltf: Res<SceneGltf>,
     gltfs: Res<Assets<Gltf>>,
+    clips: Res<Assets<AnimationClip>>,
     mut graphs: ResMut<Assets<AnimationGraph>>,
+    mut film_length: ResMut<FilmLength>,
     children: Query<&Children>,
     mut players: Query<&mut AnimationPlayer>,
     mut commands: Commands,
@@ -436,6 +666,14 @@ fn start_animation(
         warn!("zero_day: glTF asset not ready; animations will not play");
         return;
     };
+    // The take's length = the longest clip (the SCENE bake puts every clip on one shared
+    // timeline). Drives the benchmark window so it works for any measure.
+    film_length.0 = gltf
+        .animations
+        .iter()
+        .filter_map(|h| clips.get(h).map(AnimationClip::duration))
+        .fold(0.0_f32, f32::max);
+
     let (graph, nodes) = AnimationGraph::from_clips(gltf.animations.iter().cloned());
     let graph = graphs.add(graph);
     for entity in children.iter_descendants(scene_ready.entity) {
@@ -448,7 +686,11 @@ fn start_animation(
                 .insert(AnimationGraphHandle(graph.clone()));
         }
     }
-    info!("zero_day: started {} animation clips", nodes.len());
+    info!(
+        "zero_day: started {} animation clips ({:.1}s take)",
+        nodes.len(),
+        film_length.0
+    );
 }
 
 /// Toggles the film flythrough vs. free-fly.
@@ -458,11 +700,11 @@ fn toggle_flythrough(input: Res<ButtonInput<KeyCode>>, mut cinematic: ResMut<Cin
     }
 }
 
-/// The DLSS Ray Reconstruction component, at default quality.
+/// The DLSS Ray Reconstruction component at the requested quality (`--dlss-quality`).
 #[cfg(feature = "dlss")]
-fn dlss_rr() -> Dlss<DlssRayReconstructionFeature> {
+fn dlss_rr(perf_quality_mode: DlssPerfQualityMode) -> Dlss<DlssRayReconstructionFeature> {
     Dlss::<DlssRayReconstructionFeature> {
-        perf_quality_mode: Default::default(),
+        perf_quality_mode,
         reset: Default::default(),
         _phantom_data: Default::default(),
     }
@@ -473,6 +715,7 @@ fn dlss_rr() -> Dlss<DlssRayReconstructionFeature> {
 #[cfg(feature = "dlss")]
 fn toggle_denoiser(
     input: Res<ButtonInput<KeyCode>>,
+    args: Res<Args>,
     camera: Single<(Entity, Has<Dlss<DlssRayReconstructionFeature>>), With<RenderCamera>>,
     dlss_rr_supported: Option<Res<DlssRayReconstructionSupported>>,
     mut commands: Commands,
@@ -486,7 +729,9 @@ fn toggle_denoiser(
             .entity(entity)
             .remove::<(Dlss<DlssRayReconstructionFeature>, TemporalJitter, MipBias)>();
     } else {
-        commands.entity(entity).insert(dlss_rr());
+        commands
+            .entity(entity)
+            .insert(dlss_rr(args.dlss_perf_quality()));
     }
 }
 
@@ -513,10 +758,10 @@ fn frame_stats(
 /// `B` restarts the flythrough from the beginning and benchmarks one loop (~13.7 s),
 /// printing a summary. Rewinding + forcing cinematic mode makes runs comparable (the
 /// same camera path and object motion every time).
-#[allow(clippy::too_many_arguments)]
 fn benchmark(
     input: Res<ButtonInput<KeyCode>>,
     stats: Res<FrameStats>,
+    film_length: Res<FilmLength>,
     meshes: Res<Assets<Mesh>>,
     materials: Res<Assets<StandardMaterial>>,
     mesh_instances: Query<&Mesh3d>,
@@ -527,6 +772,12 @@ fn benchmark(
     mut low_sum: Local<f64>,
     mut high_sum: Local<f64>,
 ) {
+    // One full flythrough loop; falls back to MEASURE_ONE's length until the take loads.
+    let target = if film_length.0 > 0.0 {
+        film_length.0 as f64
+    } else {
+        13.7
+    };
     if input.just_pressed(KeyCode::KeyB) && running.is_none() {
         // Restart the take from frame 0 and follow the film camera so the measured
         // segment is identical each run.
@@ -538,7 +789,7 @@ fn benchmark(
         *frames = 0;
         *low_sum = 0.0;
         *high_sum = 0.0;
-        println!("zero_day: benchmarking one flythrough loop (~13.7s)...");
+        println!("zero_day: benchmarking one flythrough loop (~{target:.1}s)...");
     }
     let Some(start) = *running else {
         return;
@@ -547,7 +798,7 @@ fn benchmark(
     *low_sum += stats.one_percent_low_ms;
     *high_sum += stats.one_percent_high_ms;
     let elapsed = start.elapsed().as_secs_f64();
-    if elapsed >= 13.7 {
+    if elapsed >= target {
         let f = *frames as f64;
         println!(
             "  {:.2} ms/frame avg  ({:.0} fps)  over {} frames",
@@ -593,23 +844,32 @@ fn drive_flythrough(
     render.rotation = film.rotation;
 }
 
-/// Breathes the emissive panels in and out of sync -- a synthetic stand-in for the
-/// film's animated lights. Under Solari this pulses the actual illumination.
+/// Fakes the film's animated lights: a wave of brightness travelling down the corridor,
+/// sharpened into discrete flares, with a stable per-panel phase so neighbours don't pulse
+/// in lockstep. Under Solari this modulates the real illumination -- each panel is its own
+/// area light, so passing flares light the corridor as they go. The film's actual
+/// sequencing was procedural in Octane and isn't in the asset, so this only evokes it;
+/// `--no-pulse` holds the panels at their steady boosted emissive instead.
 fn animate_emissive(
     args: Res<Args>,
     time: Res<Time>,
-    emissive: Res<EmissiveMaterials>,
+    panels: Query<(&GlobalTransform, &EmissivePanel, &MeshMaterial3d<StandardMaterial>)>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
     if args.no_pulse {
         return;
     }
     let t = time.elapsed_secs();
-    for (i, (handle, base)) in emissive.0.iter().enumerate() {
-        if let Some(mut mat) = materials.get_mut(handle) {
-            let phase = i as f32 * 1.7;
-            let pulse = 1.0 + PULSE_AMPLITUDE * (t * PULSE_FREQ + phase).sin();
-            mat.emissive = *base * pulse;
+    for (transform, panel, material) in &panels {
+        // A wave travelling along the corridor's long (Z) axis, offset per panel so the
+        // whole scene shimmers rather than blinking as one.
+        let z = transform.translation().z;
+        let wave = ops::sin(t * PULSE_FREQ - z * PULSE_WAVE_NUMBER + panel.phase);
+        // Sharpen the sine so each panel sits dim, then pops.
+        let flare = ops::powf(0.5 + 0.5 * wave, PULSE_SHARPNESS);
+        let level = PULSE_FLOOR + (PULSE_PEAK - PULSE_FLOOR) * flare;
+        if let Some(mut mat) = materials.get_mut(material.id()) {
+            mat.emissive = panel.base * level;
         }
     }
 }
