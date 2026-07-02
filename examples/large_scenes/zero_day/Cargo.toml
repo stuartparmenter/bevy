@@ -1,0 +1,22 @@
+[package]
+name = "zero_day"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+bevy = { path = "../../../", features = [
+  "bevy_camera_controller",
+  "free_camera",
+  "bevy_solari",
+] }
+
+argh = "0.1.12"
+
+[features]
+# DLSS Ray Reconstruction denoises the Solari path. On by default (needs an NVIDIA
+# RTX GPU + the DLSS SDK to build); drop it with `--no-default-features` to run Solari
+# without DLSS.
+default = ["dlss"]
+dlss = ["bevy/dlss"]
