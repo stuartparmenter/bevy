@@ -1,8 +1,10 @@
 """Re-export an ORCA Zero-Day FBX as a single self-contained glTF binary (.glb) for
 the `zero_day` Bevy example.
 
-Zero-Day (NVIDIA ORCA) ships as `MEASURE_ONE/MEASURE_ONE.fbx` plus a `tex/` folder of
-`.dds` textures. Bevy can't load FBX, and -- more importantly -- Blender's FBX
+Zero-Day (NVIDIA ORCA) ships each measure (`MEASURE_ONE`, `MEASURE_SEVEN`, ...) as an
+`.fbx` plus a sibling `tex/` folder of `.dds` textures. This script converts whichever
+`.fbx` you pass; the example's README lists the per-measure output names. Bevy can't load
+FBX, and -- more importantly -- Blender's FBX
 importer mis-reads this Octane-exported asset's material conventions (it routes the
 ORM map into `KHR_materials_specular`, turns the BaseColor opacity into alpha blend,
 and drops most emissive maps). So instead of trusting the imported material graph,
@@ -56,16 +58,13 @@ for path in glob.glob(os.path.join(texdir, "*.dds")):
 
 
 def base_for_material(mat):
-    """Find the texture base name for a material, preferring the BaseColor image
-    Blender already linked, then falling back to the material name."""
-    if mat.use_nodes:
-        for node in mat.node_tree.nodes:
-            if node.type == "TEX_IMAGE" and node.image and node.image.filepath:
-                stem = os.path.splitext(os.path.basename(node.image.filepath))[0]
-                if "_" in stem:
-                    base = stem.rsplit("_", 1)[0].lower()
-                    if base in tex:
-                        return base
+    """The texture base name for a material, from its ORCA material NAME.
+
+    The name is the authored identity the download's README keys `tex/` by, and the mapping
+    is deterministic, so match on it alone -- don't guess from whatever BaseColor image
+    Blender's FBX import happens to link, which can point at a different set and drop the
+    material's emissive (the scene's only light). A name that doesn't resolve is reported in
+    `skipped` so the mismatch surfaces instead of being papered over with a wrong guess."""
     nm = mat.name.lower()
     # The full name, then the name with any trailing "_suffix" (e.g. Blender's "_c4d")
     # stripped; dict.fromkeys keeps order and drops the duplicate when they are equal.
@@ -154,9 +153,9 @@ print(
     % (lo.x, lo.y, lo.z, hi.x, hi.y, hi.z)
 )
 
-# The actions run past the scene's playback range (the camera goes to frame 412 but
-# the scene ends at 250), so extend the range to cover every action. Otherwise the
-# baked animation -- and the flythrough -- gets cut off early.
+# The actions run past the scene's playback range (e.g. Measure One's camera runs to
+# frame 412, Measure Seven's to 441, while the scene ends at 250), so extend the range to
+# cover every action. Otherwise the baked animation -- and the flythrough -- is cut short.
 max_frame = 1
 for obj in bpy.context.scene.objects:
     ad = obj.animation_data
@@ -166,12 +165,12 @@ bpy.context.scene.frame_start = 1
 bpy.context.scene.frame_end = max_frame
 print("ZERO_DAY_FRAME_RANGE 1..%d" % max_frame)
 
-# Export a single self-contained .glb. glTF is Y-up; the scene has no real lights,
-# but it carries the film's animated camera (`DynamicCamera2`) and ~550 animated
-# objects. `export_animation_mode="SCENE"` bakes them into ONE clip over the scene
-# frame range, so every object stays on the film's shared 13.7 s timeline -- exporting
-# per-action instead gives each object its own duration, and looping them makes the
-# short ones race.
+# Export a single self-contained .glb. glTF is Y-up; the scene has no real lights, but it
+# carries the film's animated camera (named per measure -- `DynamicCamera2`,
+# `DynamicCamera`, ...) and ~550-640 animated objects. `export_animation_mode="SCENE"`
+# bakes them into ONE clip over the scene frame range, so every object stays on the film's
+# shared timeline -- exporting per-action instead gives each object its own duration, and
+# looping them makes the short ones race.
 bpy.ops.export_scene.gltf(
     filepath=dst,
     export_format="GLB",
