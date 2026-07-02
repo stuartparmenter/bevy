@@ -15,6 +15,7 @@ use bevy::{
     camera::visibility::{NoCpuCulling, NoFrustumCulling},
     camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
     core_pipeline::prepass::{DeferredPrepass, DepthPrepass},
+    core_pipeline::tonemapping::{GranTurismo7Params, Tonemapping},
     diagnostic::DiagnosticsStore,
     light::TransmittedShadowReceiver,
     pbr::{
@@ -24,7 +25,7 @@ use bevy::{
     post_process::bloom::Bloom,
     render::{
         batching::NoAutomaticBatching, occlusion_culling::OcclusionCulling, render_resource::Face,
-        view::NoIndirectDrawing,
+        view::NoIndirectDrawing, working_color_space::WorkingColorSpace, RenderPlugin,
     },
     world_serialization::WorldInstanceReady,
 };
@@ -33,7 +34,10 @@ use bevy::{
     diagnostic::FrameTimeDiagnosticsPlugin,
     light::CascadeShadowConfigBuilder,
     prelude::*,
-    window::{PresentMode, WindowResolution},
+    window::{
+        AutoField, DisplayCalibrationPolicy, DisplayTarget, PresentMode, PrimaryWindow,
+        WindowResolution,
+    },
     winit::WinitSettings,
 };
 use mipmap_generator::{
@@ -42,6 +46,11 @@ use mipmap_generator::{
 };
 
 use crate::light_consts::lux;
+
+// Opt-in HDR setup shared with the other HDR examples: keeps the primary window's
+// `DisplayTarget` on the best transfer the surface advertises, else SDR.
+#[path = "../../../helpers/hdr.rs"]
+mod hdr;
 
 #[derive(FromArgs, Resource, Clone)]
 /// Config
@@ -117,20 +126,32 @@ pub fn main() {
 
     let mut app = App::new();
 
+    // The GT7 stack (HDR output, GT7 tonemapping + glare bloom, Rec.2020 working
+    // space) rides along in the default mode; `--minimal` leaves it all off for a
+    // clean benchmark baseline. Rec.2020 is GT7's native working space and has to
+    // be set when the plugins are built.
+    let mut default_plugins = DefaultPlugins.set(WindowPlugin {
+        primary_window: Some(Window {
+            present_mode: PresentMode::Immediate,
+            resolution: WindowResolution::new(1920, 1080).with_scale_factor_override(1.0),
+            ..default()
+        }),
+        ..default()
+    });
+    if !args.minimal {
+        default_plugins = default_plugins.set(RenderPlugin {
+            working_color_space: WorkingColorSpace::Rec2020,
+            ..default()
+        });
+    }
+
     app.init_resource::<CameraPositions>()
         .init_resource::<FrameLowHigh>()
         .insert_resource(GlobalAmbientLight::NONE)
         .insert_resource(args.clone())
         .insert_resource(ClearColor(Color::srgb(1.75, 1.9, 1.99)))
         .insert_resource(WinitSettings::continuous())
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                present_mode: PresentMode::Immediate,
-                resolution: WindowResolution::new(1920, 1080).with_scale_factor_override(1.0),
-                ..default()
-            }),
-            ..default()
-        }))
+        .add_plugins(default_plugins)
         .add_plugins((
             FrameTimeDiagnosticsPlugin {
                 max_history_length: 1000,
@@ -143,6 +164,14 @@ pub fn main() {
             Update,
             (input, run_animation, spin, frame_time_system, benchmark).chain(),
         );
+
+    // Auto-select the best HDR output the surface can present, and trust the
+    // calibrated monitor for peak luminance. The camera-side GT7 components
+    // (tonemapping, glare bloom) are added in `setup`.
+    if !args.minimal {
+        app.add_plugins(hdr::HdrPlugin::default())
+            .add_systems(Startup, setup_hdr_calibration);
+    }
 
     if !args.no_mip_generation {
         app.add_plugins((MipmapGeneratorPlugin, MipmapGeneratorDebugTextPlugin))
@@ -171,6 +200,24 @@ pub fn main() {
     }
 
     app.run();
+}
+
+/// Trusts the calibrated monitor for HDR luminance: hands peak and black level to
+/// the OS so GT7 tone maps against the panel's real headroom, and seeds a 200-nit
+/// HDR reference paper white. Gamut stays paired with the `HdrPlugin`-chosen
+/// transfer. Added only in the non-minimal (GT7) mode.
+fn setup_hdr_calibration(
+    window: Single<(Entity, &mut DisplayTarget), With<PrimaryWindow>>,
+    mut commands: Commands,
+) {
+    let (window, mut display_target) = window.into_inner();
+    display_target.paper_white_nits = 200.0;
+    commands.entity(window).insert(DisplayCalibrationPolicy {
+        paper_white: AutoField::Keep,
+        peak_luminance: AutoField::Auto,
+        min_luminance: AutoField::Auto,
+        gamut: AutoField::Keep,
+    });
 }
 
 #[derive(Component)]
@@ -294,11 +341,15 @@ pub fn setup(mut commands: Commands, asset_server: Res<AssetServer>, args: Res<A
         .insert_if(NoCpuCulling, || args.no_cpu_culling);
     if !args.minimal {
         cam.insert((
+            // GT7's physically based veiling glare, the matched pair for the GT7 tonemapper.
             Bloom {
                 intensity: 0.02,
-                ..default()
+                ..Bloom::GT7_GLARE
             },
             TemporalAntiAliasing::default(),
+            // GT7 tonemapping with display-peak plumbing.
+            Tonemapping::GranTurismo7,
+            GranTurismo7Params::default(),
         ))
         .insert(ScreenSpaceAmbientOcclusion::default());
     }
