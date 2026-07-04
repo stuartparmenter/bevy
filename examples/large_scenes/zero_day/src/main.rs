@@ -373,9 +373,9 @@ fn setup(
     // reachable for `start_animation`.
     commands.insert_resource(SceneGltf(asset_server.load(glb.to_string())));
 
-    // Camera. Its field of view is overwritten with the film camera's in
-    // `setup_flythrough_camera` (near/far are kept); the transform is the fallback view
-    // held until the flythrough is actually driving.
+    // Camera. Its field of view and near plane are overwritten with the film camera's in
+    // `setup_flythrough_camera` (far is kept); the transform is the fallback view held until
+    // the flythrough is actually driving.
     let mut cam = commands.spawn((
         Camera3d::default(),
         // The imported film camera also spawns as an active camera (order 0). A
@@ -566,15 +566,23 @@ fn proc_scene(
 }
 
 /// Repurposes the imported film camera as the flythrough transform source: adopts its
-/// field of view on the render camera, then strips its render components so only our
-/// camera draws (it keeps its animated transform, which `drive_flythrough` follows).
-/// The camera entity is present at `WorldInstanceReady`, so this is reliable.
+/// field of view and near plane on the render camera, then strips its render components so
+/// only our camera draws (it keeps its animated transform, which `drive_flythrough`
+/// follows). The camera entity is present at `WorldInstanceReady`, so this is reliable.
 ///
-/// Only the FOV is copied, not the whole `Projection`: the imported camera's clip planes
-/// are authored for the film (`DynamicCamera2` ships near=0.001/far=100), which would
-/// waste the render camera's depth precision and clip the corridor short. Every measure
-/// has exactly one camera, but we still tag only the first as `FilmCamera` (and strip the
-/// rest) so `drive_flythrough`'s `single()` can never go ambiguous.
+/// FOV and near are copied, but not the film's far plane. The film ships near=0.001/far=100;
+/// we keep our own far=2000 because the measures extend far past 100 units from the camera
+/// (measure_seven's shaft is ~700 units deep) and far=100 would cut the far end short. The
+/// tiny near, though, is essential and must be copied: Solari's realtime path resolves
+/// primary visibility from a *rasterized* depth/G-buffer prepass, which clips anything
+/// closer than the near plane. The flythrough grazes geometry within ~0.02 units (measure
+/// seven threads through packed machinery), so a coarse near=0.1 clips those surfaces to
+/// empty depth and the camera appears to see straight through them. The film's 0.001 is
+/// authored to exactly clear that geometry, and Bevy's reverse-z depth keeps precision fine
+/// at 0.001/2000.
+///
+/// Every measure has exactly one camera, but we still tag only the first as `FilmCamera`
+/// (and strip the rest) so `drive_flythrough`'s `single()` can never go ambiguous.
 fn setup_flythrough_camera(
     scene_ready: On<WorldInstanceReady>,
     children: Query<&Children>,
@@ -582,7 +590,7 @@ fn setup_flythrough_camera(
     mut render_projection: Query<&mut Projection, With<RenderCamera>>,
     mut commands: Commands,
 ) {
-    let mut film_fov = None;
+    let mut film_optics = None;
     let mut tagged = false;
     for entity in children.iter_descendants(scene_ready.entity) {
         if let Ok((camera, projection)) = film_cameras.get(entity) {
@@ -592,15 +600,17 @@ fn setup_flythrough_camera(
                 tagged = true;
                 camera.insert(FilmCamera);
                 if let Projection::Perspective(p) = projection {
-                    film_fov = Some(p.fov);
+                    film_optics = Some((p.fov, p.near));
                 }
             }
         }
     }
-    if let (Some(fov), Ok(mut render_projection)) = (film_fov, render_projection.single_mut())
+    if let (Some((fov, near)), Ok(mut render_projection)) =
+        (film_optics, render_projection.single_mut())
         && let Projection::Perspective(p) = &mut *render_projection
     {
         p.fov = fov;
+        p.near = near;
     }
 }
 
@@ -645,8 +655,17 @@ fn setup_raytracing_meshes(
 
 // --- Runtime -----------------------------------------------------------------------
 
-/// Plays every animation clip (the ~550 animated objects plus the film camera) on the
-/// scene's animation player, looping.
+/// Merges every imported clip into one and plays that single clip (the ~550 animated
+/// objects plus the film camera) on the scene's animation player, looping.
+///
+/// `convert.py` exports with glTF `SCENE` animation mode intending one baked clip, but
+/// Blender's exporter still emits one clip *per object* (2337 for measure_one, 5272 for
+/// measure_seven). Playing thousands of separate clips is the example's dominant CPU cost:
+/// every frame the `AnimationPlayer` advances thousands of `ActiveAnimation`s and evaluates
+/// a thousands-wide blend graph, all pure per-clip overhead. So we merge their curves into a
+/// single clip up front. Each object's curves are keyed by a distinct `AnimationTargetId`,
+/// so they never collide; playback is identical, but there is one active animation instead of
+/// thousands. (The clips carry no events -- FBX animation is rigid TRS -- so none are lost.)
 ///
 /// Runs on `WorldInstanceReady` like `animated_mesh.rs`: by the time the scene has
 /// spawned, its parent glTF (and `animations`) is loaded and the player is a
@@ -655,7 +674,7 @@ fn start_animation(
     scene_ready: On<WorldInstanceReady>,
     scene_gltf: Res<SceneGltf>,
     gltfs: Res<Assets<Gltf>>,
-    clips: Res<Assets<AnimationClip>>,
+    mut clips: ResMut<Assets<AnimationClip>>,
     mut graphs: ResMut<Assets<AnimationGraph>>,
     mut film_length: ResMut<FilmLength>,
     children: Query<&Children>,
@@ -666,29 +685,40 @@ fn start_animation(
         warn!("zero_day: glTF asset not ready; animations will not play");
         return;
     };
-    // The take's length = the longest clip (the SCENE bake puts every clip on one shared
-    // timeline). Drives the benchmark window so it works for any measure.
-    film_length.0 = gltf
-        .animations
-        .iter()
-        .filter_map(|h| clips.get(h).map(AnimationClip::duration))
-        .fold(0.0_f32, f32::max);
 
-    let (graph, nodes) = AnimationGraph::from_clips(gltf.animations.iter().cloned());
+    // Fold all imported clips into one. The take's length is the longest source clip (every
+    // object rides the film's shared timeline), which is just the merged clip's duration.
+    let mut merged = AnimationClip::default();
+    let mut source_clips = 0;
+    for handle in &gltf.animations {
+        let Some(clip) = clips.get(handle) else {
+            continue;
+        };
+        for (target_id, curves) in clip.curves() {
+            merged
+                .curves_mut()
+                .entry(*target_id)
+                .or_default()
+                .extend(curves.iter().cloned());
+        }
+        merged.set_duration(merged.duration().max(clip.duration()));
+        source_clips += 1;
+    }
+    film_length.0 = merged.duration();
+    let merged = clips.add(merged);
+
+    let (graph, node) = AnimationGraph::from_clip(merged);
     let graph = graphs.add(graph);
     for entity in children.iter_descendants(scene_ready.entity) {
         if let Ok(mut player) = players.get_mut(entity) {
-            for node in &nodes {
-                player.play(*node).repeat();
-            }
+            player.play(node).repeat();
             commands
                 .entity(entity)
                 .insert(AnimationGraphHandle(graph.clone()));
         }
     }
     info!(
-        "zero_day: started {} animation clips ({:.1}s take)",
-        nodes.len(),
+        "zero_day: merged {source_clips} clips into one ({:.1}s take)",
         film_length.0
     );
 }
