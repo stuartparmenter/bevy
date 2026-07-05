@@ -23,6 +23,9 @@ wgpu).
 ## Getting the scene
 
 Download "Zero-Day" [from developer.nvidia.com](https://developer.nvidia.com/orca/beeple-zero-day).
+NVIDIA's real-time demo videos are the reference for how each measure should look:
+[Measure 1](https://www.youtube.com/watch?v=0WE7CgJMuVc) and
+[Measure 7](https://www.youtube.com/watch?v=zaOR22Q0RPc) (the one embedded on that page).
 
 The download ships several "measures" — each an `.fbx` plus a sibling `tex/` folder of
 `.dds` textures. This example can load any of them (see `--scene` below):
