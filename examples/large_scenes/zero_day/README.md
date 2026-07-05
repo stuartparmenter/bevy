@@ -94,9 +94,8 @@ Options:
   --scene      which ORCA measure to load: measure_one (default), measure_seven, or
                measure_seven_colored_lights. Each is a separate .glb built by convert.py.
   --emissive   emissive multiplier for the accent panels (they are the scene's only
-               lights, so they must be bright). Defaults per measure (measure_one 150000,
-               measure_seven 600000 -- a much larger space); override if it's too dark or
-               blown out.
+               lights, so they must be bright; default 150000). Override if it's too
+               dark or blown out.
   --no-pulse   disable the synthetic emissive pulse (a wave of light sweeps the panels by
                default to evoke the film's animated lights, which weren't in the asset).
   --resolution render resolution as WxH (default 1920x1080). Lower it (e.g. 1280x720) for
