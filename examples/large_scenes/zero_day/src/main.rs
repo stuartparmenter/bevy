@@ -86,8 +86,7 @@ pub struct Args {
     scene: Scene,
 
     /// emissive multiplier for the accent panels (they are the scene's only lights, so
-    /// they must be bright to illuminate the space). Defaults per measure (measure_seven is
-    /// a much larger, more open space, so its default is higher); override to taste.
+    /// they must be bright to illuminate the space); override to taste.
     #[argh(option)]
     emissive: Option<f32>,
 
@@ -130,13 +129,12 @@ impl Scene {
         }
     }
 
-    /// Default emissive multiplier (overridable with `--emissive`). Measure One is a tight
-    /// corridor; Measure Seven is a much larger, more open shaft whose panels must be far
-    /// brighter to carry the space.
+    /// Default emissive multiplier (overridable with `--emissive`). Roughly a bright LED
+    /// fixture's luminance in nits; every measure carries well at the same value.
     fn default_emissive(self) -> f32 {
         match self {
             Scene::MeasureOne => 150_000.0,
-            Scene::MeasureSeven | Scene::MeasureSevenColoredLights => 600_000.0,
+            Scene::MeasureSeven | Scene::MeasureSevenColoredLights => 150_000.0,
         }
     }
 }
