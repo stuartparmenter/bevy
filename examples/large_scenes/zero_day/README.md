@@ -38,12 +38,17 @@ material conventions, so [`convert.py`](convert.py) rebuilds each material from 
 naming/channel convention documented in the download's README, bakes the animation into
 one scene-length clip, and exports a single self-contained `.glb`:
 
-| Texture          | Channels                                        |
-|:-----------------|:------------------------------------------------|
-| `_BaseColor.dds` | RGB = base color (alpha = opacity, kept opaque) |
-| `_Specular.dds`  | R = occlusion, **G = roughness, B = metallic**  |
-| `_Normal.dds`    | DirectX normal (green flipped in the example)   |
-| `_Emissive.dds`  | RGB = emissive color                            |
+| Texture          | Channels                                                 |
+|:-----------------|:---------------------------------------------------------|
+| `_BaseColor.dds` | RGB = base color (alpha = opacity → alpha-mask cutout)   |
+| `_Specular.dds`  | R = occlusion, **G = roughness, B = metallic**           |
+| `_Normal.dds`    | DirectX normal (green flipped in the example)            |
+| `_Emissive.dds`  | RGB = emissive color                                     |
+
+It also deletes the meshes the FBX marks hidden (proxy shells, ON/OFF light-state
+variants -- ~1,700 objects in Measure Seven). The film never renders them, but glTF
+export would keep them as solid visible geometry that walls in both the camera and
+Solari's rays.
 
 Convert it with the headless Blender helper (Blender 4.x/5.x), dropping the result in
 this example's `assets/` folder (which is `.gitignore`d and never committed). Run it once
