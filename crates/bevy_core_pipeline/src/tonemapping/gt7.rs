@@ -41,6 +41,7 @@ use bevy_render::{
     render_resource::{DynamicUniformBuffer, ShaderType},
     renderer::{RenderDevice, RenderQueue},
     view::{ExtractedView, ViewDisplayTarget},
+    RenderApp,
 };
 use bevy_window::DisplayTarget;
 
@@ -126,6 +127,7 @@ pub const REC_2020_TO_REC_709: [[f32; 3]; 3] = [
 #[derive(Component, Debug, Clone, Copy, PartialEq, Reflect, ExtractComponent)]
 #[extract_component_filter(With<Camera>)]
 #[reflect(Component, Debug, Default, PartialEq, Clone)]
+#[extract_app(RenderApp)]
 pub struct GranTurismo7Params {
     /// Mix between the per-channel tone-mapped color and the hue-preserving
     /// UCS (`ICtCp`) processed color. `0.0` = fully per-channel ("camera-like"

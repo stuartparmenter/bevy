@@ -25,6 +25,7 @@ use bevy_window::{
 };
 
 use super::ExtractedWindows;
+use crate::RenderApp;
 
 /// Resource that stores the [`DisplayTarget`] for render targets that are not
 /// backed by a [`Window`] entity.
@@ -51,6 +52,7 @@ use super::ExtractedWindows;
 /// [`RenderTarget::None`]: bevy_camera::RenderTarget::None
 #[derive(Default, Clone, Debug, PartialEq, Resource, ExtractResource, Reflect)]
 #[reflect(Resource, Default, Debug, PartialEq, Clone)]
+#[extract_app(RenderApp)]
 pub struct ManualDisplayTargets(HashMap<NormalizedRenderTarget, DisplayTarget>);
 
 impl core::ops::Deref for ManualDisplayTargets {
@@ -294,6 +296,7 @@ pub(crate) mod policy {
 /// [`resolve_display_target`] consults it.
 #[derive(Default, Clone, Debug, PartialEq, Resource, ExtractResource, Reflect)]
 #[reflect(Resource, Default, Debug, PartialEq, Clone)]
+#[extract_app(RenderApp)]
 pub struct EffectiveManualDisplayTargets(HashMap<NormalizedRenderTarget, EffectiveDisplayTarget>);
 
 impl core::ops::Deref for EffectiveManualDisplayTargets {

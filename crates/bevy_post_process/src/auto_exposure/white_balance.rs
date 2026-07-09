@@ -2,7 +2,7 @@ use bevy_camera::{Camera, Hdr};
 use bevy_core_pipeline::tonemapping::ExternalWhiteBalance;
 use bevy_ecs::{prelude::*, query::QueryItem, reflect::ReflectComponent};
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
-use bevy_render::{extract_component::ExtractComponent, sync_component::SyncComponent};
+use bevy_render::{extract_component::ExtractComponent, sync_component::SyncComponent, RenderApp};
 use bevy_utils::once;
 use tracing::warn;
 
@@ -145,11 +145,11 @@ impl AutoWhiteBalance {
     }
 }
 
-impl SyncComponent for AutoWhiteBalance {
+impl SyncComponent<RenderApp> for AutoWhiteBalance {
     type Target = (AutoWhiteBalance, ExternalWhiteBalance);
 }
 
-impl ExtractComponent for AutoWhiteBalance {
+impl ExtractComponent<RenderApp> for AutoWhiteBalance {
     type QueryData = &'static Self;
     type QueryFilter = With<Camera>;
     // The `ExternalWhiteBalance` marker keeps the tonemapping pass's

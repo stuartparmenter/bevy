@@ -35,8 +35,7 @@ use bevy_render::{
         ViewSortedRenderPhases,
     },
     render_resource::{
-        BindGroupId, CachedRenderPipelineId, TextureDescriptor, TextureDimension, TextureFormat,
-        TextureUsages,
+        CachedRenderPipelineId, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages,
     },
     renderer::RenderDevice,
     sync_world::MainEntity,
@@ -119,7 +118,7 @@ pub struct Opaque2d {
 }
 
 /// Data that must be identical in order to batch phase items together.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Opaque2dBinKey {
     /// The identifier of the render pipeline.
     pub pipeline: CachedRenderPipelineId,
@@ -130,8 +129,8 @@ pub struct Opaque2dBinKey {
     /// Normally, this is the ID of the mesh, but for non-mesh items it might be
     /// the ID of another type of asset.
     pub asset_id: UntypedAssetId,
-    /// The ID of a bind group specific to the material.
-    pub material_bind_group_id: Option<BindGroupId>,
+    /// The index of a bind group specific to the material.
+    pub material_bind_group_index: Option<u32>,
 }
 
 impl PhaseItem for Opaque2d {
@@ -233,7 +232,7 @@ pub struct AlphaMask2d {
 }
 
 /// Data that must be identical in order to batch phase items together.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct AlphaMask2dBinKey {
     /// The identifier of the render pipeline.
     pub pipeline: CachedRenderPipelineId,
@@ -244,8 +243,8 @@ pub struct AlphaMask2dBinKey {
     /// Normally, this is the ID of the mesh, but for non-mesh items it might be
     /// the ID of another type of asset.
     pub asset_id: UntypedAssetId,
-    /// The ID of a bind group specific to the material.
-    pub material_bind_group_id: Option<BindGroupId>,
+    /// The index of a bind group specific to the material.
+    pub material_bind_group_index: Option<u32>,
 }
 
 impl PhaseItem for AlphaMask2d {

@@ -137,6 +137,7 @@ impl Plugin for DisplayEncodingPlugin {
 /// HDR-transfer view (e.g. to exercise or demonstrate the path).
 #[derive(Resource, ExtractResource, Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Reflect)]
 #[reflect(Resource, Debug, Default, Clone, PartialEq, Hash)]
+#[extract_app(RenderApp)]
 pub enum DisplayGamutCompression {
     /// Compress exactly when the gamut stage can produce out-of-gamut colors
     /// (a gamut contraction). Identity and expanding transforms keep the
