@@ -36,7 +36,6 @@ import sys
 
 import bpy
 import mathutils
-import numpy as np
 
 argv = sys.argv[sys.argv.index("--") + 1 :] if "--" in sys.argv else []
 if len(argv) != 2:
@@ -122,28 +121,6 @@ def load_image(path, non_color):
     return img
 
 
-_cutout_cache = {}
-
-
-def has_cutout_texels(img, cutoff=0.5):
-    """True if any texel's alpha falls below the mask cutoff.
-
-    Only the ~30 decal/label materials actually use their BaseColor alpha; every other
-    texture's alpha plane is solid 1.0. Linking the alpha indiscriminately would export
-    ~90 fully-opaque materials as alpha-masked, which costs the raster prepass early-z
-    for discards that can never happen -- so a material only becomes a cutout when its
-    texture really cuts something out."""
-    key = img.filepath
-    if key not in _cutout_cache:
-        result = False
-        if img.channels == 4 and img.size[0] > 0 and img.size[1] > 0:
-            pixels = np.empty(img.size[0] * img.size[1] * img.channels, dtype=np.float32)
-            img.pixels.foreach_get(pixels)
-            result = bool((pixels[3 :: img.channels] < cutoff).any())
-        _cutout_cache[key] = result
-    return _cutout_cache[key]
-
-
 def rebuild(mat, base):
     channels = tex[base]
     mat.use_nodes = True
@@ -153,12 +130,16 @@ def rebuild(mat, base):
     bsdf = nt.nodes.new("ShaderNodeBsdfPrincipled")
     nt.links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
 
-    basecolor_node = None
     if "basecolor" in channels:
         n = nt.nodes.new("ShaderNodeTexImage")
         n.image = load_image(channels["basecolor"], non_color=False)
         nt.links.new(n.outputs["Color"], bsdf.inputs["Base Color"])
-        basecolor_node = n
+        # The BaseColor image also carries an opacity plane (the decal/label materials are
+        # see-through outside their glyphs), but leave its Alpha output unlinked: Zero-Day
+        # renders fully opaque here, so every rebuilt material exports OPAQUE. Solari
+        # resolves primary visibility from a deferred G-buffer that a forward-blended
+        # surface never reaches, and nothing in the scene genuinely needs to be seen
+        # through -- so any transparency would only cost, and be invisible to the trace.
 
     if "specular" in channels:
         n = nt.nodes.new("ShaderNodeTexImage")
@@ -181,20 +162,6 @@ def rebuild(mat, base):
         n.image = load_image(channels["emissive"], non_color=False)
         nt.links.new(n.outputs["Color"], bsdf.inputs["Emission Color"])
         bsdf.inputs["Emission Strength"].default_value = 1.0
-
-    # The BaseColor alpha is an opacity map: the decal/label materials are see-through
-    # outside their glyphs. Preserve that as an alpha CLIP (cutout), not BLEND: Bevy
-    # renders blended materials in a forward pass that Solari's deferred-G-buffer
-    # primary visibility can't see, while a hard cutout stays in the G-buffer and just
-    # discards the see-through texels. Materials whose alpha plane is solid 1.0 (nearly
-    # all of them) stay opaque -- a mask that never discards would only cost perf.
-    if basecolor_node is not None and has_cutout_texels(basecolor_node.image):
-        nt.links.new(basecolor_node.outputs["Alpha"], bsdf.inputs["Alpha"])
-        try:
-            mat.blend_method = "CLIP"
-            mat.alpha_threshold = 0.5
-        except (AttributeError, TypeError):
-            pass
 
 
 rebuilt = 0
@@ -256,15 +223,17 @@ bpy.ops.export_scene.gltf(
 print("ZERO_DAY_EXPORT_DONE", dst)
 
 
-def patch_alpha_modes_to_mask(path, cutoff=0.5):
-    """Rewrite every ``alphaMode: BLEND`` material in the exported .glb to ``MASK``.
+def patch_alpha_modes_to_opaque(path):
+    """Force every transparent material in the exported .glb back to ``OPAQUE``.
 
-    Blender's glTF exporter emits ``BLEND`` for any material with a linked opacity, regardless
-    of blend mode. ``BLEND`` is wrong for the Bevy Solari example: blended surfaces render in a
-    forward pass and never populate the deferred G-buffer Solari resolves primary visibility
-    from, so they'd vanish from the trace. ``MASK`` (alpha cutout) keeps opaque texels in the
-    G-buffer and only discards the see-through ones -- the see-through shells and decal
-    backgrounds read through, everything else stays solid. Patches the JSON chunk in place;
+    The rebuilt materials export ``OPAQUE`` already (their BaseColor alpha is left unlinked),
+    but the handful of materials whose ORCA name doesn't resolve to a texture set (the
+    ``skipped`` list) keep Blender's FBX-imported graph, which routes the BaseColor opacity
+    into an alpha ``BLEND``. ``BLEND`` is wrong for the Bevy Solari example: blended surfaces
+    render in a forward pass and never populate the deferred G-buffer Solari resolves primary
+    visibility from, so they'd vanish from the trace. Zero-Day has no surfaces that genuinely
+    need to be seen through, so drop any residual transparency: rewrite ``BLEND``/``MASK`` to
+    ``OPAQUE`` and strip the now-meaningless ``alphaCutoff``. Patches the JSON chunk in place;
     the binary chunk is untouched."""
     import json
     import struct
@@ -278,9 +247,9 @@ def patch_alpha_modes_to_mask(path, cutoff=0.5):
 
     patched = 0
     for material in gltf.get("materials", []):
-        if material.get("alphaMode") == "BLEND":
-            material["alphaMode"] = "MASK"
-            material["alphaCutoff"] = cutoff
+        if material.get("alphaMode", "OPAQUE") != "OPAQUE":
+            material["alphaMode"] = "OPAQUE"
+            material.pop("alphaCutoff", None)
             patched += 1
 
     new_json = json.dumps(gltf, separators=(",", ":")).encode("utf-8")
@@ -291,7 +260,7 @@ def patch_alpha_modes_to_mask(path, cutoff=0.5):
         f.write(struct.pack("<II", len(new_json), json_type))
         f.write(new_json)
         f.write(bin_chunk)
-    print("ZERO_DAY_ALPHA_MASK patched=%d materials" % patched)
+    print("ZERO_DAY_ALPHA_OPAQUE patched=%d materials" % patched)
 
 
-patch_alpha_modes_to_mask(dst)
+patch_alpha_modes_to_opaque(dst)

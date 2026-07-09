@@ -43,7 +43,7 @@ one scene-length clip, and exports a single self-contained `.glb`:
 
 | Texture          | Channels                                                 |
 |:-----------------|:---------------------------------------------------------|
-| `_BaseColor.dds` | RGB = base color (alpha = opacity → alpha-mask cutout)   |
+| `_BaseColor.dds` | RGB = base color (alpha/opacity dropped — rendered opaque) |
 | `_Specular.dds`  | R = occlusion, **G = roughness, B = metallic**           |
 | `_Normal.dds`    | DirectX normal (green flipped in the example)            |
 | `_Emissive.dds`  | RGB = emissive color                                     |
