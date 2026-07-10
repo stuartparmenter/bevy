@@ -41,7 +41,7 @@ bevy_log = { path = "../bevy_log", version = "0.20.0-dev", optional = true }
 
 # other
 tracing = { version = "0.1", default-features = false, features = ["std"] }
-dlss_wgpu = { git = "https://github.com/stuartparmenter/dlss_wgpu", branch = "frame-generation", default-features = false, features = ["wgpu-30"], optional = true }
+dlss_wgpu = { git = "https://github.com/stuartparmenter/dlss_wgpu", rev = "d121a1f", default-features = false, features = ["wgpu-30"], optional = true }
 uuid = { version = "1.21.0", optional = true }
 
 [lints]

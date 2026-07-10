@@ -129,6 +129,13 @@ impl Plugin for DlssInitPlugin {
                         }
                         Err(_) => {}
                     }
+
+                    // Paced presentation of generated frames relies on driver present
+                    // metering
+                    if dlss_wgpu::present_metering::register_present_metering(&mut args, adapter) {
+                        additional_vulkan_features
+                            .insert::<paced_present::PresentMeteringSupported>();
+                    }
                 },
             )
         };
@@ -148,7 +155,12 @@ impl Plugin for DlssPlugin {
     }
 
     fn finish(&self, app: &mut App) {
-        let (super_resolution_supported, ray_reconstruction_supported, frame_generation_supported) = {
+        let (
+            super_resolution_supported,
+            ray_reconstruction_supported,
+            frame_generation_supported,
+            present_metering_supported,
+        ) = {
             let features = app
                 .sub_app_mut(RenderApp)
                 .world()
@@ -157,6 +169,7 @@ impl Plugin for DlssPlugin {
                 features.has::<DlssSuperResolutionSupported>(),
                 features.has::<DlssRayReconstructionSupported>(),
                 features.has::<DlssFrameGenerationSupported>(),
+                features.has::<paced_present::PresentMeteringSupported>(),
             )
         };
         if !super_resolution_supported && !frame_generation_supported {
@@ -174,13 +187,6 @@ impl Plugin for DlssPlugin {
             info!("DLSS is not supported on this system");
             return;
         };
-        // Paced presentation of the generated frames relies on driver present metering
-        let present_metering_supported = app
-            .sub_app(RenderApp)
-            .world()
-            .resource::<RenderDevice>()
-            .features()
-            .contains(bevy_render::settings::WgpuFeatures::VULKAN_NV_PRESENT_METERING);
         let (super_resolution_supported, frame_generation_supported, max_frames_to_generate) = {
             let sdk = dlss_sdk.lock().unwrap();
             (

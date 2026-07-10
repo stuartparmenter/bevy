@@ -2,9 +2,8 @@
 //!
 //! Frame generation features (e.g. DLSS Frame Generation) produce one or more generated
 //! frames alongside each real rendered frame, and need to present them evenly spaced in
-//! time. The [VK_NV_present_metering] Vulkan extension
-//! ([`Features::VULKAN_NV_PRESENT_METERING`]) lets the driver meter the display timing of
-//! the batch, so the frames are simply presented back to back.
+//! time. The [VK_NV_present_metering] Vulkan extension lets the driver meter the display
+//! timing of the batch, so the frames are presented back to back.
 //!
 //! A producer marks a window as paced by inserting its (main world) window entity into
 //! [`PacedWindows`] during extract, which suppresses the render thread's normal swapchain
@@ -13,11 +12,13 @@
 //! plan frame is blitted to the surface with the screenshot fullscreen pipeline and
 //! presented, with the driver metering the batch.
 //!
-//! Without driver metering support the frames are presented unmetered, so producers
-//! should gate their support on [`Features::VULKAN_NV_PRESENT_METERING`].
+//! Driver metering is used when [`PresentMeteringSupported`] is present in
+//! [`AdditionalVulkanFeatures`](crate::renderer::raw_vulkan_init::AdditionalVulkanFeatures).
+//! Whoever enables VK_NV_present_metering during raw Vulkan device creation (e.g. the DLSS
+//! plugin, via `dlss_wgpu::present_metering`) must insert the marker. Without it the
+//! frames are presented unmetered, so producers should gate their support on it too.
 //!
 //! [VK_NV_present_metering]: https://registry.khronos.org/vulkan/specs/latest/man/html/VK_NV_present_metering.html
-//! [`Features::VULKAN_NV_PRESENT_METERING`]: wgpu::Features::VULKAN_NV_PRESENT_METERING
 
 use super::{screenshot::ScreenshotToScreenPipeline, ExtractedWindow, SurfaceData};
 use crate::{
@@ -34,6 +35,26 @@ use bevy_ecs::{
 use bevy_log::warn;
 use bevy_utils::default;
 use core::mem;
+
+/// Marker for [`AdditionalVulkanFeatures`](crate::renderer::raw_vulkan_init::AdditionalVulkanFeatures),
+/// inserted by whoever enables the VK_NV_present_metering device extension during raw
+/// Vulkan device creation. Paced presentation is driver-metered only when it is present.
+pub struct PresentMeteringSupported;
+
+/// `VkSetPresentConfigNV` from VK_NV_present_metering, chained onto the `VkPresentInfoKHR`
+/// of the first present of a batch to have the driver meter the batch's display timing.
+/// Defined locally: `bevy_render` depends on neither ash (which also lacks the extension)
+/// nor `dlss_wgpu`, which carry the canonical definitions.
+#[repr(C)]
+struct SetPresentConfigNV {
+    /// `VkStructureType`: `VK_STRUCTURE_TYPE_SET_PRESENT_CONFIG_NV`
+    s_type: i32,
+    p_next: *const core::ffi::c_void,
+    num_frames_per_batch: u32,
+    present_config_feedback: u32,
+}
+
+const STRUCTURE_TYPE_SET_PRESENT_CONFIG_NV: i32 = 1000613000;
 
 /// Windows whose swapchain acquisition and presentation are owned by paced presentation
 /// this frame, keyed by main world window entity.
@@ -74,9 +95,8 @@ impl PacedPresentPlans {
 }
 
 /// Drains [`PacedPresentPlans`] and presents each plan's frames back to back, metered by
-/// the driver when [`Features::VULKAN_NV_PRESENT_METERING`](wgpu::Features::VULKAN_NV_PRESENT_METERING)
-/// is available. Returns the windows that were presented, which must be skipped by normal
-/// presentation.
+/// the driver when [`PresentMeteringSupported`] is available. Returns the windows that
+/// were presented, which must be skipped by normal presentation.
 pub(crate) fn present_paced_plans(world: &mut World) -> EntityHashSet {
     let mut presented = EntityHashSet::default();
     let mut plans = match world.get_resource_mut::<PacedPresentPlans>() {
@@ -90,9 +110,13 @@ pub(crate) fn present_paced_plans(world: &mut World) -> EntityHashSet {
                 world.resource_scope(|world, blit_pipeline: Mut<ScreenshotToScreenPipeline>| {
                     let render_device = world.resource::<RenderDevice>().clone();
                     let render_queue = world.resource::<RenderQueue>().clone();
-                    let metering_supported = render_device
-                        .features()
-                        .contains(wgpu::Features::VULKAN_NV_PRESENT_METERING);
+                    #[cfg(feature = "raw_vulkan_init")]
+                    let metering_supported = world
+                        .get_resource::<crate::renderer::raw_vulkan_init::AdditionalVulkanFeatures>(
+                        )
+                        .is_some_and(|features| features.has::<PresentMeteringSupported>());
+                    #[cfg(not(feature = "raw_vulkan_init"))]
+                    let metering_supported = false;
 
                     let mut windows =
                         world.query::<(MainEntity, &mut ExtractedWindow, Option<&SurfaceData>)>();
@@ -126,21 +150,40 @@ pub(crate) fn present_paced_plans(world: &mut World) -> EntityHashSet {
                             continue;
                         };
 
-                        // The driver meters the whole batch starting at the next present
-                        if metering_supported
-                            && let Some(hal_surface) =
-                                unsafe { surface_data.surface.as_hal::<wgpu::hal::api::Vulkan>() }
-                        {
-                            hal_surface.set_next_present_config(plan.frames.len() as u32);
-                        }
+                        // Read by the driver during the batch's first present below, so it
+                        // must outlive that present
+                        let mut present_config = SetPresentConfigNV {
+                            s_type: STRUCTURE_TYPE_SET_PRESENT_CONFIG_NV,
+                            p_next: core::ptr::null(),
+                            num_frames_per_batch: plan.frames.len() as u32,
+                            present_config_feedback: 0,
+                        };
 
                         let layout =
                             pipeline_cache.get_bind_group_layout(&blit_pipeline.bind_group_layout);
-                        for frame in &plan.frames {
+                        for (frame_index, frame) in plan.frames.iter().enumerate() {
                             let Some(surface_texture) = acquire(surface_data, &render_device)
                             else {
                                 break;
                             };
+                            // The driver meters the whole batch starting at the next
+                            // present. Armed only after a successful acquire, when a
+                            // present is guaranteed to follow in this scope, so the
+                            // stashed pointer is consumed before `present_config` drops.
+                            if frame_index == 0
+                                && metering_supported
+                                && let Some(hal_surface) = unsafe {
+                                    surface_data.surface.as_hal::<wgpu::hal::api::Vulkan>()
+                                }
+                            {
+                                // SAFETY: VK_NV_present_metering was enabled at device
+                                // creation per `PresentMeteringSupported`, and the chain
+                                // stays valid until the present below consumes it.
+                                unsafe {
+                                    hal_surface
+                                        .set_next_present_chain((&raw mut present_config).cast());
+                                }
+                            }
                             blit(
                                 &pipeline,
                                 view_format,
