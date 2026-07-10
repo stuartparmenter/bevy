@@ -4,7 +4,7 @@ use argh::FromArgs;
 use bevy::{
     camera::CameraMainTextureUsages,
     camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
-    diagnostic::{Diagnostic, DiagnosticPath, DiagnosticsStore},
+    diagnostic::{Diagnostic, DiagnosticPath, DiagnosticsStore, FrameTimeDiagnosticsPlugin},
     gltf::GltfMaterialName,
     image::{ImageAddressMode, ImageLoaderSettings},
     mesh::{Indices, VertexAttributeValues},
@@ -15,6 +15,7 @@ use bevy::{
         pathtracer::{Pathtracer, PathtracingPlugin},
         prelude::{RaytracingMesh3d, SolariLighting, SolariPlugins},
     },
+    window::PresentMode,
     world_serialization::WorldInstanceReady,
 };
 use chacha20::ChaCha8Rng;
@@ -24,7 +25,8 @@ use std::f32::consts::PI;
 #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
 use bevy::{
     anti_alias::dlss::{
-        Dlss, DlssProjectId, DlssRayReconstructionFeature, DlssRayReconstructionSupported,
+        Dlss, DlssFrameGeneration, DlssFrameGenerationMode, DlssFrameGenerationSupported,
+        DlssProjectId, DlssRayReconstructionFeature, DlssRayReconstructionSupported,
     },
     render::camera::{MipBias, TemporalJitter},
 };
@@ -51,10 +53,17 @@ fn main() {
     )));
 
     app.add_plugins((
-        DefaultPlugins,
+        DefaultPlugins.set(WindowPlugin {
+            primary_window: Some(Window {
+                present_mode: PresentMode::Fifo,
+                ..default()
+            }),
+            ..default()
+        }),
         SolariPlugins,
         FreeCameraPlugin,
         RenderDiagnosticsPlugin,
+        FrameTimeDiagnosticsPlugin::default(),
     ))
     .insert_resource(args);
 
@@ -68,7 +77,7 @@ fn main() {
         app.add_plugins(PathtracingPlugin);
     } else {
         #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
-        app.add_systems(Update, toggle_dlss_rr);
+        app.add_systems(Update, (toggle_dlss_rr, toggle_dlss_frame_generation));
 
         if args.many_lights != Some(true) {
             app.add_systems(Update, (pause_scene, toggle_lights, patrol_path));
@@ -85,6 +94,9 @@ fn setup_pica_pica(
     args: Res<Args>,
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))] dlss_rr_supported: Option<
         Res<DlssRayReconstructionSupported>,
+    >,
+    #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))] dlss_fg_supported: Option<
+        Res<DlssFrameGenerationSupported>,
     >,
 ) {
     commands
@@ -170,6 +182,10 @@ fn setup_pica_pica(
             _phantom_data: Default::default(),
         });
     }
+    #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
+    if dlss_fg_supported.is_some() {
+        camera.insert(DlssFrameGeneration::default());
+    }
 
     commands.spawn((
         ControlText,
@@ -210,6 +226,9 @@ fn setup_many_lights(
     args: Res<Args>,
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))] dlss_rr_supported: Option<
         Res<DlssRayReconstructionSupported>,
+    >,
+    #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))] dlss_fg_supported: Option<
+        Res<DlssFrameGenerationSupported>,
     >,
 ) {
     let mut rng = ChaCha8Rng::seed_from_u64(42);
@@ -355,6 +374,10 @@ fn setup_many_lights(
             _phantom_data: Default::default(),
         });
     }
+    #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
+    if dlss_fg_supported.is_some() {
+        camera.insert(DlssFrameGeneration::default());
+    }
 
     commands.spawn((
         ControlText,
@@ -484,6 +507,40 @@ fn toggle_dlss_rr(
     }
 }
 
+#[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
+fn toggle_dlss_frame_generation(
+    key_input: Res<ButtonInput<KeyCode>>,
+    camera: Single<(Entity, Option<&DlssFrameGeneration>), With<SolariLighting>>,
+    dlss_fg_supported: Option<Res<DlssFrameGenerationSupported>>,
+    mut commands: Commands,
+) {
+    let Some(dlss_fg_supported) = dlss_fg_supported else {
+        return;
+    };
+    if key_input.just_pressed(KeyCode::Digit4) {
+        let (entity, frame_generation) = *camera;
+        // Cycle Off -> 2x -> 3x -> 4x -> Off, skipping unsupported modes
+        let next_mode = match frame_generation.map(|frame_generation| frame_generation.mode) {
+            None => Some(DlssFrameGenerationMode::X2),
+            Some(DlssFrameGenerationMode::X2) => Some(DlssFrameGenerationMode::X3),
+            Some(DlssFrameGenerationMode::X3) => Some(DlssFrameGenerationMode::X4),
+            Some(DlssFrameGenerationMode::X4) => None,
+        }
+        .filter(|mode| dlss_fg_supported.supports(*mode));
+        match next_mode {
+            Some(mode) => {
+                commands.entity(entity).insert(DlssFrameGeneration {
+                    mode,
+                    ..Default::default()
+                });
+            }
+            None => {
+                commands.entity(entity).remove::<DlssFrameGeneration>();
+            }
+        }
+    }
+}
+
 fn pause_scene(mut time: ResMut<Time<Virtual>>, key_input: Res<ButtonInput<KeyCode>>) {
     if key_input.just_pressed(KeyCode::Space) {
         time.toggle();
@@ -580,6 +637,13 @@ fn update_control_text(
         Has<Dlss<DlssRayReconstructionFeature>>,
         With<SolariLighting>,
     >,
+    #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))] dlss_fg_supported: Option<
+        Res<DlssFrameGenerationSupported>,
+    >,
+    #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))] dlss_fg_camera: Query<
+        Option<&DlssFrameGeneration>,
+        With<SolariLighting>,
+    >,
 ) {
     text.0.clear();
 
@@ -618,9 +682,26 @@ fn update_control_text(
             .push_str("\nDenoising: DLSS Ray Reconstruction not supported");
     }
 
+    #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
+    if let Some(dlss_fg_supported) = dlss_fg_supported.as_deref() {
+        let max_multiplier = dlss_fg_supported.max_mode().multiplier();
+        match dlss_fg_camera.single() {
+            Ok(Some(frame_generation)) => text.0.push_str(&format!(
+                "\n(4): DLSS Frame Generation: {}x (up to {max_multiplier}x supported)",
+                frame_generation.mode.multiplier(),
+            )),
+            _ => text.0.push_str(&format!(
+                "\n(4): DLSS Frame Generation: Off (up to {max_multiplier}x supported)"
+            )),
+        }
+    } else {
+        text.0
+            .push_str("\nFrame generation: DLSS Frame Generation not supported");
+    }
+
     #[cfg(any(not(feature = "dlss"), feature = "force_disable_dlss"))]
     text.0
-        .push_str("\nDenoising: App not compiled with DLSS support");
+        .push_str("\nDenoising/Frame generation: App not compiled with DLSS support");
 }
 
 #[derive(Component)]
@@ -631,6 +712,10 @@ fn update_performance_text(
     diagnostics: Res<DiagnosticsStore>,
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))] dlss_camera: Query<
         Has<Dlss<DlssRayReconstructionFeature>>,
+        With<SolariLighting>,
+    >,
+    #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))] dlss_fg_camera: Query<
+        Option<&DlssFrameGeneration>,
         With<SolariLighting>,
     >,
 ) {
@@ -658,7 +743,25 @@ fn update_performance_text(
     if matches!(dlss_camera.single(), Ok(true)) {
         (add_diagnostic)("DLSS-RR", "render/dlss_ray_reconstruction/elapsed_gpu");
     }
-    text.push_str(&format!("{:17}  {total:.2} ms\n", "Total"));
+    #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
+    if matches!(dlss_fg_camera.single(), Ok(Some(_))) {
+        (add_diagnostic)("DLSS-FG", "render/dlss_frame_generation/elapsed_gpu");
+    }
+    text.push_str(&format!("{:17}  {total:.2} ms\n", "Rendered GPU"));
+
+    if let Some(fps) = diagnostics
+        .get(&FrameTimeDiagnosticsPlugin::FPS)
+        .and_then(Diagnostic::smoothed)
+    {
+        text.push_str(&format!("\nApp FPS            {fps:.1}"));
+        #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
+        if let Ok(Some(frame_generation)) = dlss_fg_camera.single() {
+            text.push_str(&format!(
+                "\nFG output target   {:.1}",
+                fps * frame_generation.mode.multiplier() as f64
+            ));
+        }
+    }
 
     if let Some(world_cache_active_cells_count) = diagnostics
         .get(&DiagnosticPath::new(

@@ -15,6 +15,7 @@
 //! 6. Custom rendering code, including third party crates, should account for the optional `MainPassResolutionOverride` to work with DLSS (see the `custom_render_phase` example)
 
 mod extract;
+mod frame_generation;
 mod node;
 mod prepare;
 
@@ -28,15 +29,15 @@ use bevy_core_pipeline::{
 };
 use bevy_ecs::prelude::*;
 use bevy_math::{UVec2, Vec2};
-use bevy_reflect::{reflect_remote, Reflect};
+use bevy_reflect::{prelude::ReflectDefault, reflect_remote, Reflect};
 use bevy_render::{
     camera::{MipBias, TemporalJitter},
     renderer::{
         raw_vulkan_init::{AdditionalVulkanFeatures, RawVulkanInitSettings},
-        RenderDevice, RenderQueue,
+        RenderDevice, RenderGraph, RenderGraphSystems, RenderQueue,
     },
     texture::CachedTexture,
-    view::prepare_view_targets,
+    view::{prepare_view_attachments, prepare_view_targets, window::paced_present},
     ExtractSchedule, Render, RenderApp, RenderSystems,
 };
 use dlss_wgpu::{
@@ -86,6 +87,9 @@ impl Plugin for DlssInitPlugin {
                                 additional_vulkan_features
                                     .insert::<DlssRayReconstructionSupported>();
                             }
+                            if feature_support.frame_generation_supported {
+                                additional_vulkan_features.insert::<DlssFrameGenerationSupported>();
+                            }
                         }
                         Err(_) => {}
                     }
@@ -117,6 +121,11 @@ impl Plugin for DlssInitPlugin {
                                 additional_vulkan_features
                                     .remove::<DlssRayReconstructionSupported>();
                             }
+                            if feature_support.frame_generation_supported {
+                                additional_vulkan_features.insert::<DlssFrameGenerationSupported>();
+                            } else {
+                                additional_vulkan_features.remove::<DlssFrameGenerationSupported>();
+                            }
                         }
                         Err(_) => {}
                     }
@@ -134,11 +143,12 @@ pub struct DlssPlugin;
 impl Plugin for DlssPlugin {
     fn build(&self, app: &mut App) {
         app.register_type::<Dlss<DlssSuperResolutionFeature>>()
-            .register_type::<Dlss<DlssRayReconstructionFeature>>();
+            .register_type::<Dlss<DlssRayReconstructionFeature>>()
+            .register_type::<DlssFrameGeneration>();
     }
 
     fn finish(&self, app: &mut App) {
-        let (super_resolution_supported, ray_reconstruction_supported) = {
+        let (super_resolution_supported, ray_reconstruction_supported, frame_generation_supported) = {
             let features = app
                 .sub_app_mut(RenderApp)
                 .world()
@@ -146,9 +156,10 @@ impl Plugin for DlssPlugin {
             (
                 features.has::<DlssSuperResolutionSupported>(),
                 features.has::<DlssRayReconstructionSupported>(),
+                features.has::<DlssFrameGenerationSupported>(),
             )
         };
-        if !super_resolution_supported {
+        if !super_resolution_supported && !frame_generation_supported {
             return;
         }
 
@@ -159,19 +170,44 @@ impl Plugin for DlssPlugin {
         };
         let project_id = app.world().get_resource::<DlssProjectId>()
             .expect("The `dlss` feature is enabled, but DlssProjectId was not added to the App before DlssPlugin.");
-        let dlss_sdk = dlss_wgpu::DlssSdk::new(project_id.0, wgpu_device);
-        if dlss_sdk.is_err() {
+        let Ok(dlss_sdk) = dlss_wgpu::DlssSdk::new(project_id.0, wgpu_device) else {
             info!("DLSS is not supported on this system");
             return;
-        }
+        };
+        // Paced presentation of the generated frames relies on driver present metering
+        let present_metering_supported = app
+            .sub_app(RenderApp)
+            .world()
+            .resource::<RenderDevice>()
+            .features()
+            .contains(bevy_render::settings::WgpuFeatures::VULKAN_NV_PRESENT_METERING);
+        let (super_resolution_supported, frame_generation_supported, max_frames_to_generate) = {
+            let sdk = dlss_sdk.lock().unwrap();
+            (
+                super_resolution_supported && sdk.super_resolution_supported(),
+                frame_generation_supported
+                    && sdk.frame_generation_supported()
+                    && present_metering_supported,
+                sdk.multi_frame_count_max(),
+            )
+        };
 
-        app.insert_resource(DlssSuperResolutionSupported);
-        if ray_reconstruction_supported {
+        if super_resolution_supported {
+            app.insert_resource(DlssSuperResolutionSupported);
+        }
+        if super_resolution_supported && ray_reconstruction_supported {
             app.insert_resource(DlssRayReconstructionSupported);
+        }
+        if frame_generation_supported {
+            let supported = DlssFrameGenerationSupported {
+                max_frames_to_generate,
+            };
+            app.insert_resource(supported);
+            app.sub_app_mut(RenderApp).insert_resource(supported);
         }
 
         app.sub_app_mut(RenderApp)
-            .insert_resource(DlssSdk(dlss_sdk.unwrap()))
+            .insert_resource(DlssSdk(dlss_sdk))
             .add_systems(
                 ExtractSchedule,
                 (
@@ -188,6 +224,38 @@ impl Plugin for DlssPlugin {
                     .in_set(RenderSystems::PrepareViews)
                     .before(prepare_view_targets),
             );
+
+        if frame_generation_supported {
+            app.sub_app_mut(RenderApp)
+                .add_systems(
+                    ExtractSchedule,
+                    frame_generation::extract_frame_generation
+                        .after(paced_present::reset_paced_windows)
+                        // Reads the normalized render target off ExtractedCamera
+                        .after(bevy_render::camera::extract_cameras),
+                )
+                .add_systems(
+                    Render,
+                    frame_generation::prepare_frame_generation
+                        .in_set(RenderSystems::PrepareViews)
+                        .after(prepare_view_attachments)
+                        // Window screenshots also override the target attachment; frame
+                        // generation deterministically wins (screenshots of paced windows
+                        // are unsupported)
+                        .after(bevy_render::view::window::screenshot::ScreenshotPreparation)
+                        .after(prepare::prepare_dlss::<DlssSuperResolutionFeature>)
+                        .after(prepare::prepare_dlss::<DlssRayReconstructionFeature>)
+                        .before(prepare_view_targets),
+                )
+                // Runs after all cameras have rendered, so that overlay cameras targeting
+                // the same window are composited into the frame generation input first
+                .add_systems(
+                    RenderGraph,
+                    frame_generation::frame_generation
+                        .in_set(RenderGraphSystems::Render)
+                        .after(bevy_core_pipeline::schedule::camera_driver),
+                );
+        }
 
         app.sub_app_mut(RenderApp).add_systems(
             Core3d,
@@ -394,3 +462,89 @@ pub struct DlssSuperResolutionSupported;
 /// Otherwise this resource will be absent.
 #[derive(Resource, Clone, Copy)]
 pub struct DlssRayReconstructionSupported;
+
+/// Camera component that enables DLSS Frame Generation.
+///
+/// Requires a perspective projection, a window render target, and [`Msaa::Off`](bevy_render::view::Msaa::Off).
+///
+/// Check for the presence of `Option<Res<DlssFrameGenerationSupported>>` at runtime to see if
+/// frame generation is supported on the current machine, and use
+/// [`DlssFrameGenerationSupported::supports`] to determine which modes are valid.
+#[derive(Component, Reflect, Clone, Default)]
+#[reflect(Component, Default)]
+#[require(DepthPrepass, MotionVectorPrepass, Hdr)]
+pub struct DlssFrameGeneration {
+    /// Presented frame rate multiplier.
+    ///
+    /// Modes above what the current machine supports (see [`DlssFrameGenerationSupported::max_mode`])
+    /// fall back to the highest supported mode, with a warning.
+    pub mode: DlssFrameGenerationMode,
+    /// Set to true after a camera cut or other discontinuity.
+    ///
+    /// This is automatically reset to false after extraction.
+    pub reset: bool,
+}
+
+/// How many total frames DLSS Frame Generation presents per rendered frame.
+#[derive(Reflect, Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub enum DlssFrameGenerationMode {
+    /// One generated frame per rendered frame, doubling the presented frame rate.
+    ///
+    /// Supported by all frame generation capable GPUs (RTX 40 series and newer).
+    #[default]
+    X2,
+    /// Two generated frames per rendered frame, tripling the presented frame rate.
+    ///
+    /// Requires multi frame generation support (RTX 50 series and newer).
+    X3,
+    /// Three generated frames per rendered frame, quadrupling the presented frame rate.
+    ///
+    /// Requires multi frame generation support (RTX 50 series and newer).
+    X4,
+}
+
+impl DlssFrameGenerationMode {
+    /// The number of frames generated between each pair of rendered frames.
+    pub const fn frames_to_generate(self) -> u32 {
+        match self {
+            Self::X2 => 1,
+            Self::X3 => 2,
+            Self::X4 => 3,
+        }
+    }
+
+    /// The presented frame rate multiplier.
+    pub const fn multiplier(self) -> u32 {
+        self.frames_to_generate() + 1
+    }
+}
+
+/// Present when DLSS Frame Generation is supported by the active adapter and driver.
+#[derive(Resource, Clone, Copy)]
+pub struct DlssFrameGenerationSupported {
+    max_frames_to_generate: u32,
+}
+
+impl DlssFrameGenerationSupported {
+    /// The maximum number of frames that can be generated between each pair of rendered frames.
+    ///
+    /// 1 means only [`DlssFrameGenerationMode::X2`] is supported, 3 means up to
+    /// [`DlssFrameGenerationMode::X4`].
+    pub fn max_frames_to_generate(&self) -> u32 {
+        self.max_frames_to_generate
+    }
+
+    /// Whether `mode` is supported by the current machine.
+    pub fn supports(&self, mode: DlssFrameGenerationMode) -> bool {
+        mode.frames_to_generate() <= self.max_frames_to_generate
+    }
+
+    /// The highest supported [`DlssFrameGenerationMode`], for building settings UIs.
+    pub fn max_mode(&self) -> DlssFrameGenerationMode {
+        match self.max_frames_to_generate {
+            1 => DlssFrameGenerationMode::X2,
+            2 => DlssFrameGenerationMode::X3,
+            _ => DlssFrameGenerationMode::X4,
+        }
+    }
+}
