@@ -15,10 +15,14 @@ use bevy_window::{
     CompositeAlphaMode, PresentMode, PrimaryWindow, RawHandleWrapper, Window, WindowClosing,
 };
 use core::num::NonZero;
+#[cfg(feature = "paced_present")]
+use paced_present::PacedWindows;
 use wgpu::{
     SurfaceConfiguration, SurfaceTargetUnsafe, TextureFormat, TextureUsages, TextureViewDescriptor,
 };
 
+#[cfg(feature = "paced_present")]
+pub mod paced_present;
 pub mod screenshot;
 
 use screenshot::ScreenshotPlugin;
@@ -59,6 +63,15 @@ impl Plugin for WindowRenderPlugin {
                         .before(prepare_windows),
                 )
                 .add_systems(Render, prepare_windows.in_set(RenderSystems::PrepareViews));
+
+            #[cfg(feature = "paced_present")]
+            render_app
+                .init_resource::<PacedWindows>()
+                .init_resource::<paced_present::PacedPresentPlans>()
+                .add_systems(
+                    ExtractSchedule,
+                    paced_present::reset_paced_windows.before(extract_windows),
+                );
         }
     }
 }
@@ -242,6 +255,7 @@ pub fn prepare_windows(
     mut windows: Query<(MainEntity, &mut ExtractedWindow, Option<&SurfaceData>)>,
     render_device: Res<RenderDevice>,
     sorted_cameras: Res<crate::camera::SortedCameras>,
+    #[cfg(feature = "paced_present")] paced_windows: Res<PacedWindows>,
     #[cfg(target_os = "linux")] render_instance: Res<RenderInstance>,
 ) {
     for (main_entity, mut window, maybe_surface_data) in &mut windows {
@@ -263,6 +277,15 @@ pub fn prepare_windows(
         let Some(surface_data) = maybe_surface_data else {
             continue;
         };
+        window.swap_chain_texture_format = Some(surface_data.configuration.format);
+        window.swap_chain_texture_view_format =
+            Some(surface_data.configuration.format.add_srgb_suffix());
+
+        // Paced windows have their swapchain textures acquired during presentation
+        #[cfg(feature = "paced_present")]
+        if paced_windows.0.contains(&main_entity) {
+            continue;
+        }
 
         // We didn't present the previous frame, so we can keep using our existing swapchain texture.
         if window.has_swapchain_texture() && !window.size_changed && !window.present_mode_changed {
@@ -328,7 +351,6 @@ pub fn prepare_windows(
                 bevy_log::error!("Couldn't get swap chain texture: {other:?}");
             }
         }
-        window.swap_chain_texture_format = Some(surface_data.configuration.format);
     }
 }
 

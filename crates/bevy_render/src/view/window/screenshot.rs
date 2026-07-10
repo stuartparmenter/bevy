@@ -441,10 +441,17 @@ impl Plugin for ScreenshotPlugin {
                 prepare_screenshots
                     .after(prepare_view_attachments)
                     .before(prepare_view_targets)
-                    .in_set(RenderSystems::PrepareViews),
+                    .in_set(RenderSystems::PrepareViews)
+                    .in_set(ScreenshotPreparation),
             );
     }
 }
+
+/// System set for screenshot preparation, which overrides window target attachments to
+/// capture the rendered output. Systems that also override target attachments can order
+/// against this set.
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ScreenshotPreparation;
 
 #[derive(Resource)]
 pub struct ScreenshotToScreenPipeline {

@@ -111,8 +111,16 @@ pub fn render_system(
         #[cfg(feature = "trace")]
         let _span = info_span!("present_frames").entered();
 
+        // Windows presented by driver-metered paced presentation this frame; skipped below.
+        #[cfg(feature = "paced_present")]
+        let paced_windows = crate::view::window::paced_present::present_paced_plans(world);
+
         if let Ok((views, mut windows, render_queue)) = present_state.get_mut(world) {
             for (window_entity, mut window) in &mut windows {
+                #[cfg(feature = "paced_present")]
+                if paced_windows.contains(&window_entity) {
+                    continue;
+                }
                 let view_needs_present = views.iter().any(|(view_target, camera)| {
                     matches!(
                         camera.target,
