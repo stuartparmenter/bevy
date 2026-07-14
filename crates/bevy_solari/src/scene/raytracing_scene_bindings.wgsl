@@ -3,7 +3,6 @@ enable wgpu_binding_array;
 
 #define_import_path bevy_solari::scene_bindings
 
-#import bevy_pbr::lighting::perceptualRoughnessToRoughness
 #import bevy_pbr::pbr_functions::calculate_tbn_mikktspace
 
 struct InstanceGeometryIds {
