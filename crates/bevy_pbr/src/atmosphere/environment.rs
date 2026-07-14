@@ -148,7 +148,13 @@ pub(super) fn prepare_probe_textures(
     mut commands: Commands,
 ) {
     for (probe, render_env_map) in &probes {
-        let environment = gpu_images.get(&render_env_map.environment_map).unwrap();
+        // The environment map is a GPU-authored render target; on the first
+        // frame(s) after the probe spawns its `GpuImage` may not be prepared
+        // yet. Skip until it is (matches the defensive `view_textures` lookup
+        // just below) rather than unwrapping to a panic.
+        let Some(environment) = gpu_images.get(&render_env_map.environment_map) else {
+            continue;
+        };
         // create a cube view
         let environment_view = environment.texture.create_view(&TextureViewDescriptor {
             dimension: Some(TextureViewDimension::D2Array),
