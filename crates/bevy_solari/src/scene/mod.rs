@@ -1,10 +1,12 @@
 mod binder;
 mod blas;
 mod extract;
+mod producer;
 mod types;
 
 use bevy_shader::load_shader_library;
 pub use binder::RaytracingSceneBindings;
+pub use producer::RaytracingProducerEncoder;
 pub use types::{
     RaytracingGeometry, RaytracingGeometryBuffers, RaytracingGeometryUpdateMode, RaytracingMesh3d,
 };
@@ -32,6 +34,7 @@ use extract::{
     extract_raytracing_scene_structural, extract_raytracing_scene_transforms,
     StandardMaterialAssets,
 };
+use producer::submit_raytracing_producers;
 use tracing::warn;
 
 /// Creates acceleration structures and binding arrays of resources for raytracing.
@@ -67,6 +70,7 @@ impl Plugin for RaytracingScenePlugin {
             .init_gpu_resource::<BlasManager>()
             .init_gpu_resource::<GeometryBlasManager>()
             .init_gpu_resource::<StandardMaterialAssets>()
+            .init_resource::<RaytracingProducerEncoder>()
             .insert_resource(RaytracingSceneBindings::new())
             .add_systems(
                 ExtractSchedule,
@@ -87,6 +91,12 @@ impl Plugin for RaytracingScenePlugin {
                     compact_raytracing_blas
                         .in_set(RenderSystems::PrepareAssets)
                         .after(prepare_raytracing_blas),
+                    // One submit for everything producers recorded during
+                    // PrepareResources, ahead of the BLAS/TLAS builds that
+                    // consume their output.
+                    submit_raytracing_producers
+                        .in_set(RenderSystems::PrepareBindGroups)
+                        .before(prepare_raytracing_geometry_blas),
                     // Runs after producers' fill compute in PrepareResources,
                     // just before the binder consumes the BLASes.
                     prepare_raytracing_geometry_blas
