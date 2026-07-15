@@ -48,7 +48,8 @@ use bevy_render::{
     renderer::{RenderContext, ViewQuery},
     sync_world::{MainEntity, MainEntityHashMap},
     view::{
-        ExtractedView, RenderVisibleEntities, RetainedViewEntity, ViewDepthTexture, ViewTarget,
+        ExtractedView, RenderVisibleEntities, RetainedViewEntity, ViewDepthStencilTexture,
+        ViewTarget,
     },
     working_color_space::{vec4_rec709_to_working, WorkingColorSpace},
     Extract, GpuResourceAppExt, Render, RenderApp, RenderDebugFlags, RenderStartup, RenderSystems,
@@ -366,7 +367,7 @@ pub(crate) fn wireframe_2d(
         &ExtractedCamera,
         &ExtractedView,
         &ViewTarget,
-        &ViewDepthTexture,
+        &ViewDepthStencilTexture,
     )>,
     wireframe_phases: Res<ViewBinnedRenderPhases<Wireframe2dPhaseItem>>,
     mut ctx: RenderContext,

@@ -10,7 +10,6 @@ use bevy_camera::visibility::{
 };
 use bevy_camera::{Camera, Camera3d, RenderTarget, ShadowLodOrigin};
 use bevy_color::ColorToComponents;
-use bevy_core_pipeline::core_3d::CORE_3D_DEPTH_FORMAT;
 use bevy_core_pipeline::schedule::RootNonCameraView;
 use bevy_derive::{Deref, DerefMut};
 use bevy_ecs::schedule::ScheduleLabel;
@@ -35,7 +34,7 @@ use bevy_material::{
 use bevy_math::{
     ops,
     primitives::{HalfSpace, ViewFrustum},
-    Mat4, UVec4, Vec3, Vec3Swizzles, Vec4, Vec4Swizzles,
+    proj, Mat4, UVec4, Vec3, Vec3Swizzles, Vec4, Vec4Swizzles,
 };
 use bevy_mesh::{Mesh3d, MeshVertexBufferLayoutRef};
 use bevy_platform::collections::{HashMap, HashSet};
@@ -975,7 +974,7 @@ pub struct PointAndSpotLightViewEntities(Vec<Entity>);
 
 #[derive(Component)]
 pub struct ShadowView {
-    pub depth_attachment: DepthAttachment,
+    pub depth_attachment: DepthStencilViewAttachment,
     pub pass_name: String,
 }
 
@@ -1287,7 +1286,7 @@ pub fn prepare_lights(
             flags |= PointLightFlags::CONTACT_SHADOWS_ENABLED;
         }
 
-        let cube_face_projection = Mat4::perspective_infinite_reverse_rh(
+        let cube_face_projection = proj::perspective_infinite_reverse(
             core::f32::consts::FRAC_PI_2,
             1.0,
             light.shadow_map_near_z,
@@ -1416,8 +1415,9 @@ pub fn prepare_lights(
 
     live_shadow_mapping_lights.clear();
 
-    let mut point_light_depth_attachments = HashMap::<u32, DepthAttachment>::default();
-    let mut directional_light_depth_attachments = HashMap::<u32, DepthAttachment>::default();
+    let mut point_light_depth_attachments = HashMap::<u32, DepthStencilViewAttachment>::default();
+    let mut directional_light_depth_attachments =
+        HashMap::<u32, DepthStencilViewAttachment>::default();
 
     let point_light_depth_texture = texture_cache.get(
         &render_device,
@@ -1430,7 +1430,7 @@ pub fn prepare_lights(
             mip_level_count: 1,
             sample_count: 1,
             dimension: TextureDimension::D2,
-            format: CORE_3D_DEPTH_FORMAT,
+            format: CORE_3D_SHADOW_MAP_FORMAT,
             label: Some("point_light_shadow_map_texture"),
             usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
@@ -1482,7 +1482,7 @@ pub fn prepare_lights(
             mip_level_count: 1,
             sample_count: 1,
             dimension: TextureDimension::D2,
-            format: CORE_3D_DEPTH_FORMAT,
+            format: CORE_3D_SHADOW_MAP_FORMAT,
             label: Some("directional_light_shadow_map_texture"),
             usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
@@ -1917,7 +1917,13 @@ pub fn prepare_lights(
                 // NOTE: For point and spotlights, we reuse the same depth attachment for all views.
                 // However, for directional lights, we want a new depth attachment for each view,
                 // so that the view is cleared for each view.
-                let depth_attachment = DepthAttachment::new(depth_texture_view.clone(), Some(0.0));
+                let depth_attachment = DepthStencilViewAttachment::new(
+                    DepthStencilViews::DepthOnly {
+                        depth_view: depth_texture_view.clone(),
+                    },
+                    Some(0.0),
+                    None,
+                );
 
                 directional_depth_texture_array_index += 1;
 
@@ -1953,7 +1959,7 @@ pub fn prepare_lights(
                         world_from_view: GlobalTransform::from(cascade.world_from_cascade),
                         clip_from_view: cascade.clip_from_cascade,
                         clip_from_world: Some(cascade.clip_from_world),
-                        target_format: CORE_3D_DEPTH_FORMAT,
+                        target_format: CORE_3D_SHADOW_MAP_FORMAT,
                         color_grading: Default::default(),
                         invert_culling: false,
                     },
@@ -2070,7 +2076,7 @@ pub fn prepare_lights(
 /// all cameras.
 fn create_point_shadow_maps(
     commands: &mut Commands,
-    point_light_depth_attachments: &mut HashMap<u32, DepthAttachment>,
+    point_light_depth_attachments: &mut HashMap<u32, DepthStencilViewAttachment>,
     global_clusterable_object_meta: &ResMut<GlobalClusterableObjectMeta>,
     (cube_face_rotations, point_light_frusta, light_view_entities): (
         &Vec<Transform>,
@@ -2096,7 +2102,7 @@ fn create_point_shadow_maps(
     // and ignore rotation because we want the shadow map projections to align with the axes
     let view_translation = GlobalTransform::from_translation(light.transform.translation());
 
-    let cube_face_projection = Mat4::perspective_infinite_reverse_rh(
+    let cube_face_projection = proj::perspective_infinite_reverse(
         core::f32::consts::FRAC_PI_2,
         1.0,
         light.shadow_map_near_z,
@@ -2128,7 +2134,13 @@ fn create_point_shadow_maps(
                             array_layer_count: Some(1u32),
                         });
 
-                DepthAttachment::new(depth_texture_view, Some(0.0))
+                DepthStencilViewAttachment::new(
+                    DepthStencilViews::DepthOnly {
+                        depth_view: depth_texture_view,
+                    },
+                    Some(0.0),
+                    None,
+                )
             })
             .clone();
 
@@ -2157,7 +2169,7 @@ fn create_point_shadow_maps(
                 world_from_view: view_translation * *view_rotation,
                 clip_from_world: None,
                 clip_from_view: cube_face_projection,
-                target_format: CORE_3D_DEPTH_FORMAT,
+                target_format: CORE_3D_SHADOW_MAP_FORMAT,
                 color_grading: Default::default(),
                 invert_culling: false,
             },
@@ -2183,7 +2195,7 @@ fn create_point_shadow_maps(
 /// This shadow map is shared across all cameras.
 fn create_spot_shadow_map(
     commands: &mut Commands,
-    directional_light_depth_attachments: &mut HashMap<u32, DepthAttachment>,
+    directional_light_depth_attachments: &mut HashMap<u32, DepthStencilViewAttachment>,
     (num_directional_cascades_enabled, light_index): (usize, usize),
     directional_light_depth_texture: &CachedTexture,
     view_light_entity: Entity,
@@ -2224,7 +2236,13 @@ fn create_spot_shadow_map(
                         array_layer_count: Some(1u32),
                     });
 
-            DepthAttachment::new(depth_texture_view, Some(0.0))
+            DepthStencilViewAttachment::new(
+                DepthStencilViews::DepthOnly {
+                    depth_view: depth_texture_view,
+                },
+                Some(0.0),
+                None,
+            )
         })
         .clone();
 
@@ -2245,7 +2263,7 @@ fn create_spot_shadow_map(
             world_from_view: spot_world_from_view,
             clip_from_view: spot_projection,
             clip_from_world: None,
-            target_format: CORE_3D_DEPTH_FORMAT,
+            target_format: CORE_3D_SHADOW_MAP_FORMAT,
             color_grading: Default::default(),
             invert_culling: false,
         },
