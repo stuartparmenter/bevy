@@ -475,17 +475,15 @@ pub fn check_views_need_specialization(
             }
         }
 
-        if view.target_format == TextureFormat::Rgba8UnormSrgb
-            || view.target_format == TextureFormat::Rgba8Unorm
+        if (view.target_format == TextureFormat::Rgba8UnormSrgb
+            || view.target_format == TextureFormat::Rgba8Unorm)
+            && let Some(tonemapping) = tonemapping
+            && *tonemapping != Tonemapping::None
         {
-            if let Some(tonemapping) = tonemapping {
-                if *tonemapping != Tonemapping::None {
-                    view_key |= MeshPipelineKey::TONEMAP_IN_SHADER;
-                    view_key |= tonemapping_pipeline_key(*tonemapping);
-                    if let Some(DebandDither::Enabled) = dither {
-                        view_key |= MeshPipelineKey::DEBAND_DITHER;
-                    }
-                }
+            view_key |= MeshPipelineKey::TONEMAP_IN_SHADER;
+            view_key |= tonemapping_pipeline_key(*tonemapping);
+            if let Some(DebandDither::Enabled) = dither {
+                view_key |= MeshPipelineKey::DEBAND_DITHER;
             }
         }
         if ssao {

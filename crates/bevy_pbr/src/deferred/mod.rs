@@ -492,39 +492,31 @@ pub fn prepare_deferred_lighting_pipelines(
         // Always true, since we're in the deferred lighting pipeline
         view_key |= MeshPipelineKey::DEFERRED_PREPASS;
 
-        if view.target_format == TextureFormat::Rgba8UnormSrgb
-            || view.target_format == TextureFormat::Rgba8Unorm
+        if (view.target_format == TextureFormat::Rgba8UnormSrgb
+            || view.target_format == TextureFormat::Rgba8Unorm)
+            && let Some(tonemapping) = tonemapping
+            && *tonemapping != Tonemapping::None
         {
-            if let Some(tonemapping) = tonemapping {
-                if *tonemapping != Tonemapping::None {
-                    view_key |= MeshPipelineKey::TONEMAP_IN_SHADER;
-                    view_key |= match tonemapping {
-                        Tonemapping::None => MeshPipelineKey::TONEMAP_METHOD_NONE,
-                        Tonemapping::Reinhard => MeshPipelineKey::TONEMAP_METHOD_REINHARD,
-                        Tonemapping::ReinhardLuminance => {
-                            MeshPipelineKey::TONEMAP_METHOD_REINHARD_LUMINANCE
-                        }
-                        Tonemapping::AcesFitted => MeshPipelineKey::TONEMAP_METHOD_ACES_FITTED,
-                        Tonemapping::AgX => MeshPipelineKey::TONEMAP_METHOD_AGX,
-                        Tonemapping::SomewhatBoringDisplayTransform => {
-                            MeshPipelineKey::TONEMAP_METHOD_SOMEWHAT_BORING_DISPLAY_TRANSFORM
-                        }
-                        Tonemapping::TonyMcMapface => {
-                            MeshPipelineKey::TONEMAP_METHOD_TONY_MC_MAPFACE
-                        }
-                        Tonemapping::BlenderFilmic => {
-                            MeshPipelineKey::TONEMAP_METHOD_BLENDER_FILMIC
-                        }
-                        Tonemapping::KhronosPbrNeutral => {
-                            MeshPipelineKey::TONEMAP_METHOD_PBR_NEUTRAL
-                        }
-                        Tonemapping::Linear => MeshPipelineKey::TONEMAP_METHOD_LINEAR,
-                        Tonemapping::GranTurismo7 => MeshPipelineKey::TONEMAP_METHOD_GRAN_TURISMO_7,
-                    };
-                    if let Some(DebandDither::Enabled) = dither {
-                        view_key |= MeshPipelineKey::DEBAND_DITHER;
-                    }
+            view_key |= MeshPipelineKey::TONEMAP_IN_SHADER;
+            view_key |= match tonemapping {
+                Tonemapping::None => MeshPipelineKey::TONEMAP_METHOD_NONE,
+                Tonemapping::Reinhard => MeshPipelineKey::TONEMAP_METHOD_REINHARD,
+                Tonemapping::ReinhardLuminance => {
+                    MeshPipelineKey::TONEMAP_METHOD_REINHARD_LUMINANCE
                 }
+                Tonemapping::AcesFitted => MeshPipelineKey::TONEMAP_METHOD_ACES_FITTED,
+                Tonemapping::AgX => MeshPipelineKey::TONEMAP_METHOD_AGX,
+                Tonemapping::SomewhatBoringDisplayTransform => {
+                    MeshPipelineKey::TONEMAP_METHOD_SOMEWHAT_BORING_DISPLAY_TRANSFORM
+                }
+                Tonemapping::TonyMcMapface => MeshPipelineKey::TONEMAP_METHOD_TONY_MC_MAPFACE,
+                Tonemapping::BlenderFilmic => MeshPipelineKey::TONEMAP_METHOD_BLENDER_FILMIC,
+                Tonemapping::KhronosPbrNeutral => MeshPipelineKey::TONEMAP_METHOD_PBR_NEUTRAL,
+                Tonemapping::Linear => MeshPipelineKey::TONEMAP_METHOD_LINEAR,
+                Tonemapping::GranTurismo7 => MeshPipelineKey::TONEMAP_METHOD_GRAN_TURISMO_7,
+            };
+            if let Some(DebandDither::Enabled) = dither {
+                view_key |= MeshPipelineKey::DEBAND_DITHER;
             }
         }
 
