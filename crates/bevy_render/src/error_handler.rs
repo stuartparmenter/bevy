@@ -17,12 +17,6 @@ use crate::{
 };
 
 /// Resource to indicate renderer behavior upon error.
-// `RenderCreation` carries `RenderResources` by value, which grew on wgpu
-// trunk past clippy's variant-size threshold (see `RenderCreation`).
-#[expect(
-    clippy::large_enum_variant,
-    reason = "`RenderCreation` grew with wgpu trunk's `AdapterInfo`; boxing it would break the public API"
-)]
 pub enum RenderErrorPolicy {
     /// Pretends nothing happened and continues rendering.
     /// This discards the error after logging it to console.

@@ -220,16 +220,9 @@ impl RenderResources {
 }
 
 /// An enum describing how the renderer will initialize resources. This is used when creating the [`RenderPlugin`](crate::RenderPlugin).
-// `RenderResources` carries `wgpu::AdapterInfo` by value, which grew on wgpu
-// trunk past clippy's variant-size threshold. Boxing it would be a public API
-// change, so the lint is expected instead.
-#[expect(
-    clippy::large_enum_variant,
-    reason = "`RenderResources` grew with wgpu trunk's `AdapterInfo`; boxing it would break the public API"
-)]
 pub enum RenderCreation {
     /// Allows renderer resource initialization to happen outside of the rendering plugin.
-    Manual(RenderResources),
+    Manual(Box<RenderResources>),
     /// Lets the rendering plugin create resources itself.
     Automatic(Box<WgpuSettings>),
 }
@@ -272,7 +265,7 @@ impl RenderCreation {
     ) -> bool {
         match self {
             RenderCreation::Manual(resources) => {
-                *future_resources.lock().unwrap() = Some(resources.clone());
+                *future_resources.lock().unwrap() = Some(*resources.clone());
             }
             RenderCreation::Automatic(render_creation) => {
                 let Some(backends) = render_creation.backends else {
@@ -309,7 +302,7 @@ impl RenderCreation {
 
 impl From<RenderResources> for RenderCreation {
     fn from(value: RenderResources) -> Self {
-        Self::Manual(value)
+        Self::Manual(Box::new(value))
     }
 }
 

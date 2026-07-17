@@ -1,4 +1,4 @@
-use crate::renderer::{RenderDevice, WgpuWrapper};
+use crate::renderer::{RenderDevice, RenderQueue, WgpuWrapper};
 use bevy_derive::{Deref, DerefMut};
 use bevy_ecs::{
     resource::Resource,
@@ -74,13 +74,8 @@ pub struct SurfaceTexture {
 }
 
 impl SurfaceTexture {
-    /// Schedules this texture to be presented on its surface.
-    ///
-    /// wgpu moved presentation from `SurfaceTexture::present()` to
-    /// [`wgpu::Queue::present`], so the queue used to render to the texture
-    /// must be supplied.
-    pub fn present(self, queue: &wgpu::Queue) {
-        queue.present(self.value.into_inner());
+    pub fn present(self, render_queue: &RenderQueue) {
+        render_queue.present(self.value.into_inner());
     }
 }
 

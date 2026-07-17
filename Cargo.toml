@@ -4988,7 +4988,7 @@ wasm = false
 name = "app_under_test"
 path = "examples/remote/app_under_test.rs"
 doc-scrape-examples = true
-required-features = ["bevy_remote"]
+required-features = ["bevy_remote", "bevy_feathers"]
 
 [package.metadata.example.app_under_test]
 name = "App Under Test"
@@ -5000,7 +5000,7 @@ wasm = false
 name = "integration_test"
 path = "examples/remote/integration_test.rs"
 doc-scrape-examples = true
-required-features = ["bevy_remote"]
+required-features = ["bevy_remote", "bevy_feathers"]
 
 [package.metadata.example.integration_test]
 name = "Integration Test"
@@ -5174,7 +5174,7 @@ wasm = true
 name = "pcss"
 path = "examples/3d/pcss.rs"
 doc-scrape-examples = true
-required-features = ["experimental_pbr_pcss"]
+required-features = ["bevy_feathers", "experimental_pbr_pcss"]
 
 [package.metadata.example.pcss]
 name = "Percentage-closer soft shadows"
@@ -5676,9 +5676,3 @@ name = "Material - 2D Bindless"
 description = "Demonstrates bindless materials in 2D"
 category = "Shaders"
 wasm = false
-
-[patch.crates-io]
-wgpu = { git = "https://github.com/gfx-rs/wgpu", rev = "a03be8d2232ad3507b69e431c02e483a5ea792d0" }
-wgpu-types = { git = "https://github.com/gfx-rs/wgpu", rev = "a03be8d2232ad3507b69e431c02e483a5ea792d0" }
-wgpu-naga-bridge = { git = "https://github.com/gfx-rs/wgpu", rev = "a03be8d2232ad3507b69e431c02e483a5ea792d0" }
-naga = { git = "https://github.com/gfx-rs/wgpu", rev = "a03be8d2232ad3507b69e431c02e483a5ea792d0" }
