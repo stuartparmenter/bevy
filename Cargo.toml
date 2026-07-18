@@ -3520,6 +3520,17 @@ category = "Stress Tests"
 wasm = false
 
 [[example]]
+name = "changed_sweep_bench"
+path = "examples/stress_tests/changed_sweep_bench.rs"
+doc-scrape-examples = true
+
+[package.metadata.example.changed_sweep_bench]
+name = "Changed Sweep Bench"
+description = "Times a single Changed-filter sweep over millions of mesh entities"
+category = "Stress Tests"
+wasm = false
+
+[[example]]
 name = "many_cubes"
 path = "examples/stress_tests/many_cubes.rs"
 doc-scrape-examples = true
