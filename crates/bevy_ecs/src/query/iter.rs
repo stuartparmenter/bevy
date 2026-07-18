@@ -1,4 +1,4 @@
-use super::{QueryData, QueryFilter, ReadOnlyQueryData};
+use super::{QueryData, QueryFilter, ReadOnlyQueryData, FILTER_MASK_BITS};
 use crate::{
     archetype::{Archetype, ArchetypeEntity, Archetypes},
     bundle::Bundle,
@@ -260,39 +260,139 @@ impl<'w, 's, D: IterQueryData, F: QueryFilter> QueryIter<'w, 's, D, F> {
         );
 
         let entities = table.entities();
-        for row in rows {
-            // SAFETY: Caller assures `row` in range of the current archetype.
-            let entity = unsafe { entities.get_unchecked(row as usize) };
-            // SAFETY: This is from an exclusive range, so it can't be max.
-            let row = unsafe { TableRow::new(NonMaxU32::new_unchecked(row)) };
 
-            // SAFETY: set_table was called prior.
-            // Caller assures `row` in range of the current archetype.
-            let fetched = unsafe {
-                !F::filter_fetch(
-                    &self.query_state.filter_state,
-                    &mut self.cursor.filter,
+        if F::IS_ARCHETYPAL || !F::BATCHABLE {
+            for row in rows {
+                // SAFETY: Caller assures `row` in range of the current archetype.
+                let entity = unsafe { entities.get_unchecked(row as usize) };
+                // SAFETY: This is from an exclusive range, so it can't be max.
+                let row = unsafe { TableRow::new(NonMaxU32::new_unchecked(row)) };
+
+                // SAFETY: set_table was called prior.
+                // Caller assures `row` in range of the current archetype.
+                let fetched = unsafe {
+                    !F::filter_fetch(
+                        &self.query_state.filter_state,
+                        &mut self.cursor.filter,
+                        *entity,
+                        row,
+                    )
+                };
+                if fetched {
+                    continue;
+                }
+
+                // SAFETY:
+                // - set_table was called prior.
+                // - Caller assures `row` in range of the current archetype.
+                // - Each row is unique, so each entity is only alive once
+                // - `D: IterQueryData`
+                if let Some(item) = D::fetch(
+                    &self.query_state.fetch_state,
+                    &mut self.cursor.fetch,
                     *entity,
                     row,
+                ) {
+                    accum = func(accum, item);
+                }
+            }
+            return accum;
+        }
+
+        // Batched filter path: evaluate the filter for blocks of up to `FILTER_MASK_BITS`
+        // rows at once, then fetch only the surviving rows. `F::BATCHABLE` guarantees
+        // `filter_fetch` is pure, so evaluating it ahead of yielding is unobservable: the
+        // only tick writes possible during this iteration come from `Mut::deref_mut` on
+        // rows `func` has already received, which never touches the rows still ahead of
+        // the cursor.
+
+        // Yields one row's item to `func`.
+        macro_rules! yield_row {
+            ($row:expr) => {{
+                let row = $row;
+                // SAFETY: `row` is within `rows`, which the caller assures is in range.
+                let entity = unsafe { entities.get_unchecked(row as usize) };
+                // SAFETY: `row` is bounded by an exclusive `u32` range end, so it can't be max.
+                let row = unsafe { TableRow::new(NonMaxU32::new_unchecked(row)) };
+                // SAFETY:
+                // - set_table was called prior.
+                // - `row` is in range of the current archetype.
+                // - Each row is unique, so each entity is only alive once
+                // - `D: IterQueryData`
+                if let Some(item) = unsafe {
+                    D::fetch(
+                        &self.query_state.fetch_state,
+                        &mut self.cursor.fetch,
+                        *entity,
+                        row,
+                    )
+                } {
+                    accum = func(accum, item);
+                }
+            }};
+        }
+
+        // Consumes one block whose normalized mask is `mask`; `full` is the mask value
+        // meaning "every row in the block matches".
+        macro_rules! consume_block {
+            ($block_start:expr, $len:expr, $mask:expr, $full:expr) => {{
+                let mut mask = $mask;
+                if mask == $full {
+                    // Every row in the block matches: iterate without bit-twiddling.
+                    for row in $block_start..$block_start + $len {
+                        yield_row!(row);
+                    }
+                } else {
+                    while mask != 0 {
+                        // Set bits only exist at positions < `len`, so `row` is in range.
+                        let row = $block_start + mask.trailing_zeros();
+                        mask &= mask - 1;
+                        yield_row!(row);
+                    }
+                }
+            }};
+        }
+
+        let mut block_start = rows.start;
+        // Whole blocks: every mask bit is defined, so no normalization is needed.
+        while rows.end - block_start >= FILTER_MASK_BITS {
+            // SAFETY: Caller assures `rows` is in range of the current table.
+            let block_entities = unsafe {
+                entities
+                    .get_unchecked(block_start as usize..(block_start + FILTER_MASK_BITS) as usize)
+            };
+            // SAFETY: set_table was called prior. Rows `block_start..block_start +
+            // FILTER_MASK_BITS` are in range of the current table, and `block_entities`
+            // are their entities.
+            let mask = unsafe {
+                F::filter_fetch_mask(
+                    &self.query_state.filter_state,
+                    &mut self.cursor.filter,
+                    block_entities,
+                    block_start,
                 )
             };
-            if fetched {
-                continue;
-            }
-
-            // SAFETY:
-            // - set_table was called prior.
-            // - Caller assures `row` in range of the current archetype.
-            // - Each row is unique, so each entity is only alive once
-            // - `D: IterQueryData`
-            if let Some(item) = D::fetch(
-                &self.query_state.fetch_state,
-                &mut self.cursor.fetch,
-                *entity,
-                row,
-            ) {
-                accum = func(accum, item);
-            }
+            consume_block!(block_start, FILTER_MASK_BITS, mask, u64::MAX);
+            block_start += FILTER_MASK_BITS;
+        }
+        // Trailing partial block: bits at positions >= `len` are unspecified, so clear them.
+        if block_start < rows.end {
+            let len = rows.end - block_start;
+            // SAFETY: Caller assures `rows` is in range of the current table.
+            let block_entities =
+                unsafe { entities.get_unchecked(block_start as usize..rows.end as usize) };
+            // SAFETY: set_table was called prior. Rows `block_start..rows.end` are in
+            // range of the current table, and `block_entities` are their entities.
+            let mask = unsafe {
+                F::filter_fetch_mask(
+                    &self.query_state.filter_state,
+                    &mut self.cursor.filter,
+                    block_entities,
+                    block_start,
+                )
+            };
+            let full = (1u64 << len) - 1;
+            consume_block!(block_start, len, mask & full, full);
         }
         accum
     }
@@ -411,6 +511,10 @@ impl<'w, 's, D: IterQueryData, F: QueryFilter> QueryIter<'w, 's, D, F> {
             table,
         );
         let entities = table.entities();
+        // NOTE: Unlike `fold_over_table_range`, this path deliberately stays scalar
+        // (no `filter_fetch_mask` blocks): it is only taken by non-dense queries, whose
+        // sparse-set accesses are per-entity lookups that don't benefit from batched
+        // evaluation. Extend the mask path here if profiles ever justify it.
         for row in rows {
             // SAFETY: Caller assures `row` in range of the current archetype.
             let entity = unsafe { *entities.get_unchecked(row as usize) };

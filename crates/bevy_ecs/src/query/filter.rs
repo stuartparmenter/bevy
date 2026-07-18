@@ -10,6 +10,7 @@ use crate::{
 use bevy_ptr::{ThinSlicePtr, UnsafeCellDeref};
 use bevy_utils::prelude::DebugName;
 use core::{cell::UnsafeCell, marker::PhantomData};
+use nonmax::NonMaxU32;
 use variadics_please::all_tuples;
 
 /// Types that filter the results of a [`Query`].
@@ -110,6 +111,158 @@ pub unsafe trait QueryFilter: WorldQuery {
         entity: Entity,
         table_row: TableRow,
     ) -> bool;
+
+    /// Whether [`filter_fetch`](QueryFilter::filter_fetch) is a pure function of the current
+    /// table/archetype state: no side effects and no fetch-state mutation, so it may be
+    /// evaluated for any in-range row, in any order — including rows that are never yielded,
+    /// and including skipping evaluation for rows another filter already rejected.
+    ///
+    /// When `true`, query iteration may evaluate the filter for a whole block of rows at once
+    /// via [`filter_fetch_mask`](QueryFilter::filter_fetch_mask) instead of interleaving one
+    /// `filter_fetch` call per candidate row. `false` (the default) preserves the exact
+    /// per-row call pattern.
+    #[doc(hidden)]
+    const BATCHABLE: bool = false;
+
+    /// Evaluates this filter for a contiguous block of up to [`FILTER_MASK_BITS`] table rows.
+    ///
+    /// Bit `i` of the result reports [`filter_fetch`](QueryFilter::filter_fetch) for the
+    /// entity `entities[i]` at table row `first_row + i`. Bits at positions
+    /// `>= entities.len()` are unspecified.
+    ///
+    /// # Safety
+    ///
+    /// - Must always be called _after_ [`WorldQuery::set_table`] or
+    ///   [`WorldQuery::set_archetype`], with [`filter_fetch`](QueryFilter::filter_fetch)'s
+    ///   preconditions holding for every row in the block.
+    /// - `entities.len()` must be at most [`FILTER_MASK_BITS`], and `entities[i]` must be
+    ///   the entity stored at table row `first_row + i` of the current table.
+    #[doc(hidden)]
+    #[inline]
+    unsafe fn filter_fetch_mask(
+        state: &Self::State,
+        fetch: &mut Self::Fetch<'_>,
+        entities: &[Entity],
+        first_row: u32,
+    ) -> u64
+    where
+        Self: Sized,
+    {
+        if Self::IS_ARCHETYPAL {
+            // Archetypal filters must always pass `filter_fetch` (see `IS_ARCHETYPAL`).
+            return u64::MAX;
+        }
+        // SAFETY: The caller's guarantees are exactly this helper's requirements.
+        unsafe { filter_fetch_mask_fallback::<Self>(state, fetch, entities, first_row) }
+    }
+}
+
+/// The number of table rows evaluated per [`QueryFilter::filter_fetch_mask`] block — the
+/// bit width of the returned mask.
+pub(crate) const FILTER_MASK_BITS: u32 = u64::BITS;
+
+/// Scalar fallback for [`QueryFilter::filter_fetch_mask`]: one
+/// [`filter_fetch`](QueryFilter::filter_fetch) call per row, in ascending row order.
+///
+/// Public only for the `QueryFilter` derive macro's generated code.
+///
+/// # Safety
+///
+/// Same requirements as [`QueryFilter::filter_fetch_mask`].
+#[doc(hidden)]
+#[inline]
+pub unsafe fn filter_fetch_mask_fallback<F: QueryFilter>(
+    state: &F::State,
+    fetch: &mut F::Fetch<'_>,
+    entities: &[Entity],
+    first_row: u32,
+) -> u64 {
+    let mut mask = 0u64;
+    for (i, &entity) in entities.iter().enumerate() {
+        // SAFETY: The caller guarantees `first_row + i` is a valid row in the current table,
+        // and valid table rows are always less than `u32::MAX`.
+        let row = unsafe { TableRow::new(NonMaxU32::new_unchecked(first_row + i as u32)) };
+        // SAFETY: The invariants are upheld by the caller.
+        let matched = unsafe { F::filter_fetch(state, fetch, entity, row) };
+        mask |= (matched as u64) << i;
+    }
+    mask
+}
+
+/// Packs [`FILTER_MASK_BITS`] bytes that are each `0` or `1` into a bitmask with
+/// bit `i` = `bools[i]`.
+///
+/// Split from the compare loops that fill `bools` so those loops stay trivially
+/// auto-vectorizable.
+#[inline(always)]
+fn pack_bools_to_mask(bools: &[u8; FILTER_MASK_BITS as usize]) -> u64 {
+    let mut mask = 0u64;
+    for j in 0..8 {
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&bools[j * 8..j * 8 + 8]);
+        let word = u64::from_le_bytes(bytes);
+        // Each byte is 0 or 1, so this multiply gathers every byte's low bit into the top
+        // byte without cross-term carries.
+        mask |= ((word.wrapping_mul(0x0102_0408_1020_4080) >> 56) & 0xFF) << (j * 8);
+    }
+    mask
+}
+
+/// Shared [`QueryFilter::filter_fetch_mask`] implementation for the tick-based filters
+/// ([`Added`], [`Changed`]): builds one block's match mask from the cached tick column, or
+/// via `sparse_tick` for sparse-set components.
+///
+/// # Safety
+///
+/// Same requirements as [`QueryFilter::filter_fetch_mask`], and `sparse_tick` must be
+/// sound to call for every entity in `entities`.
+#[inline]
+unsafe fn tick_filter_fetch_mask<'w, T: Component>(
+    ticks: &StorageSwitch<
+        T,
+        Option<ThinSlicePtr<'w, UnsafeCell<Tick>>>,
+        Option<&'w ComponentSparseSet>,
+    >,
+    this_run: Tick,
+    threshold: u32,
+    entities: &[Entity],
+    first_row: u32,
+    sparse_tick: impl Fn(&ComponentSparseSet, Entity) -> Tick,
+) -> u64 {
+    ticks.extract(
+        |table| {
+            // SAFETY: set_table was previously called
+            let table = unsafe { table.debug_checked_unwrap() };
+            let len = entities.len();
+            let mut bools = [0u8; FILTER_MASK_BITS as usize];
+            if len == FILTER_MASK_BITS as usize {
+                // Fixed trip count so the compare loop auto-vectorizes.
+                for (i, matched) in bools.iter_mut().enumerate() {
+                    // SAFETY: The caller ensures rows `first_row..first_row + FILTER_MASK_BITS`
+                    // are in range, and that no exclusive access aliases the tick array.
+                    let tick = unsafe { table.get_unchecked(first_row as usize + i).read() };
+                    *matched = tick.is_newer_than_threshold(this_run, threshold) as u8;
+                }
+            } else {
+                for (i, matched) in bools[..len].iter_mut().enumerate() {
+                    // SAFETY: As above, for rows `first_row..first_row + len`.
+                    let tick = unsafe { table.get_unchecked(first_row as usize + i).read() };
+                    *matched = tick.is_newer_than_threshold(this_run, threshold) as u8;
+                }
+            }
+            pack_bools_to_mask(&bools)
+        },
+        |sparse_set| {
+            // SAFETY: init_fetch was previously called for a sparse-set component.
+            let sparse_set = unsafe { sparse_set.debug_checked_unwrap() };
+            let mut mask = 0u64;
+            for (i, &entity) in entities.iter().enumerate() {
+                let tick = sparse_tick(sparse_set, entity);
+                mask |= (tick.is_newer_than_threshold(this_run, threshold) as u64) << i;
+            }
+            mask
+        },
+    )
 }
 
 /// Filter that selects entities with a component `T`.
@@ -204,6 +357,7 @@ unsafe impl<T: Component> WorldQuery for With<T> {
 // SAFETY: WorldQuery impl performs no access at all
 unsafe impl<T: Component> QueryFilter for With<T> {
     const IS_ARCHETYPAL: bool = true;
+    const BATCHABLE: bool = true;
 
     #[inline(always)]
     unsafe fn filter_fetch(
@@ -305,6 +459,7 @@ unsafe impl<T: Component> WorldQuery for Without<T> {
 // SAFETY: WorldQuery impl performs no access at all
 unsafe impl<T: Component> QueryFilter for Without<T> {
     const IS_ARCHETYPAL: bool = true;
+    const BATCHABLE: bool = true;
 
     #[inline(always)]
     unsafe fn filter_fetch(
@@ -522,6 +677,7 @@ macro_rules! impl_or_query_filter {
         // SAFETY: This only performs access that subqueries perform, and they impl `QueryFilter` and so perform no mutable access.
         unsafe impl<$($filter: QueryFilter),*> QueryFilter for Or<($($filter,)*)> {
             const IS_ARCHETYPAL: bool = true $(&& $filter::IS_ARCHETYPAL)*;
+            const BATCHABLE: bool = true $(&& $filter::BATCHABLE)*;
 
             #[inline(always)]
             unsafe fn filter_fetch(
@@ -541,6 +697,47 @@ macro_rules! impl_or_query_filter {
                     // We must treat those as matching in order to be consistent with `size_hint` for archetypal queries,
                     // so we treat them as matching for non-archetypal queries, as well.
                     || !(false $(|| $filter.matches)*))
+            }
+
+            #[inline(always)]
+            unsafe fn filter_fetch_mask(
+                state: &Self::State,
+                fetch: &mut Self::Fetch<'_>,
+                entities: &[Entity],
+                first_row: u32,
+            ) -> u64 {
+                if !Self::BATCHABLE {
+                    // Preserve the exact per-row short-circuiting call pattern when any
+                    // subquery opted out of batching. In-tree iteration never calls this
+                    // method when `!BATCHABLE` (it is gated in `fold_over_table_range`);
+                    // this branch keeps the documented contract for direct callers.
+                    // SAFETY: The invariants are upheld by the caller.
+                    return unsafe { filter_fetch_mask_fallback::<Self>(state, fetch, entities, first_row) };
+                }
+                if Self::IS_ARCHETYPAL {
+                    return u64::MAX;
+                }
+                let ($($state,)*) = state;
+                let ($($filter,)*) = fetch;
+                let mut _mask = 0u64;
+                let mut _any_matches = false;
+                $(
+                    // Once the mask is saturated no later subquery can change the result;
+                    // a saturated mask also implies an earlier subquery already matched,
+                    // so `_any_matches` stays correct.
+                    if _mask != u64::MAX && $filter.matches {
+                        _any_matches = true;
+                        // SAFETY: The invariants are upheld by the caller.
+                        _mask |= unsafe { $filter::filter_fetch_mask($state, &mut $filter.fetch, entities, first_row) };
+                    }
+                )*
+                if _any_matches {
+                    _mask
+                } else {
+                    // No subquery matched the archetype: it was added via a transmute and is
+                    // treated as matching, consistent with `filter_fetch`.
+                    u64::MAX
+                }
             }
         }
     };
@@ -564,6 +761,7 @@ macro_rules! impl_tuple_query_filter {
         // SAFETY: This only performs access that subqueries perform, and they impl `QueryFilter` and so perform no mutable access.
         unsafe impl<$($name: QueryFilter),*> QueryFilter for ($($name,)*) {
             const IS_ARCHETYPAL: bool = true $(&& $name::IS_ARCHETYPAL)*;
+            const BATCHABLE: bool = true $(&& $name::BATCHABLE)*;
 
             #[inline(always)]
             unsafe fn filter_fetch(
@@ -576,6 +774,33 @@ macro_rules! impl_tuple_query_filter {
                 let ($($name,)*) = fetch;
                 // SAFETY: The invariants are upheld by the caller.
                 true $(&& unsafe { $name::filter_fetch($state, $name, entity, table_row) })*
+            }
+
+            #[inline(always)]
+            unsafe fn filter_fetch_mask(
+                state: &Self::State,
+                fetch: &mut Self::Fetch<'_>,
+                entities: &[Entity],
+                first_row: u32,
+            ) -> u64 {
+                if !Self::BATCHABLE {
+                    // Preserve the exact per-row short-circuiting call pattern when any
+                    // member opted out of batching. In-tree iteration never calls this
+                    // method when `!BATCHABLE` (it is gated in `fold_over_table_range`);
+                    // this branch keeps the documented contract for direct callers.
+                    // SAFETY: The invariants are upheld by the caller.
+                    return unsafe { filter_fetch_mask_fallback::<Self>(state, fetch, entities, first_row) };
+                }
+                let ($($state,)*) = state;
+                let ($($name,)*) = fetch;
+                let mut _mask = u64::MAX;
+                $(
+                    if _mask != 0 {
+                        // SAFETY: The invariants are upheld by the caller.
+                        _mask &= unsafe { $name::filter_fetch_mask($state, $name, entities, first_row) };
+                    }
+                )*
+                _mask
             }
         }
     };
@@ -648,6 +873,7 @@ unsafe impl<T: Component> WorldQuery for Allow<T> {
 // SAFETY: WorldQuery impl performs no access at all
 unsafe impl<T: Component> QueryFilter for Allow<T> {
     const IS_ARCHETYPAL: bool = true;
+    const BATCHABLE: bool = true;
 
     #[inline(always)]
     unsafe fn filter_fetch(
@@ -736,16 +962,18 @@ pub struct AddedFetch<'w, T: Component> {
         // Can be `None` when the component has never been inserted
         Option<&'w ComponentSparseSet>,
     >,
-    last_run: Tick,
     this_run: Tick,
+    // Precomputed [`Tick::newness_threshold`]; a tick matches iff
+    // [`Tick::is_newer_than_threshold`] against it.
+    threshold: u32,
 }
 
 impl<T: Component> Clone for AddedFetch<'_, T> {
     fn clone(&self) -> Self {
         Self {
             ticks: self.ticks,
-            last_run: self.last_run,
             this_run: self.this_run,
+            threshold: self.threshold,
         }
     }
 }
@@ -781,8 +1009,8 @@ unsafe impl<T: Component> WorldQuery for Added<T> {
                     unsafe { world.storages().sparse_sets.get(id) }
                 },
             ),
-            last_run,
             this_run,
+            threshold: Tick::newness_threshold(last_run, this_run),
         }
     }
 
@@ -851,6 +1079,8 @@ unsafe impl<T: Component> WorldQuery for Added<T> {
 // SAFETY: WorldQuery impl performs only read access on ticks
 unsafe impl<T: Component> QueryFilter for Added<T> {
     const IS_ARCHETYPAL: bool = false;
+    const BATCHABLE: bool = true;
+
     #[inline(always)]
     unsafe fn filter_fetch(
         _state: &Self::State,
@@ -866,7 +1096,8 @@ unsafe impl<T: Component> QueryFilter for Added<T> {
                 // SAFETY: The caller ensures `table_row` is in range.
                 let tick = unsafe { table.get_unchecked(table_row.index()) };
 
-                tick.deref().is_newer_than(fetch.last_run, fetch.this_run)
+                tick.deref()
+                    .is_newer_than_threshold(fetch.this_run, fetch.threshold)
             },
             |sparse_set| {
                 // SAFETY: The caller ensures `entity` is in range.
@@ -877,9 +1108,37 @@ unsafe impl<T: Component> QueryFilter for Added<T> {
                         .debug_checked_unwrap()
                 };
 
-                tick.deref().is_newer_than(fetch.last_run, fetch.this_run)
+                tick.deref()
+                    .is_newer_than_threshold(fetch.this_run, fetch.threshold)
             },
         )
+    }
+
+    #[inline]
+    unsafe fn filter_fetch_mask(
+        _state: &Self::State,
+        fetch: &mut Self::Fetch<'_>,
+        entities: &[Entity],
+        first_row: u32,
+    ) -> u64 {
+        // SAFETY: The invariants are upheld by the caller.
+        unsafe {
+            tick_filter_fetch_mask(
+                &fetch.ticks,
+                fetch.this_run,
+                fetch.threshold,
+                entities,
+                first_row,
+                |sparse_set, entity| {
+                    // SAFETY: The caller ensures each entity is stored in the current
+                    // table, and therefore present in the sparse set.
+                    sparse_set
+                        .get_added_tick(entity)
+                        .debug_checked_unwrap()
+                        .read()
+                },
+            )
+        }
     }
 }
 
@@ -963,16 +1222,18 @@ pub struct ChangedFetch<'w, T: Component> {
         // Can be `None` when the component has never been inserted
         Option<&'w ComponentSparseSet>,
     >,
-    last_run: Tick,
     this_run: Tick,
+    // Precomputed [`Tick::newness_threshold`]; a tick matches iff
+    // [`Tick::is_newer_than_threshold`] against it.
+    threshold: u32,
 }
 
 impl<T: Component> Clone for ChangedFetch<'_, T> {
     fn clone(&self) -> Self {
         Self {
             ticks: self.ticks,
-            last_run: self.last_run,
             this_run: self.this_run,
+            threshold: self.threshold,
         }
     }
 }
@@ -1008,8 +1269,8 @@ unsafe impl<T: Component> WorldQuery for Changed<T> {
                     unsafe { world.storages().sparse_sets.get(id) }
                 },
             ),
-            last_run,
             this_run,
+            threshold: Tick::newness_threshold(last_run, this_run),
         }
     }
 
@@ -1078,6 +1339,7 @@ unsafe impl<T: Component> WorldQuery for Changed<T> {
 // SAFETY: WorldQuery impl performs only read access on ticks
 unsafe impl<T: Component> QueryFilter for Changed<T> {
     const IS_ARCHETYPAL: bool = false;
+    const BATCHABLE: bool = true;
 
     #[inline(always)]
     unsafe fn filter_fetch(
@@ -1094,7 +1356,8 @@ unsafe impl<T: Component> QueryFilter for Changed<T> {
                 // SAFETY: The caller ensures `table_row` is in range.
                 let tick = unsafe { table.get_unchecked(table_row.index()) };
 
-                tick.deref().is_newer_than(fetch.last_run, fetch.this_run)
+                tick.deref()
+                    .is_newer_than_threshold(fetch.this_run, fetch.threshold)
             },
             |sparse_set| {
                 // SAFETY: The caller ensures `entity` is in range.
@@ -1105,9 +1368,37 @@ unsafe impl<T: Component> QueryFilter for Changed<T> {
                         .debug_checked_unwrap()
                 };
 
-                tick.deref().is_newer_than(fetch.last_run, fetch.this_run)
+                tick.deref()
+                    .is_newer_than_threshold(fetch.this_run, fetch.threshold)
             },
         )
+    }
+
+    #[inline]
+    unsafe fn filter_fetch_mask(
+        _state: &Self::State,
+        fetch: &mut Self::Fetch<'_>,
+        entities: &[Entity],
+        first_row: u32,
+    ) -> u64 {
+        // SAFETY: The invariants are upheld by the caller.
+        unsafe {
+            tick_filter_fetch_mask(
+                &fetch.ticks,
+                fetch.this_run,
+                fetch.threshold,
+                entities,
+                first_row,
+                |sparse_set, entity| {
+                    // SAFETY: The caller ensures each entity is stored in the current
+                    // table, and therefore present in the sparse set.
+                    sparse_set
+                        .get_changed_tick(entity)
+                        .debug_checked_unwrap()
+                        .read()
+                },
+            )
+        }
     }
 }
 
@@ -1233,6 +1524,9 @@ unsafe impl WorldQuery for Spawned {
 // SAFETY: WorldQuery impl accesses no components or component ticks
 unsafe impl QueryFilter for Spawned {
     const IS_ARCHETYPAL: bool = false;
+    // Pure read of the entity's spawn tick; the default (scalar) `filter_fetch_mask`
+    // applies, but this must not block batching for filters composed with it.
+    const BATCHABLE: bool = true;
 
     #[inline(always)]
     unsafe fn filter_fetch(
@@ -1305,3 +1599,202 @@ all_tuples!(
     15,
     F
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::change_detection::MAX_CHANGE_AGE;
+    use alloc::{vec, vec::Vec};
+
+    #[derive(Component)]
+    struct TableA(u32);
+
+    #[derive(Component)]
+    struct TableB(u32);
+
+    #[derive(Component)]
+    #[component(storage = "SparseSet")]
+    struct SparseC(u32);
+
+    #[test]
+    fn threshold_predicate_equivalent_to_is_newer_than() {
+        let offsets = [
+            0,
+            1,
+            2,
+            63,
+            64,
+            65,
+            100,
+            MAX_CHANGE_AGE - 1,
+            MAX_CHANGE_AGE,
+            MAX_CHANGE_AGE + 1,
+            u32::MAX - 1,
+            u32::MAX,
+        ];
+        for &now in &offsets {
+            let this_run = Tick::new(now);
+            for &system_age in &offsets {
+                let last_run = Tick::new(now.wrapping_sub(system_age));
+                let threshold = Tick::newness_threshold(last_run, this_run);
+                for &tick_age in &offsets {
+                    let tick = Tick::new(now.wrapping_sub(tick_age));
+                    assert_eq!(
+                        tick.is_newer_than_threshold(this_run, threshold),
+                        tick.is_newer_than(last_run, this_run),
+                        "now={now} system_age={system_age} tick_age={tick_age}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Asserts that the `next()` path (plain iteration) and the fold path (which uses
+    /// `filter_fetch_mask` blocks for batchable filters) agree with each other and with
+    /// `expected` (as a set).
+    fn assert_next_and_fold_agree<F: QueryFilter>(world: &mut World, expected: &mut Vec<Entity>) {
+        let mut query = world.query_filtered::<Entity, F>();
+        let via_next: Vec<Entity> = query.iter(world).collect();
+        let mut via_fold: Vec<Entity> = Vec::new();
+        query.iter(world).for_each(|entity| via_fold.push(entity));
+        assert_eq!(via_next, via_fold);
+        let mut sorted = via_next;
+        sorted.sort();
+        expected.sort();
+        assert_eq!(&sorted, expected);
+    }
+
+    #[test]
+    fn batched_changed_matches_scalar_across_blocks() {
+        let mut world = World::new();
+        // Two archetypes so multiple tables (and partial trailing blocks) are exercised.
+        let entities: Vec<Entity> = (0..200u32)
+            .map(|i| {
+                if i % 3 == 0 {
+                    world.spawn((TableA(i), TableB(i))).id()
+                } else {
+                    world.spawn(TableA(i)).id()
+                }
+            })
+            .collect();
+        world.clear_trackers();
+
+        // Scattered singles, a >64-row run crossing block boundaries, and the last row.
+        let mut expected = Vec::new();
+        for (i, &entity) in entities.iter().enumerate() {
+            if i % 7 == 0 || (60..=130).contains(&i) || i == 199 {
+                world.get_mut::<TableA>(entity).unwrap().0 ^= 1;
+                expected.push(entity);
+            }
+        }
+        assert_next_and_fold_agree::<Changed<TableA>>(&mut world, &mut expected);
+    }
+
+    #[test]
+    fn batched_changed_none_and_all() {
+        let mut world = World::new();
+        let entities: Vec<Entity> = (0..150u32).map(|i| world.spawn(TableA(i)).id()).collect();
+        world.clear_trackers();
+        assert_next_and_fold_agree::<Changed<TableA>>(&mut world, &mut vec![]);
+
+        for &entity in &entities {
+            world.get_mut::<TableA>(entity).unwrap().0 ^= 1;
+        }
+        let mut expected = entities;
+        assert_next_and_fold_agree::<Changed<TableA>>(&mut world, &mut expected);
+    }
+
+    #[test]
+    fn batched_added_matches_scalar() {
+        let mut world = World::new();
+        for i in 0..100u32 {
+            world.spawn(TableA(i));
+        }
+        world.clear_trackers();
+        let mut expected: Vec<Entity> = (0..70u32).map(|i| world.spawn(TableA(i)).id()).collect();
+        assert_next_and_fold_agree::<Added<TableA>>(&mut world, &mut expected);
+    }
+
+    #[test]
+    fn batched_tuple_and_or_match_scalar() {
+        let mut world = World::new();
+        let mut spawned = Vec::new();
+        for i in 0..150u32 {
+            if i % 2 == 0 {
+                spawned.push((world.spawn((TableA(i), TableB(i))).id(), true));
+            } else {
+                spawned.push((world.spawn(TableA(i)).id(), false));
+            }
+        }
+        world.clear_trackers();
+
+        let mut changed_a = Vec::new();
+        let mut changed_b = Vec::new();
+        for (i, &(entity, has_b)) in spawned.iter().enumerate() {
+            if i % 5 == 0 {
+                world.get_mut::<TableA>(entity).unwrap().0 ^= 1;
+                changed_a.push(entity);
+            }
+            if has_b && i % 4 == 0 {
+                world.get_mut::<TableB>(entity).unwrap().0 ^= 1;
+                changed_b.push(entity);
+            }
+        }
+
+        let mut expected_tuple: Vec<Entity> = spawned
+            .iter()
+            .filter(|(entity, has_b)| *has_b && changed_a.contains(entity))
+            .map(|&(entity, _)| entity)
+            .collect();
+        assert_next_and_fold_agree::<(Changed<TableA>, With<TableB>)>(
+            &mut world,
+            &mut expected_tuple,
+        );
+
+        let mut expected_or: Vec<Entity> = spawned
+            .iter()
+            .filter(|(entity, _)| changed_a.contains(entity) || changed_b.contains(entity))
+            .map(|&(entity, _)| entity)
+            .collect();
+        assert_next_and_fold_agree::<Or<(Changed<TableA>, Changed<TableB>)>>(
+            &mut world,
+            &mut expected_or,
+        );
+    }
+
+    #[test]
+    fn batched_changed_sparse_matches_scalar() {
+        let mut world = World::new();
+        let entities: Vec<Entity> = (0..100u32).map(|i| world.spawn(SparseC(i)).id()).collect();
+        world.clear_trackers();
+        let mut expected = Vec::new();
+        for (i, &entity) in entities.iter().enumerate() {
+            if i % 4 == 0 {
+                world.get_mut::<SparseC>(entity).unwrap().0 ^= 1;
+                expected.push(entity);
+            }
+        }
+        assert_next_and_fold_agree::<Changed<SparseC>>(&mut world, &mut expected);
+    }
+
+    #[test]
+    fn batched_or_transmute_fallback_matches_scalar() {
+        let mut world = World::new();
+        world.register_component::<TableA>();
+        for i in 0..70u32 {
+            world.spawn(TableB(i));
+        }
+        world.clear_trackers();
+
+        // `TableB`-only archetype: no `Or` branch matches it, so every row must match via
+        // the transmute fallback, on both the `next()` and the fold (mask) path.
+        let mut query = world
+            .query::<(&TableB, Option<&TableA>)>()
+            .transmute_filtered::<Entity, Or<(Changed<TableA>,)>>(&world);
+        let via_next: Vec<Entity> = query.iter(&world).collect();
+        let mut via_fold: Vec<Entity> = Vec::new();
+        query.iter(&world).for_each(|entity| via_fold.push(entity));
+        assert_eq!(via_next, via_fold);
+        assert_eq!(via_next.len(), 70);
+    }
+}

@@ -61,6 +61,28 @@ impl Tick {
         ticks_since_system > ticks_since_insert
     }
 
+    /// Precomputes the loop-invariant part of [`Tick::is_newer_than`] for
+    /// [`Tick::is_newer_than_threshold`].
+    #[inline]
+    pub(crate) fn newness_threshold(last_run: Tick, this_run: Tick) -> u32 {
+        this_run.relative_to(last_run).tick.min(MAX_CHANGE_AGE)
+    }
+
+    /// Branchless form of [`Tick::is_newer_than`] with the `last_run` half hoisted out via
+    /// [`Tick::newness_threshold`]; query iteration uses it to keep the per-tick check to a
+    /// single subtract-and-compare.
+    ///
+    /// Equivalence: `is_newer_than` computes `threshold > age.min(MAX_CHANGE_AGE)` where
+    /// `age = this_run.relative_to(self).get()`. If `age < MAX_CHANGE_AGE`, both forms
+    /// reduce to `age < threshold`; otherwise both are false, since
+    /// `threshold <= MAX_CHANGE_AGE <= age` rules out `age < threshold`, and
+    /// `age.min(MAX_CHANGE_AGE) = MAX_CHANGE_AGE >= threshold` rules out the original.
+    /// The `threshold_predicate_equivalent_to_is_newer_than` test checks the boundaries.
+    #[inline]
+    pub(crate) fn is_newer_than_threshold(self, this_run: Tick, threshold: u32) -> bool {
+        this_run.relative_to(self).tick < threshold
+    }
+
     /// Returns a change tick representing the relationship between `self` and `other`.
     #[inline]
     pub(crate) fn relative_to(self, other: Self) -> Self {

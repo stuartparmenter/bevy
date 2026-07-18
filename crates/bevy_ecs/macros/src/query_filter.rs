@@ -75,6 +75,7 @@ pub fn derive_query_filter_impl(input: TokenStream) -> TokenStream {
         unsafe impl #user_impl_generics #path::query::QueryFilter
         for #struct_name #user_ty_generics #user_where_clauses {
             const IS_ARCHETYPAL: bool = true #(&& <#field_types as #path::query::QueryFilter>::IS_ARCHETYPAL)*;
+            const BATCHABLE: bool = true #(&& <#field_types as #path::query::QueryFilter>::BATCHABLE)*;
 
             #[allow(unused_variables)]
             #[inline(always)]
@@ -85,6 +86,30 @@ pub fn derive_query_filter_impl(input: TokenStream) -> TokenStream {
                 _table_row: #path::storage::TableRow,
             ) -> bool {
                 true #(&& <#field_types>::filter_fetch(&_state.#field_aliases, &mut _fetch.#field_aliases, _entity, _table_row))*
+            }
+
+            #[allow(unused_variables, unused_mut)]
+            #[inline(always)]
+            unsafe fn filter_fetch_mask<'__w>(
+                _state: &Self::State,
+                _fetch: &mut <Self as #path::query::WorldQuery>::Fetch<'__w>,
+                _entities: &[#path::entity::Entity],
+                _first_row: u32,
+            ) -> u64 {
+                if !Self::BATCHABLE {
+                    // Preserve the exact per-row short-circuiting call pattern when any
+                    // member opted out of batching. In-tree iteration never calls this
+                    // method when `!BATCHABLE`; this branch keeps the documented contract
+                    // for direct callers.
+                    return #path::query::filter_fetch_mask_fallback::<Self>(_state, _fetch, _entities, _first_row);
+                }
+                let mut _mask = u64::MAX;
+                #(
+                    if _mask != 0 {
+                        _mask &= <#field_types>::filter_fetch_mask(&_state.#field_aliases, &mut _fetch.#field_aliases, _entities, _first_row);
+                    }
+                )*
+                _mask
             }
         }
     };

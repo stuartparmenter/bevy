@@ -17,7 +17,9 @@ criterion_group!(
     all_changed_detection,
     few_changed_detection,
     none_changed_detection,
-    multiple_archetype_none_changed_detection
+    multiple_archetype_none_changed_detection,
+    added_detection_foreach,
+    changed_detection_foreach
 );
 
 macro_rules! modify {
@@ -267,6 +269,109 @@ fn none_changed_detection(criterion: &mut Criterion) {
         );
     }
 }
+// The `for` loops above iterate via `Iterator::next`; `for_each` routes through
+// `Iterator::fold`, which is the internally-batched iteration path. Both are measured
+// so the two paths can be compared and neither silently regresses.
+fn added_foreach_generic<T: Component + Default>(group: &mut BenchGroup, entity_count: u32) {
+    group.bench_function(
+        format!("{}_entities_{}", entity_count, core::any::type_name::<T>()),
+        |bencher| {
+            bencher.iter_batched_ref(
+                || {
+                    let mut world = setup::<T>(entity_count);
+                    let query = generic_filter_query::<Added<T>>(&mut world);
+                    (world, query)
+                },
+                |(world, query)| {
+                    let mut count = 0;
+                    query.iter(world).for_each(|entity| {
+                        black_box(entity);
+                        count += 1;
+                    });
+                    assert_eq!(entity_count, count);
+                },
+                criterion::BatchSize::LargeInput,
+            );
+        },
+    );
+}
+
+fn added_detection_foreach(criterion: &mut Criterion) {
+    let mut group = criterion.benchmark_group("added_detection_foreach");
+    group.warm_up_time(core::time::Duration::from_millis(500));
+    group.measurement_time(core::time::Duration::from_secs(4));
+    for &entity_count in ENTITIES_TO_BENCH_COUNT {
+        generic_bench(
+            &mut group,
+            vec![
+                Box::new(added_foreach_generic::<Table>),
+                Box::new(added_foreach_generic::<Sparse>),
+            ],
+            entity_count,
+        );
+    }
+}
+
+fn fraction_changed_foreach_generic<T: Component<Mutability = Mutable> + Default + BenchModify>(
+    ratio_pct: u32,
+) -> impl FnMut(&mut BenchGroup, u32) {
+    move |group, entity_count| {
+        let amount_to_modify = (entity_count as u64 * ratio_pct as u64 / 100) as usize;
+        group.bench_function(
+            format!(
+                "{}_entities_{}pct_{}",
+                entity_count,
+                ratio_pct,
+                core::any::type_name::<T>()
+            ),
+            |bencher| {
+                bencher.iter_batched_ref(
+                    || {
+                        let mut world = setup::<T>(entity_count);
+                        world.clear_trackers();
+                        let mut query = world.query::<&mut T>();
+                        let mut to_modify: Vec<bevy_ecs::prelude::Mut<T>> =
+                            query.iter_mut(&mut world).collect();
+                        to_modify.shuffle(&mut deterministic_rand());
+                        for component in to_modify[0..amount_to_modify].iter_mut() {
+                            black_box(component.bench_modify());
+                        }
+                        let query = generic_filter_query::<Changed<T>>(&mut world);
+                        (world, query)
+                    },
+                    |(world, query)| {
+                        let mut count = 0;
+                        query.iter(world).for_each(|entity| {
+                            black_box(entity);
+                            count += 1;
+                        });
+                        assert_eq!(amount_to_modify, count);
+                    },
+                    criterion::BatchSize::LargeInput,
+                );
+            },
+        );
+    }
+}
+
+fn changed_detection_foreach(criterion: &mut Criterion) {
+    let mut group = criterion.benchmark_group("changed_detection_foreach");
+    group.warm_up_time(core::time::Duration::from_millis(500));
+    group.measurement_time(core::time::Duration::from_secs(4));
+    for &entity_count in ENTITIES_TO_BENCH_COUNT {
+        for ratio_pct in [0, 10, 50, 100] {
+            generic_bench(
+                &mut group,
+                vec![
+                    Box::new(fraction_changed_foreach_generic::<Table>(ratio_pct)),
+                    Box::new(fraction_changed_foreach_generic::<Sparse>(ratio_pct)),
+                ],
+                entity_count,
+            );
+        }
+    }
+}
+
 fn insert_if_bit_enabled<const B: u16>(entity: &mut EntityWorldMut, i: u16) {
     if i & (1 << B) != 0 {
         entity.insert(Data::<B>(1.0));
