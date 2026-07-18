@@ -1096,6 +1096,14 @@ pub(crate) fn specialize_material_meshes(
                     continue;
                 };
                 let Some(mesh) = render_meshes.get(mesh_instance.mesh_asset_id()) else {
+                    // The mesh asset may not have been prepared as a
+                    // `RenderMesh` yet even though the mesh instance exists
+                    // (extraction runs ahead of asset preparation). Re-enqueue
+                    // like the misses above; a bare `continue` here would
+                    // silently drop the entity from the only retry mechanism.
+                    view_pending_mesh_material_queues
+                        .current_frame
+                        .insert((*render_entity, *visible_entity));
                     continue;
                 };
                 let Some(material) = render_materials.get(material_instance.asset_id) else {
