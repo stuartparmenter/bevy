@@ -1,8 +1,13 @@
-use super::{blas::BlasManager, extract::StandardMaterialAssets, RaytracingMesh3d};
+use super::{
+    blas::{BlasManager, GeometryBlasManager},
+    extract::StandardMaterialAssets,
+    RaytracingGeometry, RaytracingGeometryBuffers, RaytracingMesh3d,
+};
 use bevy_asset::{AssetId, Handle};
 use bevy_color::{ColorToComponents, LinearRgba};
 use bevy_ecs::{
     entity::{Entity, EntityHashMap},
+    query::With,
     resource::Resource,
     system::{Query, Res, ResMut},
 };
@@ -32,6 +37,9 @@ const LIGHT_NOT_PRESENT_THIS_FRAME: u32 = u32::MAX;
 pub struct RaytracingSceneBindings {
     pub bind_group: Option<BindGroup>,
     pub bind_group_layout: BindGroupLayoutDescriptor,
+    /// Mesh BLASes stay alive through the retained TLAS's instance
+    /// references; per-frame geometry BLASes double-buffer so last frame's
+    /// build survives (see `GeometryBlasEntry::previous_blas`).
     previous_frame_tlas: Option<Tlas>,
     previous_frame_light_entities: Vec<Entity>,
 }
@@ -44,9 +52,20 @@ pub fn prepare_raytracing_scene_bindings(
         &GlobalTransform,
         Option<&PreviousGlobalTransform>,
     )>,
+    geometry_query: Query<
+        (
+            Entity,
+            &RaytracingGeometryBuffers,
+            &MeshMaterial3d<StandardMaterial>,
+            &GlobalTransform,
+            Option<&PreviousGlobalTransform>,
+        ),
+        With<RaytracingGeometry>,
+    >,
     directional_lights_query: Query<(Entity, &ExtractedDirectionalLight)>,
     mesh_allocator: Res<MeshAllocator>,
     blas_manager: Res<BlasManager>,
+    geometry_blas_manager: Res<GeometryBlasManager>,
     material_assets: Res<StandardMaterialAssets>,
     texture_assets: Res<RenderAssets<GpuImage>>,
     fallback_texture: Res<FallbackImage>,
@@ -67,7 +86,8 @@ pub fn prepare_raytracing_scene_bindings(
         .drain(..)
         .collect();
 
-    if instances_query.iter().len() == 0 {
+    let instance_count = instances_query.iter().len() + geometry_query.iter().len();
+    if instance_count == 0 {
         return;
     }
 
@@ -82,7 +102,7 @@ pub fn prepare_raytracing_scene_bindings(
             label: Some("tlas"),
             flags: AccelerationStructureFlags::PREFER_FAST_TRACE,
             update_mode: AccelerationStructureUpdateMode::Build,
-            max_instances: instances_query.iter().len() as u32,
+            max_instances: instance_count as u32,
         });
     let mut transforms = StorageBufferList::<[Vec4; 3]>::default();
     let mut previous_frame_transforms = StorageBufferList::<[Vec4; 3]>::default();
@@ -223,6 +243,91 @@ pub fn prepare_raytracing_scene_bindings(
         instance_id += 1;
     }
 
+    // GPU-authored geometry: same instance emission as the mesh path, but the
+    // vertex/index buffers come straight from the producer (offset 0, full
+    // buffer) and the BLAS is keyed by entity. Pending BLAS builds are folded
+    // into this system's build_acceleration_structures call below, saving a
+    // separate encoder + submit per frame.
+    let mut geometry_blas_builds = Vec::new();
+    for (entity, buffers, material, transform, previous_frame_transform) in &geometry_query {
+        let Some((blas, pending_build)) = geometry_blas_manager.get_with_pending_build(&entity)
+        else {
+            continue;
+        };
+        if let Some(size) = pending_build {
+            geometry_blas_builds.push(BlasBuildEntry {
+                blas,
+                geometry: BlasGeometries::TriangleGeometries(vec![BlasTriangleGeometry {
+                    size,
+                    vertex_buffer: &buffers.vertex_buffer,
+                    first_vertex: 0,
+                    vertex_stride: RaytracingGeometryBuffers::VERTEX_STRIDE,
+                    index_buffer: Some(&buffers.index_buffer),
+                    first_index: Some(0),
+                    transform_buffer: None,
+                    transform_buffer_offset: None,
+                }]),
+            });
+        }
+        let Some(material_id) = material_id_map.get(&material.id()).copied() else {
+            continue;
+        };
+        let Some(material) = materials.get().get(material_id as usize) else {
+            continue;
+        };
+
+        *tlas.get_mut_single(instance_id).unwrap() = Some(TlasInstance::new(
+            blas,
+            tlas_transform(&transform.to_matrix()),
+            Default::default(),
+            0xFF,
+        ));
+
+        let transform = Affine3::from(transform.affine()).to_transpose();
+        transforms.get_mut().push(transform);
+        previous_frame_transforms.get_mut().push(
+            previous_frame_transform
+                .map(|t| Affine3::from(t.0).to_transpose())
+                .unwrap_or(transform),
+        );
+
+        let (vertex_buffer_id, _) = vertex_buffers.push_if_absent(
+            buffers.vertex_buffer.as_entire_buffer_binding(),
+            buffers.vertex_buffer.id(),
+        );
+        let (index_buffer_id, _) = index_buffers.push_if_absent(
+            buffers.index_buffer.as_entire_buffer_binding(),
+            buffers.index_buffer.id(),
+        );
+
+        let triangle_count = buffers.index_count / 3;
+        geometry_ids.get_mut().push(GpuInstanceGeometryIds {
+            vertex_buffer_id,
+            vertex_buffer_offset: 0,
+            index_buffer_id,
+            index_buffer_offset: 0,
+            triangle_count,
+        });
+
+        material_ids.get_mut().push(material_id);
+
+        if material.emissive != Vec3::ZERO {
+            light_sources
+                .get_mut()
+                .push(GpuLightSource::new_emissive_mesh_light(
+                    instance_id as u32,
+                    triangle_count,
+                ));
+
+            this_frame_entity_to_light_id.insert(entity, light_sources.get().len() as u32 - 1);
+            raytracing_scene_bindings
+                .previous_frame_light_entities
+                .push(entity);
+        }
+
+        instance_id += 1;
+    }
+
     if instance_id == 0 {
         return;
     }
@@ -272,7 +377,7 @@ pub fn prepare_raytracing_scene_bindings(
     let time_span = diagnostics
         .as_mut()
         .map(|diagnostics| diagnostics.time_span(&mut command_encoder, "tlas_build"));
-    command_encoder.build_acceleration_structures(&[], [&tlas]);
+    command_encoder.build_acceleration_structures(&geometry_blas_builds, [&tlas]);
     if let Some(time_span) = time_span {
         time_span.end(&mut command_encoder);
     }

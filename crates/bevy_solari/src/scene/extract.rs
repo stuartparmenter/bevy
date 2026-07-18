@@ -1,4 +1,4 @@
-use super::RaytracingMesh3d;
+use super::{RaytracingGeometry, RaytracingMesh3d};
 use bevy_asset::{AssetEvent, AssetId, Assets};
 use bevy_derive::{Deref, DerefMut};
 use bevy_ecs::{
@@ -27,7 +27,19 @@ pub fn extract_raytracing_scene_structural(
             Added<RaytracingMesh3d>,
         >,
     >,
+    geometry_instances: Extract<
+        Query<
+            (
+                RenderEntity,
+                &MeshMaterial3d<StandardMaterial>,
+                &GlobalTransform,
+                Option<&PreviousGlobalTransform>,
+            ),
+            With<RaytracingGeometry>,
+        >,
+    >,
     mut removed_raytracing_meshes: Extract<RemovedComponents<RaytracingMesh3d>>,
+    mut removed_raytracing_geometry: Extract<RemovedComponents<RaytracingGeometry>>,
     render_entities: Extract<Query<RenderEntity>>,
     mut commands: Commands,
 ) {
@@ -35,6 +47,12 @@ pub fn extract_raytracing_scene_structural(
     for main_entity in removed_raytracing_meshes.read() {
         if let Ok(render_entity) = render_entities.get(main_entity) {
             commands.entity(render_entity).remove::<RaytracingMesh3d>();
+        }
+    }
+
+    for main_entity in removed_raytracing_geometry.read() {
+        if let Ok(render_entity) = render_entities.get(main_entity) {
+            commands.entity(render_entity).remove::<RaytracingGeometry>();
         }
     }
 
@@ -47,6 +65,23 @@ pub fn extract_raytracing_scene_structural(
                 .cloned()
                 .unwrap_or(PreviousGlobalTransform(transform.affine())),
         ));
+    }
+
+    // GPU-authored geometry: extract only the marker + material + transform.
+    // The vertex/index buffers live in `RaytracingGeometryBuffers`, inserted
+    // separately on the render entity by the producer.
+    for (render_entity, material, transform, previous_frame_transform) in &geometry_instances {
+        let mut commands = commands.entity(render_entity);
+
+        match previous_frame_transform.cloned() {
+            Some(previous_frame_transform) => commands.insert((
+                RaytracingGeometry,
+                material.clone(),
+                *transform,
+                previous_frame_transform,
+            )),
+            None => commands.insert((RaytracingGeometry, material.clone(), *transform)),
+        };
     }
 }
 

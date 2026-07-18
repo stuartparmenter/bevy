@@ -5,7 +5,9 @@ mod types;
 
 use bevy_shader::load_shader_library;
 pub use binder::RaytracingSceneBindings;
-pub use types::RaytracingMesh3d;
+pub use types::{
+    RaytracingGeometry, RaytracingGeometryBuffers, RaytracingGeometryUpdateMode, RaytracingMesh3d,
+};
 
 use crate::SolariPlugins;
 use bevy_app::{App, Plugin};
@@ -21,7 +23,10 @@ use bevy_render::{
     ExtractSchedule, GpuResourceAppExt, Render, RenderApp, RenderSystems,
 };
 use binder::prepare_raytracing_scene_bindings;
-use blas::{compact_raytracing_blas, prepare_raytracing_blas, BlasManager};
+use blas::{
+    compact_raytracing_blas, prepare_raytracing_blas, prepare_raytracing_geometry_blas,
+    BlasManager, GeometryBlasManager,
+};
 use extract::{
     extract_raytracing_material_assets, extract_raytracing_scene_meshes_and_materials,
     extract_raytracing_scene_structural, extract_raytracing_scene_transforms,
@@ -60,6 +65,7 @@ impl Plugin for RaytracingScenePlugin {
 
         render_app
             .init_gpu_resource::<BlasManager>()
+            .init_gpu_resource::<GeometryBlasManager>()
             .init_gpu_resource::<StandardMaterialAssets>()
             .insert_resource(RaytracingSceneBindings::new())
             .add_systems(
@@ -81,6 +87,11 @@ impl Plugin for RaytracingScenePlugin {
                     compact_raytracing_blas
                         .in_set(RenderSystems::PrepareAssets)
                         .after(prepare_raytracing_blas),
+                    // Runs after producers' fill compute in PrepareResources,
+                    // just before the binder consumes the BLASes.
+                    prepare_raytracing_geometry_blas
+                        .in_set(RenderSystems::PrepareBindGroups)
+                        .before(prepare_raytracing_scene_bindings),
                     prepare_raytracing_scene_bindings.in_set(RenderSystems::PrepareBindGroups),
                 ),
             );
