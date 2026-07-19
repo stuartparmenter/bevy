@@ -95,6 +95,12 @@ pub struct Args {
     #[argh(switch)]
     no_pulse: bool,
 
+    /// disable Solari and light the scene with a flat ambient instead. The panels Solari
+    /// resolves are the corridor's only real lights, so this is not representative
+    /// lighting -- it isolates Solari's cost, and runs on GPUs without ray tracing.
+    #[argh(switch)]
+    no_solari: bool,
+
     /// render resolution as `WxH` (default 1920x1080). Solari cost scales with pixel count,
     /// so lower it (e.g. `1280x720`) to trade sharpness for framerate on the heavy measures.
     #[argh(option)]
@@ -222,9 +228,21 @@ fn main() {
         "b1a7c0de-4d2f-4e6a-9b3c-0d1e2f3a4b5c"
     )));
 
+    let no_solari = args.no_solari;
+
     app.insert_resource(ClearColor(Color::BLACK))
-        // All light comes from the emissive meshes (via Solari); no ambient fill.
-        .insert_resource(GlobalAmbientLight::NONE)
+        // All light comes from the emissive meshes (via Solari); no ambient fill. With
+        // `--no-solari` there is no path tracer to resolve them, so a flat ambient is the
+        // only light. 5000 cd/m^2 reads as a bright interior under the nits-scale GT7
+        // tonemapper without washing out the still-emissive panels.
+        .insert_resource(if no_solari {
+            GlobalAmbientLight {
+                brightness: 5_000.0,
+                ..default()
+            }
+        } else {
+            GlobalAmbientLight::NONE
+        })
         .insert_resource(args)
         .insert_resource(WinitSettings::continuous())
         .init_resource::<Cinematic>()
@@ -246,7 +264,6 @@ fn main() {
                     working_color_space: WorkingColorSpace::Rec2020,
                     ..default()
                 }),
-            SolariPlugins,
             FreeCameraPlugin,
             // Auto-select the best HDR output the surface can present, else SDR.
             hdr::HdrPlugin::default(),
@@ -271,6 +288,12 @@ fn main() {
             )
                 .chain(),
         );
+
+    // Skipping the plugin entirely (not just the camera's `SolariLighting`) also skips
+    // requesting the ray-tracing device features, so `--no-solari` runs on any GPU.
+    if !no_solari {
+        app.add_plugins(SolariPlugins);
+    }
 
     // Runtime DLSS on/off (`N`); only meaningful when compiled with the `dlss` feature.
     #[cfg(feature = "dlss")]
@@ -384,7 +407,8 @@ fn setup(
             ..default()
         },
         Hdr,
-        // Solari (and DLSS) require MSAA off.
+        // Solari (and DLSS) require MSAA off; kept off under `--no-solari` too so the
+        // comparison stays apples-to-apples.
         Msaa::Off,
         Transform::from_xyz(-27.0, 8.0, 70.0).looking_at(Vec3::new(-27.0, 8.0, -150.0), Vec3::Y),
         Projection::Perspective(PerspectiveProjection {
@@ -393,11 +417,15 @@ fn setup(
             far: 2000.0,
             ..default()
         }),
-        // Solari writes its result into the main texture via a storage binding.
-        CameraMainTextureUsages::default().with(TextureUsages::STORAGE_BINDING),
-        SolariLighting::default(),
         RenderCamera,
     ));
+    if !args.no_solari {
+        cam.insert((
+            // Solari writes its result into the main texture via a storage binding.
+            CameraMainTextureUsages::default().with(TextureUsages::STORAGE_BINDING),
+            SolariLighting::default(),
+        ));
+    }
     cam.insert((
         // GT7 tonemapping + physically based glare drive the HDR output.
         Tonemapping::GranTurismo7,
@@ -412,9 +440,10 @@ fn setup(
             ..default()
         },
     ));
-    // DLSS Ray Reconstruction denoises the path-traced output when supported.
+    // DLSS Ray Reconstruction denoises the path-traced output when supported. It reads
+    // Solari's G-buffer outputs, so it stays off entirely under `--no-solari`.
     #[cfg(feature = "dlss")]
-    if dlss_rr_supported.is_some() {
+    if dlss_rr_supported.is_some() && !args.no_solari {
         cam.insert(dlss_rr(args.dlss_perf_quality()));
     }
 
@@ -474,18 +503,21 @@ fn spawn_scene_when_ready(
         return;
     }
     state.spawned = true;
-    commands
-        .spawn(WorldAssetRoot(
-            asset_server.load(format!("{}#Scene0", args.scene.glb())),
-        ))
+    let mut scene = commands.spawn(WorldAssetRoot(
+        asset_server.load(format!("{}#Scene0", args.scene.glb())),
+    ));
+    scene
         // Repairs + boosts the emissive materials, one clone per emissive instance.
         .observe(proc_scene)
         // Turns the film camera into the flythrough source.
         .observe(setup_flythrough_camera)
-        // Tags every mesh `RaytracingMesh3d` so Solari can trace against it.
-        .observe(setup_raytracing_meshes)
         // Plays every animation clip once the scene (and its player) exist.
         .observe(start_animation);
+    if !args.no_solari {
+        // Tags every mesh `RaytracingMesh3d` so Solari can trace against it. Without
+        // `SolariPlugins` nothing consumes the tag, so skip the descendant walk.
+        scene.observe(setup_raytracing_meshes);
+    }
 }
 
 // --- Scene processing (on load) ----------------------------------------------------
@@ -720,6 +752,7 @@ fn dlss_rr(perf_quality_mode: DlssPerfQualityMode) -> Dlss<DlssRayReconstruction
 
 /// Turns DLSS Ray Reconstruction on/off at runtime (`N`), mirroring the `solari`
 /// example. DLSS also owns `TemporalJitter`/`MipBias`, so they come off with it.
+/// Inert under `--no-solari`: RR denoises Solari's output, which doesn't exist.
 #[cfg(feature = "dlss")]
 fn toggle_denoiser(
     input: Res<ButtonInput<KeyCode>>,
@@ -728,7 +761,7 @@ fn toggle_denoiser(
     dlss_rr_supported: Option<Res<DlssRayReconstructionSupported>>,
     mut commands: Commands,
 ) {
-    if !input.just_pressed(KeyCode::KeyN) || dlss_rr_supported.is_none() {
+    if !input.just_pressed(KeyCode::KeyN) || dlss_rr_supported.is_none() || args.no_solari {
         return;
     }
     let (entity, has_dlss) = *camera;
@@ -886,6 +919,7 @@ fn update_hud(
     stats: Res<FrameStats>,
     diagnostics: Res<DiagnosticsStore>,
     cinematic: Res<Cinematic>,
+    args: Res<Args>,
     #[cfg(feature = "dlss")] denoiser: Single<
         Has<Dlss<DlssRayReconstructionFeature>>,
         With<RenderCamera>,
@@ -903,12 +937,21 @@ fn update_hud(
     };
 
     #[cfg(feature = "dlss")]
-    let dlss_line = format!("\nDLSS-RR: {}  (N)", if *denoiser { "on" } else { "off" });
+    let dlss_line = if args.no_solari {
+        String::new()
+    } else {
+        format!("\nDLSS-RR: {}  (N)", if *denoiser { "on" } else { "off" })
+    };
     #[cfg(not(feature = "dlss"))]
     let dlss_line = "";
 
+    let title = if args.no_solari {
+        "Zero-Day (Solari OFF: flat ambient)"
+    } else {
+        "Zero-Day (Solari)"
+    };
     text.0 = format!(
-        "Zero-Day (Solari)\n{fps:>5.0} fps | {:.1} ms avg | {:.1} ms 1%-worst\n{mode}\nB: benchmark{dlss_line}",
+        "{title}\n{fps:>5.0} fps | {:.1} ms avg | {:.1} ms 1%-worst\n{mode}\nB: benchmark{dlss_line}",
         stats.avg_ms, stats.one_percent_high_ms,
     );
 }

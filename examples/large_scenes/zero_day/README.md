@@ -101,6 +101,9 @@ Options:
                dark or blown out.
   --no-pulse   disable the synthetic emissive pulse (a wave of light sweeps the panels by
                default to evoke the film's animated lights, which weren't in the asset).
+  --no-solari  disable Solari and light the scene with a flat ambient instead. Not
+               representative lighting (the panels are the scene's only real lights);
+               isolates Solari's cost, and runs on GPUs without ray tracing.
   --resolution render resolution as WxH (default 1920x1080). Lower it (e.g. 1280x720) for
                more framerate -- Solari cost scales with pixel count.
   --dlss-quality  DLSS mode: auto (default), dlaa, quality, balanced, performance,
