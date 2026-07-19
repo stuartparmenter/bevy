@@ -653,17 +653,8 @@ fn setup_raytracing_meshes(
 
 // --- Runtime -----------------------------------------------------------------------
 
-/// Merges every imported clip into one and plays that single clip (the ~550 animated
-/// objects plus the film camera) on the scene's animation player, looping.
-///
-/// `convert.py` exports with glTF `SCENE` animation mode intending one baked clip, but
-/// Blender's exporter still emits one clip *per object* (2337 for measure_one, 5272 for
-/// measure_seven). Playing thousands of separate clips is the example's dominant CPU cost:
-/// every frame the `AnimationPlayer` advances thousands of `ActiveAnimation`s and evaluates
-/// a thousands-wide blend graph, all pure per-clip overhead. So we merge their curves into a
-/// single clip up front. Each object's curves are keyed by a distinct `AnimationTargetId`,
-/// so they never collide; playback is identical, but there is one active animation instead of
-/// thousands. (The clips carry no events -- FBX animation is rigid TRS -- so none are lost.)
+/// Plays every animation clip (the ~550 animated objects plus the film camera) on the
+/// scene's animation player, looping.
 ///
 /// Runs on `WorldInstanceReady` like `animated_mesh.rs`: by the time the scene has
 /// spawned, its parent glTF (and `animations`) is loaded and the player is a
@@ -672,7 +663,7 @@ fn start_animation(
     scene_ready: On<WorldInstanceReady>,
     scene_gltf: Res<SceneGltf>,
     gltfs: Res<Assets<Gltf>>,
-    mut clips: ResMut<Assets<AnimationClip>>,
+    clips: Res<Assets<AnimationClip>>,
     mut graphs: ResMut<Assets<AnimationGraph>>,
     mut film_length: ResMut<FilmLength>,
     children: Query<&Children>,
@@ -683,40 +674,29 @@ fn start_animation(
         warn!("zero_day: glTF asset not ready; animations will not play");
         return;
     };
+    // The take's length = the longest clip (the SCENE bake puts every clip on one shared
+    // timeline). Drives the benchmark window so it works for any measure.
+    film_length.0 = gltf
+        .animations
+        .iter()
+        .filter_map(|h| clips.get(h).map(AnimationClip::duration))
+        .fold(0.0_f32, f32::max);
 
-    // Fold all imported clips into one. The take's length is the longest source clip (every
-    // object rides the film's shared timeline), which is just the merged clip's duration.
-    let mut merged = AnimationClip::default();
-    let mut source_clips = 0;
-    for handle in &gltf.animations {
-        let Some(clip) = clips.get(handle) else {
-            continue;
-        };
-        for (target_id, curves) in clip.curves() {
-            merged
-                .curves_mut()
-                .entry(*target_id)
-                .or_default()
-                .extend(curves.iter().cloned());
-        }
-        merged.set_duration(merged.duration().max(clip.duration()));
-        source_clips += 1;
-    }
-    film_length.0 = merged.duration();
-    let merged = clips.add(merged);
-
-    let (graph, node) = AnimationGraph::from_clip(merged);
+    let (graph, nodes) = AnimationGraph::from_clips(gltf.animations.iter().cloned());
     let graph = graphs.add(graph);
     for entity in children.iter_descendants(scene_ready.entity) {
         if let Ok(mut player) = players.get_mut(entity) {
-            player.play(node).repeat();
+            for node in &nodes {
+                player.play(*node).repeat();
+            }
             commands
                 .entity(entity)
                 .insert(AnimationGraphHandle(graph.clone()));
         }
     }
     info!(
-        "zero_day: merged {source_clips} clips into one ({:.1}s take)",
+        "zero_day: started {} animation clips ({:.1}s take)",
+        nodes.len(),
         film_length.0
     );
 }
