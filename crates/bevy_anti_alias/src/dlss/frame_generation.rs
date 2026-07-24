@@ -156,9 +156,7 @@ pub(super) fn prepare_frame_generation(
             warn_once!("DLSS Frame Generation requires Msaa::Off on the camera, and is disabled");
             continue;
         }
-        let Some((storage_format, view_format, view_formats)) =
-            frame_generation_formats(surface_format)
-        else {
+        let Some((storage_format, view_formats)) = frame_generation_formats(surface_format) else {
             warn_once!("DLSS Frame Generation does not support surface format {surface_format:?}");
             commands
                 .entity(entity)
@@ -166,18 +164,21 @@ pub(super) fn prepare_frame_generation(
             continue;
         };
 
+        let view_format = storage_format.add_srgb_suffix();
+
         let output_resolution = UVec2::new(window.physical_width, window.physical_height);
         let render_resolution = resolution_override.map_or(view.viewport.zw(), |size| size.0);
-        let frames_to_generate = settings.mode.frames_to_generate();
-        let max_frames_to_generate = supported.max_frames_to_generate();
-        if frames_to_generate > max_frames_to_generate {
+        if !supported.supports(settings.mode) {
             warn_once!(
                 "DlssFrameGenerationMode::{:?} is not supported on this machine (max {}x); falling back",
                 settings.mode,
-                max_frames_to_generate + 1,
+                supported.max_mode().multiplier(),
             );
         }
-        let frames_to_generate = frames_to_generate.min(max_frames_to_generate);
+        let frames_to_generate = settings
+            .mode
+            .frames_to_generate()
+            .min(supported.max_frames_to_generate());
 
         let recreate_context = context.is_none_or(|context| {
             context.output_resolution != output_resolution
@@ -292,18 +293,16 @@ pub(super) fn prepare_frame_generation(
 /// (`surface_format.add_srgb_suffix()`).
 fn frame_generation_formats(
     surface_format: TextureFormat,
-) -> Option<(TextureFormat, TextureFormat, &'static [TextureFormat])> {
+) -> Option<(TextureFormat, &'static [TextureFormat])> {
+    // `view_formats` must be `'static` for `TextureCache::get`, so the sRGB view format is
+    // spelled out here rather than derived.
     match surface_format.remove_srgb_suffix() {
-        TextureFormat::Bgra8Unorm => Some((
-            TextureFormat::Bgra8Unorm,
-            TextureFormat::Bgra8UnormSrgb,
-            &[TextureFormat::Bgra8UnormSrgb],
-        )),
-        TextureFormat::Rgba8Unorm => Some((
-            TextureFormat::Rgba8Unorm,
-            TextureFormat::Rgba8UnormSrgb,
-            &[TextureFormat::Rgba8UnormSrgb],
-        )),
+        TextureFormat::Bgra8Unorm => {
+            Some((TextureFormat::Bgra8Unorm, &[TextureFormat::Bgra8UnormSrgb]))
+        }
+        TextureFormat::Rgba8Unorm => {
+            Some((TextureFormat::Rgba8Unorm, &[TextureFormat::Rgba8UnormSrgb]))
+        }
         _ => None,
     }
 }
@@ -319,7 +318,7 @@ pub(super) fn frame_generation(
         &ViewPrepassTextures,
         Option<&TemporalJitter>,
     )>,
-    windows: Query<(MainEntity, &ExtractedWindow)>,
+    windows: Query<MainEntity, With<ExtractedWindow>>,
     paced_windows: Res<PacedWindows>,
     adapter: Res<RenderAdapter>,
     mut plans: ResMut<PacedPresentPlans>,
@@ -340,7 +339,7 @@ pub(super) fn frame_generation(
             continue;
         };
         let window_entity = window_ref.entity();
-        if !windows.iter().any(|(window, _)| window == window_entity) {
+        if !windows.iter().any(|window| window == window_entity) {
             continue;
         }
         let Projection::Perspective(projection) = projection else {
@@ -436,9 +435,7 @@ pub(super) fn frame_generation(
         match result {
             Ok(command_buffer) => {
                 ctx.add_command_buffer(command_buffer);
-                // Present the generated frames followed by the real frame, metered by the
-                // driver. On reset the generated frames are copies of the input and are
-                // skipped.
+                // On reset the generated frames are copies of the input and are skipped.
                 if !reset {
                     frames.extend(
                         textures
@@ -447,14 +444,14 @@ pub(super) fn frame_generation(
                             .map(|interpolated| interpolated.srgb_view.clone()),
                     );
                 }
-                frames.push(textures.input_srgb_view.clone());
             }
             Err(error) => {
                 state.previous_clip_from_world = None;
                 warn!("Failed to render DLSS Frame Generation: {error}");
-                frames.push(textures.input_srgb_view.clone());
             }
         }
+        // The real frame is always presented last, after any generated frames
+        frames.push(textures.input_srgb_view.clone());
         time_span.end(ctx.command_encoder());
         plans.insert(window_entity, PacedPresentPlan { frames });
     }

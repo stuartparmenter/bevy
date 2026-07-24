@@ -685,15 +685,13 @@ fn update_control_text(
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
     if let Some(dlss_fg_supported) = dlss_fg_supported.as_deref() {
         let max_multiplier = dlss_fg_supported.max_mode().multiplier();
-        match dlss_fg_camera.single() {
-            Ok(Some(frame_generation)) => text.0.push_str(&format!(
-                "\n(4): DLSS Frame Generation: {}x (up to {max_multiplier}x supported)",
-                frame_generation.mode.multiplier(),
-            )),
-            _ => text.0.push_str(&format!(
-                "\n(4): DLSS Frame Generation: Off (up to {max_multiplier}x supported)"
-            )),
-        }
+        let mode = match dlss_fg_camera.single() {
+            Ok(Some(frame_generation)) => format!("{}x", frame_generation.mode.multiplier()),
+            _ => "Off".to_string(),
+        };
+        text.0.push_str(&format!(
+            "\n(4): DLSS Frame Generation: {mode} (up to {max_multiplier}x supported)"
+        ));
     } else {
         text.0
             .push_str("\nFrame generation: DLSS Frame Generation not supported");
@@ -721,6 +719,13 @@ fn update_performance_text(
 ) {
     text.0.clear();
 
+    #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
+    let frame_generation_mode = dlss_fg_camera
+        .single()
+        .ok()
+        .flatten()
+        .map(|frame_generation| frame_generation.mode);
+
     let mut total = 0.0;
     let mut add_diagnostic = |name: &str, path: &'static str| {
         let path = DiagnosticPath::new(path);
@@ -744,7 +749,7 @@ fn update_performance_text(
         (add_diagnostic)("DLSS-RR", "render/dlss_ray_reconstruction/elapsed_gpu");
     }
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
-    if matches!(dlss_fg_camera.single(), Ok(Some(_))) {
+    if frame_generation_mode.is_some() {
         (add_diagnostic)("DLSS-FG", "render/dlss_frame_generation/elapsed_gpu");
     }
     text.push_str(&format!("{:17}  {total:.2} ms\n", "Rendered GPU"));
@@ -755,10 +760,10 @@ fn update_performance_text(
     {
         text.push_str(&format!("\nApp FPS            {fps:.1}"));
         #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
-        if let Ok(Some(frame_generation)) = dlss_fg_camera.single() {
+        if let Some(mode) = frame_generation_mode {
             text.push_str(&format!(
                 "\nFG output target   {:.1}",
-                fps * frame_generation.mode.multiplier() as f64
+                fps * mode.multiplier() as f64
             ));
         }
     }

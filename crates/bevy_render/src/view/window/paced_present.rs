@@ -31,6 +31,7 @@ use crate::{
 use bevy_ecs::{
     entity::{EntityHashMap, EntityHashSet},
     prelude::*,
+    system::SystemState,
 };
 use bevy_log::warn;
 use bevy_utils::default;
@@ -94,116 +95,121 @@ impl PacedPresentPlans {
     }
 }
 
+/// System parameters for [`present_paced_plans`], threaded in from `render_system`.
+pub(crate) type PacedPresentState<'w, 's> = (
+    ResMut<'w, SpecializedRenderPipelines<ScreenshotToScreenPipeline>>,
+    ResMut<'w, PipelineCache>,
+    Res<'w, ScreenshotToScreenPipeline>,
+    Res<'w, RenderDevice>,
+    Res<'w, RenderQueue>,
+    Query<'w, 's, (MainEntity, &'s mut ExtractedWindow, Option<&'s SurfaceData>)>,
+);
+
 /// Drains [`PacedPresentPlans`] and presents each plan's frames back to back, metered by
 /// the driver when [`PresentMeteringSupported`] is available. Returns the windows that
 /// were presented, which must be skipped by normal presentation.
-pub(crate) fn present_paced_plans(world: &mut World) -> EntityHashSet {
+pub(crate) fn present_paced_plans(
+    world: &mut World,
+    state: &mut SystemState<PacedPresentState>,
+) -> EntityHashSet {
     let mut presented = EntityHashSet::default();
     let mut plans = match world.get_resource_mut::<PacedPresentPlans>() {
         Some(mut plans) if !plans.plans.is_empty() => mem::take(&mut plans.plans),
         _ => return presented,
     };
 
-    world.resource_scope(
-        |world, mut pipelines: Mut<SpecializedRenderPipelines<ScreenshotToScreenPipeline>>| {
-            world.resource_scope(|world, mut pipeline_cache: Mut<PipelineCache>| {
-                world.resource_scope(|world, blit_pipeline: Mut<ScreenshotToScreenPipeline>| {
-                    let render_device = world.resource::<RenderDevice>().clone();
-                    let render_queue = world.resource::<RenderQueue>().clone();
-                    #[cfg(feature = "raw_vulkan_init")]
-                    let metering_supported = world
-                        .get_resource::<crate::renderer::raw_vulkan_init::AdditionalVulkanFeatures>(
-                        )
-                        .is_some_and(|features| features.has::<PresentMeteringSupported>());
-                    #[cfg(not(feature = "raw_vulkan_init"))]
-                    let metering_supported = false;
+    #[cfg(feature = "raw_vulkan_init")]
+    let metering_supported = world
+        .get_resource::<crate::renderer::raw_vulkan_init::AdditionalVulkanFeatures>()
+        .is_some_and(|features| features.has::<PresentMeteringSupported>());
+    #[cfg(not(feature = "raw_vulkan_init"))]
+    let metering_supported = false;
 
-                    let mut windows =
-                        world.query::<(MainEntity, &mut ExtractedWindow, Option<&SurfaceData>)>();
-                    for (window_entity, mut window, surface_data) in windows.iter_mut(world) {
-                        let Some(plan) = plans.remove(&window_entity) else {
-                            continue;
-                        };
-                        if plan.frames.is_empty() {
-                            continue;
-                        }
-                        let (Some(surface_data), Some(view_format)) =
-                            (surface_data, window.swap_chain_texture_view_format)
-                        else {
-                            warn!("No surface for paced window {window_entity}");
-                            continue;
-                        };
+    let Ok((
+        mut pipelines,
+        mut pipeline_cache,
+        blit_pipeline,
+        render_device,
+        render_queue,
+        mut windows,
+    )) = state.get_mut(world)
+    else {
+        return presented;
+    };
 
-                        // Release any swapchain texture acquired before this window
-                        // became paced, so presentation can acquire from the full pool
-                        drop(window.swap_chain_texture.take());
-                        window.swap_chain_texture_view = None;
-                        window.needs_initial_present = false;
+    for (window_entity, mut window, surface_data) in &mut windows {
+        let Some(plan) = plans.remove(&window_entity) else {
+            continue;
+        };
+        if plan.frames.is_empty() {
+            continue;
+        }
+        let (Some(surface_data), Some(view_format)) =
+            (surface_data, window.swap_chain_texture_view_format)
+        else {
+            warn!("No surface for paced window {window_entity}");
+            continue;
+        };
 
-                        let pipeline_id =
-                            pipelines.specialize(&pipeline_cache, &blit_pipeline, view_format);
-                        pipeline_cache.block_on_render_pipeline(pipeline_id);
-                        let Some(pipeline) =
-                            pipeline_cache.get_render_pipeline(pipeline_id).cloned()
-                        else {
-                            warn!("Failed to compile paced present blit pipeline");
-                            continue;
-                        };
+        // Release any swapchain texture acquired before this window became paced, so
+        // presentation can acquire from the full pool
+        drop(window.swap_chain_texture.take());
+        window.swap_chain_texture_view = None;
+        window.needs_initial_present = false;
 
-                        // Read by the driver during the batch's first present below, so it
-                        // must outlive that present
-                        let mut present_config = SetPresentConfigNV {
-                            s_type: STRUCTURE_TYPE_SET_PRESENT_CONFIG_NV,
-                            p_next: core::ptr::null(),
-                            num_frames_per_batch: plan.frames.len() as u32,
-                            present_config_feedback: 0,
-                        };
+        let pipeline_id = pipelines.specialize(&pipeline_cache, &blit_pipeline, view_format);
+        pipeline_cache.block_on_render_pipeline(pipeline_id);
+        let Some(pipeline) = pipeline_cache.get_render_pipeline(pipeline_id).cloned() else {
+            warn!("Failed to compile paced present blit pipeline");
+            continue;
+        };
 
-                        let layout =
-                            pipeline_cache.get_bind_group_layout(&blit_pipeline.bind_group_layout);
-                        for (frame_index, frame) in plan.frames.iter().enumerate() {
-                            let Some(surface_texture) = acquire(surface_data, &render_device)
-                            else {
-                                break;
-                            };
-                            // The driver meters the whole batch starting at the next
-                            // present. Armed only after a successful acquire, when a
-                            // present is guaranteed to follow in this scope, so the
-                            // stashed pointer is consumed before `present_config` drops.
-                            if frame_index == 0
-                                && metering_supported
-                                && let Some(hal_surface) = unsafe {
-                                    surface_data.surface.as_hal::<wgpu::hal::api::Vulkan>()
-                                }
-                            {
-                                // SAFETY: VK_NV_present_metering was enabled at device
-                                // creation per `PresentMeteringSupported`, and the chain
-                                // stays valid until the present below consumes it.
-                                unsafe {
-                                    hal_surface
-                                        .set_next_present_chain((&raw mut present_config).cast());
-                                }
-                            }
-                            blit(
-                                &pipeline,
-                                view_format,
-                                &render_device,
-                                &render_queue,
-                                &render_device.create_bind_group(
-                                    "paced_present_bind_group",
-                                    &layout,
-                                    &BindGroupEntries::single(frame),
-                                ),
-                                &surface_texture,
-                            );
-                            render_queue.present(surface_texture);
-                        }
-                        presented.insert(window_entity);
-                    }
-                });
-            });
-        },
-    );
+        // Read by the driver during the batch's first present below, so it must outlive
+        // that present
+        let mut present_config = SetPresentConfigNV {
+            s_type: STRUCTURE_TYPE_SET_PRESENT_CONFIG_NV,
+            p_next: core::ptr::null(),
+            num_frames_per_batch: plan.frames.len() as u32,
+            present_config_feedback: 0,
+        };
+
+        let layout = pipeline_cache.get_bind_group_layout(&blit_pipeline.bind_group_layout);
+        for (frame_index, frame) in plan.frames.iter().enumerate() {
+            let Some(surface_texture) = acquire(surface_data, &render_device) else {
+                break;
+            };
+            // The driver meters the whole batch starting at the next present. Armed only
+            // after a successful acquire, when a present is guaranteed to follow in this
+            // scope, so the stashed pointer is consumed before `present_config` drops.
+            if frame_index == 0
+                && metering_supported
+                && let Some(hal_surface) =
+                    unsafe { surface_data.surface.as_hal::<wgpu::hal::api::Vulkan>() }
+            {
+                // SAFETY: VK_NV_present_metering was enabled at device creation per
+                // `PresentMeteringSupported`, and the chain stays valid until the present
+                // below consumes it.
+                unsafe {
+                    hal_surface.set_next_present_chain((&raw mut present_config).cast());
+                }
+            }
+            let bind_group = render_device.create_bind_group(
+                "paced_present_bind_group",
+                &layout,
+                &BindGroupEntries::single(frame),
+            );
+            blit(
+                &pipeline,
+                view_format,
+                &render_device,
+                &render_queue,
+                &bind_group,
+                &surface_texture,
+            );
+            render_queue.present(surface_texture);
+        }
+        presented.insert(window_entity);
+    }
 
     presented
 }
@@ -212,22 +218,14 @@ fn acquire(
     surface_data: &SurfaceData,
     render_device: &RenderDevice,
 ) -> Option<wgpu::SurfaceTexture> {
-    match surface_data.surface.get_current_texture() {
+    let mut status = surface_data.surface.get_current_texture();
+    if matches!(status, wgpu::CurrentSurfaceTexture::Outdated) {
+        render_device.configure_surface(&surface_data.surface, &surface_data.configuration);
+        status = surface_data.surface.get_current_texture();
+    }
+    match status {
         wgpu::CurrentSurfaceTexture::Success(surface_texture)
         | wgpu::CurrentSurfaceTexture::Suboptimal(surface_texture) => Some(surface_texture),
-        wgpu::CurrentSurfaceTexture::Outdated => {
-            render_device.configure_surface(&surface_data.surface, &surface_data.configuration);
-            match surface_data.surface.get_current_texture() {
-                wgpu::CurrentSurfaceTexture::Success(surface_texture)
-                | wgpu::CurrentSurfaceTexture::Suboptimal(surface_texture) => Some(surface_texture),
-                status => {
-                    warn!(
-                        "Couldn't acquire paced swap chain texture after reconfiguring: {status:?}"
-                    );
-                    None
-                }
-            }
-        }
         status => {
             warn!("Couldn't acquire paced swap chain texture: {status:?}");
             None

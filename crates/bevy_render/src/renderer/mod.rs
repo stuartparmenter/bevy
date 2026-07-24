@@ -88,6 +88,9 @@ pub fn render_system(
         Res<RenderQueue>,
     )>,
     screenshot_state: &mut SystemState<SubmitScreenshotCommandsState>,
+    #[cfg(feature = "paced_present")] paced_present_state: &mut SystemState<
+        crate::view::window::paced_present::PacedPresentState,
+    >,
 ) {
     #[cfg(feature = "trace")]
     let _span = info_span!("main_render_schedule").entered();
@@ -113,7 +116,8 @@ pub fn render_system(
 
         // Windows presented by driver-metered paced presentation this frame; skipped below.
         #[cfg(feature = "paced_present")]
-        let paced_windows = crate::view::window::paced_present::present_paced_plans(world);
+        let paced_windows =
+            crate::view::window::paced_present::present_paced_plans(world, paced_present_state);
 
         if let Ok((views, mut windows, render_queue)) = present_state.get_mut(world) {
             for (window_entity, mut window) in &mut windows {
