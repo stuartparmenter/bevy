@@ -46,6 +46,10 @@ encoder's source gamut now comes from `ViewStackContract::source_gamut`.
 `tonemap_output_gamut` remains the single source of truth for an operator's output
 gamut.
 
+`SortedCamera::hdr` is removed: cameras sort by `(order, target)`, and their
+per-target stacking index keys on the target alone. Read `ExtractedCamera::hdr`
+on the view entity if you need a camera's raw HDR request.
+
 ## Behavior changes
 
 These affect non-default compositing-space and HDR configurations, never default
