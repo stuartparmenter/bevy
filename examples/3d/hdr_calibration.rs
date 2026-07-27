@@ -456,8 +456,6 @@ fn update_data_panel(
 fn provenance_tag(provenance: FieldProvenance) -> &'static str {
     match provenance {
         FieldProvenance::User => "user",
-        FieldProvenance::Hgig => "HGIG",
-        FieldProvenance::Policy => "policy",
         FieldProvenance::Os => "OS-sensed",
         FieldProvenance::Default => "default",
     }

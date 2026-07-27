@@ -273,8 +273,7 @@ impl DisplayCalibrationPolicy {
 /// in [`EffectiveDisplayTarget`].
 ///
 /// Calibration UIs read this to show *why* a value is what it is — a user
-/// override, an HDR-game-interface live override, an engine policy choice, an
-/// OS-sensed value, or the SDR default.
+/// override, an OS-sensed value, or the SDR default.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 #[cfg_attr(
     feature = "bevy_reflect",
@@ -292,10 +291,6 @@ pub enum FieldProvenance {
     /// default and the byte-identity case.
     #[default]
     User,
-    /// An HDR-game-interface live override took precedence.
-    Hgig,
-    /// An engine policy value took precedence.
-    Policy,
     /// A value sensed from the operating system / display took precedence.
     Os,
     /// The SDR sRGB fallback, used when an [`Auto`](AutoField::Auto) field had

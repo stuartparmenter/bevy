@@ -128,28 +128,6 @@ pub(crate) mod policy {
     pub(crate) struct SensedInputs<'a> {
         pub capability: Option<&'a MonitorDisplayCapability>,
         pub live: Option<&'a WindowDisplayState>,
-        /// HDR-game-interface live override (no protocol yet; always `None`
-        /// today). The resolver reads it so the rank exists; nothing mints it.
-        pub hgig: Option<HgigOverride>,
-        /// Engine policy values, when an engine policy is active (none today).
-        pub engine: Option<EnginePolicy>,
-    }
-
-    /// Reserved HGIG override seam: the per-field values an HDR-game-interface
-    /// session would supply. There is no protocol to populate it yet.
-    #[derive(Default, Clone, Copy)]
-    pub(crate) struct HgigOverride {
-        pub peak_luminance_nits: Option<f32>,
-        pub paper_white_nits: Option<f32>,
-        pub min_luminance_nits: Option<f32>,
-    }
-
-    /// Reserved engine-policy seam (none active today).
-    #[derive(Default, Clone, Copy)]
-    pub(crate) struct EnginePolicy {
-        pub peak_luminance_nits: Option<f32>,
-        pub paper_white_nits: Option<f32>,
-        pub min_luminance_nits: Option<f32>,
     }
 
     /// Resolves one [`EffectiveDisplayTarget`] from the authored target, its
@@ -158,10 +136,15 @@ pub(crate) mod policy {
     /// Per field, the highest applicable source wins:
     /// 1. the authored value when the field's policy is [`AutoField::Keep`]
     ///    (always — `Keep` is absolute and never overridden);
-    /// 2. otherwise, for an [`AutoField::Auto`] field:
-    ///    HGIG live override > engine policy > OS-sensed > the authored value
-    ///    (the SDR default for a default project), tagged
-    ///    [`FieldProvenance::Default`].
+    /// 2. otherwise, for an [`AutoField::Auto`] field: the OS-sensed value,
+    ///    else the authored value (the SDR default for a default project),
+    ///    tagged [`FieldProvenance::Default`].
+    ///
+    /// A platform that pushes calibration at the app would rank an
+    /// HDR-game-interface (HGIG) override, then an engine policy, between
+    /// `Keep` and OS-sensed. Neither wgpu nor winit exposes a channel that
+    /// could fill them — an HGIG push is console-SDK territory — so the ladder
+    /// carries only the rungs something can reach.
     ///
     /// The transfer is never auto-resolved: it is copied verbatim with
     /// [`FieldProvenance::User`].
@@ -182,8 +165,6 @@ pub(crate) mod policy {
             &mut out.paper_white_nits,
             &mut prov.paper_white,
             target.paper_white_nits,
-            sensed.hgig.and_then(|h| h.paper_white_nits),
-            sensed.engine.and_then(|e| e.paper_white_nits),
             sensed.live.and_then(|l| l.sdr_white_nits),
         );
         resolve_f32(
@@ -191,8 +172,6 @@ pub(crate) mod policy {
             &mut out.peak_luminance_nits,
             &mut prov.peak_luminance,
             target.peak_luminance_nits,
-            sensed.hgig.and_then(|h| h.peak_luminance_nits),
-            sensed.engine.and_then(|e| e.peak_luminance_nits),
             // The HDR-vs-SDR decision is the transfer's `is_hdr` (a capability
             // question), never the live headroom value. The transfer is never
             // auto-resolved, so `out.transfer` is the authored request.
@@ -203,12 +182,8 @@ pub(crate) mod policy {
             &mut out.min_luminance_nits,
             &mut prov.min_luminance,
             target.min_luminance_nits,
-            sensed.hgig.and_then(|h| h.min_luminance_nits),
-            sensed.engine.and_then(|e| e.min_luminance_nits),
             sensed.capability.and_then(|c| c.min_nits),
         );
-        // Gamut: Auto draws from the capability gamut hint; there is no
-        // HGIG/engine gamut seam.
         if policy.gamut == AutoField::Auto {
             if let Some(g) = sensed.capability.and_then(|c| c.gamut_hint) {
                 out.gamut = g;
@@ -262,19 +237,11 @@ pub(crate) mod policy {
         out: &mut f32,
         prov: &mut FieldProvenance,
         authored: f32,
-        hgig: Option<f32>,
-        engine: Option<f32>,
         os: Option<f32>,
     ) {
         if field_policy == AutoField::Keep {
             *out = authored;
             *prov = FieldProvenance::User;
-        } else if let Some(v) = hgig {
-            *out = v;
-            *prov = FieldProvenance::Hgig;
-        } else if let Some(v) = engine {
-            *out = v;
-            *prov = FieldProvenance::Policy;
         } else if let Some(v) = os {
             *out = v;
             *prov = FieldProvenance::Os;
@@ -346,12 +313,7 @@ pub fn resolve_calibration(
         let target = target.copied().unwrap_or_default();
         let policy = policy.copied().unwrap_or_default();
         let capability = on_monitor.and_then(|m| monitors.get(m.0).ok());
-        let sensed = policy::SensedInputs {
-            capability,
-            live,
-            hgig: None,
-            engine: None,
-        };
+        let sensed = policy::SensedInputs { capability, live };
         let effective = policy::resolve(target, policy, sensed);
         // Insert-on-change keeps `Changed<EffectiveDisplayTarget>` usable and
         // avoids a write every frame on default projects.
@@ -459,56 +421,6 @@ mod policy_tests {
         );
         assert_eq!(e.target.peak_luminance_nits, 1000.0);
         assert_eq!(e.provenance.peak_luminance, FieldProvenance::Default);
-    }
-
-    #[test]
-    fn auto_peak_hgig_beats_os() {
-        let target = DisplayTarget::SDR_SRGB.with_peak(1000.0);
-        let policy = DisplayCalibrationPolicy {
-            peak_luminance: AutoField::Auto,
-            ..Default::default()
-        };
-        let cap = cap_with_peak(4000.0);
-        let hgig = HgigOverride {
-            peak_luminance_nits: Some(800.0),
-            ..Default::default()
-        };
-        let e = resolve(
-            target,
-            policy,
-            SensedInputs {
-                capability: Some(&cap),
-                hgig: Some(hgig),
-                ..Default::default()
-            },
-        );
-        assert_eq!(e.target.peak_luminance_nits, 800.0);
-        assert_eq!(e.provenance.peak_luminance, FieldProvenance::Hgig);
-    }
-
-    #[test]
-    fn auto_peak_engine_beats_os_below_hgig() {
-        let target = DisplayTarget::SDR_SRGB.with_peak(1000.0);
-        let policy = DisplayCalibrationPolicy {
-            peak_luminance: AutoField::Auto,
-            ..Default::default()
-        };
-        let cap = cap_with_peak(4000.0);
-        let engine = EnginePolicy {
-            peak_luminance_nits: Some(1200.0),
-            ..Default::default()
-        };
-        let e = resolve(
-            target,
-            policy,
-            SensedInputs {
-                capability: Some(&cap),
-                engine: Some(engine),
-                ..Default::default()
-            },
-        );
-        assert_eq!(e.target.peak_luminance_nits, 1200.0);
-        assert_eq!(e.provenance.peak_luminance, FieldProvenance::Policy);
     }
 
     #[test]
