@@ -11,8 +11,8 @@
 //! (SIGGRAPH 2025 PBS course, "Physically Based Tone Mapping and Glare in
 //! Gran Turismo 7", Polyphony Digital, slides 177–187). Polyphony's 240
 //! hand-calibrated weights (per-level × per-channel × 10 F-numbers) are not
-//! published, so this module does **not** clone them. Instead it derives a
-//! weight table from the same physical model the talk describes:
+//! published, so this module does **not** clone them. Its weights come from
+//! the same physical model the talk describes:
 //!
 //! The Fraunhofer diffraction pattern of an ideal circular aperture is the
 //! Airy pattern. Its *encircled energy* — the fraction of the PSF's total
@@ -63,21 +63,29 @@
 //! # Calibration
 //!
 //! Mapping image-plane microns to pyramid texels requires a virtual sensor
-//! scale, [`TEXEL_PITCH_MICRONS`]. It is the one perceptual tuning constant
-//! of the derivation: it is chosen so that the standard f/1–f/22 ladder
-//! sweeps the Airy core from well below one texel to a few texels at the
-//! pyramid's reference resolution (512 rows), which is the range over which
-//! the level-weight *shape* responds to the F-number. The physical model
-//! fixes the shape; this constant fixes the overall angular scale.
+//! scale: one pyramid level-0 texel is 2 µm across. It is the one perceptual
+//! tuning constant of the derivation, chosen so that the standard f/1–f/22
+//! ladder sweeps the Airy core from well below one texel to a few texels at
+//! the pyramid's reference resolution (512 rows), which is the range over
+//! which the level-weight *shape* responds to the F-number. The physical
+//! model fixes the shape; this constant fixes the overall angular scale.
 //!
 //! The weights are achromatic (one weight per level, not per channel):
 //! chromatic dispersion à la GT7 would triple the upsample cost for
 //! per-channel blur radii and is left as a follow-up.
+//!
+//! # Where the numbers live
+//!
+//! [`GLARE_WEIGHT_TABLE`] holds the finished weights as literals. The Bessel
+//! quadrature behind them costs a few milliseconds, too much to spend at every
+//! app's startup for a scatter model most apps never enable, so the derivation
+//! — the Airy, photopic and band-integration code, and the sensor pitch and
+//! wavelength range it is calibrated with — lives in this module's tests.
+//! `tests::table_matches_derivation` compares the two bit for bit, so changing
+//! the model fails until the literals are regenerated.
 
 use bevy_math::ops;
-use bevy_platform::sync::LazyLock;
 use bevy_utils::once;
-use core::f64::consts::PI;
 use tracing::warn;
 
 /// The number of pyramid levels (octave-spaced annular bands) the weight
@@ -99,156 +107,122 @@ pub(crate) const F_NUMBER_LADDER: [f32; 10] = [1.0, 1.4, 2.0, 2.8, 4.0, 5.6, 8.0
 /// (mid-ladder, a common photographic walk-around aperture).
 pub(crate) const DEFAULT_F_NUMBER: f32 = 5.6;
 
-/// Virtual sensor pitch of one pyramid level-0 texel, in micrometers.
+/// The per-F-stop weight table: for each entry of [`F_NUMBER_LADDER`], the
+/// normalized energy fraction each pyramid level receives.
 ///
-/// See the module docs ("Calibration"): this constant maps pyramid texels to
-/// image-plane distances inside the Airy formula and therefore sets how
-/// large the diffraction pattern appears on screen. At 2 µm the Airy core
-/// radius (`1.22·λ·N`) spans ~0.3 texels at f/1.0 and ~7 texels at f/22 for
-/// λ = 555 nm.
-const TEXEL_PITCH_MICRONS: f64 = 2.0;
-
-/// Wavelength integration range (µm) and sample count for the polychromatic
-/// PSF. 400–700 nm covers where the photopic weight is non-negligible.
-const LAMBDA_MIN_MICRONS: f64 = 0.40;
-const LAMBDA_MAX_MICRONS: f64 = 0.70;
-const WAVELENGTH_SAMPLES: usize = 16;
-
-/// Single-Gaussian approximation of the CIE 1924 photopic luminosity
-/// function `V(λ)`, with `λ` in micrometers (peak at 555 nm, σ ≈ 42 nm).
-fn photopic_weight(lambda_microns: f64) -> f64 {
-    let d = lambda_microns - 0.559;
-    1.019 * (-285.4 * d * d).exp()
-}
-
-/// Bessel function of the first kind `J_n(x)` via Simpson integration of
-/// Bessel's integral `J_n(x) = (1/π)·∫₀^π cos(n·τ − x·sin τ) dτ`.
-///
-/// Accurate to machine precision for the `x ≤ 16` range it is used in (the
-/// integrand extends to a smooth periodic function, so the composite rule
-/// converges geometrically once the sample count exceeds `x`). Only used at
-/// table build time and in tests.
-fn bessel_j(n: u32, x: f64) -> f64 {
-    // 128 (even) keeps ~1e-16 absolute error up to the asymptotic seam at
-    // x = 16 and produces a bit-identical f32 weight table to 512 intervals
-    // (verified; degradation only begins below ~64 intervals), while keeping
-    // the one-time table build at plugin init (see [`warm`]) to ~3 ms.
-    const INTERVALS: usize = 128;
-    let h = PI / INTERVALS as f64;
-    let f = |tau: f64| (f64::from(n) * tau - x * tau.sin()).cos();
-    let mut sum = f(0.0) + f(PI);
-    for i in 1..INTERVALS {
-        let weight = if i % 2 == 1 { 4.0 } else { 2.0 };
-        sum += weight * f(i as f64 * h);
-    }
-    sum * h / (3.0 * PI)
-}
-
-/// The radius beyond which [`airy_encircled_energy`] switches from the
-/// exact Bessel form to the `1/v` tail.
-const AIRY_ASYMPTOTIC_SEAM: f64 = 16.0;
-
-/// Fraction of the Airy pattern's total energy within the dimensionless
-/// radius `v = π·r/(λ·N)`: `E(v) = 1 − J0(v)² − J1(v)²` (Born & Wolf
-/// §8.5.2).
-///
-/// For `v ≥` [`AIRY_ASYMPTOTIC_SEAM`] the ring-averaged asymptotic
-/// `J0² + J1² → 2/(π·v)` (relative error `O(v⁻²)`) is used, with its
-/// constant calibrated so the two branches meet exactly at the seam — this
-/// keeps `E` continuous and monotonic, which the band-energy differences
-/// rely on.
-fn airy_encircled_energy(v: f64) -> f64 {
-    // seam · (J0(seam)² + J1(seam)²), ≈ 2/π up to the O(v⁻²) ring residual.
-    static TAIL_CONSTANT: LazyLock<f64> = LazyLock::new(|| {
-        let j0 = bessel_j(0, AIRY_ASYMPTOTIC_SEAM);
-        let j1 = bessel_j(1, AIRY_ASYMPTOTIC_SEAM);
-        AIRY_ASYMPTOTIC_SEAM * (j0 * j0 + j1 * j1)
-    });
-    if v <= 0.0 {
-        return 0.0;
-    }
-    if v < AIRY_ASYMPTOTIC_SEAM {
-        let j0 = bessel_j(0, v);
-        let j1 = bessel_j(1, v);
-        1.0 - j0 * j0 - j1 * j1
-    } else {
-        1.0 - *TAIL_CONSTANT / v
-    }
-}
-
-/// Raw (un-normalized) photopically weighted energy fractions of the
-/// polychromatic Airy PSF over each pyramid level's annulus
-/// `r ∈ [t·2ᵏ, t·2ᵏ⁺¹)`, `t =` [`TEXEL_PITCH_MICRONS`], for the given
-/// F-number.
-///
-/// Level 0's band extends down to the center (`[0, 2t)`): the diffraction
-/// core belongs to the finest blur level, so the distribution describes the
-/// *whole* PSF and the sharp/scattered split stays entirely with
-/// `Bloom::intensity`. (Excluding a sub-texel "core" region instead makes
-/// the normalized shape non-monotonic in N as the Airy bulk crosses the
-/// arbitrary cutoff — tested and rejected.) The only energy not covered is
-/// the residual beyond the last band, < 0.5% even at f/22.
-fn raw_band_energies(f_number: f64) -> [f64; GLARE_BANDS] {
-    let mut bands = [0.0; GLARE_BANDS];
-    let mut total_weight = 0.0;
-    for i in 0..WAVELENGTH_SAMPLES {
-        let lambda = LAMBDA_MIN_MICRONS
-            + (LAMBDA_MAX_MICRONS - LAMBDA_MIN_MICRONS) * i as f64
-                / (WAVELENGTH_SAMPLES - 1) as f64;
-        let weight = photopic_weight(lambda);
-        total_weight += weight;
-        // v = π·r/(λ·N)
-        let v_per_micron = PI / (lambda * f_number);
-        for (k, band) in bands.iter_mut().enumerate() {
-            let r_inner = if k == 0 {
-                0.0
-            } else {
-                TEXEL_PITCH_MICRONS * f64::powi(2.0, k as i32)
-            };
-            let r_outer = TEXEL_PITCH_MICRONS * f64::powi(2.0, k as i32 + 1);
-            *band += weight
-                * (airy_encircled_energy(v_per_micron * r_outer)
-                    - airy_encircled_energy(v_per_micron * r_inner));
-        }
-    }
-    for band in &mut bands {
-        *band /= total_weight;
-    }
-    bands
-}
-
-/// [`raw_band_energies`] normalized to sum to 1 (the distribution shape; the
-/// total scattered amount is [`Bloom::intensity`](super::Bloom::intensity)'s
-/// job, see module docs).
-fn normalized_band_weights(f_number: f64) -> [f32; GLARE_BANDS] {
-    let raw = raw_band_energies(f_number);
-    let sum: f64 = raw.iter().sum();
-    let mut weights = [0.0f32; GLARE_BANDS];
-    for (weight, raw) in weights.iter_mut().zip(raw) {
-        *weight = (raw / sum) as f32;
-    }
-    weights
-}
-
-/// The precomputed per-F-stop weight table: for each entry of
-/// [`F_NUMBER_LADDER`], the normalized energy fraction each pyramid level
-/// receives. Built once, on first use, from the documented derivation —
-/// there are deliberately no literal weight constants in this module.
-static GLARE_WEIGHT_TABLE: LazyLock<[[f32; GLARE_BANDS]; F_NUMBER_LADDER.len()]> =
-    LazyLock::new(|| F_NUMBER_LADDER.map(|n| normalized_band_weights(f64::from(n))));
-
-/// Forces the one-time build of [`GLARE_WEIGHT_TABLE`] (a few milliseconds
-/// of Bessel quadrature).
-///
-/// Called from `BloomPlugin::build` so the cost lands at app startup. Without
-/// this, the `LazyLock` would first be dereferenced inside the bloom render
-/// node's command-encoding loop (via [`blend_factor`]) on the first frame a
-/// view switches to
-/// [`BloomScatterModel::Gt7Glare`](super::BloomScatterModel::Gt7Glare),
-/// stalling the render thread mid-frame for a visible one-frame hitch.
-pub(crate) fn warm() {
-    LazyLock::force(&GLARE_WEIGHT_TABLE);
-}
+/// Baked from the derivation in this module's tests; see the module docs.
+static GLARE_WEIGHT_TABLE: [[f32; GLARE_BANDS]; F_NUMBER_LADDER.len()] = [
+    // f/1.0
+    [
+        0.9726225,
+        0.013796542,
+        0.006898271,
+        0.0034491355,
+        0.0017245677,
+        0.00086228386,
+        0.00043114193,
+        0.00021557097,
+    ],
+    // f/1.4
+    [
+        0.9613017,
+        0.019683303,
+        0.009658412,
+        0.004829206,
+        0.002414603,
+        0.0012073015,
+        0.00060365075,
+        0.00030182538,
+    ],
+    // f/2.0
+    [
+        0.9430178,
+        0.029814422,
+        0.0137995165,
+        0.0068997582,
+        0.0034498791,
+        0.0017249396,
+        0.0008624698,
+        0.0004312349,
+    ],
+    // f/2.8
+    [
+        0.91862756,
+        0.0429644,
+        0.019689245,
+        0.009661328,
+        0.004830664,
+        0.002415332,
+        0.001207666,
+        0.000603833,
+    ],
+    // f/4.0
+    [
+        0.88773185,
+        0.05569274,
+        0.029827286,
+        0.01380547,
+        0.006902735,
+        0.0034513676,
+        0.0017256838,
+        0.0008628419,
+    ],
+    // f/5.6
+    [
+        0.8402882,
+        0.07889436,
+        0.042990357,
+        0.019701142,
+        0.009667166,
+        0.004833583,
+        0.0024167914,
+        0.0012083957,
+    ],
+    // f/8.0
+    [
+        0.79718775,
+        0.09131077,
+        0.055740833,
+        0.029853044,
+        0.013817392,
+        0.006908696,
+        0.003454348,
+        0.001727174,
+    ],
+    // f/11
+    [
+        0.63371426,
+        0.20822804,
+        0.08005063,
+        0.042136833,
+        0.019235399,
+        0.009505614,
+        0.004752807,
+        0.0023764034,
+    ],
+    // f/16
+    [
+        0.39158967,
+        0.40697736,
+        0.09146875,
+        0.055837274,
+        0.029904693,
+        0.013841298,
+        0.006920649,
+        0.0034603246,
+    ],
+    // f/22
+    [
+        0.2332217,
+        0.40200213,
+        0.20872405,
+        0.08024132,
+        0.042237204,
+        0.019281218,
+        0.009528257,
+        0.0047641285,
+    ],
+];
 
 /// Replaces a non-finite or non-positive F-number with
 /// [`DEFAULT_F_NUMBER`], warning once.
@@ -269,7 +243,7 @@ fn sanitize_f_number(f_number: f32) -> f32 {
 /// matching the ladder's geometric spacing), clamping to the ladder ends.
 /// Linear interpolation of normalized weight vectors stays normalized.
 pub(crate) fn mip_weights(f_number: f32) -> [f32; GLARE_BANDS] {
-    let table = &*GLARE_WEIGHT_TABLE;
+    let table = &GLARE_WEIGHT_TABLE;
     let n = sanitize_f_number(f_number).clamp(
         F_NUMBER_LADDER[0],
         F_NUMBER_LADDER[F_NUMBER_LADDER.len() - 1],
@@ -345,6 +319,142 @@ pub(crate) fn blend_factor(f_number: f32, intensity: f32, mip: u32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bevy_platform::sync::LazyLock;
+    use core::f64::consts::PI;
+
+    // The derivation `GLARE_WEIGHT_TABLE` is baked from, kept out of the
+    // shipped build; `table_matches_derivation` keeps the two in sync.
+
+    /// Virtual sensor pitch of one pyramid level-0 texel, in micrometers.
+    ///
+    /// See the module docs ("Calibration"): this constant maps pyramid texels
+    /// to image-plane distances inside the Airy formula and therefore sets how
+    /// large the diffraction pattern appears on screen. At 2 µm the Airy core
+    /// radius (`1.22·λ·N`) spans ~0.3 texels at f/1.0 and ~7 texels at f/22
+    /// for λ = 555 nm.
+    const TEXEL_PITCH_MICRONS: f64 = 2.0;
+
+    /// Wavelength integration range (µm) and sample count for the
+    /// polychromatic PSF. 400–700 nm covers where the photopic weight is
+    /// non-negligible.
+    const LAMBDA_MIN_MICRONS: f64 = 0.40;
+    const LAMBDA_MAX_MICRONS: f64 = 0.70;
+    const WAVELENGTH_SAMPLES: usize = 16;
+
+    /// Single-Gaussian approximation of the CIE 1924 photopic luminosity
+    /// function `V(λ)`, with `λ` in micrometers (peak at 555 nm, σ ≈ 42 nm).
+    fn photopic_weight(lambda_microns: f64) -> f64 {
+        let d = lambda_microns - 0.559;
+        1.019 * (-285.4 * d * d).exp()
+    }
+
+    /// Bessel function of the first kind `J_n(x)` via Simpson integration of
+    /// Bessel's integral `J_n(x) = (1/π)·∫₀^π cos(n·τ − x·sin τ) dτ`.
+    ///
+    /// Accurate to machine precision for the `x ≤ 16` range it is used in (the
+    /// integrand extends to a smooth periodic function, so the composite rule
+    /// converges geometrically once the sample count exceeds `x`).
+    fn bessel_j(n: u32, x: f64) -> f64 {
+        // 128 (even) keeps ~1e-16 absolute error up to the asymptotic seam at
+        // x = 16 and produces a bit-identical f32 weight table to 512
+        // intervals (verified; degradation only begins below ~64 intervals).
+        const INTERVALS: usize = 128;
+        let h = PI / INTERVALS as f64;
+        let f = |tau: f64| (f64::from(n) * tau - x * tau.sin()).cos();
+        let mut sum = f(0.0) + f(PI);
+        for i in 1..INTERVALS {
+            let weight = if i % 2 == 1 { 4.0 } else { 2.0 };
+            sum += weight * f(i as f64 * h);
+        }
+        sum * h / (3.0 * PI)
+    }
+
+    /// The radius beyond which [`airy_encircled_energy`] switches from the
+    /// exact Bessel form to the `1/v` tail.
+    const AIRY_ASYMPTOTIC_SEAM: f64 = 16.0;
+
+    /// Fraction of the Airy pattern's total energy within the dimensionless
+    /// radius `v = π·r/(λ·N)`: `E(v) = 1 − J0(v)² − J1(v)²` (Born & Wolf
+    /// §8.5.2).
+    ///
+    /// For `v ≥` [`AIRY_ASYMPTOTIC_SEAM`] the ring-averaged asymptotic
+    /// `J0² + J1² → 2/(π·v)` (relative error `O(v⁻²)`) is used, with its
+    /// constant calibrated so the two branches meet exactly at the seam — this
+    /// keeps `E` continuous and monotonic, which the band-energy differences
+    /// rely on.
+    fn airy_encircled_energy(v: f64) -> f64 {
+        // seam · (J0(seam)² + J1(seam)²), ≈ 2/π up to the O(v⁻²) ring
+        // residual.
+        static TAIL_CONSTANT: LazyLock<f64> = LazyLock::new(|| {
+            let j0 = bessel_j(0, AIRY_ASYMPTOTIC_SEAM);
+            let j1 = bessel_j(1, AIRY_ASYMPTOTIC_SEAM);
+            AIRY_ASYMPTOTIC_SEAM * (j0 * j0 + j1 * j1)
+        });
+        if v <= 0.0 {
+            return 0.0;
+        }
+        if v < AIRY_ASYMPTOTIC_SEAM {
+            let j0 = bessel_j(0, v);
+            let j1 = bessel_j(1, v);
+            1.0 - j0 * j0 - j1 * j1
+        } else {
+            1.0 - *TAIL_CONSTANT / v
+        }
+    }
+
+    /// Raw (un-normalized) photopically weighted energy fractions of the
+    /// polychromatic Airy PSF over each pyramid level's annulus
+    /// `r ∈ [t·2ᵏ, t·2ᵏ⁺¹)`, `t =` [`TEXEL_PITCH_MICRONS`], for the given
+    /// F-number.
+    ///
+    /// Level 0's band extends down to the center (`[0, 2t)`): the diffraction
+    /// core belongs to the finest blur level, so the distribution describes
+    /// the *whole* PSF and the sharp/scattered split stays entirely with
+    /// `Bloom::intensity`. (Excluding a sub-texel "core" region instead makes
+    /// the normalized shape non-monotonic in N as the Airy bulk crosses the
+    /// arbitrary cutoff — tested and rejected.) The only energy not covered is
+    /// the residual beyond the last band, < 0.5% even at f/22.
+    fn raw_band_energies(f_number: f64) -> [f64; GLARE_BANDS] {
+        let mut bands = [0.0; GLARE_BANDS];
+        let mut total_weight = 0.0;
+        for i in 0..WAVELENGTH_SAMPLES {
+            let lambda = LAMBDA_MIN_MICRONS
+                + (LAMBDA_MAX_MICRONS - LAMBDA_MIN_MICRONS) * i as f64
+                    / (WAVELENGTH_SAMPLES - 1) as f64;
+            let weight = photopic_weight(lambda);
+            total_weight += weight;
+            // v = π·r/(λ·N)
+            let v_per_micron = PI / (lambda * f_number);
+            for (k, band) in bands.iter_mut().enumerate() {
+                let r_inner = if k == 0 {
+                    0.0
+                } else {
+                    TEXEL_PITCH_MICRONS * f64::powi(2.0, k as i32)
+                };
+                let r_outer = TEXEL_PITCH_MICRONS * f64::powi(2.0, k as i32 + 1);
+                *band += weight
+                    * (airy_encircled_energy(v_per_micron * r_outer)
+                        - airy_encircled_energy(v_per_micron * r_inner));
+            }
+        }
+        for band in &mut bands {
+            *band /= total_weight;
+        }
+        bands
+    }
+
+    /// [`raw_band_energies`] normalized to sum to 1 (the distribution shape;
+    /// the total scattered amount is `Bloom::intensity`'s job, see module
+    /// docs).
+    fn normalized_band_weights(f_number: f64) -> [f32; GLARE_BANDS] {
+        let raw = raw_band_energies(f_number);
+        let sum: f64 = raw.iter().sum();
+        let mut weights = [0.0f32; GLARE_BANDS];
+        for (weight, raw) in weights.iter_mut().zip(raw) {
+            *weight = (raw / sum) as f32;
+        }
+        weights
+    }
 
     /// `J0`/`J1` against standard reference values (Abramowitz & Stegun,
     /// table 9.1) and the first zeros.
@@ -420,6 +530,20 @@ mod tests {
             );
             previous_total = total;
             previous_core_share = raw[0];
+        }
+    }
+
+    /// Every table entry reproduces, bit for bit, the normalized band weights
+    /// the derivation produces for its F-number. Regenerate the literals if
+    /// this fails.
+    #[test]
+    fn table_matches_derivation() {
+        for (i, n) in F_NUMBER_LADDER.into_iter().enumerate() {
+            let derived = normalized_band_weights(f64::from(n));
+            assert_eq!(
+                GLARE_WEIGHT_TABLE[i], derived,
+                "f/{n}: baked table entry does not match the derivation"
+            );
         }
     }
 

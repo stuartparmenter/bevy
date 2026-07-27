@@ -92,12 +92,6 @@ impl Plugin for BloomPlugin {
             return;
         };
 
-        // Build the glare weight table now (a few ms of Bessel quadrature)
-        // instead of lazily inside the bloom node's command-encoding loop,
-        // which would hitch the render thread on the first frame a view
-        // enables `BloomScatterModel::Gt7Glare`.
-        glare::warm();
-
         render_app
             .init_gpu_resource::<SpecializedRenderPipelines<BloomDownsamplingPipeline>>()
             .init_gpu_resource::<SpecializedRenderPipelines<BloomUpsamplingPipeline>>()
