@@ -1,6 +1,6 @@
 use crate::{
-    DistanceFog, ExtractedAtmosphere, MeshPipeline, MeshPipelineKey, MeshPipelineSystems,
-    MeshViewBindGroup, RenderViewLightProbes, ScreenSpaceAmbientOcclusion,
+    tonemapping_pipeline_key, DistanceFog, ExtractedAtmosphere, MeshPipeline, MeshPipelineKey,
+    MeshPipelineSystems, MeshViewBindGroup, RenderViewLightProbes, ScreenSpaceAmbientOcclusion,
     ScreenSpaceReflectionsUniform, ScreenSpaceTransmission, TONEMAPPING_LUT_SAMPLER_BINDING_INDEX,
     TONEMAPPING_LUT_TEXTURE_BINDING_INDEX,
 };
@@ -498,23 +498,7 @@ pub fn prepare_deferred_lighting_pipelines(
             && *tonemapping != Tonemapping::None
         {
             view_key |= MeshPipelineKey::TONEMAP_IN_SHADER;
-            view_key |= match tonemapping {
-                Tonemapping::None => MeshPipelineKey::TONEMAP_METHOD_NONE,
-                Tonemapping::Reinhard => MeshPipelineKey::TONEMAP_METHOD_REINHARD,
-                Tonemapping::ReinhardLuminance => {
-                    MeshPipelineKey::TONEMAP_METHOD_REINHARD_LUMINANCE
-                }
-                Tonemapping::AcesFitted => MeshPipelineKey::TONEMAP_METHOD_ACES_FITTED,
-                Tonemapping::AgX => MeshPipelineKey::TONEMAP_METHOD_AGX,
-                Tonemapping::SomewhatBoringDisplayTransform => {
-                    MeshPipelineKey::TONEMAP_METHOD_SOMEWHAT_BORING_DISPLAY_TRANSFORM
-                }
-                Tonemapping::TonyMcMapface => MeshPipelineKey::TONEMAP_METHOD_TONY_MC_MAPFACE,
-                Tonemapping::BlenderFilmic => MeshPipelineKey::TONEMAP_METHOD_BLENDER_FILMIC,
-                Tonemapping::KhronosPbrNeutral => MeshPipelineKey::TONEMAP_METHOD_PBR_NEUTRAL,
-                Tonemapping::Linear => MeshPipelineKey::TONEMAP_METHOD_LINEAR,
-                Tonemapping::GranTurismo7 => MeshPipelineKey::TONEMAP_METHOD_GRAN_TURISMO_7,
-            };
+            view_key |= tonemapping_pipeline_key(*tonemapping);
             if let Some(DebandDither::Enabled) = dither {
                 view_key |= MeshPipelineKey::DEBAND_DITHER;
             }

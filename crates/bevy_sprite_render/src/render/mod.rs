@@ -182,6 +182,27 @@ impl SpritePipelineKey {
             Some(CompositingSpace::Linear) | None => Self::NONE,
         }
     }
+
+    /// Method-selection bits for a tone-mapping operator. Specialization reads
+    /// them only when [`Self::TONEMAP_IN_SHADER`] is also set.
+    #[inline]
+    const fn from_tonemapping(tonemapping: Tonemapping) -> Self {
+        match tonemapping {
+            Tonemapping::None => Self::TONEMAP_METHOD_NONE,
+            Tonemapping::Linear => Self::TONEMAP_METHOD_LINEAR,
+            Tonemapping::Reinhard => Self::TONEMAP_METHOD_REINHARD,
+            Tonemapping::ReinhardLuminance => Self::TONEMAP_METHOD_REINHARD_LUMINANCE,
+            Tonemapping::AcesFitted => Self::TONEMAP_METHOD_ACES_FITTED,
+            Tonemapping::AgX => Self::TONEMAP_METHOD_AGX,
+            Tonemapping::SomewhatBoringDisplayTransform => {
+                Self::TONEMAP_METHOD_SOMEWHAT_BORING_DISPLAY_TRANSFORM
+            }
+            Tonemapping::TonyMcMapface => Self::TONEMAP_METHOD_TONY_MC_MAPFACE,
+            Tonemapping::BlenderFilmic => Self::TONEMAP_METHOD_BLENDER_FILMIC,
+            Tonemapping::KhronosPbrNeutral => Self::TONEMAP_METHOD_PBR_NEUTRAL,
+            Tonemapping::GranTurismo7 => Self::TONEMAP_METHOD_GRAN_TURISMO_7,
+        }
+    }
 }
 
 impl SpecializedRenderPipeline for SpritePipeline {
@@ -579,23 +600,7 @@ pub fn queue_sprites(
             && *tonemapping != Tonemapping::None
         {
             view_key |= SpritePipelineKey::TONEMAP_IN_SHADER;
-            view_key |= match tonemapping {
-                Tonemapping::None => SpritePipelineKey::TONEMAP_METHOD_NONE,
-                Tonemapping::Linear => SpritePipelineKey::TONEMAP_METHOD_LINEAR,
-                Tonemapping::Reinhard => SpritePipelineKey::TONEMAP_METHOD_REINHARD,
-                Tonemapping::ReinhardLuminance => {
-                    SpritePipelineKey::TONEMAP_METHOD_REINHARD_LUMINANCE
-                }
-                Tonemapping::AcesFitted => SpritePipelineKey::TONEMAP_METHOD_ACES_FITTED,
-                Tonemapping::AgX => SpritePipelineKey::TONEMAP_METHOD_AGX,
-                Tonemapping::SomewhatBoringDisplayTransform => {
-                    SpritePipelineKey::TONEMAP_METHOD_SOMEWHAT_BORING_DISPLAY_TRANSFORM
-                }
-                Tonemapping::TonyMcMapface => SpritePipelineKey::TONEMAP_METHOD_TONY_MC_MAPFACE,
-                Tonemapping::BlenderFilmic => SpritePipelineKey::TONEMAP_METHOD_BLENDER_FILMIC,
-                Tonemapping::KhronosPbrNeutral => SpritePipelineKey::TONEMAP_METHOD_PBR_NEUTRAL,
-                Tonemapping::GranTurismo7 => SpritePipelineKey::TONEMAP_METHOD_GRAN_TURISMO_7,
-            };
+            view_key |= SpritePipelineKey::from_tonemapping(*tonemapping);
             if let Some(DebandDither::Enabled) = dither {
                 view_key |= SpritePipelineKey::DEBAND_DITHER;
             }

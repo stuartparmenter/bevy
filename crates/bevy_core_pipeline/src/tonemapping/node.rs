@@ -58,9 +58,7 @@ pub fn tonemapping(
 
     // `Tonemapping::None` is a true opt-out: the pass does not run, the
     // camera keeps its pre-existing main-texture format, and no color
-    // grading / exposure from `ColorGrading` is applied. Every other
-    // operator runs node-side for every camera (with or without `Hdr`);
-    // the legacy in-shader (`TONEMAP_IN_SHADER`) path no longer exists.
+    // grading / exposure from `ColorGrading` is applied.
     if *tonemapping == Tonemapping::None {
         return;
     }
