@@ -1162,7 +1162,7 @@ fn cluster_on_gpu(
                 let buffer_view = captured_staging_buffer
                     .slice(..)
                     .get_mapped_range()
-                    .expect("cluster readback staging buffer should be mapped");
+                    .unwrap();
                 let Ok(mut buffer_reader) =
                     Reader::new::<ClusterMetadata>(buffer_view[..].to_vec(), 0)
                 else {

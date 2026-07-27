@@ -2,7 +2,7 @@ use core::ops::Range;
 
 use crate::ComputedTextureSlices;
 use bevy_asset::{load_embedded_asset, AssetEvent, AssetId, AssetServer, Assets, Handle};
-use bevy_camera::{visibility::ViewVisibility, Camera2d, CompositingSpace};
+use bevy_camera::{visibility::ViewVisibility, CompositingSpace};
 use bevy_color::{ColorToComponents, LinearRgba};
 use bevy_core_pipeline::{
     core_2d::{Transparent2d, CORE_2D_DEPTH_FORMAT},
@@ -656,10 +656,7 @@ pub fn prepare_sprite_view_bind_groups(
     pipeline_cache: Res<PipelineCache>,
     sprite_pipeline: Res<SpritePipeline>,
     view_uniforms: Res<ViewUniforms>,
-    // Sprites only draw through Transparent2d phases, which exist solely on
-    // `Camera2d` views; shadow, light-probe, and 3D camera views never need
-    // this bind group.
-    views: Query<(Entity, &Tonemapping), (With<ExtractedView>, With<Camera2d>)>,
+    views: Query<(Entity, &Tonemapping), With<ExtractedView>>,
     tonemapping_luts: Res<TonemappingLuts>,
     images: Res<RenderAssets<GpuImage>>,
     fallback_image: Res<FallbackImage>,
@@ -672,7 +669,7 @@ pub fn prepare_sprite_view_bind_groups(
         let lut_bindings =
             get_lut_bindings(&images, &tonemapping_luts, tonemapping, &fallback_image);
         let view_bind_group = render_device.create_bind_group(
-            "sprite_view_bind_group",
+            "mesh2d_view_bind_group",
             &pipeline_cache.get_bind_group_layout(&sprite_pipeline.view_layout),
             &BindGroupEntries::sequential((view_binding.clone(), lut_bindings.0, lut_bindings.1)),
         );
