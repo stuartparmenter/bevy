@@ -64,59 +64,8 @@ pub enum DisplayInfoSource {
     Web,
 }
 
-/// The CIE 1931 *xy* chromaticities of a display's primaries and white point.
-///
-/// Plain-data mirror of the backend's per-display chromaticity report. Each
-/// coordinate is `[x, y]`; absence means that primary was not reported.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-#[cfg_attr(
-    feature = "bevy_reflect",
-    derive(Reflect),
-    reflect(Default, Debug, PartialEq, Clone)
-)]
-#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(
-    all(feature = "serialize", feature = "bevy_reflect"),
-    reflect(Serialize, Deserialize)
-)]
-pub struct DisplayChromaticity {
-    /// CIE 1931 `[x, y]` of the red primary.
-    pub red: Option<[f32; 2]>,
-    /// CIE 1931 `[x, y]` of the green primary.
-    pub green: Option<[f32; 2]>,
-    /// CIE 1931 `[x, y]` of the blue primary.
-    pub blue: Option<[f32; 2]>,
-    /// CIE 1931 `[x, y]` of the white point.
-    pub white: Option<[f32; 2]>,
-}
-
-/// A display's *coarse* dynamic-range and gamut capability, as reported by the
-/// web platform's CSS `dynamic-range` / `color-gamut` media features.
-///
-/// This describes what the display *can* do, not what it is doing now: a
-/// monitor may advertise `high_dynamic_range == Some(true)` while HDR output
-/// is currently off.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
-#[cfg_attr(
-    feature = "bevy_reflect",
-    derive(Reflect),
-    reflect(Default, Debug, PartialEq, Hash, Clone)
-)]
-#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(
-    all(feature = "serialize", feature = "bevy_reflect"),
-    reflect(Serialize, Deserialize)
-)]
-pub struct DisplayCoarseRange {
-    /// Whether the display reports high-dynamic-range capability. `None` when
-    /// the platform does not report it.
-    pub high_dynamic_range: Option<bool>,
-    /// The coarse gamut the display reports covering, when reported.
-    pub gamut: Option<crate::DisplayGamut>,
-}
-
 /// Static-per-display capability of the [`Monitor`](crate::Monitor) a window is
-/// presented on: how bright it can get, its primaries, its bit depth.
+/// presented on: how bright it can get and how wide a gamut it covers.
 ///
 /// Its **absence** means "can't tell" — the renderer never treats a missing
 /// component as "SDR". When present, every field is still `Option`: a platform
@@ -144,22 +93,23 @@ pub struct MonitorDisplayCapability {
     /// of the panel (its peak).
     pub max_nits: Option<f32>,
     /// The maximum luminance, in nits, the display can sustain across the full
-    /// panel (its full-frame ceiling), typically lower than [`max_nits`].
+    /// panel (its full-frame ceiling), typically well below [`max_nits`]:
+    /// automatic brightness limiting pulls a large bright region down.
+    ///
+    /// Author [`DisplayTarget::peak_luminance_nits`] from this rather than from
+    /// [`max_nits`] when the content fills the frame with highlights — a sky, a
+    /// snowfield — so tone mapping targets a level the panel can hold. Only
+    /// DXGI reports it, so it is `None` under Metal and Vulkan even on a display
+    /// that has a full-frame ceiling; fall back to [`max_nits`] there.
     ///
     /// [`max_nits`]: Self::max_nits
     pub max_full_frame_nits: Option<f32>,
     /// The minimum luminance, in nits, the display can show (its black level).
     pub min_nits: Option<f32>,
-    /// The display's measured primaries and white point, when reported.
-    pub chromaticity: Option<DisplayChromaticity>,
-    /// A coarse gamut the display covers, when a fine chromaticity report is
-    /// unavailable (the web path).
+    /// The coarse gamut bucket the display covers. Only DXGI (matched against
+    /// the EDID primaries) and the web (CSS `color-gamut`) report one; `None`
+    /// elsewhere, including on displays that do cover a wide gamut.
     pub gamut_hint: Option<crate::DisplayGamut>,
-    /// The display's bit depth per color channel, when reported.
-    pub bits_per_color: Option<u8>,
-    /// The web platform's coarse dynamic-range / gamut report, when that is the
-    /// only capability source.
-    pub coarse: Option<DisplayCoarseRange>,
     /// Where this capability record came from.
     pub source: DisplayInfoSource,
 }
@@ -172,10 +122,7 @@ impl Default for MonitorDisplayCapability {
             max_nits: None,
             max_full_frame_nits: None,
             min_nits: None,
-            chromaticity: None,
             gamut_hint: None,
-            bits_per_color: None,
-            coarse: None,
             source: DisplayInfoSource::Unknown,
         }
     }

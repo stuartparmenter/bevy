@@ -21,7 +21,7 @@ use {bevy_ecs::prelude::ReflectComponent, bevy_reflect::Reflect};
 /// # HDR capability metadata
 ///
 /// `Monitor` itself carries only geometry and refresh information. A display's
-/// luminance, primaries, and bit depth — when the platform reports them — live
+/// luminance and a coarse gamut bucket — when the platform reports them — live
 /// in the additive [`MonitorDisplayCapability`](crate::MonitorDisplayCapability)
 /// component on the same entity, populated by the renderer's display-sensing
 /// poll. Its absence means the platform reports nothing, never that the display

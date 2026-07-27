@@ -20,8 +20,8 @@
 use bevy_ecs::prelude::*;
 use bevy_platform::collections::HashMap;
 use bevy_window::{
-    DisplayChromaticity, DisplayCoarseRange, DisplayGamut, DisplayInfoSource, DisplayTransfer,
-    MonitorDisplayCapability, OnMonitor, WindowDisplayState,
+    DisplayGamut, DisplayInfoSource, DisplayTransfer, MonitorDisplayCapability, OnMonitor,
+    WindowDisplayState,
 };
 use wgpu::{DisplayGamut as WgpuDisplayGamut, DisplayHdrInfo};
 
@@ -44,10 +44,7 @@ pub(crate) struct DisplaySnapshot {
     pub max_nits: Option<f32>,
     pub max_full_frame_nits: Option<f32>,
     pub min_nits: Option<f32>,
-    pub chromaticity: Option<DisplayChromaticity>,
     pub gamut_hint: Option<DisplayGamut>,
-    pub bits_per_color: Option<u8>,
-    pub coarse: Option<DisplayCoarseRange>,
     /// Provenance of this snapshot, shared by the live-state and capability
     /// halves (a single read has one source).
     pub source: DisplayInfoSource,
@@ -61,10 +58,7 @@ impl DisplaySnapshot {
             max_nits: self.max_nits,
             max_full_frame_nits: self.max_full_frame_nits,
             min_nits: self.min_nits,
-            chromaticity: self.chromaticity,
             gamut_hint: self.gamut_hint,
-            bits_per_color: self.bits_per_color,
-            coarse: self.coarse,
             source: self.source,
         }
     }
@@ -101,25 +95,6 @@ pub(crate) fn finite_positive(v: Option<f32>) -> Option<f32> {
     v.filter(|x| x.is_finite() && *x > 0.0)
 }
 
-/// Mirrors a wgpu chromaticity report onto the plain-data window-crate type.
-fn map_chromaticity(c: wgpu::DisplayChromaticity) -> DisplayChromaticity {
-    DisplayChromaticity {
-        red: c.red,
-        green: c.green,
-        blue: c.blue,
-        white: c.white,
-    }
-}
-
-/// Mirrors a wgpu coarse-range report onto the plain-data window-crate type,
-/// classifying its gamut bucket through [`map_gamut`].
-fn map_coarse(c: wgpu::DisplayCoarseRange) -> DisplayCoarseRange {
-    DisplayCoarseRange {
-        high_dynamic_range: c.high_dynamic_range,
-        gamut: c.gamut.map(map_gamut),
-    }
-}
-
 /// Collapses a wgpu [`DisplayHdrInfo`] into a [`DisplaySnapshot`].
 ///
 /// The live half is wgpu's already-folded
@@ -132,10 +107,12 @@ fn map_coarse(c: wgpu::DisplayCoarseRange) -> DisplayCoarseRange {
 /// `sdr_white_nits` is carried alongside (Windows only) to anchor the
 /// `paper_white` auto-calibration.
 ///
-/// The capability half (peak / min nits, primaries, gamut bucket, bit depth) is
-/// copied through for the [`MonitorDisplayCapability`] mirror. `source` is the
-/// caller-classified provenance ([`classify_source`]); it tags the mirror for
-/// calibration UIs and never affects how a value commits.
+/// The capability half — peak / full-frame / min nits and the coarse gamut
+/// bucket the backend reports (nearest-primaries match on DXGI, the CSS
+/// `color-gamut` query on web) — is copied through for the
+/// [`MonitorDisplayCapability`] mirror. `source` is the caller-classified
+/// provenance ([`classify_source`]); it tags the mirror for calibration UIs and
+/// never affects how a value commits.
 pub(crate) fn normalize(info: &DisplayHdrInfo, source: DisplayInfoSource) -> DisplaySnapshot {
     let luminance = info.luminance;
 
@@ -147,9 +124,7 @@ pub(crate) fn normalize(info: &DisplayHdrInfo, source: DisplayInfoSource) -> Dis
     let max_full_frame_nits = finite_positive(luminance.and_then(|l| l.max_full_frame_nits));
     let min_nits = finite_positive(luminance.and_then(|l| l.min_nits));
 
-    let chromaticity = info.chromaticity.map(map_chromaticity);
-    let coarse = info.coarse.map(map_coarse);
-    let gamut_hint = coarse.and_then(|c| c.gamut);
+    let gamut_hint = info.coarse.and_then(|c| c.gamut).map(map_gamut);
 
     DisplaySnapshot {
         tone_map_headroom,
@@ -157,10 +132,7 @@ pub(crate) fn normalize(info: &DisplayHdrInfo, source: DisplayInfoSource) -> Dis
         max_nits,
         max_full_frame_nits,
         min_nits,
-        chromaticity,
         gamut_hint,
-        bits_per_color: info.bits_per_color,
-        coarse,
         source,
     }
 }
@@ -525,10 +497,7 @@ mod commit_tests {
             max_nits: None,
             max_full_frame_nits: None,
             min_nits: None,
-            chromaticity: None,
             gamut_hint: None,
-            bits_per_color: None,
-            coarse: None,
             source,
         }
     }

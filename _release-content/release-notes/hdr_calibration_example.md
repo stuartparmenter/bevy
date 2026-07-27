@@ -6,7 +6,7 @@ pull_requests: []
 
 HDR output is only as good as the calibration values in the window's
 `DisplayTarget`. wgpu now senses some of them — `DisplayHdrInfo` feeds peak,
-black, full-frame and SDR-white nits, headroom, and chromaticity into
+black, full-frame and SDR-white nits, headroom, and a gamut bucket into
 `WindowDisplayState` / `MonitorDisplayCapability` — but paper white is a viewing
 preference no display can report, and sensed values are missing or coarse on many
 platforms. So an in-app, HGIG-style calibration flow complements that sensing
