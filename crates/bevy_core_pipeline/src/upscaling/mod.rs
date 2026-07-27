@@ -178,7 +178,6 @@ mod tests {
             compositing_space,
             source_gamut: DisplayGamut::Rec709,
             encoding: None,
-            stack_tonemaps: true,
         }
     }
 

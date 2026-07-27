@@ -603,7 +603,6 @@ mod tests {
             texture: 0,
             sorted_index: index,
             composites_fullscreen: false,
-            tonemap_enabled: true,
             encode_enabled: true,
             output_writes: true,
             explicit_blend: false,
@@ -623,7 +622,6 @@ mod tests {
             texture: 0,
             sorted_index: index,
             composites_fullscreen: true,
-            tonemap_enabled: false,
             encode_enabled: true,
             output_writes: true,
             explicit_blend: false,
@@ -657,7 +655,6 @@ mod tests {
                     OutOfGamutHandling::Clip
                 },
             }),
-            stack_tonemaps: output.stack_tonemaps,
         }
     }
 

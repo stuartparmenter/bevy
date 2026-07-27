@@ -160,9 +160,6 @@ pub struct ViewStackContract {
     /// Resolved encode parameters; `Some` exactly when the view's resolved
     /// display target requests an HDR transfer.
     pub encoding: Option<ResolvedEncoding>,
-    /// Whether any member of this view's stack runs a tonemapping pass this
-    /// frame (used by diagnostics and tests).
-    pub stack_tonemaps: bool,
 }
 
 impl ViewStackContract {
@@ -240,9 +237,6 @@ pub(crate) struct ContractInput<K> {
     pub sorted_index: usize,
     /// See [`composites_fullscreen`].
     pub composites_fullscreen: bool,
-    /// Whether the view's tonemapping pass would run
-    /// (`effective_tonemapping(..).is_enabled()`).
-    pub tonemap_enabled: bool,
     /// Whether the view's display-encoding pass would run (the resolved
     /// display target requests an HDR transfer).
     pub encode_enabled: bool,
@@ -263,8 +257,10 @@ pub(crate) struct ContractInput<K> {
     /// (`ClearColorConfig::None`); distinguishes viewport members from
     /// clearing members in the stack-shape diagnostics.
     pub loads_previous: bool,
-    /// The view's effective tone-mapping operator; compared against the
-    /// finalizer's for the operator-mismatch diagnostic.
+    /// The view's effective tone-mapping operator (`effective_tonemapping(..)`).
+    /// [`Tonemapping::is_enabled`] gates the view's tonemapping pass; the
+    /// operator is compared against the finalizer's for the operator-mismatch
+    /// diagnostic.
     pub operator: Tonemapping,
     /// Fingerprint of the view's `ColorGrading` / `GranTurismo7Params` /
     /// `DebandDither`; compared against the finalizer's for the
@@ -347,13 +343,13 @@ fn resolve_group<K: Copy + Eq + Hash>(
     outputs: &mut EntityHashMap<ContractOutput>,
 ) {
     let encode_enabled_group = members.iter().any(|member| member.encode_enabled);
-    let stack_tonemaps = members.iter().any(|member| member.tonemap_enabled);
+    let stack_tonemaps = members.iter().any(|member| member.operator.is_enabled());
 
     let mut tonemap_deferred = stack_deferred_views(members.iter().map(|member| StackView {
         entity: member.entity,
         texture: member.texture,
         sorted_index: member.sorted_index,
-        enabled: member.tonemap_enabled,
+        enabled: member.operator.is_enabled(),
         composites_fullscreen: member.composites_fullscreen,
     }));
     let encode_deferred = stack_deferred_views(members.iter().map(|member| StackView {
@@ -399,7 +395,7 @@ fn resolve_group<K: Copy + Eq + Hash>(
     let group_gamut = members
         .iter()
         .rev()
-        .find(|member| member.tonemap_enabled)
+        .find(|member| member.operator.is_enabled())
         .map(|member| member.tonemap_output_gamut)
         .unwrap_or(DisplayGamut::Rec709);
 
@@ -452,7 +448,7 @@ fn resolve_group<K: Copy + Eq + Hash>(
     // A member whose enabled pass runs per camera (not deferred, not the
     // stack-wide finalizer).
     let runs_own_pass = |member: &ContractInput<K>| {
-        let tonemap_solo = member.tonemap_enabled
+        let tonemap_solo = member.operator.is_enabled()
             && !tonemap_deferred.contains_key(&member.entity)
             && !tonemap_finalizers.contains(&member.entity);
         let encode_solo = member.encode_enabled
@@ -588,7 +584,6 @@ pub fn resolve_camera_stack_contracts(
             texture: view_target.main_texture().id(),
             sorted_index: camera.sorted_camera_index_for_target,
             composites_fullscreen: composites_fullscreen(camera),
-            tonemap_enabled: operator.is_enabled(),
             encode_enabled: view_display_target.is_some_and(ViewDisplayTarget::is_hdr_transfer),
             output_writes: !matches!(camera.output_mode, CameraOutputMode::Skip),
             explicit_blend: matches!(
@@ -663,31 +658,14 @@ pub fn resolve_camera_stack_contracts(
             compositing_space: output.compositing_space,
             source_gamut: output.source_gamut,
             encoding,
-            stack_tonemaps: output.stack_tonemaps,
         });
     }
 }
 
-/// Resolves a texture group's display transfer and gamut: the prepare-time
-/// coercion chain plus the group-level display-target diagnostics. Returns
-/// `None` for groups whose resolved display target does not request an HDR
-/// transfer (no encode pass; a missing [`ViewDisplayTarget`] counts as plain
-/// SDR).
-///
-/// Coercions:
-/// * [`DisplayGamut::DisplayP3`] -> [`DisplayGamut::Rec709`] for every transfer
-///   except [`DisplayTransfer::ExtendedSrgb`]: P3 is a real encoder gamut only
-///   for the encoded extended-range sRGB transfer (wgpu's `ExtendedDisplayP3`);
-///   no other transfer negotiates a P3 surface.
-/// * [`DisplayTransfer::ExtendedSrgb`] with a Rec.2020 gamut ->
-///   [`DisplayGamut::Rec709`]: there is no encoded-extended Rec.2020 surface
-///   (only `ExtendedSrgb` / `ExtendedDisplayP3`).
-/// * scRGB-linear with a non-Rec.709 gamut -> [`DisplayGamut::Rec709`]:
-///   scRGB (IEC 61966-2-2) is definitionally encoded against Rec.709/sRGB
-///   primaries. Only the encoding is coerced; `DisplayTarget::gamut` itself
-///   stays user-authored.
-/// * PQ with a non-Rec.2020 gamut -> [`DisplayGamut::Rec2020`]: PQ is
-///   canonically Rec.2020.
+/// Resolves a texture group's display transfer and gamut: the group-level
+/// display-target diagnostics plus [`coerce_display_encode`]. Returns `None`
+/// for groups whose resolved display target does not request an HDR transfer
+/// (no encode pass; a missing [`ViewDisplayTarget`] counts as plain SDR).
 fn resolve_group_encode_parameters(
     view_display_target: Option<&ViewDisplayTarget>,
     view_target: &ViewTarget,
@@ -729,28 +707,31 @@ fn resolve_group_encode_parameters(
     }
 
     let target = view_display_target.resolved;
-    let transfer = target.transfer;
-    let mut gamut = target.gamut;
+    Some(coerce_display_encode(target.transfer, target.gamut))
+}
 
-    // Mirror the coercion in `coerce_display_encode` to report each arm it
-    // takes. The coerced value comes from that pure helper; only the
-    // diagnostics live here. The running `gamut` tracks the sequential
-    // coercion so a later arm's condition (and message) sees the value the
-    // earlier arms produced, exactly as the helper does.
+/// The prepare-time display-encode coercion chain over the resolved transfer
+/// and gamut: `DisplayP3` -> Rec709 for every transfer except `ExtendedSrgb`
+/// (which keeps P3 — wgpu's `ExtendedDisplayP3`), then scRGB forces Rec709,
+/// then `ExtendedSrgb` forces Rec2020 -> Rec709 (no extended Rec.2020 surface),
+/// then PQ forces Rec2020. The order is load bearing: the P3 -> 709 arm runs
+/// before the transfer-specific gamut arms. Each arm reports the coercion it
+/// applies as a `warn_once` / `info_once`; the result depends on nothing but
+/// the arguments, so the chain is tested directly.
+fn coerce_display_encode(
+    transfer: DisplayTransfer,
+    gamut: DisplayGamut,
+) -> (DisplayTransfer, DisplayGamut) {
+    let mut gamut = gamut;
+    // Display-P3 is a real encoder gamut only for the encoded extended-range
+    // sRGB transfer (wgpu's `ExtendedDisplayP3` surface color space); every
+    // other transfer ships no P3 surface and collapses it to Rec.709.
     if gamut == DisplayGamut::DisplayP3 && transfer != DisplayTransfer::ExtendedSrgb {
         warn_once!(
             "`DisplayGamut::DisplayP3` output is only supported with \
             `DisplayTransfer::ExtendedSrgb` (wgpu's `ExtendedDisplayP3` surface \
             color space); the {transfer:?} transfer ships no P3 surface, \
             so leaving colors in Rec.709 primaries."
-        );
-        gamut = DisplayGamut::Rec709;
-    }
-    if transfer == DisplayTransfer::ExtendedSrgb && gamut == DisplayGamut::Rec2020 {
-        warn_once!(
-            "Encoded extended-range sRGB (`DisplayTransfer::ExtendedSrgb`) has no \
-            Rec.2020 surface (only `ExtendedSrgb` / `ExtendedDisplayP3`); coercing \
-            `DisplayTarget::gamut` from Rec2020 to Rec709 for encoding."
         );
         gamut = DisplayGamut::Rec709;
     }
@@ -771,46 +752,23 @@ fn resolve_group_encode_parameters(
         );
         gamut = DisplayGamut::Rec709;
     }
+    // Encoded extended-range sRGB has no Rec.2020 surface (only `ExtendedSrgb`
+    // / `ExtendedDisplayP3`), so a Rec.2020 gamut falls back to Rec.709; a
+    // Display-P3 gamut is kept (handled above).
+    if transfer == DisplayTransfer::ExtendedSrgb && gamut == DisplayGamut::Rec2020 {
+        warn_once!(
+            "Encoded extended-range sRGB (`DisplayTransfer::ExtendedSrgb`) has no \
+            Rec.2020 surface (only `ExtendedSrgb` / `ExtendedDisplayP3`); coercing \
+            `DisplayTarget::gamut` from Rec2020 to Rec709 for encoding."
+        );
+        gamut = DisplayGamut::Rec709;
+    }
     if transfer == DisplayTransfer::Pq && gamut != DisplayGamut::Rec2020 {
         info_once!(
             "PQ display targets are canonically Rec.2020 (ITU-R BT.2100); encoding \
             the {gamut:?} gamut against Rec.2020 primaries (a lossless widening; \
             `DisplayTarget::gamut` is unchanged)."
         );
-    }
-
-    Some(coerce_display_encode(transfer, target.gamut))
-}
-
-/// The prepare-time display-encode coercion chain as a pure function of the
-/// resolved transfer and gamut: `DisplayP3` -> Rec709 for every transfer except
-/// `ExtendedSrgb` (which keeps P3 — wgpu's `ExtendedDisplayP3`), then scRGB
-/// forces Rec709, then `ExtendedSrgb` forces Rec2020 -> Rec709 (no extended
-/// Rec.2020 surface), then PQ forces Rec2020. The order is load bearing (the
-/// P3 -> 709 arm runs before the transfer-specific gamut arms), so the chain is
-/// tested directly. The diagnostics in `resolve_group_encode_parameters` mirror
-/// these arms.
-fn coerce_display_encode(
-    transfer: DisplayTransfer,
-    gamut: DisplayGamut,
-) -> (DisplayTransfer, DisplayGamut) {
-    let mut gamut = gamut;
-    // Display-P3 is a real encoder gamut only for the encoded extended-range
-    // sRGB transfer (wgpu's `ExtendedDisplayP3` surface color space); every
-    // other transfer ships no P3 surface and collapses it to Rec.709.
-    if gamut == DisplayGamut::DisplayP3 && transfer != DisplayTransfer::ExtendedSrgb {
-        gamut = DisplayGamut::Rec709;
-    }
-    if transfer == DisplayTransfer::ScRgbLinear && gamut != DisplayGamut::Rec709 {
-        gamut = DisplayGamut::Rec709;
-    }
-    // Encoded extended-range sRGB has no Rec.2020 surface (only `ExtendedSrgb`
-    // / `ExtendedDisplayP3`), so a Rec.2020 gamut falls back to Rec.709; a
-    // Display-P3 gamut is kept (handled above).
-    if transfer == DisplayTransfer::ExtendedSrgb && gamut == DisplayGamut::Rec2020 {
-        gamut = DisplayGamut::Rec709;
-    }
-    if transfer == DisplayTransfer::Pq && gamut != DisplayGamut::Rec2020 {
         gamut = DisplayGamut::Rec2020;
     }
     (transfer, gamut)
@@ -1093,7 +1051,6 @@ mod contract_tests {
             texture: 0,
             sorted_index: index,
             composites_fullscreen: false,
-            tonemap_enabled: true,
             encode_enabled: false,
             output_writes: true,
             explicit_blend: false,
@@ -1132,7 +1089,6 @@ mod contract_tests {
     /// Marks a member as `Tonemapping::None` on an HDR (PQ) target.
     fn passthrough_hdr(mut input: ContractInput<u32>) -> ContractInput<u32> {
         input.encode_enabled = true;
-        input.tonemap_enabled = false;
         input.operator = Tonemapping::None;
         input.tonemap_output_gamut = DisplayGamut::Rec709;
         input
@@ -1140,7 +1096,6 @@ mod contract_tests {
 
     /// Marks a member as `Tonemapping::None` on an SDR target.
     fn disabled(mut input: ContractInput<u32>) -> ContractInput<u32> {
-        input.tonemap_enabled = false;
         input.operator = Tonemapping::None;
         input
     }
