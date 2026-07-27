@@ -1,11 +1,12 @@
-//! CPU mirrors of the display transfer functions in `transfer_functions.wgsl`
-//! (importable in WGSL as `bevy_render::transfer_functions`).
+//! Transfer functions (OETFs / EOTFs) converting between *display-linear*
+//! light and the encoded signal a display expects.
 //!
-//! These convert between *display-linear* light and the encoded signal a
-//! display expects. The shader-side versions are the ones the display-encoding
-//! pass executes; the functions here are the operation-for-operation `f32`
-//! reference used by tests (and by future CPU-side consumers such as readback
-//! parity checks). Keep both files in sync.
+//! The subset the display-encoding pass runs on the GPU — [`srgb_oetf_extended`],
+//! [`scrgb_encode`] and the PQ inverse EOTF — mirrors `transfer_functions.wgsl`
+//! (importable in WGSL as `bevy_render::transfer_functions`) operation for
+//! operation and is the `f32` parity reference for it; keep both files in sync.
+//! The rest — the EOTFs and the plain [`srgb_oetf`] — is CPU-only, consumed by
+//! the screenshot readback and save paths.
 //!
 //! All math uses [`bevy_math::ops`] so results are deterministic across
 //! platforms and match the parity policy used by the GT7 CPU reference
@@ -22,37 +23,31 @@ pub const SCRGB_REFERENCE_WHITE_NITS: f32 = 80.0;
 pub const PQ_MAX_LUMINANCE_NITS: f32 = 10000.0;
 
 /// ST-2084 constant `m1` = (2610 / 4096) / 4.
-pub const PQ_M1: f32 = 0.159_301_76;
+const PQ_M1: f32 = 0.159_301_76;
 /// ST-2084 constant `m2` = (2523 / 4096) × 128.
-pub const PQ_M2: f32 = 78.84375;
+const PQ_M2: f32 = 78.84375;
 /// ST-2084 constant `c1` = 3424 / 4096.
-pub const PQ_C1: f32 = 0.8359375;
+const PQ_C1: f32 = 0.8359375;
 /// ST-2084 constant `c2` = (2413 / 4096) × 32 = 18.8515625 (exact in `f32`).
-pub const PQ_C2: f32 = 18.851_563;
+const PQ_C2: f32 = 18.851_563;
 /// ST-2084 constant `c3` = (2392 / 4096) × 32.
-pub const PQ_C3: f32 = 18.6875;
+const PQ_C3: f32 = 18.6875;
 
 /// The sRGB (IEC 61966-2-1) OETF (inverse EOTF): display-linear `[0, 1]` →
 /// encoded signal.
 ///
 /// `V = 12.92·L` for `L ≤ 0.0031308`, `V = 1.055·L^(1/2.4) − 0.055` otherwise.
-/// Negative inputs take the linear segment (extended-sRGB style), mirroring
-/// the WGSL version's `pow`-safety behavior.
+/// Negative inputs take the linear segment, which keeps `powf` away from a
+/// negative base.
+///
+/// There is no shader counterpart: sRGB swapchains apply this curve in hardware
+/// on the `*UnormSrgb` writeback. The screenshot path uses it to quantize a
+/// display-linear capture into an 8-bit image.
 pub fn srgb_oetf(linear: f32) -> f32 {
     if linear <= 0.003_130_8 {
         12.92 * linear
     } else {
         1.055 * ops::powf(linear, 1.0 / 2.4) - 0.055
-    }
-}
-
-/// The sRGB EOTF: encoded signal → display-linear. Exact inverse of
-/// [`srgb_oetf`]. Negative inputs take the linear segment.
-pub fn srgb_eotf(signal: f32) -> f32 {
-    if signal <= 0.04045 {
-        signal / 12.92
-    } else {
-        ops::powf((signal + 0.055) / 1.055, 2.4)
     }
 }
 
@@ -218,9 +213,12 @@ mod tests {
 
     #[test]
     fn srgb_round_trips_and_is_continuous() {
+        // On `[0, 1]` the extended EOTF *is* the plain sRGB EOTF (`abs` and
+        // `sign` are no-ops for non-negative input), so it inverts `srgb_oetf`
+        // exactly here.
         for l in [0.0, 0.001, 0.0031308, 0.004, 0.1, 0.18, 0.5, 0.9, 1.0] {
             let signal = srgb_oetf(l);
-            let back = srgb_eotf(signal);
+            let back = srgb_eotf_extended(signal);
             assert!(
                 (back - l).abs() < 1e-6,
                 "sRGB round trip at {l}: got {back}"
@@ -237,7 +235,6 @@ mod tests {
         assert!((srgb_oetf(0.18) - 0.461_356).abs() < 1e-4);
         // Negatives use the linear extension (no NaN).
         assert_eq!(srgb_oetf(-0.5), 12.92 * -0.5);
-        assert_eq!(srgb_eotf(-0.5), -0.5 / 12.92);
     }
 
     #[test]

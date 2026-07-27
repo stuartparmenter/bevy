@@ -126,10 +126,10 @@ pub const REC2020_TO_REC709: Mat3 = Mat3::from_cols(
 ///
 /// Used by the display-encoding pass to carry Rec.709 tone-map output into the
 /// P3-gamut [`ExtendedDisplayP3`](bevy_window::DisplayTransfer::ExtendedSrgb)
-/// signal. The Rust literals are bit-identical to `REC_709_TO_DISPLAY_P3` in
-/// `display_encoding.wgsl`; both round to the same `f32` as the f64 derivation
-/// and agree with `bevy_color::rgb_to_rgb_matrix(BT709, DISPLAY_P3)` within a
-/// few ULP (verified by test).
+/// signal. The Rust literals are bit-identical to `REC709_TO_DISPLAYP3` in
+/// `working_color_space.wgsl`; both round to the same `f32` as the f64
+/// derivation and agree with `bevy_color::rgb_to_rgb_matrix(BT709,
+/// DISPLAY_P3)` within a few ULP (verified by test).
 pub const REC709_TO_DISPLAYP3: Mat3 = Mat3::from_cols(
     Vec3::new(0.822_461_96, 0.033_194_2, 0.017_082_632),
     Vec3::new(0.177_538_04, 0.966_805_8, 0.072_397_44),
@@ -149,7 +149,7 @@ pub const DISPLAYP3_TO_REC709: Mat3 = Mat3::from_cols(
 /// (both D65). Used by the display-encoding pass for the GT7-on-HDR path,
 /// whose tone-map output is native Rec.2020, onto a P3-gamut signal (a gamut
 /// *contraction*: Display-P3 ⊂ Rec.2020). Bit-identical to
-/// `REC_2020_TO_DISPLAY_P3` in `display_encoding.wgsl`.
+/// `REC2020_TO_DISPLAYP3` in `working_color_space.wgsl`.
 pub const REC2020_TO_DISPLAYP3: Mat3 = Mat3::from_cols(
     Vec3::new(1.343_578_2, -0.065_297_455, 0.002_821_787_3),
     Vec3::new(-0.282_179_68, 1.075_787_9, -0.019_598_495),
@@ -236,7 +236,7 @@ mod tests {
     /// the `bevy_color` runtime derivation to a tight relative tolerance.
     /// They are NOT bit-identical: `rgb_to_rgb_matrix` derives the D65 white
     /// from the (0.3127, 0.3290) chromaticity, while the BT.2087 constants
-    /// (shared bit-for-bit with `gt7.rs`/`gt7.wgsl`/`display_encoding.wgsl`)
+    /// (shared bit-for-bit with `gt7.rs`/`gt7.wgsl`/`working_color_space.wgsl`)
     /// follow the tabulated-white convention; observed disagreement is a few
     /// ULP (relative ~1e-6). The bitwise gt7-parity test lives in
     /// `bevy_core_pipeline::tonemapping::gt7`.

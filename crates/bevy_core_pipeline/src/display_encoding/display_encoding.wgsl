@@ -42,6 +42,10 @@
 #import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput
 #import bevy_render::display_target::DisplayTargetUniform
 #import bevy_render::transfer_functions::{scrgb_encode, pq_inverse_eotf_from_nits, srgb_oetf_extended}
+// Gamut matrices for stage 2; that module documents their derivation and the
+// bit-identity contract with the Rust constants. Each is used under exactly one
+// of the gamut defs below.
+#import bevy_render::working_color_space::{REC709_TO_REC2020, REC2020_TO_REC709, REC709_TO_DISPLAYP3, REC2020_TO_DISPLAYP3}
 #ifdef SRGB_TO_LINEAR
 #import bevy_render::color_operations::srgb_to_linear
 #endif
@@ -58,62 +62,6 @@
 // <= 10000) with the same rules the tone-map operators fold at prepare time,
 // so the seam scale factors cancel exactly.
 @group(0) @binding(2) var<uniform> display_target: DisplayTargetUniform;
-
-#ifdef DISPLAY_GAMUT_REC2020
-// Full-precision linear Rec.709 → Rec.2020 matrix (D65, per ITU-R BT.2087;
-// f64-derived via the Lindbloom primaries→XYZ method, matching
-// `bevy_color::primaries::rgb_to_rgb_matrix(RgbPrimaries::BT709,
-// RgbPrimaries::BT2020)`). Identical literals to `GT7_REC_709_TO_REC_2020`
-// in gt7.wgsl / `REC_709_TO_REC_2020` in gt7.rs.
-// TODO: deduplicate with shared color-space constants once they land in
-// `bevy_render::color_operations`.
-const REC_709_TO_REC_2020 = mat3x3<f32>(
-    0.627403895934699, 0.06909728935823199, 0.016391438875150228,   // column 0
-    0.32928303837788375, 0.919540395075459, 0.08801330787722578,    // column 1
-    0.043313065687417246, 0.011362315566309154, 0.895595253247624,  // column 2
-);
-#endif
-
-#ifdef GAMUT_REC2020_TO_REC709
-// Full-precision linear Rec.2020 → Rec.709 matrix (D65, per ITU-R BT.2087;
-// inverse of the matrix above). Identical literals to
-// `GT7_REC_2020_TO_REC_709` in gt7.wgsl / `REC_2020_TO_REC_709` in gt7.rs /
-// `REC2020_TO_REC709` in bevy_render::working_color_space.
-// TODO: deduplicate with shared color-space constants once they land in
-// `bevy_render::color_operations`.
-const REC_2020_TO_REC_709 = mat3x3<f32>(
-    1.6604910021084347, -0.12455047452159052, -0.01815076335490522, // column 0
-    -0.5876411387885496, 1.1328998971259598, -0.10057889800800739,  // column 1
-    -0.07284986331988484, -0.008349422604369487, 1.1187296613629125, // column 2
-);
-#endif
-
-#ifdef DISPLAY_GAMUT_DISPLAYP3
-// Full-precision linear Rec.709 → Display-P3 matrix (both D65; DCI-P3
-// primaries). f64-derived via the same Lindbloom primaries→XYZ method,
-// matching `bevy_color::rgb_to_rgb_matrix(RgbPrimaries::BT709,
-// RgbPrimaries::DISPLAY_P3)`. Bit-identical literals to `REC709_TO_DISPLAYP3`
-// in `bevy_render::working_color_space`. The shared blue primary makes the
-// third column's off-diagonals exactly zero.
-const REC_709_TO_DISPLAY_P3 = mat3x3<f32>(
-    0.822461968714363, 0.0331941988509616, 0.01708263072112,     // column 0
-    0.177538031285638, 0.966805801149038, 0.0723974406639634,    // column 1
-    0.0, 0.0, 0.910519928614916,                                 // column 2
-);
-#endif
-
-#ifdef GAMUT_REC2020_TO_DISPLAYP3
-// Full-precision linear Rec.2020 → Display-P3 matrix (both D65). The GT7
-// HDR-native Rec.2020 tone-map output onto a P3-gamut signal: a gamut
-// *contraction* (Display-P3 ⊂ Rec.2020), for which prepare keys in the
-// out-of-gamut compression below. Bit-identical literals to
-// `REC2020_TO_DISPLAYP3` in `bevy_render::working_color_space`.
-const REC_2020_TO_DISPLAY_P3 = mat3x3<f32>(
-    1.34357825258433, -0.0652974527891195, 0.00282178726170105,  // column 0
-    -0.282179670526136, 1.07578791584857, -0.0195984945244942,   // column 1
-    -0.0613985820581962, -0.010490463059455, 1.01677670726279,   // column 2
-);
-#endif
 
 #ifdef DISPLAY_GAMUT_COMPRESSION
 // Out-of-gamut chroma compression in the style of the ACES 1.3 Reference
@@ -204,7 +152,7 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     // keys exactly one of the defs below — or none for the identity
     // stages (Rec.709 → scRGB, Rec.2020 → PQ/Rec.2020).
 #ifdef DISPLAY_GAMUT_REC2020
-    rgb = REC_709_TO_REC_2020 * rgb;
+    rgb = REC709_TO_REC2020 * rgb;
 #endif
 #ifdef GAMUT_REC2020_TO_REC709
     // A gamut *contraction* (GT7's Rec.2020 output onto the
@@ -212,18 +160,18 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     // components, for which prepare keys in the out-of-gamut compression
     // below (`DISPLAY_GAMUT_COMPRESSION`; see `DisplayGamutCompression` and
     // `is_gamut_contraction` in mod.rs).
-    rgb = REC_2020_TO_REC_709 * rgb;
+    rgb = REC2020_TO_REC709 * rgb;
 #endif
 #ifdef DISPLAY_GAMUT_DISPLAYP3
     // Rec.709 source → Display-P3 signal (the `ExtendedDisplayP3` color space):
     // an expansion (Display-P3 ⊃ Rec.709), in-gamut by construction.
-    rgb = REC_709_TO_DISPLAY_P3 * rgb;
+    rgb = REC709_TO_DISPLAYP3 * rgb;
 #endif
 #ifdef GAMUT_REC2020_TO_DISPLAYP3
     // GT7's Rec.2020 source → Display-P3 signal: a contraction
     // (Display-P3 ⊂ Rec.2020), for which prepare keys in the out-of-gamut
     // compression below, exactly like the Rec.2020 → Rec.709 case.
-    rgb = REC_2020_TO_DISPLAY_P3 * rgb;
+    rgb = REC2020_TO_DISPLAYP3 * rgb;
 #endif
 
     // 3. Out-of-gamut handling (perceptual compression, with the per-channel

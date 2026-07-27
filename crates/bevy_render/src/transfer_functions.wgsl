@@ -1,14 +1,15 @@
-// Display transfer functions (OETFs / EOTFs) for signal encoding.
+// Display transfer functions (OETFs) for signal encoding.
 //
-// These functions convert between *display-linear* light and the encoded
-// signal a display expects. They are the shader-side building blocks of the
+// These functions convert *display-linear* light into the encoded signal a
+// display expects. They are the shader-side building blocks of the
 // display-encoding pass (gamut transform → transfer encoding), and are kept
-// separate from `bevy_render::color_operations` (whose sRGB helpers exist for
-// color-*authoring* conversions) so that tonemapping, the encoder, and UI can
-// all import one canonical set of signal-encoding primitives.
+// separate from `bevy_render::color_operations`, whose sRGB helpers exist for
+// color-*authoring* conversions.
 //
-// CPU mirrors with parity tests live in `bevy_render::transfer_functions`
-// (transfer_functions.rs); keep both files in sync.
+// Only the encode direction the display-encoding pass runs lives here. The
+// EOTFs and the plain sRGB OETF are CPU-only, in
+// `bevy_render::transfer_functions` (transfer_functions.rs), which also holds
+// the `f32` parity references for the functions here; keep both in sync.
 //
 // NOTE on duplication: `bevy_core_pipeline::tonemapping_gt7` (gt7.wgsl)
 // carries its own self-contained PQ helpers (same ST-2084 constants, same
@@ -18,59 +19,6 @@
 // consistent.
 
 #define_import_path bevy_render::transfer_functions
-
-// ---------------------------------------------------------------------------
-// sRGB (IEC 61966-2-1)
-// ---------------------------------------------------------------------------
-
-// sRGB OETF (inverse EOTF) for one channel: display-linear [0, 1] → signal.
-//
-//   V = 12.92 * L                      if L <= 0.0031308
-//   V = 1.055 * L^(1/2.4) - 0.055      otherwise
-//
-// Negative inputs take the linear segment (12.92 * L), i.e. the curve is
-// extended linearly below zero like scRGB's extended-sRGB encoding; this also
-// keeps `pow` away from negative bases (indeterminate in WGSL).
-//
-// Bevy's default SDR path never calls this: plain sRGB swapchains use the
-// hardware encode on the `*UnormSrgb` texture view (which implements exactly
-// this curve, for free). This shader-side version exists for output formats
-// without an sRGB view (e.g. a future `Rgb10a2Unorm` target, which quantizes
-// raw values on store).
-fn srgb_oetf_channel(linear: f32) -> f32 {
-    if linear <= 0.0031308 {
-        return 12.92 * linear;
-    }
-    return 1.055 * pow(linear, 1.0 / 2.4) - 0.055;
-}
-
-// Per-channel sRGB OETF; see `srgb_oetf_channel`.
-fn srgb_oetf(linear: vec3<f32>) -> vec3<f32> {
-    return vec3(
-        srgb_oetf_channel(linear.x),
-        srgb_oetf_channel(linear.y),
-        srgb_oetf_channel(linear.z),
-    );
-}
-
-// sRGB EOTF for one channel: signal → display-linear. Exact inverse of
-// `srgb_oetf_channel` (the piecewise breakpoint 0.04045 = 12.92 * 0.0031308...
-// rounded per IEC 61966-2-1). Negative inputs take the linear segment.
-fn srgb_eotf_channel(signal: f32) -> f32 {
-    if signal <= 0.04045 {
-        return signal / 12.92;
-    }
-    return pow((signal + 0.055) / 1.055, 2.4);
-}
-
-// Per-channel sRGB EOTF; see `srgb_eotf_channel`.
-fn srgb_eotf(signal: vec3<f32>) -> vec3<f32> {
-    return vec3(
-        srgb_eotf_channel(signal.x),
-        srgb_eotf_channel(signal.y),
-        srgb_eotf_channel(signal.z),
-    );
-}
 
 // ---------------------------------------------------------------------------
 // Extended-range sRGB (IEC 61966-2-2 encoded form / "scRGB nonlinear")
@@ -88,12 +36,13 @@ fn srgb_eotf(signal: vec3<f32>) -> vec3<f32> {
 // `kCGColorSpaceExtendedSRGB` / `kCGColorSpaceExtendedDisplayP3`, the browser
 // WebGPU `srgb` / `display-p3` canvas with `toneMapping: "extended"`).
 //
-// Distinct from `srgb_oetf_channel`, which extends only the LINEAR segment
-// below zero (`12.92 * c`): that is the right pow-safety behavior for an SDR
-// `[0, 1]`-domain encode, but the extended-range HDR signal must apply the
-// full gamma curve to the magnitude of negative (wide-gamut / out-of-gamut)
-// components and preserve their sign. `abs` keeps `pow` away from a negative
-// base, so the result is NaN-free for every finite input.
+// Distinct from the plain sRGB OETF (`srgb_oetf` in transfer_functions.rs),
+// which extends only the LINEAR segment below zero (`12.92 * c`): that is the
+// right pow-safety behavior for an SDR `[0, 1]`-domain encode, but the
+// extended-range HDR signal must apply the full gamma curve to the magnitude
+// of negative (wide-gamut / out-of-gamut) components and preserve their sign.
+// `abs` keeps `pow` away from a negative base, so the result is NaN-free for
+// every finite input.
 fn srgb_oetf_extended_channel(c: f32) -> f32 {
     let a = abs(c);
     let lo = a * 12.92;
@@ -108,26 +57,6 @@ fn srgb_oetf_extended(linear: vec3<f32>) -> vec3<f32> {
         srgb_oetf_extended_channel(linear.x),
         srgb_oetf_extended_channel(linear.y),
         srgb_oetf_extended_channel(linear.z),
-    );
-}
-
-// Odd-symmetric extended sRGB EOTF for one channel: encoded signal →
-// display-linear. Exact inverse of `srgb_oetf_extended_channel`, sign
-// preserved (the screenshot path decodes an extended-sRGB readback with it).
-fn srgb_eotf_extended_channel(s: f32) -> f32 {
-    let a = abs(s);
-    let lo = a / 12.92;
-    let hi = pow((a + 0.055) / 1.055, 2.4);
-    return sign(s) * select(hi, lo, a <= 0.04045);
-}
-
-// Per-channel odd-symmetric extended sRGB EOTF; see
-// `srgb_eotf_extended_channel`.
-fn srgb_eotf_extended(signal: vec3<f32>) -> vec3<f32> {
-    return vec3(
-        srgb_eotf_extended_channel(signal.x),
-        srgb_eotf_extended_channel(signal.y),
-        srgb_eotf_extended_channel(signal.z),
     );
 }
 
@@ -200,22 +129,4 @@ fn pq_inverse_eotf(y: vec3<f32>) -> vec3<f32> {
 // `pq_inverse_eotf_from_nits(vec3(1000.0))` ≈ vec3(0.7518).
 fn pq_inverse_eotf_from_nits(nits: vec3<f32>) -> vec3<f32> {
     return pq_inverse_eotf(nits / PQ_MAX_LUMINANCE_NITS);
-}
-
-// PQ EOTF for one channel: PQ signal (clamped to [0, 1]) → normalized
-// display-linear luminance (1.0 = 10000 nits).
-fn pq_eotf_channel(signal: f32) -> f32 {
-    let n = clamp(signal, 0.0, 1.0);
-    let np = pow(n, 1.0 / PQ_M2);
-    let l = max(np - PQ_C1, 0.0) / (PQ_C2 - PQ_C3 * np);
-    return pow(l, 1.0 / PQ_M1);
-}
-
-// Per-channel PQ EOTF; see `pq_eotf_channel`.
-fn pq_eotf(signal: vec3<f32>) -> vec3<f32> {
-    return vec3(
-        pq_eotf_channel(signal.x),
-        pq_eotf_channel(signal.y),
-        pq_eotf_channel(signal.z),
-    );
 }
