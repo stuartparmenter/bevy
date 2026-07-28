@@ -28,10 +28,10 @@
 //          PQ/Rec.2020),
 //   3. out-of-gamut handling: ACES-RGC-style hue-approximate chroma
 //      compression toward the achromatic axis (`DISPLAY_GAMUT_COMPRESSION`),
-//      with the plain hue-shifting per-channel clip as the debug fallback
-//      (`DISPLAY_GAMUT_CLIP_DEBUG`), followed by a `max(0)` safety clip (PQ
-//      requires non-negative input) — skipped for the sign-preserving
-//      `DISPLAY_TRANSFER_EXTENDED_SRGB` transfer,
+//      followed by a `max(0)` safety clip (PQ requires non-negative input;
+//      with no compression def the clip is the entire handling, including
+//      the `DisplayGamutCompression::Clip` debug fallback) — skipped for the
+//      sign-preserving `DISPLAY_TRANSFER_EXTENDED_SRGB` transfer,
 //   4. transfer encoding (`DISPLAY_TRANSFER_SCRGB` /
 //      `DISPLAY_TRANSFER_PQ` / `DISPLAY_TRANSFER_EXTENDED_SRGB`).
 //
@@ -187,9 +187,10 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     // non-negative input before its `pow`). After compression this only
     // catches floating-point residue and scene-referred negatives that did
     // not come from the gamut stage (compressed colors land in-gamut by
-    // construction); under DISPLAY_GAMUT_CLIP_DEBUG — or when no compression
-    // is active — it IS the entire out-of-gamut handling: the hue-shifting
-    // per-channel clip, kept for A/B comparison against the compression.
+    // construction); when no compression is active — including the
+    // `DisplayGamutCompression::Clip` debug fallback — it IS the entire
+    // out-of-gamut handling: the hue-shifting per-channel clip, kept for A/B
+    // comparison against the compression.
     //
     // Skipped for the encoded extended-range sRGB transfer: its OETF is
     // odd-symmetric (sign-preserving by design), and the whole point of the

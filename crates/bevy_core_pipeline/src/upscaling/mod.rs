@@ -164,7 +164,6 @@ fn prepare_view_upscaling_pipelines(
 mod tests {
     use super::*;
     use crate::camera_stack::{ResolvedEncoding, StackRole};
-    use crate::display_encoding::OutOfGamutHandling;
     use bevy_window::{DisplayGamut, DisplayTransfer};
 
     /// A solo SDR view's contract: no encode parameters, no resolved space.
@@ -224,7 +223,6 @@ mod tests {
         contract.encoding = Some(ResolvedEncoding {
             transfer: DisplayTransfer::Pq,
             gamut: DisplayGamut::Rec2020,
-            out_of_gamut: OutOfGamutHandling::Clip,
         });
         assert_eq!(blit_source_space(Some(&contract)), None);
     }

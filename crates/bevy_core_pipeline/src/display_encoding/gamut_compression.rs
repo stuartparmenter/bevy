@@ -41,24 +41,10 @@
 //! (≈ `1.594 / 1.087 / 1.117`) plus headroom. A test sweeps the Rec.2020 hull
 //! and asserts every compressed color is in-gamut.
 //!
-//! # Why ACES RGC and not an exact hue-preserving `ICtCp` compression?
+//! The rationale for choosing the ACES RGC over an exact hue-preserving
+//! `ICtCp` compression is on [`DisplayGamutCompression`].
 //!
-//! The ideal out-of-gamut strategy is hue-preserving compression in `ICtCp`.
-//! An *exact* constant-hue mapping needs the distance
-//! to the RGB gamut boundary along the chroma direction in `ICtCp`, which has
-//! no closed form — production implementations (e.g. ACES 2.0's output
-//! transform) iterate a chroma bisection per pixel through three matrix pairs
-//! and six PQ evaluations per step. The ACES RGC is the published,
-//! battle-tested cheap alternative: closed-form, monotonic, NaN-free,
-//! exactly identity below the threshold, and *approximately* hue-preserving
-//! (measured `ICtCp` hue drift in this implementation: ≈ 1–4.5° for moderately
-//! out-of-gamut colors, ≈ 5–6° for the extreme Rec.2020 green/red primaries,
-//! and ≈ 16° worst case for the Rec.2020 blue corner — see the fixture
-//! tests; the per-channel clip it replaces drifts substantially more and,
-//! unlike the compression, collapses distinct out-of-gamut colors onto one
-//! another). A true `ICtCp` boundary search would replace the
-//! `DISPLAY_GAMUT_COMPRESSION` shader path; the ACES RGC is the cheap
-//! default.
+//! [`DisplayGamutCompression`]: super::DisplayGamutCompression
 
 use bevy_math::{ops, Vec3};
 

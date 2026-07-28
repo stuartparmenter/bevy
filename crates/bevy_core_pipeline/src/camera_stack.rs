@@ -54,7 +54,6 @@ use bevy_render::{
 use bevy_window::{DisplayGamut, DisplayTransfer};
 use core::hash::Hash;
 
-use crate::display_encoding::{is_gamut_contraction, DisplayGamutCompression, OutOfGamutHandling};
 use crate::tonemapping::{effective_tonemapping, tonemap_output_gamut, Tonemapping};
 
 /// Registers the phase-2 contract resolver
@@ -119,8 +118,6 @@ pub struct ResolvedEncoding {
     pub transfer: DisplayTransfer,
     /// The resolved display gamut the encoder transforms to.
     pub gamut: DisplayGamut,
-    /// The resolved out-of-gamut handling of the encoder's gamut stage.
-    pub out_of_gamut: OutOfGamutHandling,
 }
 
 /// Per-view resolved composition state. The single source every
@@ -135,8 +132,7 @@ pub struct ResolvedEncoding {
 /// corresponds to a view that holds one.
 ///
 /// Not registered for reflection: the component is render-world internal, and
-/// [`ResolvedEncoding`] embeds [`OutOfGamutHandling`], which has no `Reflect`
-/// implementation.
+/// [`StackRole`] and [`BlitDisposition`] have no `Reflect` implementations.
 #[derive(Component, Clone, Copy, PartialEq, Debug)]
 pub struct ViewStackContract {
     /// Role of this view's tonemapping pass.
@@ -484,13 +480,11 @@ pub fn resolve_camera_stack_contracts(
         Option<&ResolvedCompositingSpace>,
     )>,
     working_color_space: Res<WorkingColorSpace>,
-    gamut_compression: Res<DisplayGamutCompression>,
 ) {
     // Encode parameters resolve once per texture group: members share one
     // `ViewDisplayTarget` (it resolves per render target, and the target is
     // part of the texture grouping key), so transfer and gamut are uniform
-    // across a group; only the out-of-gamut handling varies per view with
-    // its `source_gamut`. Resolving from the first-iterated member's
+    // across a group. Resolving from the first-iterated member's
     // `ViewDisplayTarget` therefore matches the per-member `encode_enabled`
     // used by `resolve_contracts` (both read `is_hdr_transfer()` off the same
     // shared target). The shared-target invariant holds in every supported
@@ -499,8 +493,7 @@ pub fn resolve_camera_stack_contracts(
     // plain SDR, out of scope per the spec). The `debug_assert!` makes that
     // divergence loud in debug builds rather than letting it silently mix an
     // encoded group with an unencoded out-texture clear.
-    let mut group_encodings: HashMap<TextureId, Option<(DisplayTransfer, DisplayGamut)>> =
-        HashMap::default();
+    let mut group_encodings: HashMap<TextureId, Option<ResolvedEncoding>> = HashMap::default();
     let mut inputs = Vec::new();
     for (entity, camera, view_target, view_display_target, tonemapping, resolved_space) in &views {
         let texture = view_target.main_texture().id();
@@ -545,12 +538,7 @@ pub fn resolve_camera_stack_contracts(
         let encoding = group_encodings
             .get(&view_target.main_texture().id())
             .copied()
-            .flatten()
-            .map(|(transfer, gamut)| ResolvedEncoding {
-                transfer,
-                gamut,
-                out_of_gamut: resolve_out_of_gamut(*gamut_compression, output.source_gamut, gamut),
-            });
+            .flatten();
 
         commands.entity(entity).insert(ViewStackContract {
             tonemap: output.tonemap,
@@ -571,7 +559,7 @@ fn resolve_group_encode_parameters(
     view_display_target: Option<&ViewDisplayTarget>,
     view_target: &ViewTarget,
     working_color_space: WorkingColorSpace,
-) -> Option<(DisplayTransfer, DisplayGamut)> {
+) -> Option<ResolvedEncoding> {
     let view_display_target = view_display_target?;
     if !view_display_target.is_hdr_transfer() {
         return None;
@@ -608,7 +596,8 @@ fn resolve_group_encode_parameters(
     }
 
     let target = view_display_target.resolved;
-    Some(coerce_display_encode(target.transfer, target.gamut))
+    let (transfer, gamut) = coerce_display_encode(target.transfer, target.gamut);
+    Some(ResolvedEncoding { transfer, gamut })
 }
 
 /// The prepare-time display-encode coercion chain over the resolved transfer
@@ -619,7 +608,7 @@ fn resolve_group_encode_parameters(
 /// before the transfer-specific gamut arms. Each arm reports the coercion it
 /// applies as a `warn_once` / `info_once`; the result depends on nothing but
 /// the arguments, so the chain is tested directly.
-fn coerce_display_encode(
+pub(crate) fn coerce_display_encode(
     transfer: DisplayTransfer,
     gamut: DisplayGamut,
 ) -> (DisplayTransfer, DisplayGamut) {
@@ -673,28 +662,6 @@ fn coerce_display_encode(
         gamut = DisplayGamut::Rec2020;
     }
     (transfer, gamut)
-}
-
-/// Resolves the encoder's out-of-gamut handling for one view from the global
-/// [`DisplayGamutCompression`] setting: under `Auto`, compression is keyed in
-/// exactly when the gamut stage contracts (the buffer's primaries are wider
-/// than the resolved display primaries).
-fn resolve_out_of_gamut(
-    gamut_compression: DisplayGamutCompression,
-    source_gamut: DisplayGamut,
-    display_gamut: DisplayGamut,
-) -> OutOfGamutHandling {
-    match gamut_compression {
-        DisplayGamutCompression::Auto => {
-            if is_gamut_contraction(source_gamut, display_gamut) {
-                OutOfGamutHandling::Compress
-            } else {
-                OutOfGamutHandling::Clip
-            }
-        }
-        DisplayGamutCompression::Always => OutOfGamutHandling::Compress,
-        DisplayGamutCompression::Clip => OutOfGamutHandling::ClipDebug,
-    }
 }
 
 /// Reports the resolver diagnostics that fired for one view.
