@@ -5,11 +5,12 @@ use super::{
 };
 use bevy_asset::{load_embedded_asset, AssetServer, Handle};
 use bevy_ecs::{
-    prelude::{Component, Entity},
+    prelude::{Component, Entity, With},
     resource::Resource,
     system::{Commands, Query, Res, ResMut},
 };
 use bevy_render::{
+    camera::ExtractedCamera,
     render_resource::{
         binding_types::{sampler, texture_2d, uniform_buffer},
         *,
@@ -135,7 +136,7 @@ pub fn prepare_upsampling_pipeline(
     pipeline_cache: Res<PipelineCache>,
     mut pipelines: ResMut<SpecializedRenderPipelines<BloomUpsamplingPipeline>>,
     pipeline: Res<BloomUpsamplingPipeline>,
-    views: Query<(&ExtractedView, Entity, &Bloom, Option<&ViewDisplayTarget>)>,
+    views: Query<(&ExtractedView, Entity, &Bloom, &ViewDisplayTarget), With<ExtractedCamera>>,
 ) {
     for (view, entity, bloom, display_target) in &views {
         // `effective_composite_mode`: the GT7 glare scatter model derives
@@ -157,7 +158,7 @@ pub fn prepare_upsampling_pipeline(
                 // The intermediate upsample passes render into the bloom
                 // pyramid, whose format is per-view (fp16 on HDR display
                 // targets); the final pass below targets the view target.
-                target_format: bloom_texture_format(display_target),
+                target_format: bloom_texture_format(Some(display_target)),
             },
         );
 

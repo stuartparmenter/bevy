@@ -247,7 +247,7 @@ pub fn prepare_fxaa_pipelines(
             Entity,
             &ExtractedView,
             &Fxaa,
-            Option<&ViewDisplayTarget>,
+            &ViewDisplayTarget,
             Option<&ResolvedCompositingSpace>,
         ),
         With<ExtractedCamera>,
@@ -264,8 +264,7 @@ pub fn prepare_fxaa_pipelines(
                 edge_threshold: fxaa.edge_threshold,
                 edge_threshold_min: fxaa.edge_threshold_min,
                 target_format: view.target_format,
-                // Missing `ViewDisplayTarget` means plain SDR (see its docs).
-                hdr: display_target.is_some_and(ViewDisplayTarget::is_hdr_transfer),
+                hdr: display_target.is_hdr_transfer(),
                 // The phase-1 resolved space, not the camera's raw request: a
                 // signed-a/b Oklab buffer needs the Oklab-L luma path.
                 oklab_compositing: resolved_space.and_then(|space| space.0)

@@ -451,7 +451,7 @@ fn prepare_taa_pipelines(
         &ExtractedView,
         &TemporalAntiAliasing,
         Option<&Tonemapping>,
-        Option<&ViewDisplayTarget>,
+        &ViewDisplayTarget,
     )>,
 ) -> Result<(), BevyError> {
     for (entity, camera, view, taa_settings, tonemapping, display_target) in &cameras {
@@ -467,7 +467,7 @@ fn prepare_taa_pipelines(
             // is forced to an unclamped fp16 format even with `Tonemapping::None`.
             tonemap: camera.hdr
                 || tonemapping.is_some_and(Tonemapping::is_enabled)
-                || display_target.is_some_and(ViewDisplayTarget::is_hdr_transfer),
+                || display_target.is_hdr_transfer(),
             reset: taa_settings.reset,
         };
         let pipeline_id = pipeline

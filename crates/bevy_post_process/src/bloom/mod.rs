@@ -67,7 +67,8 @@ const DEFAULT_PAPER_WHITE_NITS: f32 = 100.0;
 ///
 /// Used by texture creation ([`prepare_bloom_textures`]) and both pipeline
 /// specializations so they can never disagree about the format. A missing
-/// [`ViewDisplayTarget`] means plain SDR (see its docs).
+/// [`ViewDisplayTarget`] (a view never extracted as a camera) means plain
+/// SDR.
 pub(crate) fn bloom_texture_format(display_target: Option<&ViewDisplayTarget>) -> TextureFormat {
     if display_target.is_some_and(ViewDisplayTarget::is_hdr_transfer) {
         BLOOM_TEXTURE_FORMAT_HDR
@@ -374,7 +375,7 @@ fn resolve_bloom_threshold_nits(
             continue;
         }
         let paper_white_nits = display_target
-            .map(|target| target.resolved.sanitized_paper_white_nits())
+            .map(|target| target.sanitized_paper_white_nits())
             .unwrap_or(DEFAULT_PAPER_WHITE_NITS);
         uniforms.threshold_precomputations = BloomUniforms::threshold_precomputations(
             bloom.prefilter.resolve_threshold(paper_white_nits),
@@ -387,7 +388,7 @@ fn prepare_bloom_textures(
     mut commands: Commands,
     mut texture_cache: ResMut<TextureCache>,
     render_device: Res<RenderDevice>,
-    views: Query<(Entity, &ExtractedCamera, &Bloom, Option<&ViewDisplayTarget>)>,
+    views: Query<(Entity, &ExtractedCamera, &Bloom, &ViewDisplayTarget)>,
 ) {
     for (entity, camera, bloom, display_target) in &views {
         if let Some(viewport) = camera.physical_viewport_size {
@@ -409,7 +410,7 @@ fn prepare_bloom_textures(
                 mip_level_count: mip_count,
                 sample_count: 1,
                 dimension: TextureDimension::D2,
-                format: bloom_texture_format(display_target),
+                format: bloom_texture_format(Some(display_target)),
                 usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             };

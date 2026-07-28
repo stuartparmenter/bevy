@@ -82,10 +82,9 @@ falls back to plain SDR sRGB — byte-identical to a default window — when the
 surface offers nothing better (SDR displays, OS HDR disabled, X11, GLES). A
 cross-HDR downgrade (PQ → scRGB) keeps your calibration values and swaps only
 the transfer. The outcome is visible in the render world: `ViewDisplayTarget`
-carries both the `requested` and the `resolved` display target, and every
-consumer (the encoding pass, the upscaling blit, GT7's HDR mode, the
-display-target uniform) keys on `resolved`, so an unfulfilled HDR request can
-never mis-encode the image. Bevy also renegotiates defensively if the
+carries the post-negotiation display target, and every consumer (the encoding
+pass, the upscaling blit, GT7's HDR mode, the display-target uniform) keys on
+it, so an unfulfilled HDR request can never mis-encode the image. Bevy also renegotiates defensively if the
 capabilities change at runtime (e.g. the OS HDR toggle is flipped) rather than
 failing surface validation.
 

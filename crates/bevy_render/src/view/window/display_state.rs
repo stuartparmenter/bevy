@@ -108,7 +108,7 @@ const EPSILON_REL: f32 = 0.01;
 /// Per-surface committed live state and last capability, keyed by window entity.
 /// Render-world only.
 #[derive(Resource, Default)]
-pub struct DisplayStateStore {
+pub(crate) struct DisplayStateStore {
     /// The committed (post-epsilon) [`WindowDisplayState`] per surface. A
     /// present-but-`None` entry marks a surface that has been read on a platform
     /// that reports nothing: it stops the per-frame re-read without minting a
@@ -185,7 +185,7 @@ fn commit(
 /// and an HDR resolved transfer, so SDR and all-manual projects never pay it.
 /// A read on a platform that reports nothing marks the surface seen (so it is
 /// not re-read every frame) but commits nothing — `None` never means "SDR".
-pub fn poll_display_state(
+pub(crate) fn poll_display_state(
     // Apple's relative-headroom query gates on the main thread; pin the system
     // there, matching `create_surfaces`.
     #[cfg(any(target_os = "macos", target_os = "ios"))] _marker: bevy_ecs::system::NonSendMarker,
@@ -261,7 +261,7 @@ pub fn poll_display_state(
 /// [`Changed`] stays a usable signal.
 ///
 /// [`Monitor`]: bevy_window::Monitor
-pub fn write_back_display_state(
+pub(crate) fn write_back_display_state(
     mut main_world: ResMut<MainWorld>,
     window_surfaces: Res<WindowSurfaces>,
     store: Res<DisplayStateStore>,

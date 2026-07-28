@@ -467,15 +467,14 @@ fn resolve_group<K>(members: &[ContractInput<K>], outputs: &mut EntityHashMap<Co
 /// The stack rules live on `resolve_contracts`; this system feeds it,
 /// resolves the encode parameters per group (the coercion chain over the
 /// group's shared `ViewDisplayTarget`), reports the diagnostics as
-/// `warn_once`s, and inserts the contracts. A missing [`ViewDisplayTarget`]
-/// counts as a plain SDR target.
+/// `warn_once`s, and inserts the contracts.
 pub fn resolve_camera_stack_contracts(
     mut commands: Commands,
     views: Query<(
         Entity,
         &ExtractedCamera,
         &ViewTarget,
-        Option<&ViewDisplayTarget>,
+        &ViewDisplayTarget,
         Option<&Tonemapping>,
         Option<&ResolvedCompositingSpace>,
     )>,
@@ -489,15 +488,15 @@ pub fn resolve_camera_stack_contracts(
     // used by `resolve_contracts` (both read `is_hdr_transfer()` off the same
     // shared target). The shared-target invariant holds in every supported
     // configuration; it can break only in the pathological plugin order where
-    // a camera view momentarily lacks its `ViewDisplayTarget` (treated as
-    // plain SDR, out of scope per the spec). The `debug_assert!` makes that
-    // divergence loud in debug builds rather than letting it silently mix an
-    // encoded group with an unencoded out-texture clear.
+    // a camera view still holds its default (plain SDR) `ViewDisplayTarget`,
+    // out of scope per the spec. The `debug_assert!` makes that divergence
+    // loud in debug builds rather than letting it silently mix an encoded
+    // group with an unencoded out-texture clear.
     let mut group_encodings: HashMap<TextureId, Option<ResolvedEncoding>> = HashMap::default();
     let mut inputs = Vec::new();
     for (entity, camera, view_target, view_display_target, tonemapping, resolved_space) in &views {
         let texture = view_target.main_texture().id();
-        let encode_enabled = view_display_target.is_some_and(ViewDisplayTarget::is_hdr_transfer);
+        let encode_enabled = view_display_target.is_hdr_transfer();
         let encoding = *group_encodings.entry(texture).or_insert_with(|| {
             resolve_group_encode_parameters(view_display_target, view_target, *working_color_space)
         });
@@ -554,13 +553,12 @@ pub fn resolve_camera_stack_contracts(
 /// Resolves a texture group's display transfer and gamut: the group-level
 /// display-target diagnostics plus [`coerce_display_encode`]. Returns `None`
 /// for groups whose resolved display target does not request an HDR transfer
-/// (no encode pass; a missing [`ViewDisplayTarget`] counts as plain SDR).
+/// (no encode pass).
 fn resolve_group_encode_parameters(
-    view_display_target: Option<&ViewDisplayTarget>,
+    view_display_target: &ViewDisplayTarget,
     view_target: &ViewTarget,
     working_color_space: WorkingColorSpace,
 ) -> Option<ResolvedEncoding> {
-    let view_display_target = view_display_target?;
     if !view_display_target.is_hdr_transfer() {
         return None;
     }
@@ -595,8 +593,8 @@ fn resolve_group_encode_parameters(
         );
     }
 
-    let target = view_display_target.resolved;
-    let (transfer, gamut) = coerce_display_encode(target.transfer, target.gamut);
+    let (transfer, gamut) =
+        coerce_display_encode(view_display_target.transfer, view_display_target.gamut);
     Some(ResolvedEncoding { transfer, gamut })
 }
 

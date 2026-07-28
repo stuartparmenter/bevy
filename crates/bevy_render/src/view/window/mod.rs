@@ -25,11 +25,11 @@ use wgpu::{
     SurfaceTargetUnsafe, TextureFormat, TextureUsages, TextureViewDescriptor,
 };
 
-pub mod display_state;
+pub(crate) mod display_state;
 pub mod display_target;
 pub mod screenshot;
 
-pub use display_state::*;
+pub(crate) use display_state::*;
 pub use display_target::*;
 use screenshot::ScreenshotPlugin;
 

@@ -634,10 +634,7 @@ fn prepare_smaa_pipelines(
     pipeline_cache: Res<PipelineCache>,
     mut specialized_render_pipelines: ResMut<SmaaSpecializedRenderPipelines>,
     smaa_pipelines: Res<SmaaPipelines>,
-    cameras: Query<
-        (Entity, &ExtractedView, &Smaa, Option<&ViewDisplayTarget>),
-        With<ExtractedCamera>,
-    >,
+    cameras: Query<(Entity, &ExtractedView, &Smaa, &ViewDisplayTarget), With<ExtractedCamera>>,
 ) {
     for (entity, view, smaa, display_target) in &cameras {
         let edge_detection_pipeline_id = specialized_render_pipelines.edge_detection.specialize(
@@ -645,8 +642,7 @@ fn prepare_smaa_pipelines(
             &smaa_pipelines.edge_detection,
             SmaaEdgeDetectionPipelineKey {
                 preset: smaa.preset,
-                // Missing `ViewDisplayTarget` means plain SDR (see its docs).
-                hdr: display_target.is_some_and(ViewDisplayTarget::is_hdr_transfer),
+                hdr: display_target.is_hdr_transfer(),
             },
         );
 

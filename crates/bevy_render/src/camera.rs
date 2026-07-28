@@ -457,7 +457,7 @@ pub fn camera_system(
 /// view comes from a camera. For example, views can come from lights,
 /// for drawing shadow maps.
 #[derive(Component, Debug)]
-#[require(RenderVisibleEntities)]
+#[require(RenderVisibleEntities, ViewDisplayTarget)]
 pub struct ExtractedCamera {
     pub target: Option<NormalizedRenderTarget>,
     pub physical_viewport_size: Option<UVec2>,
@@ -858,15 +858,15 @@ fn main_texture_mode(camera: MainTextureCamera) -> MainTextureMode {
     // `Srgb` would route to `Rgba8Unorm` (no hardware sRGB encode, which the 3D
     // fold relies on) and `Oklab` needs signed-float storage — both keep the
     // node-side path. `NeedsNodeTonemapping` excludes operators whose config
-    // the fold cannot reproduce (custom GT7 params). The resolved display
-    // target, not the requested one, decides: a downgraded HDR request folds
-    // like any other SDR view.
+    // the fold cannot reproduce (custom GT7 params). The display target is
+    // the post-negotiation value, so a downgraded HDR request folds like any
+    // other SDR view.
     let eligible_in_shader_tonemap = tonemapping_enabled
         && !hdr
         && !needs_scene_linear_target
         && !needs_node_tonemapping
         && compositing_space.is_none_or(|s| s == CompositingSpace::Linear)
-        && display_target.resolved == DisplayTarget::SDR_SRGB
+        && *display_target == DisplayTarget::SDR_SRGB
         && matches!(target, Some(NormalizedRenderTarget::Window(_)))
         && cameras_on_target.is_some_and(|count| count <= 1);
 
@@ -1354,7 +1354,7 @@ mod tests {
             needs_scene_linear_target: false,
             needs_node_tonemapping: false,
             compositing_space: None,
-            display_target: ViewDisplayTarget::fulfilled(DisplayTarget::SDR_SRGB),
+            display_target: ViewDisplayTarget(DisplayTarget::SDR_SRGB),
             target: Some(target),
             cameras_on_target: Some(1),
         }
@@ -1364,7 +1364,7 @@ mod tests {
     fn main_texture_mode_selects_the_documented_policy() {
         let window = window_target();
         let texture_view = NormalizedRenderTarget::TextureView(ManualTextureViewHandle(0));
-        let hdr10 = ViewDisplayTarget::fulfilled(DisplayTarget {
+        let hdr10 = ViewDisplayTarget(DisplayTarget {
             transfer: DisplayTransfer::Pq,
             ..DisplayTarget::SDR_SRGB
         });
@@ -1380,17 +1380,6 @@ mod tests {
                 "explicit linear compositing stays eligible",
                 MainTextureCamera {
                     compositing_space: Some(CompositingSpace::Linear),
-                    ..base
-                },
-                MainTextureMode::InShaderTonemapSdr,
-            ),
-            (
-                "a downgraded HDR request folds like any SDR view",
-                MainTextureCamera {
-                    display_target: ViewDisplayTarget {
-                        requested: hdr10.resolved,
-                        resolved: DisplayTarget::SDR_SRGB,
-                    },
                     ..base
                 },
                 MainTextureMode::InShaderTonemapSdr,
@@ -1477,7 +1466,7 @@ mod tests {
             (
                 "a recalibrated SDR target vetoes the fold",
                 MainTextureCamera {
-                    display_target: ViewDisplayTarget::fulfilled(DisplayTarget {
+                    display_target: ViewDisplayTarget(DisplayTarget {
                         paper_white_nits: 203.0,
                         ..DisplayTarget::SDR_SRGB
                     }),

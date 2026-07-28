@@ -66,7 +66,7 @@ pub fn upscaling(
             Some((encoding, view_display_target)) => encode_out_texture_clear_color(
                 color.into(),
                 &encoding,
-                view_display_target.resolved.sanitized_paper_white_nits(),
+                view_display_target.sanitized_paper_white_nits(),
             ),
             None => color.into(),
         }

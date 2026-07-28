@@ -536,12 +536,10 @@ impl ViewTonemappingPipeline {
 /// about it separately).
 pub fn effective_tonemapping(
     tonemapping: Option<&Tonemapping>,
-    view_display_target: Option<&ViewDisplayTarget>,
+    view_display_target: &ViewDisplayTarget,
 ) -> Tonemapping {
     let tonemapping = *tonemapping.unwrap_or(&Tonemapping::None);
-    if tonemapping.is_sdr_only()
-        && view_display_target.is_some_and(ViewDisplayTarget::is_hdr_transfer)
-    {
+    if tonemapping.is_sdr_only() && view_display_target.is_hdr_transfer() {
         Tonemapping::GranTurismo7
     } else {
         tonemapping
@@ -613,16 +611,14 @@ pub fn gt7_params_uniform_active(
 /// the substitution is applied internally so all callers stay in lockstep
 /// with the pipeline that actually runs.
 ///
-/// A missing [`ViewDisplayTarget`] is treated as the plain SDR default
-/// (matching the component's documented fallback), and a missing or
-/// [`Tonemapping::None`] operator emits Rec.709 (pass-through views never
-/// reach the GT7 wrapper).
+/// A missing or [`Tonemapping::None`] operator emits Rec.709 (pass-through
+/// views never reach the GT7 wrapper).
 pub fn tonemap_output_gamut(
     tonemapping: Option<&Tonemapping>,
-    view_display_target: Option<&ViewDisplayTarget>,
+    view_display_target: &ViewDisplayTarget,
 ) -> DisplayGamut {
     if effective_tonemapping(tonemapping, view_display_target) == Tonemapping::GranTurismo7
-        && view_display_target.is_some_and(ViewDisplayTarget::is_hdr_transfer)
+        && view_display_target.is_hdr_transfer()
     {
         DisplayGamut::Rec2020
     } else {
@@ -647,7 +643,7 @@ fn tonemapping_key_flags(
     external_white_balance: bool,
     compositing_space: Option<CompositingSpace>,
     requested_tonemapping: Tonemapping,
-    view_display_target: Option<&ViewDisplayTarget>,
+    view_display_target: &ViewDisplayTarget,
     has_gt7_params_uniform: bool,
 ) -> TonemappingPipelineKeyFlags {
     // As an optimization, we omit parts of the shader that are unneeded.
@@ -716,7 +712,7 @@ pub fn prepare_view_tonemapping_pipelines(
             &ViewStackContract,
             Option<&Tonemapping>,
             Option<&DebandDither>,
-            Option<&ViewDisplayTarget>,
+            &ViewDisplayTarget,
             Has<Gt7ParamsUniform>,
             Has<ExternalWhiteBalance>,
             Has<ViewTonemappingPipeline>,
@@ -942,7 +938,7 @@ mod tests {
     ];
 
     fn hdr_view_display_target() -> ViewDisplayTarget {
-        ViewDisplayTarget::fulfilled(DisplayTarget {
+        ViewDisplayTarget(DisplayTarget {
             paper_white_nits: 200.0,
             peak_luminance_nits: 1000.0,
             transfer: DisplayTransfer::ScRgbLinear,
@@ -951,17 +947,7 @@ mod tests {
     }
 
     fn sdr_view_display_target() -> ViewDisplayTarget {
-        ViewDisplayTarget::fulfilled(DisplayTarget::SDR_SRGB)
-    }
-
-    /// A view whose HDR request was downgraded at surface negotiation: the
-    /// resolved target is plain SDR, so it must behave exactly like an SDR
-    /// view.
-    fn downgraded_view_display_target() -> ViewDisplayTarget {
-        ViewDisplayTarget {
-            requested: hdr_view_display_target().requested,
-            resolved: DisplayTarget::SDR_SRGB,
-        }
+        ViewDisplayTarget(DisplayTarget::SDR_SRGB)
     }
 
     #[test]
@@ -980,7 +966,7 @@ mod tests {
     fn sdr_only_operator_substitution_fires_exactly_for_sdr_only_operators_on_hdr_targets() {
         let hdr = hdr_view_display_target();
         for operator in ALL_OPERATORS {
-            let effective = effective_tonemapping(Some(&operator), Some(&hdr));
+            let effective = effective_tonemapping(Some(&operator), &hdr);
             if operator.is_sdr_only() {
                 // SDR-only operator + HDR transfer → GT7 substitute (never
                 // `None`, never an operator capped at paper white).
@@ -1000,23 +986,16 @@ mod tests {
     #[test]
     fn sdr_only_operator_substitution_never_fires_off_hdr_targets() {
         for operator in ALL_OPERATORS {
-            // Plain SDR target.
+            // Plain SDR target — including an HDR request downgraded at
+            // surface negotiation, which resolves to the same value.
             assert_eq!(
-                effective_tonemapping(Some(&operator), Some(&sdr_view_display_target())),
+                effective_tonemapping(Some(&operator), &sdr_view_display_target()),
                 operator
             );
-            // HDR request downgraded at surface negotiation: resolved target
-            // is SDR, so the view keeps the authored operator unchanged.
-            assert_eq!(
-                effective_tonemapping(Some(&operator), Some(&downgraded_view_display_target())),
-                operator
-            );
-            // Missing `ViewDisplayTarget` is the documented SDR fallback.
-            assert_eq!(effective_tonemapping(Some(&operator), None), operator);
         }
         // Missing operator is `None` (which is never substituted).
         assert_eq!(
-            effective_tonemapping(None, Some(&hdr_view_display_target())),
+            effective_tonemapping(None, &hdr_view_display_target()),
             Tonemapping::None
         );
     }
@@ -1033,21 +1012,13 @@ mod tests {
                 DisplayGamut::Rec2020
             };
             assert_eq!(
-                tonemap_output_gamut(Some(&operator), Some(&hdr)),
+                tonemap_output_gamut(Some(&operator), &hdr),
                 expected,
                 "output gamut mismatch for {operator:?} on an HDR target"
             );
-            // SDR (and downgraded, and missing) targets are always Rec.709.
+            // SDR targets (downgraded requests included) are always Rec.709.
             assert_eq!(
-                tonemap_output_gamut(Some(&operator), Some(&sdr_view_display_target())),
-                DisplayGamut::Rec709
-            );
-            assert_eq!(
-                tonemap_output_gamut(Some(&operator), Some(&downgraded_view_display_target())),
-                DisplayGamut::Rec709
-            );
-            assert_eq!(
-                tonemap_output_gamut(Some(&operator), None),
+                tonemap_output_gamut(Some(&operator), &sdr_view_display_target()),
                 DisplayGamut::Rec709
             );
         }
@@ -1075,7 +1046,7 @@ mod tests {
             if !operator.is_sdr_only() {
                 continue;
             }
-            let effective = effective_tonemapping(Some(&operator), Some(&hdr));
+            let effective = effective_tonemapping(Some(&operator), &hdr);
             assert!(gt7_params_uniform_active(effective, false, true));
             assert!(gt7_params_uniform_active(effective, true, true));
         }
@@ -1096,21 +1067,19 @@ mod tests {
     #[test]
     fn solo_sdr_default_keys_empty_flags() {
         for operator in ALL_OPERATORS {
-            for view_display_target in [None, Some(sdr_view_display_target())] {
-                let flags = tonemapping_key_flags(
-                    &ColorGrading::default(),
-                    false,
-                    None,
-                    operator,
-                    view_display_target.as_ref(),
-                    false,
-                );
-                assert_eq!(
-                    flags,
-                    TonemappingPipelineKeyFlags::empty(),
-                    "flags must be empty for {operator:?} on a plain SDR target"
-                );
-            }
+            let flags = tonemapping_key_flags(
+                &ColorGrading::default(),
+                false,
+                None,
+                operator,
+                &sdr_view_display_target(),
+                false,
+            );
+            assert_eq!(
+                flags,
+                TonemappingPipelineKeyFlags::empty(),
+                "flags must be empty for {operator:?} on a plain SDR target"
+            );
         }
     }
 
@@ -1124,7 +1093,7 @@ mod tests {
                 false,
                 space,
                 Tonemapping::None,
-                Some(&sdr_view_display_target()),
+                &sdr_view_display_target(),
                 false,
             )
         };

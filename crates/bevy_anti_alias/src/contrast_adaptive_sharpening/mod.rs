@@ -9,6 +9,7 @@ use bevy_core_pipeline::{
 use bevy_ecs::{prelude::*, query::QueryItem};
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
 use bevy_render::{
+    camera::ExtractedCamera,
     extract_component::{ExtractComponent, ExtractComponentPlugin, UniformComponentPlugin},
     render_resource::{
         binding_types::{sampler, texture_2d, uniform_buffer},
@@ -239,13 +240,11 @@ fn prepare_cas_pipelines(
     pipeline_cache: Res<PipelineCache>,
     mut sharpening_pipeline: ResMut<CasPipeline>,
     cameras: Query<
+        (Entity, &ExtractedView, &DenoiseCas, &ViewDisplayTarget),
         (
-            Entity,
-            &ExtractedView,
-            &DenoiseCas,
-            Option<&ViewDisplayTarget>,
+            With<ExtractedCamera>,
+            Or<(Added<CasUniform>, Changed<DenoiseCas>)>,
         ),
-        Or<(Added<CasUniform>, Changed<DenoiseCas>)>,
     >,
     mut removals: RemovedComponents<CasUniform>,
 ) -> Result<(), BevyError> {
@@ -259,8 +258,7 @@ fn prepare_cas_pipelines(
             CasPipelineKey {
                 denoise: denoise_cas.0,
                 target_format: view.target_format,
-                // Missing `ViewDisplayTarget` means plain SDR (see its docs).
-                hdr: display_target.is_some_and(ViewDisplayTarget::is_hdr_transfer),
+                hdr: display_target.is_hdr_transfer(),
             },
         )?;
 

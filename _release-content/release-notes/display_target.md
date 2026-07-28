@@ -19,8 +19,8 @@ output through the display-encoding pass, and the `Rgba16Float` scRGB
 swapchain format (see the "HDR display output (scRGB-linear)" release note).
 
 In the render world, every camera view resolves its target's calibration into
-a `ViewDisplayTarget` component, carrying both the `requested` calibration and
-the `resolved` one after surface negotiation. The outcome is also mirrored back
+a `ViewDisplayTarget` component carrying the post-negotiation calibration.
+The outcome is also mirrored back
 to the main world as a read-only `WindowSurfaceTransfers` component on the
 window: `resolved` is the transfer the surface actually presents, so apps can
 detect a downgraded HDR request, and `supported` is the set of transfers this

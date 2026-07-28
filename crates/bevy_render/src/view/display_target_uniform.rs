@@ -7,16 +7,15 @@
 //!
 //! 1. [`prepare_view_display_targets`] runs in
 //!    [`RenderSystems::PrepareViews`](crate::RenderSystems::PrepareViews) and
-//!    inserts a [`ViewDisplayTarget`] on every extracted camera view, using
-//!    [`resolve_display_target`] for the *requested* target and the window
-//!    surface's negotiated transfer
+//!    inserts a [`ViewDisplayTarget`] on every extracted camera view: the
+//!    target's authored [`DisplayTarget`] (via [`resolve_display_target`])
+//!    with the window surface's negotiated transfer
 //!    ([`ExtractedWindow::resolved_transfer`](super::window::ExtractedWindow::resolved_transfer))
-//!    for the *resolved* one: when the surface could not fulfil the requested
-//!    transfer (e.g. scRGB-linear on a backend without `Rgba16Float`
-//!    surfaces), the resolved target degrades to
-//!    [`DisplayTarget::SDR_SRGB`], so downgraded views take the same plain
-//!    SDR path as a natively-SDR view. Views whose target cannot be resolved
-//!    fall back to
+//!    folded in. When the surface could not fulfil the requested transfer
+//!    (e.g. scRGB-linear on a backend without `Rgba16Float` surfaces), the
+//!    target degrades to [`DisplayTarget::SDR_SRGB`], so downgraded views
+//!    take the same plain SDR path as a natively-SDR view. Views whose target
+//!    cannot be resolved fall back to
 //!    [`DisplayTarget::SDR_SRGB`]. All cameras rendering to the same surface
 //!    resolve to the same value by construction.
 //! 2. The same system also inserts the [`DisplayTargetUniform`] built from the
@@ -41,6 +40,7 @@
 //! `bevy_render::display_target`.
 
 use bevy_camera::NormalizedRenderTarget;
+use bevy_derive::Deref;
 use bevy_ecs::prelude::*;
 use bevy_log::warn_once;
 use bevy_window::{DisplayTarget, DisplayTransfer};
@@ -54,66 +54,37 @@ use super::{
 };
 use crate::{camera::ExtractedCamera, render_resource::ShaderType};
 
-/// Render-world component holding the [`DisplayTarget`] of the surface
-/// (window, image, or manual texture view) a view renders to, in both its
-/// *requested* and *resolved* forms.
+/// Render-world component holding the post-negotiation [`DisplayTarget`] of
+/// the surface (window, image, or manual texture view) a view renders to.
 ///
-/// Inserted by [`prepare_view_display_targets`] on every extracted view that
-/// has an [`ExtractedCamera`]; falls back to [`DisplayTarget::SDR_SRGB`] when
-/// the camera's render target has no explicit display target. Views without a
-/// camera (e.g. shadow views) do not receive this component; consumers should
-/// treat a missing component as [`DisplayTarget::SDR_SRGB`].
+/// Required by [`ExtractedCamera`], defaulting to [`DisplayTarget::SDR_SRGB`];
+/// [`prepare_view_display_targets`] overwrites it every frame with the
+/// resolved value: the target's authored [`DisplayTarget`] with the window
+/// surface's negotiated transfer folded in (see
+/// `resolve_window_display_target` in this module). Views whose target cannot
+/// be resolved fall back to [`DisplayTarget::SDR_SRGB`].
 ///
 /// Prepare-time systems (tonemapping pipeline specialization, operator uniform
-/// preparation, the display-encoding pass, and the upscaling blit) read the
-/// [`resolved`](Self::resolved) target instead of re-resolving the render
-/// target themselves, so they always agree on whether a view takes the HDR
-/// path — and they key on what the surface can actually show, never on an
-/// unfulfilled request.
-#[derive(Component, Debug, Clone, Copy, PartialEq)]
-pub struct ViewDisplayTarget {
-    /// The display target this view's render target resolves to (a window's
-    /// `EffectiveDisplayTarget`, or a manual target's `ManualDisplayTargets`
-    /// entry), before surface negotiation.
-    ///
-    /// Useful for diagnostics and for re-resolution logic; rendering systems
-    /// should use [`resolved`](Self::resolved).
-    pub requested: DisplayTarget,
-    /// The display target after surface negotiation.
-    ///
-    /// Equal to [`requested`](Self::requested) when the surface fulfils the
-    /// requested transfer (or the target is not a window surface, where the
-    /// user owns the texture format). When the requested transfer had to be
-    /// downgraded (see `negotiate_surface_format` in `view::window`), this
-    /// is [`DisplayTarget::SDR_SRGB`] for a full SDR downgrade (so the
-    /// downgraded view takes the same plain SDR path as a natively-SDR view),
-    /// or the requested target with only the transfer replaced when the surface
-    /// carries a *different HDR* transfer (PQ downgraded to scRGB-linear) —
-    /// the user's calibration still applies.
-    /// See `resolve_window_display_target` in this module.
-    pub resolved: DisplayTarget,
-}
+/// preparation, the display-encoding pass, and the upscaling blit) read this
+/// target instead of re-resolving the render target themselves, so they
+/// always agree on whether a view takes the HDR path — and they key on what
+/// the surface can actually show, never on an unfulfilled request (the
+/// requested-vs-granted downgrade warnings fire at negotiation time in
+/// `negotiate_surface_format` in `view::window`).
+#[derive(Component, Debug, Clone, Copy, PartialEq, Deref, Default)]
+pub struct ViewDisplayTarget(pub DisplayTarget);
 
 impl ViewDisplayTarget {
-    /// Creates a `ViewDisplayTarget` whose resolved target equals the
-    /// requested one (no surface-side downgrade).
-    pub fn fulfilled(target: DisplayTarget) -> Self {
-        Self {
-            requested: target,
-            resolved: target,
-        }
-    }
-
-    /// Returns `true` if the **resolved** transfer function is a high dynamic
-    /// range transfer (see [`DisplayTransfer::is_hdr`]).
+    /// Returns `true` if the transfer function is a high dynamic range
+    /// transfer (see [`DisplayTransfer::is_hdr`]).
     ///
     /// This gates the display-encoding pass and the upscaling blit's
     /// pass-through mode, and HDR-capable operators (e.g.
     /// `Tonemapping::GranTurismo7`) use it to pick their HDR mode at prepare
-    /// time. Because it reads the resolved transfer, a view whose HDR request
-    /// was downgraded behaves exactly like a plain SDR view.
+    /// time. Because the component holds the post-negotiation target, a view
+    /// whose HDR request was downgraded behaves exactly like a plain SDR view.
     pub fn is_hdr_transfer(&self) -> bool {
-        self.resolved.transfer.is_hdr()
+        self.0.transfer.is_hdr()
     }
 }
 
@@ -209,12 +180,7 @@ pub(crate) fn resolve_view_display_target(
             .and_then(|window| window.resolved_transfer),
         _ => None,
     };
-    let resolved = resolve_window_display_target(requested, surface_transfer);
-
-    ViewDisplayTarget {
-        requested,
-        resolved,
-    }
+    ViewDisplayTarget(resolve_window_display_target(requested, surface_transfer))
 }
 
 /// Resolves and inserts a [`ViewDisplayTarget`] on every extracted view that
@@ -269,8 +235,8 @@ pub fn prepare_view_display_targets(
             &extracted_windows,
             &manual_display_targets,
         );
-        let authored = view_display_target.resolved.paper_white_nits;
-        let sanitized = view_display_target.resolved.sanitized_paper_white_nits();
+        let authored = view_display_target.paper_white_nits;
+        let sanitized = view_display_target.sanitized_paper_white_nits();
         // Sanitize and warn for every view, not just HDR ones: SDR consumers
         // (bloom's nits-denominated threshold) fold the sanitized value too,
         // and this is the only diagnostic a plain-SDR project gets.
@@ -403,11 +369,11 @@ mod tests {
 
     #[test]
     fn view_display_target_is_hdr_transfer() {
-        let sdr = ViewDisplayTarget::fulfilled(DisplayTarget::SDR_SRGB);
+        let sdr = ViewDisplayTarget(DisplayTarget::SDR_SRGB);
         assert!(!sdr.is_hdr_transfer());
 
         // A non-transfer field change does not flip the HDR predicate.
-        let brighter = ViewDisplayTarget::fulfilled(DisplayTarget {
+        let brighter = ViewDisplayTarget(DisplayTarget {
             paper_white_nits: 203.0,
             ..DisplayTarget::SDR_SRGB
         });
@@ -418,7 +384,7 @@ mod tests {
             DisplayTransfer::Pq,
             DisplayTransfer::ExtendedSrgb,
         ] {
-            let hdr = ViewDisplayTarget::fulfilled(DisplayTarget {
+            let hdr = ViewDisplayTarget(DisplayTarget {
                 transfer,
                 ..DisplayTarget::SDR_SRGB
             });
@@ -476,19 +442,20 @@ mod tests {
 
     #[test]
     fn downgraded_target_takes_the_plain_sdr_path() {
-        // A view whose HDR request was downgraded at surface negotiation
-        // (resolved = SDR_SRGB) must be indistinguishable from a plain SDR
-        // view to every predicate, regardless of what was requested.
-        let downgraded = ViewDisplayTarget {
-            requested: DisplayTarget {
-                paper_white_nits: 200.0,
-                peak_luminance_nits: 1000.0,
-                transfer: DisplayTransfer::ScRgbLinear,
-                ..DisplayTarget::SDR_SRGB
-            },
-            resolved: DisplayTarget::SDR_SRGB,
+        // A view whose HDR request was downgraded at surface negotiation must
+        // be indistinguishable from a plain SDR view to every predicate,
+        // regardless of what was requested.
+        let requested = DisplayTarget {
+            paper_white_nits: 200.0,
+            peak_luminance_nits: 1000.0,
+            transfer: DisplayTransfer::ScRgbLinear,
+            ..DisplayTarget::SDR_SRGB
         };
+        let downgraded = ViewDisplayTarget(resolve_window_display_target(
+            requested,
+            Some(DisplayTransfer::Srgb),
+        ));
         assert!(!downgraded.is_hdr_transfer());
-        assert_eq!(downgraded.resolved, DisplayTarget::SDR_SRGB);
+        assert_eq!(*downgraded, DisplayTarget::SDR_SRGB);
     }
 }

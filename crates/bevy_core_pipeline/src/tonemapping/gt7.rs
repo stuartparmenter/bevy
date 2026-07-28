@@ -533,7 +533,7 @@ pub fn queue_gt7_params_uniforms(
             // to `Tonemapping::None`.
             Option<&Tonemapping>,
             Option<&GranTurismo7Params>,
-            Option<&ViewDisplayTarget>,
+            &ViewDisplayTarget,
             Option<&ViewStackContract>,
             Has<Gt7ParamsUniform>,
         ),
@@ -552,7 +552,7 @@ pub fn queue_gt7_params_uniforms(
             && gt7_params_uniform_active(
                 effective_tonemapping(tonemapping, view_display_target),
                 params.is_some(),
-                view_display_target.is_some_and(ViewDisplayTarget::is_hdr_transfer),
+                view_display_target.is_hdr_transfer(),
             );
 
         if !active {
@@ -565,13 +565,10 @@ pub fn queue_gt7_params_uniforms(
             continue;
         }
 
-        let display_target = view_display_target
-            .map(|view_display_target| view_display_target.resolved)
-            .unwrap_or_default();
         let params = params.copied().unwrap_or_default();
         commands
             .entity(entity)
-            .insert(Gt7ParamsUniform::new(&display_target, &params));
+            .insert(Gt7ParamsUniform::new(view_display_target, &params));
     }
 }
 
