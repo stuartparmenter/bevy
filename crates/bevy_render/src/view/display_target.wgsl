@@ -10,19 +10,10 @@
 
 // The resolved calibration of the display a view is presented on.
 //
-// Luminance fields are in nits (cd/m²). `gamut` and `transfer` hold the
-// `u32` indices documented on the Rust struct. Gamut conversion matrices are
-// not part of this uniform; the gamut-transform pass derives them per
-// pipeline.
+// Paper white is the only calibration value read at runtime; the display
+// gamut and transfer select compile-time shader defs in the display-encoding
+// pipeline instead.
 struct DisplayTargetUniform {
     // Luminance of "paper white" (1.0 at the tone-map operator output), nits.
     paper_white_nits: f32,
-    // Maximum luminance of the display, nits.
-    peak_luminance_nits: f32,
-    // Black level of the display, nits.
-    min_luminance_nits: f32,
-    // Display gamut as a u32 index.
-    gamut: u32,
-    // Resolved transfer function as a u32 index.
-    transfer: u32,
 }

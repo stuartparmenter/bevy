@@ -26,8 +26,8 @@ window: `resolved` is the transfer the surface actually presents, so apps can
 detect a downgraded HDR request, and `supported` is the set of transfers this
 surface could present, so an app can offer only the modes that will work
 instead of requesting one that silently downgrades. Both lag negotiation by one
-frame. A per-view `DisplayTargetUniform` (luminance values
-plus gamut/transfer indices, importable in WGSL as
+frame. A per-view `DisplayTargetUniform` (the paper-white luminance,
+importable in WGSL as
 `bevy_render::display_target`) is prepared each frame for views whose resolved
 transfer is HDR — SDR views carry no display-target uniform — and bound solely
 by the display-encoding (gamut-mapping and transfer-encoding) pass. The GT7

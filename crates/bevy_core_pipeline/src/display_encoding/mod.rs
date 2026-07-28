@@ -315,7 +315,7 @@ pub fn init_display_encoding_pipeline(
             (
                 texture_2d(TextureSampleType::Float { filterable: false }),
                 sampler(SamplerBindingType::NonFiltering),
-                // The per-view display-target calibration (paper white, peak),
+                // The per-view display-target calibration (paper white),
                 // produced by `prepare_view_display_targets` (bevy_render);
                 // this pass is its only binder.
                 uniform_buffer::<DisplayTargetUniform>(true),

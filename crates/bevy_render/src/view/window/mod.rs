@@ -1153,9 +1153,9 @@ pub fn create_surfaces(
                 // carries: the wgpu surface API exposes no HDR10 mastering
                 // metadata (SMPTE ST 2086 display primaries/luminance,
                 // CTA-861.3 MaxCLL/MaxFALL), so drivers apply their own
-                // defaults and `DisplayTarget::peak_luminance_nits` /
-                // `min_luminance_nits` reach the GPU through the view uniform
-                // rather than the swapchain configuration.
+                // defaults. `DisplayTarget` keeps `peak_luminance_nits` and
+                // `min_luminance_nits` so they can feed that metadata once
+                // wgpu exposes it.
                 color_space: negotiated.color_space,
                 width: window.physical_width,
                 height: window.physical_height,

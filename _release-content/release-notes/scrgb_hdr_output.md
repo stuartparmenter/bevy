@@ -94,8 +94,8 @@ fresh (format, color space) negotiation (and invalidates the window's view
 targets), so HDR output can be toggled from a settings menu. A
 `DisplayTarget::gamut` change is treated the same way when the transfer is
 `ExtendedSrgb` (it selects `ExtendedSrgb` vs `ExtendedDisplayP3`); paper white,
-peak, and every other gamut change flow through uniforms without any surface
-work.
+peak, and every other gamut change take effect through per-view uniforms and
+pipeline respecialization without any surface work.
 
 Screenshots understand the new surfaces too: scRGB (`Rgba16Float`) captures
 read back as display-linear floats, HDR10 captures are decoded from the PQ

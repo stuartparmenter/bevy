@@ -55,12 +55,12 @@
 
 @group(0) @binding(0) var in_texture: texture_2d<f32>;
 @group(0) @binding(1) var in_sampler: sampler;
-// Per-view display-target calibration (paper white / peak / gamut / transfer
-// indices). Gamut and transfer are compile-time shader defs here; only the
-// luminance fields are read at runtime. `paper_white_nits` is sanitized by
-// the uniform producer (`prepare_view_display_targets`: finite, positive,
-// <= 10000) with the same rules the tone-map operators fold at prepare time,
-// so the seam scale factors cancel exactly.
+// Per-view display-target calibration. The gamut and transfer are
+// compile-time shader defs here; paper white is the only value read at
+// runtime. It is sanitized by the uniform producer
+// (`prepare_view_display_targets`: finite, positive, <= 10000) with the same
+// rules the tone-map operators fold at prepare time, so the seam scale
+// factors cancel exactly.
 @group(0) @binding(2) var<uniform> display_target: DisplayTargetUniform;
 
 #ifdef DISPLAY_GAMUT_COMPRESSION

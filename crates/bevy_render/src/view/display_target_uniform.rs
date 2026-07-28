@@ -43,7 +43,7 @@
 use bevy_camera::NormalizedRenderTarget;
 use bevy_ecs::prelude::*;
 use bevy_log::warn_once;
-use bevy_window::{DisplayGamut, DisplayTarget, DisplayTransfer};
+use bevy_window::{DisplayTarget, DisplayTransfer};
 
 use super::{
     window::{
@@ -123,22 +123,11 @@ impl ViewDisplayTarget {
 /// `bevy_render::display_target` (`display_target.wgsl`); the two must stay
 /// field-for-field in sync.
 ///
-/// The [`gamut`](Self::gamut) and [`transfer`](Self::transfer) enums are
-/// encoded as `u32` indices:
+/// Paper white is the only calibration value the GPU reads at runtime: the
+/// display gamut and transfer select compile-time shader defs in the
+/// display-encoding pipeline, and the GT7 operator's peak-luminance
+/// parameters are baked on the CPU into its own per-camera uniform.
 ///
-/// | `gamut` | meaning | | `transfer` | meaning |
-/// |---|---|---|---|---|
-/// | 0 | Rec.709 | | 0 | sRGB |
-/// | 1 | Display P3 | | 1 | scRGB linear |
-/// | 2 | Rec.2020 | | 2 | PQ (ST 2084) |
-/// | | | | 3 | (reserved for HLG) |
-/// | | | | 4 | extended sRGB (encoded) |
-///
-/// Gamut conversion matrices are deliberately **not** part of this uniform;
-/// the gamut-transform stage of the display-encoding pass derives them per
-/// pipeline.
-///
-/// The [`From<DisplayTarget>`] conversion copies values verbatim, but
 /// [`prepare_view_display_targets`] sanitizes
 /// [`paper_white_nits`](Self::paper_white_nits) through
 /// [`DisplayTarget::sanitized_paper_white_nits`] before writing — every GPU
@@ -147,48 +136,12 @@ impl ViewDisplayTarget {
 /// operators fold into their seam renormalization, or the two factors stop
 /// cancelling (a `NaN`/zero/negative paper white would otherwise `NaN` or
 /// black out the encoded frame, and a value above the 10000-nit PQ ceiling
-/// would silently disagree with GT7's clamped renormalization). The remaining
-/// fields are unvalidated; consumers with hard numeric requirements (e.g. the
-/// GT7 operator's HDR peak range) sanitize at their own prepare step.
+/// would silently disagree with GT7's clamped renormalization).
 #[derive(Component, Clone, Copy, Debug, PartialEq, ShaderType)]
 pub struct DisplayTargetUniform {
     /// [`DisplayTarget::paper_white_nits`]: the luminance, in nits, that
     /// `1.0` at the tone-map operator output corresponds to.
     pub paper_white_nits: f32,
-    /// [`DisplayTarget::peak_luminance_nits`]: the display's maximum
-    /// luminance in nits.
-    pub peak_luminance_nits: f32,
-    /// [`DisplayTarget::min_luminance_nits`]: the display's black level in
-    /// nits.
-    pub min_luminance_nits: f32,
-    /// The display gamut as a `u32` index (see the type docs).
-    pub gamut: u32,
-    /// The (resolved) transfer function as a `u32` index (see the type
-    /// docs).
-    pub transfer: u32,
-}
-
-impl From<DisplayTarget> for DisplayTargetUniform {
-    fn from(target: DisplayTarget) -> Self {
-        Self {
-            paper_white_nits: target.paper_white_nits,
-            peak_luminance_nits: target.peak_luminance_nits,
-            min_luminance_nits: target.min_luminance_nits,
-            gamut: match target.gamut {
-                DisplayGamut::Rec709 => 0,
-                DisplayGamut::DisplayP3 => 1,
-                DisplayGamut::Rec2020 => 2,
-            },
-            // Index 3 is reserved for a future HLG transfer, so
-            // `ExtendedSrgb` keeps index 4.
-            transfer: match target.transfer {
-                DisplayTransfer::Srgb => 0,
-                DisplayTransfer::ScRgbLinear => 1,
-                DisplayTransfer::Pq => 2,
-                DisplayTransfer::ExtendedSrgb => 4,
-            },
-        }
-    }
 }
 
 /// Resolves a window view's display target from the transfer the configured
@@ -332,13 +285,12 @@ pub fn prepare_view_display_targets(
             );
         }
         if view_display_target.is_hdr_transfer() {
-            let uniform = DisplayTargetUniform {
-                paper_white_nits: sanitized,
-                ..DisplayTargetUniform::from(view_display_target.resolved)
-            };
-            commands
-                .entity(entity)
-                .insert((view_display_target, uniform));
+            commands.entity(entity).insert((
+                view_display_target,
+                DisplayTargetUniform {
+                    paper_white_nits: sanitized,
+                },
+            ));
         } else {
             let mut entity_commands = commands.entity(entity);
             entity_commands.insert(view_display_target);
@@ -360,6 +312,7 @@ mod tests {
     use bevy_ecs::{schedule::ScheduleLabel, system::RunSystemOnce, world::World};
     use bevy_math::{Mat4, UVec4};
     use bevy_transform::components::GlobalTransform;
+    use bevy_window::DisplayGamut;
     use wgpu::TextureFormat;
 
     use crate::view::{ColorGrading, RetainedViewEntity};
@@ -427,7 +380,9 @@ mod tests {
             .spawn((
                 extracted_camera(sdr_target),
                 extracted_view(),
-                DisplayTargetUniform::from(DisplayTarget::SDR_SRGB),
+                DisplayTargetUniform {
+                    paper_white_nits: 100.0,
+                },
             ))
             .id();
 
@@ -437,35 +392,13 @@ mod tests {
             assert!(world.entity(entity).contains::<ViewDisplayTarget>());
         }
         assert!(!world.entity(sdr).contains::<DisplayTargetUniform>());
-        assert!(world.entity(hdr).contains::<DisplayTargetUniform>());
+        assert_eq!(
+            world.entity(hdr).get::<DisplayTargetUniform>(),
+            Some(&DisplayTargetUniform {
+                paper_white_nits: 100.0
+            })
+        );
         assert!(!world.entity(downgraded).contains::<DisplayTargetUniform>());
-    }
-
-    #[test]
-    fn uniform_copies_display_target_verbatim() {
-        let target = DisplayTarget {
-            paper_white_nits: 203.0,
-            peak_luminance_nits: 1000.0,
-            min_luminance_nits: 0.005,
-            gamut: DisplayGamut::Rec2020,
-            transfer: DisplayTransfer::ScRgbLinear,
-        };
-        let uniform = DisplayTargetUniform::from(target);
-        assert_eq!(uniform.paper_white_nits, 203.0);
-        assert_eq!(uniform.peak_luminance_nits, 1000.0);
-        assert_eq!(uniform.min_luminance_nits, 0.005);
-        assert_eq!(uniform.gamut, 2);
-        assert_eq!(uniform.transfer, 1);
-    }
-
-    #[test]
-    fn default_target_uniform_is_sdr_srgb() {
-        let uniform = DisplayTargetUniform::from(DisplayTarget::SDR_SRGB);
-        assert_eq!(uniform.paper_white_nits, 100.0);
-        assert_eq!(uniform.peak_luminance_nits, 100.0);
-        assert_eq!(uniform.min_luminance_nits, 0.0);
-        assert_eq!(uniform.gamut, 0);
-        assert_eq!(uniform.transfer, 0);
     }
 
     #[test]
@@ -556,9 +489,6 @@ mod tests {
             resolved: DisplayTarget::SDR_SRGB,
         };
         assert!(!downgraded.is_hdr_transfer());
-        assert_eq!(
-            DisplayTargetUniform::from(downgraded.resolved),
-            DisplayTargetUniform::from(DisplayTarget::SDR_SRGB)
-        );
+        assert_eq!(downgraded.resolved, DisplayTarget::SDR_SRGB);
     }
 }
