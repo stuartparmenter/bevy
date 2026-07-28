@@ -28,56 +28,21 @@ use {
 #[cfg(all(feature = "serialize", feature = "bevy_reflect"))]
 use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
 
-/// Where a piece of display information came from.
-///
-/// Sensed values flow from the windowing system or the graphics backend; the
-/// renderer keeps the source purely as provenance, so calibration UIs can
-/// distinguish a value the OS reported in absolute nits (Windows) from one
-/// derived from a relative EDR headroom (Apple) or a coarse web capability. It
-/// does not affect how a value commits — every continuous field is smoothed the
-/// same way.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
-#[cfg_attr(
-    feature = "bevy_reflect",
-    derive(Reflect),
-    reflect(Default, Debug, PartialEq, Hash, Clone)
-)]
-#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(
-    all(feature = "serialize", feature = "bevy_reflect"),
-    reflect(Serialize, Deserialize)
-)]
-pub enum DisplayInfoSource {
-    /// No information is available: the platform or the moment cannot tell us.
-    /// This is the default and reads as "not sensed", never as "SDR".
-    #[default]
-    Unknown,
-    /// The operating system / windowing system reported the value directly
-    /// (for example a Windows HDR enablement flag or absolute luminance from
-    /// display metadata).
-    Os,
-    /// Derived from a relative EDR-headroom signal (the Apple path), which
-    /// reports a unitless multiplier over SDR white and no absolute nits.
-    DerivedFromHeadroom,
-    /// Reported by the web platform's coarse `dynamic-range` / `color-gamut`
-    /// capability query (a capability, not a live mode).
-    Web,
-}
-
 /// Static-per-display capability of the [`Monitor`](crate::Monitor) a window is
 /// presented on: how bright it can get and how wide a gamut it covers.
 ///
 /// Its **absence** means "can't tell" — the renderer never treats a missing
 /// component as "SDR". When present, every field is still `Option`: a platform
-/// reports whatever subset it can. All luminance fields are absolute nits
-/// (candela per square meter), achromatic CIE *Y*.
+/// reports whatever subset it can, and the all-`None` default likewise reads as
+/// "nothing sensed". All luminance fields are absolute nits (candela per square
+/// meter), achromatic CIE *Y*.
 ///
 /// # Placement
 ///
 /// Attached to the [`Monitor`](crate::Monitor) entity (resolved from a window
 /// through its [`OnMonitor`](crate::OnMonitor) relationship), so every window
 /// on the same physical display shares one capability record.
-#[derive(Component, Debug, Clone, Copy, PartialEq)]
+#[derive(Component, Debug, Clone, Copy, Default, PartialEq)]
 #[cfg_attr(
     feature = "bevy_reflect",
     derive(Reflect),
@@ -110,22 +75,6 @@ pub struct MonitorDisplayCapability {
     /// the EDID primaries) and the web (CSS `color-gamut`) report one; `None`
     /// elsewhere, including on displays that do cover a wide gamut.
     pub gamut_hint: Option<crate::DisplayGamut>,
-    /// Where this capability record came from.
-    pub source: DisplayInfoSource,
-}
-
-impl Default for MonitorDisplayCapability {
-    /// An all-`None` capability with an [`Unknown`](DisplayInfoSource::Unknown)
-    /// source: "nothing sensed yet", never "SDR".
-    fn default() -> Self {
-        Self {
-            max_nits: None,
-            max_full_frame_nits: None,
-            min_nits: None,
-            gamut_hint: None,
-            source: DisplayInfoSource::Unknown,
-        }
-    }
 }
 
 /// The live, drifting display state of a window's surface: how much HDR headroom
@@ -134,15 +83,17 @@ impl Default for MonitorDisplayCapability {
 /// Unlike [`MonitorDisplayCapability`] (static per display) this changes while
 /// the window is open — the user drags the window to another monitor, moves the
 /// SDR-brightness slider, or (on the Apple EDR path) the system headroom shifts
-/// with ambient light, brightness, and thermal conditions. The renderer mirrors
-/// it back to the main world insert-on-change, so
-/// [`Changed<WindowDisplayState>`](bevy_ecs::prelude::Changed) is a real signal:
-/// [`generation`](Self::generation) is bumped only when a value actually commits
-/// past the renderer's epsilon, never on raw read jitter.
+/// with ambient light, brightness, and thermal conditions. The renderer commits
+/// a fresh reading only once it moves past a relative epsilon and mirrors the
+/// committed value back insert-on-change, so
+/// [`Changed<WindowDisplayState>`](bevy_ecs::prelude::Changed) marks a real
+/// transition rather than raw read jitter.
 ///
 /// Treat it as read-only diagnostics: writing it has no effect on the surface.
-/// It is absent until the window's first successful read.
-#[derive(Component, Debug, Clone, Copy, PartialEq)]
+/// It is absent until the window's first successful read — on a platform that
+/// reports nothing (Vulkan outside Win32, GLES/WebGL, Android) it never appears
+/// at all.
+#[derive(Component, Debug, Clone, Copy, Default, PartialEq)]
 #[cfg_attr(
     feature = "bevy_reflect",
     derive(Reflect),
@@ -171,25 +122,6 @@ pub struct WindowDisplayState {
     /// slider). `None` on the Apple EDR and web paths, which report no absolute
     /// nits. Feeds the `paper_white` auto-calibration.
     pub sdr_white_nits: Option<f32>,
-    /// Where this live state came from.
-    pub source: DisplayInfoSource,
-    /// Bumped each time a field commits past the renderer's epsilon, so
-    /// [`Changed<WindowDisplayState>`](bevy_ecs::prelude::Changed) signals a
-    /// real transition rather than read jitter.
-    pub generation: u32,
-}
-
-impl Default for WindowDisplayState {
-    /// An all-`None` state with an [`Unknown`](DisplayInfoSource::Unknown)
-    /// source and generation `0`: "nothing sensed yet", never "SDR".
-    fn default() -> Self {
-        Self {
-            tone_map_headroom: None,
-            sdr_white_nits: None,
-            source: DisplayInfoSource::Unknown,
-            generation: 0,
-        }
-    }
 }
 
 /// Whether the engine may auto-resolve a [`DisplayTarget`] field from sensed
@@ -402,17 +334,15 @@ mod tests {
     }
 
     #[test]
-    fn live_and_capability_defaults_are_unknown_not_sdr() {
-        assert_eq!(
-            WindowDisplayState::default().source,
-            DisplayInfoSource::Unknown
-        );
+    fn live_and_capability_defaults_are_all_none_not_sdr() {
         assert_eq!(WindowDisplayState::default().tone_map_headroom, None);
-        assert_eq!(WindowDisplayState::default().generation, 0);
-        assert_eq!(
-            MonitorDisplayCapability::default().source,
-            DisplayInfoSource::Unknown
-        );
+        assert_eq!(WindowDisplayState::default().sdr_white_nits, None);
         assert_eq!(MonitorDisplayCapability::default().max_nits, None);
+        assert_eq!(
+            MonitorDisplayCapability::default().max_full_frame_nits,
+            None
+        );
+        assert_eq!(MonitorDisplayCapability::default().min_nits, None);
+        assert_eq!(MonitorDisplayCapability::default().gamut_hint, None);
     }
 }

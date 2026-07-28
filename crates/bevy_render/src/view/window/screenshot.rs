@@ -127,7 +127,7 @@ struct ScreenshotPreparedState {
 /// How a captured HDR screenshot's signal is decoded back to display-linear
 /// values at the scRGB scale (`1.0` = 80 nits), matching the transfer the
 /// display-encoding pass applied to the surface it was captured from.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ScreenshotDecode {
     /// Nothing is decoded. An SDR capture keeps its `*UnormSrgb` format label,
     /// which declares the sRGB encoding its bytes carry, and a
@@ -143,6 +143,26 @@ enum ScreenshotDecode {
     /// linear values are converted back to Rec.709 so every HDR screenshot
     /// shares one Rec.709, scRGB-scale convention.
     ExtendedSrgb { display_p3: bool },
+}
+
+impl ScreenshotDecode {
+    /// The decode that reverses what the display encoder wrote for a target
+    /// resolved to `(transfer, gamut)`.
+    ///
+    /// Keyed on the encoder's own two inputs (`coerce_display_encode` in
+    /// `bevy_core_pipeline::camera_stack`), so decoder and encoder cannot drift:
+    /// `ExtendedSrgb` is the one transfer that keeps a Display-P3 gamut (wgpu's
+    /// `ExtendedDisplayP3` surface), `Pq` is always written in Rec.2020, and the
+    /// rest reach the readback already display-linear.
+    fn for_target(transfer: DisplayTransfer, gamut: DisplayGamut) -> Self {
+        match transfer {
+            DisplayTransfer::Pq => Self::Pq,
+            DisplayTransfer::ExtendedSrgb => Self::ExtendedSrgb {
+                display_p3: gamut == DisplayGamut::DisplayP3,
+            },
+            DisplayTransfer::Srgb | DisplayTransfer::ScRgbLinear => Self::Linear,
+        }
+    }
 }
 
 #[derive(Resource, Deref, DerefMut)]
@@ -347,34 +367,28 @@ fn extract_screenshots(
     system_state.apply(&mut main_world);
 }
 
-/// How a manual (`Image` / `TextureView`) render target's signal must be
-/// decoded, from its [`ManualDisplayTargets`] entry. Manual targets resolve to
-/// the requested transfer verbatim — there is no surface negotiation to
-/// downgrade them — so the decoders only have to undo the encoder's own gamut
-/// coercion: `ExtendedSrgb` is the one transfer that can keep a Display-P3
-/// gamut, and `Pq` is always written in Rec.2020.
+/// Looks up how a manual (`Image` / `TextureView`) render target's signal must
+/// be decoded, from its [`ManualDisplayTargets`] entry. Manual targets resolve
+/// to the requested transfer verbatim — there is no surface negotiation to
+/// downgrade them — so the registered target is the encoder's input directly.
+/// An unregistered target falls back to `DisplayTarget::SDR_SRGB`, exactly as
+/// `resolve_display_target` does for the encoder.
 fn manual_target_decode(
     manual_display_targets: &ManualDisplayTargets,
     target: &NormalizedRenderTarget,
 ) -> ScreenshotDecode {
-    match manual_display_targets
+    let display_target = manual_display_targets
         .get(target)
-        .map(|t| (t.transfer, t.gamut))
-    {
-        Some((DisplayTransfer::Pq, _)) => ScreenshotDecode::Pq,
-        Some((DisplayTransfer::ExtendedSrgb, gamut)) => ScreenshotDecode::ExtendedSrgb {
-            display_p3: gamut == DisplayGamut::DisplayP3,
-        },
-        Some((DisplayTransfer::Srgb | DisplayTransfer::ScRgbLinear, _)) | None => {
-            ScreenshotDecode::Linear
-        }
-    }
+        .copied()
+        .unwrap_or_default();
+    ScreenshotDecode::for_target(display_target.transfer, display_target.gamut)
 }
 
 fn prepare_screenshots(
     targets: Res<RenderScreenshotTargets>,
     mut prepared: ResMut<RenderScreenshotsPrepared>,
     window_surfaces: Res<WindowSurfaces>,
+    extracted_windows: Res<ExtractedWindows>,
     render_device: Res<RenderDevice>,
     screenshot_pipeline: Res<ScreenshotToScreenPipeline>,
     pipeline_cache: Res<PipelineCache>,
@@ -391,6 +405,13 @@ fn prepare_screenshots(
                 let window = window.entity();
                 let Some(surface_data) = window_surfaces.surfaces.get(&window) else {
                     warn!("Unknown window for screenshot, skipping: {}", window);
+                    continue;
+                };
+                // The requested gamut, the encoder's other input. A window with
+                // a surface is always extracted, so this never skips in
+                // practice.
+                let Some(extracted_window) = extracted_windows.get(&window) else {
+                    warn!("Unextracted window for screenshot, skipping: {}", window);
                     continue;
                 };
                 // Single-sourced with `SurfaceData`: the sRGB view of the
@@ -415,19 +436,19 @@ fn prepare_screenshots(
                 );
                 // HDR surfaces hold an encoded signal (the display encoder's
                 // OETF output); record how to decode the readback back to
-                // display-linear values. The surface's configured color space
-                // distinguishes the Rec.709 `ExtendedSrgb` from the P3
-                // `ExtendedDisplayP3`.
-                state.decode = match surface_data.resolved_transfer {
-                    DisplayTransfer::Pq => ScreenshotDecode::Pq,
-                    DisplayTransfer::ExtendedSrgb => ScreenshotDecode::ExtendedSrgb {
-                        display_p3: surface_data.configuration.color_space
-                            == wgpu::SurfaceColorSpace::ExtendedDisplayP3,
-                    },
-                    DisplayTransfer::Srgb | DisplayTransfer::ScRgbLinear => {
-                        ScreenshotDecode::Linear
-                    }
-                };
+                // display-linear values.
+                //
+                // The transfer is the one this frame's pixels were *encoded*
+                // with, not the live configuration: `prepare_windows` can
+                // renegotiate a surface mid-frame, after the encoder's
+                // `ViewDisplayTarget`s were built, and decoding a PQ readback as
+                // if it were already display-linear would silently corrupt the
+                // saved image. The gamut needs no such care — renegotiation
+                // never changes it.
+                state.decode = ScreenshotDecode::for_target(
+                    surface_data.encoded_transfer(),
+                    extracted_window.display_target.gamut,
+                );
                 prepared.insert(*entity, state);
                 view_target_attachments.insert(
                     target.clone(),
@@ -1079,6 +1100,43 @@ mod tests {
             "green should decode negative: {}",
             values[1]
         );
+    }
+
+    /// The one keying both the window and manual paths go through. The gamut
+    /// reaches only `ExtendedSrgb`, the sole transfer whose surface can carry
+    /// Display-P3 primaries.
+    #[test]
+    fn decode_keys_on_transfer_and_gamut() {
+        use ScreenshotDecode as Decode;
+
+        for gamut in [
+            DisplayGamut::Rec709,
+            DisplayGamut::DisplayP3,
+            DisplayGamut::Rec2020,
+        ] {
+            assert_eq!(
+                Decode::for_target(DisplayTransfer::Srgb, gamut),
+                Decode::Linear
+            );
+            assert_eq!(
+                Decode::for_target(DisplayTransfer::ScRgbLinear, gamut),
+                Decode::Linear
+            );
+            assert_eq!(Decode::for_target(DisplayTransfer::Pq, gamut), Decode::Pq);
+        }
+
+        assert_eq!(
+            Decode::for_target(DisplayTransfer::ExtendedSrgb, DisplayGamut::DisplayP3),
+            Decode::ExtendedSrgb { display_p3: true }
+        );
+        // Rec.2020 has no encoded-extended surface and is coerced to Rec.709,
+        // so it decodes as the Rec.709 `ExtendedSrgb` surface does.
+        for gamut in [DisplayGamut::Rec709, DisplayGamut::Rec2020] {
+            assert_eq!(
+                Decode::for_target(DisplayTransfer::ExtendedSrgb, gamut),
+                Decode::ExtendedSrgb { display_p3: false }
+            );
+        }
     }
 
     /// The manual-target decode reads the authored `ManualDisplayTargets`

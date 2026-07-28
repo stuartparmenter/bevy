@@ -357,8 +357,8 @@ fn toggle_tonemapping_method(
 /// extended-range sRGB / Display-P3 on Metal, Vulkan, and browser WebGPU;
 /// PQ (HDR10) on Vulkan/DX12/Metal with the OS HDR setting enabled. The UI
 /// shows the *requested* transfer; if the surface cannot carry it, Bevy logs a
-/// warning and degrades to plain SDR — read the `WindowResolvedTransfer`
-/// component on the window to see the outcome.
+/// warning and degrades to plain SDR — read `WindowSurfaceTransfers::resolved`
+/// on the window to see the outcome.
 fn toggle_hdr_output(
     keys: Res<ButtonInput<KeyCode>>,
     mut display_target: Single<&mut DisplayTarget, With<PrimaryWindow>>,

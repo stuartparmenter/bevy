@@ -43,10 +43,10 @@ pub mod prelude {
     #[doc(hidden)]
     pub use crate::{
         AutoField, CursorEntered, CursorLeft, CursorMoved, DisplayCalibrationPolicy, DisplayGamut,
-        DisplayProvenance, DisplayTarget, DisplayTransfer, EffectiveDisplayTarget, FileDragAndDrop,
-        Ime, MonitorDisplayCapability, MonitorSelection, VideoModeSelection, Window,
-        WindowDisplayState, WindowMonitorChanged, WindowMoved, WindowPlugin, WindowPosition,
-        WindowResizeConstraints, WindowResolvedTransfer, WindowSupportedTransfers,
+        DisplayProvenance, DisplayTarget, DisplayTransfer, DisplayTransfers,
+        EffectiveDisplayTarget, FileDragAndDrop, Ime, MonitorDisplayCapability, MonitorSelection,
+        VideoModeSelection, Window, WindowDisplayState, WindowMonitorChanged, WindowMoved,
+        WindowPlugin, WindowPosition, WindowResizeConstraints, WindowSurfaceTransfers,
     };
 }
 

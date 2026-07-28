@@ -41,7 +41,7 @@ use bevy::{
     prelude::*,
     window::{
         AutoField, DisplayCalibrationPolicy, DisplayTarget, EffectiveDisplayTarget, Monitor,
-        PrimaryWindow, WindowMonitorChanged, WindowResolvedTransfer,
+        PrimaryWindow, WindowMonitorChanged, WindowSurfaceTransfers,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -731,10 +731,10 @@ fn update_banner(
     mut text: Single<&mut Text, With<BannerText>>,
     step: Res<CalibrationStep>,
     strategy: Res<CalibrationStrategy>,
-    resolved: Option<Single<&WindowResolvedTransfer, With<PrimaryWindow>>>,
+    surface: Option<Single<&WindowSurfaceTransfers, With<PrimaryWindow>>>,
     monitor_notice: Res<MonitorChangeNotice>,
 ) {
-    let is_sdr = resolved.is_none_or(|r| !r.0.is_hdr());
+    let is_sdr = surface.is_none_or(|s| !s.resolved.is_hdr());
     let (name, instruction) = match *step {
         CalibrationStep::PeakLuminance => (
             "PEAK LUMINANCE",

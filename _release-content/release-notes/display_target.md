@@ -20,10 +20,13 @@ swapchain format (see the "HDR display output (scRGB-linear)" release note).
 
 In the render world, every camera view resolves its target's calibration into
 a `ViewDisplayTarget` component, carrying both the `requested` calibration and
-the `resolved` one after surface negotiation. The negotiated transfer is also
-mirrored back to the main world as a read-only `WindowResolvedTransfer`
-component on the window, so apps can detect a downgraded HDR request (it lags
-negotiation by one frame). A per-view `DisplayTargetUniform` (luminance values
+the `resolved` one after surface negotiation. The outcome is also mirrored back
+to the main world as a read-only `WindowSurfaceTransfers` component on the
+window: `resolved` is the transfer the surface actually presents, so apps can
+detect a downgraded HDR request, and `supported` is the set of transfers this
+surface could present, so an app can offer only the modes that will work
+instead of requesting one that silently downgrades. Both lag negotiation by one
+frame. A per-view `DisplayTargetUniform` (luminance values
 plus gamut/transfer indices, importable in WGSL as
 `bevy_render::display_target`) is prepared each frame and bound solely by the
 display-encoding (gamut-mapping and transfer-encoding) pass. The GT7 operator's

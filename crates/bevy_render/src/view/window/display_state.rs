@@ -3,9 +3,9 @@
 //! window event (move / focus / monitor change), or, for the one signal that
 //! drifts with no event (the Apple EDR headroom), every frame while an HDR
 //! surface is auto-calibrating. It folds every platform's reporting asymmetry
-//! into one cross-platform value (`normalize`), suppresses sub-threshold
-//! jitter ([`DisplayStateStore`]), and mirrors the result back to the main world
-//! as [`WindowDisplayState`] / [`MonitorDisplayCapability`].
+//! into one cross-platform value (`read_display_state`), suppresses
+//! sub-threshold jitter ([`DisplayStateStore`]), and mirrors the result back to
+//! the main world as [`WindowDisplayState`] / [`MonitorDisplayCapability`].
 //!
 //! The single live value the tone mapper consumes is
 //! [`DisplayHdrInfo::tone_map_headroom`] — the linear multiplier of SDR white the
@@ -20,8 +20,8 @@
 use bevy_ecs::prelude::*;
 use bevy_platform::collections::HashMap;
 use bevy_window::{
-    DisplayGamut, DisplayInfoSource, DisplayTransfer, MonitorDisplayCapability, OnMonitor,
-    WindowDisplayState,
+    DisplayGamut, DisplayTransfer, MonitorDisplayCapability, OnMonitor, WindowDisplayState,
+    WindowSurfaceTransfers,
 };
 use wgpu::{DisplayGamut as WgpuDisplayGamut, DisplayHdrInfo};
 
@@ -29,52 +29,6 @@ use crate::renderer::RenderAdapter;
 use crate::MainWorld;
 
 use super::{ExtractedWindows, WindowSurfaces};
-
-/// A platform-agnostic snapshot of one surface's display state, produced by
-/// [`normalize`]. All cross-platform asymmetry collapses here: the live half is
-/// a single [`tone_map_headroom`](Self::tone_map_headroom) multiplier plus the
-/// SDR-white anchor, and callers downstream never see per-backend `Option`
-/// shapes.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct DisplaySnapshot {
-    // Live-state fields (mirrored to `WindowDisplayState`).
-    pub tone_map_headroom: Option<f32>,
-    pub sdr_white_nits: Option<f32>,
-    // Capability fields (mirrored to `MonitorDisplayCapability`).
-    pub max_nits: Option<f32>,
-    pub max_full_frame_nits: Option<f32>,
-    pub min_nits: Option<f32>,
-    pub gamut_hint: Option<DisplayGamut>,
-    /// Provenance of this snapshot, shared by the live-state and capability
-    /// halves (a single read has one source).
-    pub source: DisplayInfoSource,
-}
-
-impl DisplaySnapshot {
-    /// The capability half of this snapshot as a [`MonitorDisplayCapability`]
-    /// (a field-for-field copy).
-    fn capability(&self) -> MonitorDisplayCapability {
-        MonitorDisplayCapability {
-            max_nits: self.max_nits,
-            max_full_frame_nits: self.max_full_frame_nits,
-            min_nits: self.min_nits,
-            gamut_hint: self.gamut_hint,
-            source: self.source,
-        }
-    }
-
-    /// The live-state half of this snapshot as a [`WindowDisplayState`]
-    /// candidate. `generation` starts at zero; [`commit`] bumps it when the
-    /// candidate actually commits.
-    fn live_state(&self) -> WindowDisplayState {
-        WindowDisplayState {
-            tone_map_headroom: self.tone_map_headroom,
-            sdr_white_nits: self.sdr_white_nits,
-            source: self.source,
-            generation: 0,
-        }
-    }
-}
 
 /// Maps a wgpu coarse [`DisplayGamut`](WgpuDisplayGamut) onto the plain-data
 /// [`DisplayGamut`] the window crate carries. `Srgb` and any unrecognized
@@ -95,7 +49,19 @@ pub(crate) fn finite_positive(v: Option<f32>) -> Option<f32> {
     v.filter(|x| x.is_finite() && *x > 0.0)
 }
 
-/// Collapses a wgpu [`DisplayHdrInfo`] into a [`DisplaySnapshot`].
+/// Whether a [`DisplayHdrInfo`] carries any usable reporting model at all:
+/// absolute luminance (Windows), a relative headroom (Apple), or a coarse
+/// capability (web). `false` is "this platform or this moment can't tell us
+/// anything" — never "SDR".
+fn reports_anything(info: &DisplayHdrInfo) -> bool {
+    info.luminance
+        .is_some_and(|l| l.max_nits.is_some() || l.sdr_white_nits.is_some())
+        || info.headroom.is_some()
+        || info.coarse.is_some()
+}
+
+/// Collapses a wgpu [`DisplayHdrInfo`] into the two plain-data carriers, or
+/// `None` when the platform reported nothing usable.
 ///
 /// The live half is wgpu's already-folded
 /// [`tone_map_headroom`](DisplayHdrInfo::tone_map_headroom): the one
@@ -110,57 +76,31 @@ pub(crate) fn finite_positive(v: Option<f32>) -> Option<f32> {
 /// The capability half — peak / full-frame / min nits and the coarse gamut
 /// bucket the backend reports (nearest-primaries match on DXGI, the CSS
 /// `color-gamut` query on web) — is copied through for the
-/// [`MonitorDisplayCapability`] mirror. `source` is the caller-classified
-/// provenance ([`classify_source`]); it tags the mirror for calibration UIs and
-/// never affects how a value commits.
-pub(crate) fn normalize(info: &DisplayHdrInfo, source: DisplayInfoSource) -> DisplaySnapshot {
+/// [`MonitorDisplayCapability`] mirror.
+fn read_display_state(
+    info: &DisplayHdrInfo,
+) -> Option<(WindowDisplayState, MonitorDisplayCapability)> {
+    if !reports_anything(info) {
+        return None;
+    }
+
     let luminance = info.luminance;
-
-    // The single cross-platform live HDR value, already folded by wgpu.
-    let tone_map_headroom = finite_positive(info.tone_map_headroom());
-    let sdr_white_nits = luminance.and_then(|l| finite_positive(l.sdr_white_nits));
-
-    let max_nits = finite_positive(luminance.and_then(|l| l.max_nits));
-    let max_full_frame_nits = finite_positive(luminance.and_then(|l| l.max_full_frame_nits));
-    let min_nits = finite_positive(luminance.and_then(|l| l.min_nits));
-
-    let gamut_hint = info.coarse.and_then(|c| c.gamut).map(map_gamut);
-
-    DisplaySnapshot {
-        tone_map_headroom,
-        sdr_white_nits,
-        max_nits,
-        max_full_frame_nits,
-        min_nits,
-        gamut_hint,
-        source,
-    }
-}
-
-/// Classifies which reporting model a [`DisplayHdrInfo`] represents, so callers
-/// pass the right [`DisplayInfoSource`] to [`normalize`]. Absolute luminance →
-/// [`Os`](DisplayInfoSource::Os); relative headroom →
-/// [`DerivedFromHeadroom`](DisplayInfoSource::DerivedFromHeadroom); coarse-only
-/// → [`Web`](DisplayInfoSource::Web); nothing usable →
-/// [`Unknown`](DisplayInfoSource::Unknown). This is pure provenance: it tags the
-/// mirror for calibration UIs and does not change how a value commits.
-pub(crate) fn classify_source(info: &DisplayHdrInfo) -> DisplayInfoSource {
-    if info
-        .luminance
-        .is_some_and(|l| l.max_nits.is_some() || l.sdr_white_nits.is_some())
-    {
-        DisplayInfoSource::Os
-    } else if info.headroom.is_some() {
-        DisplayInfoSource::DerivedFromHeadroom
-    } else if info.coarse.is_some() {
-        DisplayInfoSource::Web
-    } else {
-        DisplayInfoSource::Unknown
-    }
+    let state = WindowDisplayState {
+        // The single cross-platform live HDR value, already folded by wgpu.
+        tone_map_headroom: finite_positive(info.tone_map_headroom()),
+        sdr_white_nits: luminance.and_then(|l| finite_positive(l.sdr_white_nits)),
+    };
+    let capability = MonitorDisplayCapability {
+        max_nits: finite_positive(luminance.and_then(|l| l.max_nits)),
+        max_full_frame_nits: finite_positive(luminance.and_then(|l| l.max_full_frame_nits)),
+        min_nits: finite_positive(luminance.and_then(|l| l.min_nits)),
+        gamut_hint: info.coarse.and_then(|c| c.gamut).map(map_gamut),
+    };
+    Some((state, capability))
 }
 
 /// Relative change below which a continuous field is treated as unchanged, so
-/// sub-threshold read jitter never bumps `generation` / fires
+/// sub-threshold read jitter never commits a new value / fires
 /// [`Changed`](bevy_ecs::prelude::Changed). Small enough to track the Apple EDR
 /// ramp smoothly (it climbs over ~1–2 s), large enough to swallow float noise.
 const EPSILON_REL: f32 = 0.01;
@@ -169,8 +109,12 @@ const EPSILON_REL: f32 = 0.01;
 /// Render-world only.
 #[derive(Resource, Default)]
 pub struct DisplayStateStore {
-    /// The committed (post-epsilon) [`WindowDisplayState`] per surface.
-    states: HashMap<Entity, WindowDisplayState>,
+    /// The committed (post-epsilon) [`WindowDisplayState`] per surface. A
+    /// present-but-`None` entry marks a surface that has been read on a platform
+    /// that reports nothing: it stops the per-frame re-read without minting a
+    /// live-state component, so the carrier stays absent until a real read
+    /// lands.
+    states: HashMap<Entity, Option<WindowDisplayState>>,
     /// The last committed capability per surface (so the [`Monitor`] write-back
     /// is insert-on-change).
     ///
@@ -194,27 +138,30 @@ fn rel_changed(old: Option<f32>, new: Option<f32>) -> bool {
     }
 }
 
-/// Folds a fresh snapshot into the committed live state for `entity`. A field
-/// commits only when it moves past the relative [`EPSILON_REL`] (or the source
-/// changes), and `generation` bumps only on a real commit — so
-/// [`Changed<WindowDisplayState>`](bevy_ecs::prelude::Changed) signals a genuine
-/// transition rather than read jitter. The capability half passes through
-/// unsmoothed (insert-on-change is handled at write-back).
-fn commit(store: &mut DisplayStateStore, entity: Entity, snap: &DisplaySnapshot) {
-    let candidate = snap.live_state();
+/// Folds a fresh read into the committed live state for `entity`. A field
+/// commits only when it moves past the relative [`EPSILON_REL`], so the
+/// insert-on-change write-back — and therefore
+/// [`Changed<WindowDisplayState>`](bevy_ecs::prelude::Changed) — signals a
+/// genuine transition rather than read jitter. The capability half passes
+/// through unsmoothed (insert-on-change is handled at write-back).
+fn commit(
+    store: &mut DisplayStateStore,
+    entity: Entity,
+    candidate: WindowDisplayState,
+    capability: MonitorDisplayCapability,
+) {
     let committed = store.states.entry(entity).or_default();
 
-    let changed = rel_changed(committed.tone_map_headroom, candidate.tone_map_headroom)
-        || rel_changed(committed.sdr_white_nits, candidate.sdr_white_nits)
-        || committed.source != candidate.source;
+    let changed = committed.is_none_or(|committed| {
+        rel_changed(committed.tone_map_headroom, candidate.tone_map_headroom)
+            || rel_changed(committed.sdr_white_nits, candidate.sdr_white_nits)
+    });
 
     if changed {
-        let generation = committed.generation.wrapping_add(1);
-        *committed = candidate;
-        committed.generation = generation;
+        *committed = Some(candidate);
     }
 
-    store.capabilities.insert(entity, snap.capability());
+    store.capabilities.insert(entity, capability);
 }
 
 /// Re-reads each configured surface's live HDR state when it can have changed,
@@ -236,9 +183,9 @@ fn commit(store: &mut DisplayStateStore, entity: Entity, snap: &DisplaySnapshot)
 /// The per-frame branch is gated on
 /// [`display_calibration_auto`](super::ExtractedWindow::display_calibration_auto)
 /// and an HDR resolved transfer, so SDR and all-[`Keep`](bevy_window::AutoField::Keep)
-/// projects never pay it. An [`Unknown`](DisplayInfoSource::Unknown) read marks
-/// the surface seen (so it is not re-read every frame on a platform that reports
-/// nothing) but never overwrites a committed value — `None` never means "SDR".
+/// projects never pay it. A read on a platform that reports nothing marks the
+/// surface seen (so it is not re-read every frame) but commits nothing — `None`
+/// never means "SDR".
 pub fn poll_display_state(
     // Apple's relative-headroom query gates on the main thread; pin the system
     // there, matching `create_surfaces`.
@@ -287,8 +234,7 @@ pub fn poll_display_state(
         }
 
         let info = surface_data.surface.display_hdr_info(&render_adapter);
-        let source = classify_source(&info);
-        if source == DisplayInfoSource::Unknown {
+        let Some((state, capability)) = read_display_state(&info) else {
             // "Can't tell": mark the surface seen so it is not re-read every
             // frame on a no-HDR platform, but never clobber a committed value.
             // The capability is left untouched: a display that can't report now
@@ -297,28 +243,49 @@ pub fn poll_display_state(
             // accepted trade — `None` never means "SDR").
             store.states.entry(entity).or_default();
             continue;
-        }
+        };
 
-        commit(&mut store, entity, &normalize(&info, source));
+        commit(&mut store, entity, state, capability);
     }
 }
 
-/// Mirrors each surface's committed [`WindowDisplayState`] back to its window
-/// entity, and its [`MonitorDisplayCapability`] back to the [`Monitor`] entity
-/// the window is on (resolved through [`OnMonitor`]). Runs during extraction —
-/// the render world's only window into the main world — so the value lags the
-/// read by one frame. Insert-on-change, so
+/// Mirrors everything the render world learned about each window surface back to
+/// the main world: the negotiated and supported transfers
+/// ([`WindowSurfaceTransfers`], so apps can detect a downgraded request and
+/// offer only the modes that will actually work), the surface's committed
+/// [`WindowDisplayState`], and its [`MonitorDisplayCapability`] on the
+/// [`Monitor`] entity the window is on (resolved through [`OnMonitor`], so every
+/// window on a display shares one record).
+///
+/// Runs during extraction — the render world's only window into the main world —
+/// so every value lags the frame that produced it by one. Insert-on-change, so
 /// [`Changed`] stays a usable signal.
 ///
 /// [`Monitor`]: bevy_window::Monitor
-pub fn write_back_display_state(mut main_world: ResMut<MainWorld>, store: Res<DisplayStateStore>) {
-    for (&entity, state) in store.states.iter() {
-        super::insert_on_change(&mut main_world, entity, *state);
-    }
+pub fn write_back_display_state(
+    mut main_world: ResMut<MainWorld>,
+    window_surfaces: Res<WindowSurfaces>,
+    store: Res<DisplayStateStore>,
+) {
+    for (&entity, surface_data) in window_surfaces.surfaces.iter() {
+        super::insert_on_change(
+            &mut main_world,
+            entity,
+            WindowSurfaceTransfers {
+                resolved: surface_data.resolved_transfer,
+                supported: surface_data.supported_transfers,
+            },
+        );
 
-    // Resolve each window's Monitor entity through `OnMonitor`, then mirror the
-    // capability there (every window on a display shares one record).
-    for (&entity, capability) in store.capabilities.iter() {
+        // Absent until this surface's first successful read: a platform that
+        // reports nothing leaves the carrier off the window entirely.
+        if let Some(state) = store.states.get(&entity).copied().flatten() {
+            super::insert_on_change(&mut main_world, entity, state);
+        }
+
+        let Some(&capability) = store.capabilities.get(&entity) else {
+            continue;
+        };
         let Some(monitor_entity) = main_world
             .get_entity(entity)
             .ok()
@@ -327,12 +294,12 @@ pub fn write_back_display_state(mut main_world: ResMut<MainWorld>, store: Res<Di
         else {
             continue;
         };
-        super::insert_on_change(&mut main_world, monitor_entity, *capability);
+        super::insert_on_change(&mut main_world, monitor_entity, capability);
     }
 }
 
 #[cfg(test)]
-mod normalize_tests {
+mod read_tests {
     use super::*;
     use wgpu::{DisplayCoarseRange as WgpuCoarseRange, DisplayHeadroom, DisplayLuminance};
 
@@ -380,13 +347,12 @@ mod normalize_tests {
             headroom: Some(headroom(Some(4.0), Some(5.0), None)),
             ..Default::default()
         };
-        let snap = normalize(&info, DisplayInfoSource::DerivedFromHeadroom);
+        let (state, capability) = read_display_state(&info).unwrap();
         // `tone_map_headroom()` returns Apple's live `current`, not `potential`.
-        assert_eq!(snap.tone_map_headroom, Some(4.0));
+        assert_eq!(state.tone_map_headroom, Some(4.0));
         // Apple reports no absolute nits.
-        assert_eq!(snap.sdr_white_nits, None);
-        assert_eq!(snap.max_nits, None);
-        assert_eq!(snap.source, DisplayInfoSource::DerivedFromHeadroom);
+        assert_eq!(state.sdr_white_nits, None);
+        assert_eq!(capability.max_nits, None);
     }
 
     #[test]
@@ -400,13 +366,13 @@ mod normalize_tests {
             )),
             ..Default::default()
         };
-        let snap = normalize(&info, DisplayInfoSource::Os);
+        let (state, capability) = read_display_state(&info).unwrap();
         // Folded multiplier is the nit ratio 1000 / 200.
-        assert_eq!(snap.tone_map_headroom, Some(5.0));
-        assert_eq!(snap.max_nits, Some(1000.0));
-        assert_eq!(snap.max_full_frame_nits, Some(600.0));
-        assert_eq!(snap.sdr_white_nits, Some(200.0));
-        assert_eq!(snap.min_nits, Some(0.01));
+        assert_eq!(state.tone_map_headroom, Some(5.0));
+        assert_eq!(state.sdr_white_nits, Some(200.0));
+        assert_eq!(capability.max_nits, Some(1000.0));
+        assert_eq!(capability.max_full_frame_nits, Some(600.0));
+        assert_eq!(capability.min_nits, Some(0.01));
     }
 
     #[test]
@@ -420,19 +386,14 @@ mod normalize_tests {
             coarse: Some(coarse(Some(false))),
             ..Default::default()
         };
-        let snap = normalize(&info, DisplayInfoSource::Os);
-        assert_eq!(snap.tone_map_headroom, Some(1.0));
-        assert_eq!(snap.max_nits, Some(270.0));
+        let (state, capability) = read_display_state(&info).unwrap();
+        assert_eq!(state.tone_map_headroom, Some(1.0));
+        assert_eq!(capability.max_nits, Some(270.0));
     }
 
     #[test]
     fn none_stays_none_never_sdr() {
-        let info = DisplayHdrInfo::default();
-        assert_eq!(classify_source(&info), DisplayInfoSource::Unknown);
-        let snap = normalize(&info, DisplayInfoSource::Unknown);
-        assert_eq!(snap.tone_map_headroom, None);
-        assert_eq!(snap.max_nits, None);
-        assert_eq!(snap.sdr_white_nits, None);
+        assert!(read_display_state(&DisplayHdrInfo::default()).is_none());
     }
 
     #[test]
@@ -441,37 +402,46 @@ mod normalize_tests {
             luminance: Some(luminance(Some(f32::NAN), None, None, Some(0.0))),
             ..Default::default()
         };
-        let snap = normalize(&info, DisplayInfoSource::Os);
+        let (state, capability) = read_display_state(&info).unwrap();
         // NaN peak and the 0-nit white both fold to "not reported"; with no
-        // usable nits and no headroom, the folded multiplier is unknown.
-        assert_eq!(snap.max_nits, None);
-        assert_eq!(snap.sdr_white_nits, None);
-        assert_eq!(snap.tone_map_headroom, None);
+        // usable nits and no headroom, the folded multiplier is unknown. The read
+        // still counts as a read: the platform named the fields, it just filled
+        // them with garbage.
+        assert_eq!(capability.max_nits, None);
+        assert_eq!(state.sdr_white_nits, None);
+        assert_eq!(state.tone_map_headroom, None);
     }
 
     #[test]
-    fn classify_prefers_absolute_then_headroom_then_coarse() {
+    fn reports_anything_covers_every_reporting_model() {
         let absolute = DisplayHdrInfo {
             luminance: Some(luminance(Some(1000.0), None, None, None)),
             headroom: Some(headroom(Some(4.0), Some(5.0), None)),
             ..Default::default()
         };
-        assert_eq!(classify_source(&absolute), DisplayInfoSource::Os);
+        assert!(reports_anything(&absolute));
 
         let relative = DisplayHdrInfo {
             headroom: Some(headroom(Some(4.0), Some(5.0), None)),
             ..Default::default()
         };
-        assert_eq!(
-            classify_source(&relative),
-            DisplayInfoSource::DerivedFromHeadroom
-        );
+        assert!(reports_anything(&relative));
 
         let coarse_only = DisplayHdrInfo {
             coarse: Some(coarse(Some(true))),
             ..Default::default()
         };
-        assert_eq!(classify_source(&coarse_only), DisplayInfoSource::Web);
+        assert!(reports_anything(&coarse_only));
+
+        // A luminance record whose every absolute field is absent reports
+        // nothing: the backend named the struct but filled in no value.
+        let empty_luminance = DisplayHdrInfo {
+            luminance: Some(luminance(None, Some(600.0), Some(0.01), None)),
+            ..Default::default()
+        };
+        assert!(!reports_anything(&empty_luminance));
+
+        assert!(!reports_anything(&DisplayHdrInfo::default()));
     }
 
     #[test]
@@ -490,89 +460,78 @@ mod normalize_tests {
 mod commit_tests {
     use super::*;
 
-    fn snapshot(source: DisplayInfoSource) -> DisplaySnapshot {
-        DisplaySnapshot {
-            tone_map_headroom: None,
-            sdr_white_nits: None,
-            max_nits: None,
-            max_full_frame_nits: None,
-            min_nits: None,
-            gamut_hint: None,
-            source,
+    fn state(tone_map_headroom: Option<f32>, sdr_white_nits: Option<f32>) -> WindowDisplayState {
+        WindowDisplayState {
+            tone_map_headroom,
+            sdr_white_nits,
         }
     }
 
-    fn committed(store: &DisplayStateStore, entity: Entity) -> WindowDisplayState {
-        *store.states.get(&entity).unwrap()
+    fn committed(store: &DisplayStateStore, entity: Entity) -> Option<WindowDisplayState> {
+        store.states.get(&entity).copied().flatten()
     }
 
     #[test]
-    fn commit_bumps_generation_on_change() {
+    fn first_read_commits() {
         let mut store = DisplayStateStore::default();
         let entity = Entity::from_raw_u32(1).unwrap();
 
-        let mut snap = snapshot(DisplayInfoSource::Os);
-        snap.tone_map_headroom = Some(5.0);
-        commit(&mut store, entity, &snap);
+        commit(
+            &mut store,
+            entity,
+            state(Some(5.0), None),
+            MonitorDisplayCapability::default(),
+        );
 
-        let state = committed(&store, entity);
-        assert_eq!(state.tone_map_headroom, Some(5.0));
-        assert_eq!(state.generation, 1);
-        assert_eq!(state.source, DisplayInfoSource::Os);
+        assert_eq!(committed(&store, entity), Some(state(Some(5.0), None)));
     }
 
     #[test]
-    fn sub_epsilon_change_does_not_bump() {
+    fn sub_epsilon_change_does_not_commit() {
         let mut store = DisplayStateStore::default();
         let entity = Entity::from_raw_u32(2).unwrap();
 
-        let mut snap = snapshot(DisplayInfoSource::DerivedFromHeadroom);
-        snap.tone_map_headroom = Some(5.0);
-        commit(&mut store, entity, &snap);
-        let generation = committed(&store, entity).generation;
+        let capability = MonitorDisplayCapability::default();
+        commit(&mut store, entity, state(Some(5.0), None), capability);
 
-        // A 0.4% change is below the 1% relative epsilon: never commits.
-        snap.tone_map_headroom = Some(5.02);
-        commit(&mut store, entity, &snap);
-        assert_eq!(committed(&store, entity).tone_map_headroom, Some(5.0));
-        assert_eq!(committed(&store, entity).generation, generation);
+        // A 0.4% change is below the 1% relative epsilon: never commits, so the
+        // insert-on-change write-back never fires.
+        commit(&mut store, entity, state(Some(5.02), None), capability);
+        assert_eq!(committed(&store, entity), Some(state(Some(5.0), None)));
     }
 
     #[test]
-    fn supra_epsilon_change_commits_and_bumps() {
+    fn supra_epsilon_change_commits() {
         let mut store = DisplayStateStore::default();
         let entity = Entity::from_raw_u32(3).unwrap();
 
-        let mut snap = snapshot(DisplayInfoSource::DerivedFromHeadroom);
-        snap.tone_map_headroom = Some(5.0);
-        commit(&mut store, entity, &snap);
-        let generation = committed(&store, entity).generation;
+        let capability = MonitorDisplayCapability::default();
+        commit(&mut store, entity, state(Some(5.0), None), capability);
 
-        // A 10% change is above the epsilon: commits and bumps once.
-        snap.tone_map_headroom = Some(5.5);
-        commit(&mut store, entity, &snap);
-        assert_eq!(committed(&store, entity).tone_map_headroom, Some(5.5));
-        assert_eq!(committed(&store, entity).generation, generation + 1);
+        // A 10% change is above the epsilon: commits.
+        commit(&mut store, entity, state(Some(5.5), None), capability);
+        assert_eq!(committed(&store, entity), Some(state(Some(5.5), None)));
     }
 
     #[test]
-    fn source_change_commits() {
-        // A provenance change commits even when the numeric value is identical,
-        // so the mirrored source stays truthful.
+    fn sdr_white_change_commits_on_its_own() {
+        // The SDR-white anchor is smoothed independently of the headroom: the
+        // Windows brightness slider moves it while the headroom holds still.
         let mut store = DisplayStateStore::default();
         let entity = Entity::from_raw_u32(4).unwrap();
 
-        let mut snap = snapshot(DisplayInfoSource::Os);
-        snap.tone_map_headroom = Some(2.0);
-        commit(&mut store, entity, &snap);
-        let generation = committed(&store, entity).generation;
+        let capability = MonitorDisplayCapability::default();
+        commit(&mut store, entity, state(Some(2.0), Some(80.0)), capability);
 
-        snap.source = DisplayInfoSource::DerivedFromHeadroom;
-        commit(&mut store, entity, &snap);
-        assert_eq!(
-            committed(&store, entity).source,
-            DisplayInfoSource::DerivedFromHeadroom
+        commit(
+            &mut store,
+            entity,
+            state(Some(2.0), Some(200.0)),
+            capability,
         );
-        assert_eq!(committed(&store, entity).generation, generation + 1);
+        assert_eq!(
+            committed(&store, entity),
+            Some(state(Some(2.0), Some(200.0)))
+        );
     }
 }

@@ -387,14 +387,13 @@ mod resolve_display_target_tests {
 mod policy_tests {
     use super::policy::*;
     use bevy_window::{
-        AutoField, DisplayCalibrationPolicy, DisplayInfoSource, DisplayProvenance, DisplayTarget,
-        DisplayTransfer, FieldProvenance, MonitorDisplayCapability, WindowDisplayState,
+        AutoField, DisplayCalibrationPolicy, DisplayProvenance, DisplayTarget, DisplayTransfer,
+        FieldProvenance, MonitorDisplayCapability, WindowDisplayState,
     };
 
     fn cap_with_peak(max_nits: f32) -> MonitorDisplayCapability {
         MonitorDisplayCapability {
             max_nits: Some(max_nits),
-            source: DisplayInfoSource::Os,
             ..Default::default()
         }
     }
@@ -515,7 +514,6 @@ mod policy_tests {
         let live = WindowDisplayState {
             // sdr_white_nits is reported only on the absolute-nits (Windows) path.
             sdr_white_nits: Some(80.0),
-            source: DisplayInfoSource::Os,
             ..Default::default()
         };
         let e = resolve(
@@ -545,7 +543,6 @@ mod policy_tests {
         };
         let live = WindowDisplayState {
             tone_map_headroom: Some(5.0),
-            source: DisplayInfoSource::DerivedFromHeadroom,
             ..Default::default()
         };
         let e = resolve(
@@ -573,7 +570,6 @@ mod policy_tests {
         };
         let live = WindowDisplayState {
             tone_map_headroom: Some(4.0),
-            source: DisplayInfoSource::DerivedFromHeadroom,
             ..Default::default()
         };
         let e = resolve(
@@ -612,8 +608,6 @@ mod policy_tests {
         let live = WindowDisplayState {
             sdr_white_nits: Some(120.0),
             tone_map_headroom: Some(3.0),
-            source: DisplayInfoSource::Os,
-            ..Default::default()
         };
         let e = resolve(
             target,

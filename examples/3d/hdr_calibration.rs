@@ -24,10 +24,9 @@ use bevy::{
     core_pipeline::tonemapping::Tonemapping,
     prelude::*,
     window::{
-        DisplayCalibrationPolicy, DisplayGamut, DisplayInfoSource, DisplayProvenance,
-        DisplayTarget, DisplayTransfer, EffectiveDisplayTarget, FieldProvenance,
-        MonitorDisplayCapability, OnMonitor, PrimaryWindow, WindowDisplayState,
-        WindowResolvedTransfer, WindowSupportedTransfers,
+        DisplayCalibrationPolicy, DisplayGamut, DisplayProvenance, DisplayTarget, DisplayTransfer,
+        EffectiveDisplayTarget, FieldProvenance, MonitorDisplayCapability, OnMonitor,
+        PrimaryWindow, WindowDisplayState, WindowSurfaceTransfers,
     },
 };
 
@@ -256,14 +255,14 @@ const TRANSFER_CYCLE: [DisplayTransfer; 4] = [
 /// auto-selecting).
 fn toggle_transfer(
     keys: Res<ButtonInput<KeyCode>>,
-    window: Single<(&mut DisplayTarget, Option<&WindowSupportedTransfers>), With<PrimaryWindow>>,
+    window: Single<(&mut DisplayTarget, Option<&WindowSurfaceTransfers>), With<PrimaryWindow>>,
     mut hdr_preference: ResMut<hdr::HdrPreference>,
 ) {
     if !keys.just_pressed(KeyCode::KeyT) {
         return;
     }
     hdr_preference.manual_override = true;
-    let (mut display_target, supported) = window.into_inner();
+    let (mut display_target, surface) = window.into_inner();
     let current = display_target.transfer;
     let start = TRANSFER_CYCLE
         .iter()
@@ -271,7 +270,7 @@ fn toggle_transfer(
         .unwrap_or(0);
     let next = (1..=TRANSFER_CYCLE.len())
         .map(|offset| TRANSFER_CYCLE[(start + offset) % TRANSFER_CYCLE.len()])
-        .find(|&t| supported.is_none_or(|s| s.contains(t)))
+        .find(|&t| surface.is_none_or(|s| s.supported.contains(t)))
         .unwrap_or(current);
     display_target.transfer = next;
 }
@@ -325,8 +324,7 @@ fn update_data_panel(
             &EffectiveDisplayTarget,
             Option<&WindowDisplayState>,
             Option<&OnMonitor>,
-            Option<&WindowSupportedTransfers>,
-            Option<&WindowResolvedTransfer>,
+            Option<&WindowSurfaceTransfers>,
         ),
         With<PrimaryWindow>,
     >,
@@ -336,8 +334,7 @@ fn update_data_panel(
         return;
     }
     let mut text = text.into_inner();
-    let (display_target, policy, effective, live, on_monitor, supported, resolved_transfer) =
-        window.into_inner();
+    let (display_target, policy, effective, live, on_monitor, surface) = window.into_inner();
     let resolved = &effective.target;
     let provenance: &DisplayProvenance = &effective.provenance;
     let capability = on_monitor.and_then(|on_monitor| capabilities.get(on_monitor.0).ok());
@@ -356,8 +353,9 @@ fn update_data_panel(
         .and_then(|c| c.gamut_hint)
         .map_or_else(|| "      -".into(), |gamut| format!("{gamut:>7?}"));
 
-    let transfers_available = match supported {
-        Some(supported) => supported
+    let transfers_available = match surface {
+        Some(surface) => surface
+            .supported
             .iter()
             .map(transfer_short_name)
             .collect::<Vec<_>>()
@@ -368,11 +366,11 @@ fn update_data_panel(
     let mut ui = String::new();
     ui.push_str("ENGINE TELEMETRY (your UI shows none of this)\n");
     ui.push_str(&format!("transfer (req): {:?}\n", display_target.transfer));
-    match resolved_transfer {
-        Some(resolved_transfer) => ui.push_str(&format!(
+    match surface {
+        Some(surface) => ui.push_str(&format!(
             "transfer (got): {:?} ({})\n",
-            resolved_transfer.0,
-            if resolved_transfer.0.is_hdr() {
+            surface.resolved,
+            if surface.resolved.is_hdr() {
                 "HDR"
             } else {
                 "SDR"
@@ -430,7 +428,7 @@ fn update_data_panel(
                 "Window state (live): headroom {} | src {}\n",
                 live.tone_map_headroom
                     .map_or_else(|| "unknown".into(), |h| format!("{h:.2}x")),
-                source_name(live.source),
+                source_name(live, sensed_peak),
             ));
             ui.push_str(&format!("  SDR white {}\n", fmt_nits(live.sdr_white_nits)));
         }
@@ -461,13 +459,20 @@ fn provenance_tag(provenance: FieldProvenance) -> &'static str {
     }
 }
 
-/// Human-readable name for a [`DisplayInfoSource`].
-fn source_name(source: DisplayInfoSource) -> &'static str {
-    match source {
-        DisplayInfoSource::Unknown => "unknown (nothing sensed)",
-        DisplayInfoSource::Os => "OS / windowing system",
-        DisplayInfoSource::DerivedFromHeadroom => "derived from EDR headroom",
-        DisplayInfoSource::Web => "web coarse capability",
+/// Which reporting model the sensed display values came from, inferred from
+/// which of them the platform filled in.
+///
+/// Absolute nits — the SDR-white anchor on the live state, or the monitor's
+/// peak — mean the OS reported real luminance (the Windows path). A headroom
+/// multiplier with no absolute nits anywhere is the Apple EDR path, which
+/// reports a unitless ratio and nothing else.
+fn source_name(live: &WindowDisplayState, sensed_peak: Option<f32>) -> &'static str {
+    if live.sdr_white_nits.is_some() || sensed_peak.is_some() {
+        "OS / windowing system"
+    } else if live.tone_map_headroom.is_some() {
+        "derived from EDR headroom"
+    } else {
+        "unknown (nothing sensed)"
     }
 }
 

@@ -12,7 +12,6 @@
 //! surface (format, color space) selection. The default value,
 //! [`DisplayTarget::SDR_SRGB`], reproduces Bevy's current SDR behavior exactly.
 
-use alloc::vec::Vec;
 use bevy_ecs::prelude::Component;
 
 #[cfg(feature = "bevy_reflect")]
@@ -379,21 +378,99 @@ impl DisplayTransfer {
     }
 }
 
-/// The [`DisplayTransfer`] a window's surface actually negotiated, written
-/// back by the renderer.
+/// A set of [`DisplayTransfer`]s, held as a bitset so it can be copied rather
+/// than allocated.
+///
+/// [`iter`](Self::iter) yields members in the stable cycle order apps step
+/// through — [`Srgb`], [`ScRgbLinear`], [`ExtendedSrgb`], [`Pq`] — which is
+/// neither the declaration order of [`DisplayTransfer`] nor the bit order.
+///
+/// [`Srgb`]: DisplayTransfer::Srgb
+/// [`ScRgbLinear`]: DisplayTransfer::ScRgbLinear
+/// [`ExtendedSrgb`]: DisplayTransfer::ExtendedSrgb
+/// [`Pq`]: DisplayTransfer::Pq
+#[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(
+    feature = "bevy_reflect",
+    derive(Reflect),
+    reflect(Default, Debug, PartialEq, Hash, Clone)
+)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    all(feature = "serialize", feature = "bevy_reflect"),
+    reflect(Serialize, Deserialize)
+)]
+pub struct DisplayTransfers(u8);
+
+impl DisplayTransfers {
+    /// The empty set.
+    pub const EMPTY: Self = Self(0);
+
+    /// The order [`iter`](Self::iter) walks: the stable cycle order, kept
+    /// explicit because it differs from both the declaration order of
+    /// [`DisplayTransfer`] and the bit order `bit` assigns.
+    const CYCLE_ORDER: [DisplayTransfer; 4] = [
+        DisplayTransfer::Srgb,
+        DisplayTransfer::ScRgbLinear,
+        DisplayTransfer::ExtendedSrgb,
+        DisplayTransfer::Pq,
+    ];
+
+    /// The bit a transfer occupies, spelled out by an explicit match rather than
+    /// a cast or a slice index so that adding a variant (the reserved HLG slot)
+    /// cannot renumber the existing bits.
+    const fn bit(transfer: DisplayTransfer) -> u8 {
+        match transfer {
+            DisplayTransfer::Srgb => 0b0001,
+            DisplayTransfer::ScRgbLinear => 0b0010,
+            DisplayTransfer::Pq => 0b0100,
+            DisplayTransfer::ExtendedSrgb => 0b1000,
+        }
+    }
+
+    /// Returns this set with `transfer` added.
+    pub const fn with(self, transfer: DisplayTransfer) -> Self {
+        Self(self.0 | Self::bit(transfer))
+    }
+
+    /// Returns `true` if `transfer` is a member.
+    pub const fn contains(self, transfer: DisplayTransfer) -> bool {
+        self.0 & Self::bit(transfer) != 0
+    }
+
+    /// Iterates the members in the stable cycle order.
+    pub fn iter(self) -> impl Iterator<Item = DisplayTransfer> {
+        Self::CYCLE_ORDER
+            .into_iter()
+            .filter(move |&transfer| self.contains(transfer))
+    }
+}
+
+impl core::fmt::Debug for DisplayTransfers {
+    /// Prints the members in cycle order, e.g. `[Srgb, ExtendedSrgb, Pq]`.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+/// What a window's surface negotiated: the [`DisplayTransfer`] it currently
+/// presents, and every transfer it could present right now.
 ///
 /// [`DisplayTarget::transfer`] is the *request*; surface negotiation can
-/// downgrade it (PQ → scRGB → plain sRGB, with a warning) when the backend
-/// or OS cannot fulfil it. This component reflects the outcome, so apps can
-/// adapt to the actual output mode — for example, skip an HDR calibration
-/// flow or switch UI assets when an HDR request resolved to SDR.
+/// downgrade it (PQ → scRGB → plain sRGB, with a warning) when the backend or
+/// OS cannot fulfil it. [`resolved`](Self::resolved) reports the outcome, so
+/// apps can adapt to the actual output mode — for example, skip an HDR
+/// calibration flow or switch UI assets when an HDR request resolved to SDR —
+/// and [`supported`](Self::supported) lists the requests that would be
+/// fulfilled verbatim, so an app can offer only the modes that will actually
+/// work instead of requesting one that silently downgrades.
 ///
-/// The renderer inserts and updates this on window entities once their
-/// surface is configured; the value lags the negotiation by one frame, and
-/// updates again if the surface is later renegotiated. Treat it as
-/// read-only: writing it has no effect on the surface. It is absent until
-/// the window's first surface configuration (and on windows that never get
-/// a surface, e.g. headless).
+/// The renderer inserts and updates this on window entities once their surface
+/// is configured; the values lag the negotiation by one frame, and update again
+/// if the surface is later renegotiated against changed capabilities. Treat it
+/// as read-only: writing it has no effect on the surface. It is absent until
+/// the window's first surface configuration (and on windows that never get a
+/// surface, e.g. headless).
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(
     feature = "bevy_reflect",
@@ -405,47 +482,14 @@ impl DisplayTransfer {
     all(feature = "serialize", feature = "bevy_reflect"),
     reflect(Serialize, Deserialize)
 )]
-pub struct WindowResolvedTransfer(pub DisplayTransfer);
-
-/// The [`DisplayTransfer`]s this window's surface can currently present,
-/// derived from the color spaces the surface advertises.
-///
-/// Where [`WindowResolvedTransfer`] reports the *one* transfer currently in
-/// use, this lists *all* the transfers a [`DisplayTarget::transfer`] request
-/// could be fulfilled with on this surface right now — so an app can offer
-/// only the modes that will actually work instead of requesting one that
-/// silently downgrades. [`DisplayTransfer::Srgb`] (the SDR fallback) is always
-/// present; the set follows a stable order suitable for cycling: `Srgb`,
-/// `ScRgbLinear`, `ExtendedSrgb`, `Pq`.
-///
-/// Read-only and mirrored from the renderer; writing it has no effect on the
-/// surface. It is absent until the window's first surface configuration (and on
-/// windows that never get a surface, e.g. headless), and updates if the surface
-/// is later renegotiated against changed capabilities.
-#[derive(Component, Debug, Clone, PartialEq, Eq, Default)]
-#[cfg_attr(
-    feature = "bevy_reflect",
-    derive(Reflect),
-    reflect(Component, Default, Debug, PartialEq, Clone)
-)]
-#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(
-    all(feature = "serialize", feature = "bevy_reflect"),
-    reflect(Serialize, Deserialize)
-)]
-pub struct WindowSupportedTransfers(pub Vec<DisplayTransfer>);
-
-impl WindowSupportedTransfers {
-    /// Returns `true` if `transfer` is one of the transfers this surface can
-    /// currently present.
-    pub fn contains(&self, transfer: DisplayTransfer) -> bool {
-        self.0.contains(&transfer)
-    }
-
-    /// Iterates the supported transfers in the surface's stable cycle order.
-    pub fn iter(&self) -> impl Iterator<Item = DisplayTransfer> + '_ {
-        self.0.iter().copied()
-    }
+pub struct WindowSurfaceTransfers {
+    /// The transfer the configured surface currently carries — the negotiated
+    /// outcome of the [`DisplayTarget::transfer`] request.
+    pub resolved: DisplayTransfer,
+    /// The transfers this surface can present, derived from the color spaces it
+    /// advertises. [`DisplayTransfer::Srgb`] (the SDR fallback) is always a
+    /// member.
+    pub supported: DisplayTransfers,
 }
 
 #[cfg(test)]
@@ -556,5 +600,51 @@ mod tests {
         assert!(DisplayTransfer::ScRgbLinear.is_hdr());
         assert!(DisplayTransfer::Pq.is_hdr());
         assert!(DisplayTransfer::ExtendedSrgb.is_hdr());
+    }
+
+    #[test]
+    fn transfer_set_membership() {
+        let set = DisplayTransfers::EMPTY
+            .with(DisplayTransfer::Srgb)
+            .with(DisplayTransfer::Pq);
+        assert!(set.contains(DisplayTransfer::Srgb));
+        assert!(set.contains(DisplayTransfer::Pq));
+        assert!(!set.contains(DisplayTransfer::ScRgbLinear));
+        assert!(!set.contains(DisplayTransfer::ExtendedSrgb));
+        assert!(!DisplayTransfers::EMPTY.contains(DisplayTransfer::Srgb));
+        // `with` is idempotent: one bit per transfer, never a duplicate entry.
+        assert_eq!(set.with(DisplayTransfer::Pq), set);
+    }
+
+    #[test]
+    fn transfer_set_iterates_in_cycle_order() {
+        // `Pq` is declared before `ExtendedSrgb` but cycles after it, so a
+        // bit-index walk would yield these two the wrong way round.
+        let set = DisplayTransfers::EMPTY
+            .with(DisplayTransfer::Pq)
+            .with(DisplayTransfer::ExtendedSrgb)
+            .with(DisplayTransfer::Srgb);
+        assert!(set.iter().eq([
+            DisplayTransfer::Srgb,
+            DisplayTransfer::ExtendedSrgb,
+            DisplayTransfer::Pq,
+        ]));
+    }
+
+    #[test]
+    fn transfer_set_bits_are_distinct() {
+        let all = DisplayTransfers::EMPTY
+            .with(DisplayTransfer::Srgb)
+            .with(DisplayTransfer::ScRgbLinear)
+            .with(DisplayTransfer::Pq)
+            .with(DisplayTransfer::ExtendedSrgb);
+        // Every variant reaches `iter`, so `CYCLE_ORDER` lists them all.
+        assert_eq!(all.iter().count(), DisplayTransfers::CYCLE_ORDER.len());
+        // Two transfers sharing a bit survive that count — both still report as
+        // members — but not a singleton set.
+        for transfer in DisplayTransfers::CYCLE_ORDER {
+            assert!(DisplayTransfers::EMPTY.with(transfer).iter().eq([transfer]));
+        }
+        assert_eq!(DisplayTransfers::EMPTY.iter().count(), 0);
     }
 }
