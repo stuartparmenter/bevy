@@ -28,10 +28,11 @@ surface could present, so an app can offer only the modes that will work
 instead of requesting one that silently downgrades. Both lag negotiation by one
 frame. A per-view `DisplayTargetUniform` (luminance values
 plus gamut/transfer indices, importable in WGSL as
-`bevy_render::display_target`) is prepared each frame and bound solely by the
-display-encoding (gamut-mapping and transfer-encoding) pass. The GT7 operator's
-HDR mode is driven separately, by a `Gt7ParamsUniform` baked from the target's
-peak luminance at prepare time and bound in the tonemapping pass.
+`bevy_render::display_target`) is prepared each frame for views whose resolved
+transfer is HDR — SDR views carry no display-target uniform — and bound solely
+by the display-encoding (gamut-mapping and transfer-encoding) pass. The GT7
+operator's HDR mode is driven separately, by a `Gt7ParamsUniform` baked from
+the target's peak luminance at prepare time and bound in the tonemapping pass.
 
 Render targets that aren't windows, such as `RenderTarget::Image` and
 `RenderTarget::TextureView` (used by OpenXR), have no window entity to host

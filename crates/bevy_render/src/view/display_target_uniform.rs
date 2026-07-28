@@ -20,7 +20,8 @@
 //!    [`DisplayTarget::SDR_SRGB`]. All cameras rendering to the same surface
 //!    resolve to the same value by construction.
 //! 2. The same system also inserts the [`DisplayTargetUniform`] built from the
-//!    resolved target. [`UniformComponentPlugin`](crate::uniform::UniformComponentPlugin),
+//!    resolved target — but only on views whose resolved transfer is HDR.
+//!    [`UniformComponentPlugin`](crate::uniform::UniformComponentPlugin),
 //!    registered for it in [`ViewPlugin`](super::ViewPlugin), packs those
 //!    components into the [`ComponentUniforms<DisplayTargetUniform>`](crate::uniform::ComponentUniforms)
 //!    dynamic uniform buffer during
@@ -33,7 +34,8 @@
 //! transfer OETF, and that pass is scheduled only for HDR-transfer targets.
 //! The tone-mapping pass does not read display calibration — GT7's HDR
 //! parameters are baked on the CPU into a separate per-camera uniform — so
-//! plain-SDR pipelines carry no display-target binding at all.
+//! plain-SDR pipelines carry no display-target binding, and SDR-only apps
+//! carry no display-target uniform buffer at all.
 //!
 //! The matching WGSL struct lives in `display_target.wgsl` and is importable as
 //! `bevy_render::display_target`.
@@ -292,14 +294,25 @@ pub(crate) fn resolve_view_display_target(
     }
 }
 
-/// Resolves and inserts a [`ViewDisplayTarget`] and its matching
-/// [`DisplayTargetUniform`] on every extracted view that has an
-/// [`ExtractedCamera`].
+/// Resolves and inserts a [`ViewDisplayTarget`] on every extracted view that
+/// has an [`ExtractedCamera`], plus the matching [`DisplayTargetUniform`] on
+/// views whose resolved transfer is HDR.
+///
+/// Only the display-encoding pass binds the uniform, and that pass runs only
+/// for HDR-transfer views (`resolve_group_encode_parameters` in
+/// `bevy_core_pipeline` gates on the same [`ViewDisplayTarget::is_hdr_transfer`]
+/// predicate), so SDR views skip the insert and contribute no entry to the
+/// [`ComponentUniforms<DisplayTargetUniform>`](crate::uniform::ComponentUniforms)
+/// buffer — a plain-SDR app never creates it at all. A view whose target
+/// drops from HDR to SDR has its uniform removed; the
+/// [`DynamicUniformIndex`](crate::uniform::DynamicUniformIndex) left behind
+/// goes stale, which is harmless because the display-encoding pass bails on
+/// its missing pipeline before reading the index.
 ///
 /// Runs in [`RenderSystems::PrepareViews`](crate::RenderSystems::PrepareViews)
 /// — after `create_surfaces`, so the window surface's negotiated transfer is
 /// fresh — so later prepare systems (pipeline specialization, uniform
-/// packing) can rely on both components being present. The
+/// packing) can rely on the components being present. The
 /// [`DisplayTargetUniform`] in particular must be inserted before
 /// [`UniformComponentPlugin`](crate::uniform::UniformComponentPlugin) packs it
 /// in [`RenderSystems::PrepareResources`](crate::RenderSystems::PrepareResources).
@@ -325,36 +338,138 @@ pub fn prepare_view_display_targets(
     mut commands: Commands,
     extracted_windows: Res<ExtractedWindows>,
     manual_display_targets: Res<ManualDisplayTargets>,
-    views: Query<(Entity, &ExtractedCamera), With<ExtractedView>>,
+    views: Query<(Entity, &ExtractedCamera, Has<DisplayTargetUniform>), With<ExtractedView>>,
 ) {
-    for (entity, camera) in &views {
+    for (entity, camera, has_uniform) in &views {
         let view_display_target = resolve_view_display_target(
             camera.target.as_ref(),
             &extracted_windows,
             &manual_display_targets,
         );
-        let mut uniform = DisplayTargetUniform::from(view_display_target.resolved);
+        let authored = view_display_target.resolved.paper_white_nits;
         let sanitized = view_display_target.resolved.sanitized_paper_white_nits();
+        // Sanitize and warn for every view, not just HDR ones: SDR consumers
+        // (bloom's nits-denominated threshold) fold the sanitized value too,
+        // and this is the only diagnostic a plain-SDR project gets.
         // Bit comparison: valid values pass through bit-for-bit, and a NaN
         // input (NaN != NaN) is still detected as replaced.
-        if sanitized.to_bits() != uniform.paper_white_nits.to_bits() {
+        if sanitized.to_bits() != authored.to_bits() {
             warn_once!(
                 "DisplayTarget::paper_white_nits ({}) is non-finite, non-positive, or above \
                  the 10000-nit PQ ceiling; the display pipeline is using {} nits instead",
-                uniform.paper_white_nits,
+                authored,
                 sanitized
             );
-            uniform.paper_white_nits = sanitized;
         }
-        commands
-            .entity(entity)
-            .insert((view_display_target, uniform));
+        if view_display_target.is_hdr_transfer() {
+            let uniform = DisplayTargetUniform {
+                paper_white_nits: sanitized,
+                ..DisplayTargetUniform::from(view_display_target.resolved)
+            };
+            commands
+                .entity(entity)
+                .insert((view_display_target, uniform));
+        } else {
+            let mut entity_commands = commands.entity(entity);
+            entity_commands.insert(view_display_target);
+            // Only queue the removal when there is a uniform to remove
+            // (an HDR view whose target dropped to SDR); a blanket remove
+            // would cost one command per camera per frame on SDR projects.
+            if has_uniform {
+                entity_commands.remove::<DisplayTargetUniform>();
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bevy_app::Main;
+    use bevy_camera::{CameraOutputMode, ClearColorConfig, ManualTextureViewHandle, MsaaWriteback};
+    use bevy_ecs::{schedule::ScheduleLabel, system::RunSystemOnce, world::World};
+    use bevy_math::{Mat4, UVec4};
+    use bevy_transform::components::GlobalTransform;
+    use wgpu::TextureFormat;
+
+    use crate::view::{ColorGrading, RetainedViewEntity};
+
+    fn extracted_camera(target: NormalizedRenderTarget) -> ExtractedCamera {
+        ExtractedCamera {
+            target: Some(target),
+            physical_viewport_size: None,
+            physical_target_size: None,
+            viewport: None,
+            schedule: Main.intern(),
+            order: 0,
+            output_mode: CameraOutputMode::default(),
+            msaa_writeback: MsaaWriteback::default(),
+            clear_color: ClearColorConfig::Default,
+            sorted_camera_index_for_target: 0,
+            exposure: 1.0,
+            hdr: false,
+            compositing_space: None,
+        }
+    }
+
+    fn extracted_view() -> ExtractedView {
+        ExtractedView {
+            retained_view_entity: RetainedViewEntity::new(Entity::PLACEHOLDER.into(), None, 0),
+            clip_from_view: Mat4::IDENTITY,
+            world_from_view: GlobalTransform::default(),
+            clip_from_world: None,
+            target_format: TextureFormat::Rgba8UnormSrgb,
+            viewport: UVec4::ZERO,
+            color_grading: ColorGrading::default(),
+            invert_culling: false,
+        }
+    }
+
+    /// The uniform is inserted only on views whose resolved transfer is HDR;
+    /// SDR views get the [`ViewDisplayTarget`] alone, and a stale uniform
+    /// from a previous HDR resolution is removed.
+    #[test]
+    fn uniform_inserted_only_for_hdr_transfer_views() {
+        let mut world = World::new();
+        world.init_resource::<ExtractedWindows>();
+
+        let sdr_target = NormalizedRenderTarget::TextureView(ManualTextureViewHandle(0));
+        let hdr_target = NormalizedRenderTarget::TextureView(ManualTextureViewHandle(1));
+        let mut manual_targets = ManualDisplayTargets::default();
+        manual_targets.insert(
+            hdr_target.clone(),
+            DisplayTarget {
+                transfer: DisplayTransfer::Pq,
+                ..DisplayTarget::SDR_SRGB
+            },
+        );
+        world.insert_resource(manual_targets);
+
+        let sdr = world
+            .spawn((extracted_camera(sdr_target.clone()), extracted_view()))
+            .id();
+        let hdr = world
+            .spawn((extracted_camera(hdr_target), extracted_view()))
+            .id();
+        // An SDR view still carrying the uniform from when its target
+        // resolved as HDR.
+        let downgraded = world
+            .spawn((
+                extracted_camera(sdr_target),
+                extracted_view(),
+                DisplayTargetUniform::from(DisplayTarget::SDR_SRGB),
+            ))
+            .id();
+
+        world.run_system_once(prepare_view_display_targets).unwrap();
+
+        for entity in [sdr, hdr, downgraded] {
+            assert!(world.entity(entity).contains::<ViewDisplayTarget>());
+        }
+        assert!(!world.entity(sdr).contains::<DisplayTargetUniform>());
+        assert!(world.entity(hdr).contains::<DisplayTargetUniform>());
+        assert!(!world.entity(downgraded).contains::<DisplayTargetUniform>());
+    }
 
     #[test]
     fn enum_indices_are_stable() {
