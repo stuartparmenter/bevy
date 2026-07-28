@@ -2,8 +2,7 @@
 //! component and the [`DisplayTargetUniform`] GPU uniform.
 //!
 //! [`DisplayTarget`] is authored in the main world (as a required component of
-//! `Window`, or via [`ManualDisplayTargets`](super::window::ManualDisplayTargets)
-//! for non-window targets). This
+//! `Window`, or via [`ManualDisplayTargets`] for non-window targets). This
 //! module resolves it per view each frame:
 //!
 //! 1. [`prepare_view_display_targets`] runs in
@@ -44,7 +43,7 @@ use bevy_window::{DisplayGamut, DisplayTarget, DisplayTransfer};
 
 use super::{
     window::{
-        display_target::{resolve_display_target, EffectiveManualDisplayTargets},
+        display_target::{resolve_display_target, ManualDisplayTargets},
         ExtractedWindows,
     },
     ExtractedView,
@@ -73,9 +72,9 @@ use crate::{
 /// unfulfilled request.
 #[derive(Component, Debug, Clone, Copy, PartialEq)]
 pub struct ViewDisplayTarget {
-    /// The resolved effective display target for this view (the window's
-    /// `EffectiveDisplayTarget` or its `EffectiveManualDisplayTargets` entry),
-    /// before surface negotiation.
+    /// The display target this view's render target resolves to (a window's
+    /// `EffectiveDisplayTarget`, or a manual target's `ManualDisplayTargets`
+    /// entry), before surface negotiation.
     ///
     /// Useful for diagnostics and for re-resolution logic; rendering systems
     /// should use [`resolved`](Self::resolved).
@@ -297,10 +296,10 @@ pub(crate) fn resolve_window_display_target(
 }
 
 /// Resolves the [`ViewDisplayTarget`] for a camera's normalized render
-/// target: the resolved effective [`DisplayTarget`] (window component or
-/// [`EffectiveManualDisplayTargets`] entry; see [`resolve_display_target`]) with
-/// the window surface's negotiated transfer folded in (see
-/// `resolve_window_display_target` in this module).
+/// target: the target's [`DisplayTarget`] (a window's
+/// `EffectiveDisplayTarget`, or a manual target's [`ManualDisplayTargets`]
+/// entry; see [`resolve_display_target`]) with the window surface's negotiated
+/// transfer folded in (see `resolve_window_display_target` in this module).
 ///
 /// Single source shared by [`prepare_view_display_targets`] (which inserts
 /// the per-view component after surface negotiation, so the resolved
@@ -311,10 +310,9 @@ pub(crate) fn resolve_window_display_target(
 pub(crate) fn resolve_view_display_target(
     target: Option<&NormalizedRenderTarget>,
     extracted_windows: &ExtractedWindows,
-    effective_manual_display_targets: &EffectiveManualDisplayTargets,
+    manual_display_targets: &ManualDisplayTargets,
 ) -> ViewDisplayTarget {
-    let requested =
-        resolve_display_target(target, extracted_windows, effective_manual_display_targets);
+    let requested = resolve_display_target(target, extracted_windows, manual_display_targets);
 
     let surface_transfer = match target {
         Some(NormalizedRenderTarget::Window(window_ref)) => extracted_windows
@@ -348,14 +346,14 @@ pub(crate) fn resolve_view_display_target(
 pub fn prepare_view_display_targets(
     mut commands: Commands,
     extracted_windows: Res<ExtractedWindows>,
-    effective_manual_display_targets: Res<EffectiveManualDisplayTargets>,
+    manual_display_targets: Res<ManualDisplayTargets>,
     views: Query<(Entity, &ExtractedCamera), With<ExtractedView>>,
 ) {
     for (entity, camera) in &views {
         let view_display_target = resolve_view_display_target(
             camera.target.as_ref(),
             &extracted_windows,
-            &effective_manual_display_targets,
+            &manual_display_targets,
         );
         commands.entity(entity).insert(view_display_target);
     }

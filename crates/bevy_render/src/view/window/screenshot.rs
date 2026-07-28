@@ -1,4 +1,4 @@
-use super::{display_target::EffectiveManualDisplayTargets, ExtractedWindows};
+use super::{display_target::ManualDisplayTargets, ExtractedWindows};
 use crate::{
     gpu_readback,
     render_asset::RenderAssets,
@@ -348,18 +348,18 @@ fn extract_screenshots(
 }
 
 /// How a manual (`Image` / `TextureView`) render target's signal must be
-/// decoded, from its resolved [`EffectiveManualDisplayTargets`] entry. Manual
-/// targets resolve to the requested transfer verbatim — there is no surface
-/// negotiation to downgrade them — so the decoders only have to undo the
-/// encoder's own gamut coercion: `ExtendedSrgb` is the one transfer that can
-/// keep a Display-P3 gamut, and `Pq` is always written in Rec.2020.
+/// decoded, from its [`ManualDisplayTargets`] entry. Manual targets resolve to
+/// the requested transfer verbatim — there is no surface negotiation to
+/// downgrade them — so the decoders only have to undo the encoder's own gamut
+/// coercion: `ExtendedSrgb` is the one transfer that can keep a Display-P3
+/// gamut, and `Pq` is always written in Rec.2020.
 fn manual_target_decode(
-    effective_manual_display_targets: &EffectiveManualDisplayTargets,
+    manual_display_targets: &ManualDisplayTargets,
     target: &NormalizedRenderTarget,
 ) -> ScreenshotDecode {
-    match effective_manual_display_targets
+    match manual_display_targets
         .get(target)
-        .map(|e| (e.target.transfer, e.target.gamut))
+        .map(|t| (t.transfer, t.gamut))
     {
         Some((DisplayTransfer::Pq, _)) => ScreenshotDecode::Pq,
         Some((DisplayTransfer::ExtendedSrgb, gamut)) => ScreenshotDecode::ExtendedSrgb {
@@ -381,7 +381,7 @@ fn prepare_screenshots(
     mut pipelines: ResMut<SpecializedRenderPipelines<ScreenshotToScreenPipeline>>,
     images: Res<RenderAssets<GpuImage>>,
     manual_texture_views: Res<ManualTextureViews>,
-    effective_manual_display_targets: Res<EffectiveManualDisplayTargets>,
+    manual_display_targets: Res<ManualDisplayTargets>,
     mut view_target_attachments: ResMut<ViewTargetAttachments>,
 ) {
     prepared.clear();
@@ -448,7 +448,7 @@ fn prepare_screenshots(
                     &pipeline_cache,
                     &mut pipelines,
                 );
-                state.decode = manual_target_decode(&effective_manual_display_targets, target);
+                state.decode = manual_target_decode(&manual_display_targets, target);
                 prepared.insert(*entity, state);
                 view_target_attachments.insert(
                     target.clone(),
@@ -473,7 +473,7 @@ fn prepare_screenshots(
                     &pipeline_cache,
                     &mut pipelines,
                 );
-                state.decode = manual_target_decode(&effective_manual_display_targets, target);
+                state.decode = manual_target_decode(&manual_display_targets, target);
                 prepared.insert(*entity, state);
                 view_target_attachments.insert(
                     target.clone(),
@@ -1003,6 +1003,7 @@ fn f16_bits_to_f32(bits: u16) -> f32 {
 mod tests {
     use super::*;
     use crate::transfer_functions::{pq_eotf, pq_inverse_eotf_from_nits};
+    use bevy_window::DisplayTarget;
 
     #[test]
     fn f16_conversion_matches_known_values() {
@@ -1078,6 +1079,38 @@ mod tests {
             "green should decode negative: {}",
             values[1]
         );
+    }
+
+    /// The manual-target decode reads the authored `ManualDisplayTargets`
+    /// entry, and an unregistered target decodes as linear.
+    #[test]
+    fn manual_target_decode_follows_the_registered_transfer() {
+        let target = NormalizedRenderTarget::TextureView(ManualTextureViewHandle(3));
+        let mut manual = ManualDisplayTargets::default();
+        assert!(matches!(
+            manual_target_decode(&manual, &target),
+            ScreenshotDecode::Linear
+        ));
+
+        manual.insert(
+            target.clone(),
+            DisplayTarget::SDR_SRGB.with_transfer(DisplayTransfer::Pq),
+        );
+        assert!(matches!(
+            manual_target_decode(&manual, &target),
+            ScreenshotDecode::Pq
+        ));
+
+        manual.insert(
+            target.clone(),
+            DisplayTarget::SDR_SRGB
+                .with_transfer(DisplayTransfer::ExtendedSrgb)
+                .with_gamut(DisplayGamut::DisplayP3),
+        );
+        assert!(matches!(
+            manual_target_decode(&manual, &target),
+            ScreenshotDecode::ExtendedSrgb { display_p3: true }
+        ));
     }
 
     #[test]

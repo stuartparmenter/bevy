@@ -40,17 +40,20 @@ impl Plugin for WindowRenderPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins((
             ScreenshotPlugin,
-            ExtractResourcePlugin::<EffectiveManualDisplayTargets>::default(),
+            ExtractResourcePlugin::<ManualDisplayTargets>::default(),
         ))
         .init_resource::<ManualDisplayTargets>()
-        .init_resource::<EffectiveManualDisplayTargets>()
         // Runs in the main schedule, fully before extraction, so the resolved
         // `EffectiveDisplayTarget` the render world reads has zero frame lag.
         .add_systems(PostUpdate, resolve_calibration);
 
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
             render_app
-                .init_resource::<EffectiveManualDisplayTargets>()
+                // Also initialized in the main world. Extraction overwrites
+                // this in place; with no resource to overwrite it would insert
+                // through `Commands`, and `ExtractSchedule` defers those past
+                // `extract_cameras`, which reads it the same frame.
+                .init_resource::<ManualDisplayTargets>()
                 .init_resource::<DisplayStateStore>()
                 .init_gpu_resource::<ExtractedWindows>()
                 .init_gpu_resource::<WindowSurfaces>()

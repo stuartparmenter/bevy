@@ -11,7 +11,7 @@ use crate::{
     texture::{GpuImage, ManualTextureViews},
     view::{
         display_target_uniform::{resolve_view_display_target, ViewDisplayTarget},
-        ColorGrading, EffectiveManualDisplayTargets, ExtractedView, ExtractedWindows, Msaa,
+        ColorGrading, ExtractedView, ExtractedWindows, ManualDisplayTargets, Msaa,
         NoIndirectDrawing, RenderExtractedVisibleEntities, RenderVisibleEntities,
         RenderVisibleEntitiesClass, RetainedViewEntity, ViewUniformOffset,
         VisibilityExtractionSystemParam,
@@ -109,7 +109,7 @@ impl Plugin for CameraPlugin {
                     (
                         extract_cameras
                             .after(extract_resource::<ManualTextureViews, ()>)
-                            .after(extract_resource::<EffectiveManualDisplayTargets, ()>),
+                            .after(extract_resource::<ManualDisplayTargets, ()>),
                         clear_dirty_specializations.in_set(DirtySpecializationSystems::Clear),
                         clear_dirty_wireframe_specializations
                             .in_set(DirtySpecializationSystems::Clear),
@@ -511,7 +511,7 @@ pub fn extract_cameras(
     >,
     primary_window: Extract<Query<Entity, With<PrimaryWindow>>>,
     extracted_windows: Res<ExtractedWindows>,
-    effective_manual_display_targets: Res<EffectiveManualDisplayTargets>,
+    manual_display_targets: Res<ManualDisplayTargets>,
     manual_texture_views: Res<ManualTextureViews>,
     images: Res<RenderAssets<GpuImage>>,
     mut existing_render_visible_entities_cpu_culling: Query<
@@ -653,7 +653,7 @@ pub fn extract_cameras(
             let view_display_target = resolve_view_display_target(
                 target.as_ref(),
                 &extracted_windows,
-                &effective_manual_display_targets,
+                &manual_display_targets,
             );
             let target_format = main_texture_mode(MainTextureCamera {
                 hdr,

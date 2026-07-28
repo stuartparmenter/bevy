@@ -39,13 +39,16 @@ use crate::RenderApp;
 /// default of [`DisplayTarget::SDR_SRGB`].
 ///
 /// This type dereferences to a `HashMap<NormalizedRenderTarget, DisplayTarget>`.
-/// Insert into it from the main world; it is extracted (cloned) into the
-/// render world every frame, where [`resolve_display_target`] consults it.
+/// Insert into it from the main world; an [`ExtractResourcePlugin`] clones it
+/// into the render world on change, where [`resolve_display_target`] consults
+/// it. The render world sees the authored value: manual targets have no surface
+/// and no monitor, so calibration has nothing to sense or merge for them.
 ///
 /// This is the "resource sidecar" half of the hybrid `DisplayTarget`
 /// placement: most users only ever touch the window component, while
 /// offscreen and XR-style texture-view targets opt in through this map.
 ///
+/// [`ExtractResourcePlugin`]: crate::extract_resource::ExtractResourcePlugin
 /// [`RenderTarget::Window`]: bevy_camera::RenderTarget::Window
 /// [`RenderTarget::Image`]: bevy_camera::RenderTarget::Image
 /// [`RenderTarget::TextureView`]: bevy_camera::RenderTarget::TextureView
@@ -85,7 +88,7 @@ impl core::ops::DerefMut for ManualDisplayTargets {
 ///   actually encodes for (the authored target merged with engine policy and
 ///   sensed display info), not the raw authored value.
 /// - [`NormalizedRenderTarget::Image`] / [`NormalizedRenderTarget::TextureView`]:
-///   looked up in [`EffectiveManualDisplayTargets`] by the full
+///   looked up in [`ManualDisplayTargets`] by the full
 ///   [`NormalizedRenderTarget`] key. The match is exact: for an image target,
 ///   the key includes `ImageRenderTarget::scale_factor`, so a registered
 ///   entry only resolves for views whose target has the same `scale_factor`
@@ -96,7 +99,7 @@ impl core::ops::DerefMut for ManualDisplayTargets {
 pub fn resolve_display_target(
     target: Option<&NormalizedRenderTarget>,
     extracted_windows: &ExtractedWindows,
-    effective_manual_display_targets: &EffectiveManualDisplayTargets,
+    manual_display_targets: &ManualDisplayTargets,
 ) -> DisplayTarget {
     match target {
         Some(NormalizedRenderTarget::Window(window_ref)) => extracted_windows
@@ -105,9 +108,9 @@ pub fn resolve_display_target(
             .unwrap_or_default(),
         Some(
             target @ (NormalizedRenderTarget::Image(_) | NormalizedRenderTarget::TextureView(_)),
-        ) => effective_manual_display_targets
+        ) => manual_display_targets
             .get(target)
-            .map(|effective| effective.target)
+            .copied()
             .unwrap_or_default(),
         Some(NormalizedRenderTarget::None { .. }) | None => DisplayTarget::SDR_SRGB,
     }
@@ -252,46 +255,18 @@ pub(crate) mod policy {
     }
 }
 
-/// Resolved parallel to [`ManualDisplayTargets`]: the [`EffectiveDisplayTarget`]
-/// for each non-window render target, keyed by [`NormalizedRenderTarget`].
-///
-/// Manual targets have no surface or monitor, so their [`Auto`](bevy_window::AutoField::Auto)
-/// fields fall straight through the policy ladder to the SDR default;
-/// [`Keep`](bevy_window::AutoField::Keep) fields (the default) pass the authored
-/// value verbatim, keeping byte-identity. Built in the main world by
-/// [`resolve_calibration`], then extracted (cloned) into the render world, where
-/// [`resolve_display_target`] consults it.
-#[derive(Default, Clone, Debug, PartialEq, Resource, ExtractResource, Reflect)]
-#[reflect(Resource, Default, Debug, PartialEq, Clone)]
-#[extract_app(RenderApp)]
-pub struct EffectiveManualDisplayTargets(HashMap<NormalizedRenderTarget, EffectiveDisplayTarget>);
-
-impl core::ops::Deref for EffectiveManualDisplayTargets {
-    type Target = HashMap<NormalizedRenderTarget, EffectiveDisplayTarget>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl core::ops::DerefMut for EffectiveManualDisplayTargets {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-/// Resolves every window's and manual target's [`EffectiveDisplayTarget`] in the
-/// main world, *before* extraction, so the identity case has zero frame lag (a
+/// Resolves every window's [`EffectiveDisplayTarget`] in the main world,
+/// *before* extraction, so the identity case has zero frame lag (a
 /// user-set-HDR project shows HDR on its first frame with no SDR pop).
 ///
 /// For each window it merges the authored [`DisplayTarget`] with its
 /// [`DisplayCalibrationPolicy`] (defaulting to all-[`Keep`](bevy_window::AutoField::Keep)),
 /// the [`MonitorDisplayCapability`] of the monitor it is on (resolved through
-/// [`OnMonitor`]), and its live [`WindowDisplayState`]. For each
-/// [`ManualDisplayTargets`] entry it resolves with the default policy and no
-/// sensed inputs (an identity pass). Both inserts are on-change, so
-/// [`Changed<EffectiveDisplayTarget>`](bevy_ecs::prelude::Changed) stays a usable
-/// signal and a default project is not dirtied every frame.
+/// [`OnMonitor`]), and its live [`WindowDisplayState`]. Windows are the only
+/// targets with anything to sense; [`ManualDisplayTargets`] entries reach the
+/// render world as authored. The insert is on-change, so
+/// [`Changed<EffectiveDisplayTarget>`](bevy_ecs::prelude::Changed) stays a
+/// usable signal and a default project is not dirtied every frame.
 pub fn resolve_calibration(
     mut commands: Commands,
     windows: Query<
@@ -306,8 +281,6 @@ pub fn resolve_calibration(
         With<Window>,
     >,
     monitors: Query<&MonitorDisplayCapability>,
-    manual: Res<ManualDisplayTargets>,
-    mut effective_manual: ResMut<EffectiveManualDisplayTargets>,
 ) {
     for (entity, target, policy, live, on_monitor, existing) in &windows {
         let target = target.copied().unwrap_or_default();
@@ -321,19 +294,92 @@ pub fn resolve_calibration(
             commands.entity(entity).insert(effective);
         }
     }
+}
 
-    // Rebuild only when the authored map changed; resolve with no sensed inputs
-    // (manual targets have no surface or monitor).
-    if manual.is_changed() || effective_manual.len() != manual.len() {
-        effective_manual.clear();
-        for (key, target) in manual.iter() {
-            let effective = policy::resolve(
-                *target,
-                DisplayCalibrationPolicy::default(),
-                policy::SensedInputs::default(),
-            );
-            effective_manual.insert(key.clone(), effective);
-        }
+#[cfg(test)]
+mod resolve_display_target_tests {
+    use super::*;
+    use bevy_asset::Handle;
+    use bevy_camera::{ImageRenderTarget, ManualTextureViewHandle};
+    use bevy_image::Image;
+    use bevy_window::{DisplayGamut, DisplayTransfer};
+
+    fn image_target(scale_factor: f32) -> NormalizedRenderTarget {
+        NormalizedRenderTarget::Image(ImageRenderTarget {
+            handle: Handle::<Image>::default(),
+            scale_factor,
+        })
+    }
+
+    /// A registered manual target resolves to its authored value field for
+    /// field — there is no policy merge on this path.
+    #[test]
+    fn registered_manual_targets_resolve_to_the_authored_value() {
+        let pq = DisplayTarget::SDR_SRGB
+            .with_transfer(DisplayTransfer::Pq)
+            .with_gamut(DisplayGamut::Rec2020)
+            .with_peak(1000.0)
+            .with_paper_white(203.0)
+            .with_min_luminance(0.005);
+        let scrgb = DisplayTarget::SDR_SRGB.with_transfer(DisplayTransfer::ScRgbLinear);
+
+        let image = image_target(1.0);
+        let texture_view = NormalizedRenderTarget::TextureView(ManualTextureViewHandle(7));
+        let mut manual = ManualDisplayTargets::default();
+        manual.insert(image.clone(), pq);
+        manual.insert(texture_view.clone(), scrgb);
+
+        let windows = ExtractedWindows::default();
+        assert_eq!(resolve_display_target(Some(&image), &windows, &manual), pq);
+        assert_eq!(
+            resolve_display_target(Some(&texture_view), &windows, &manual),
+            scrgb
+        );
+    }
+
+    /// Every miss — an unregistered key, a key that differs only in
+    /// `scale_factor`, `None` targets, and no target at all — falls back to the
+    /// SDR default.
+    #[test]
+    fn misses_fall_back_to_sdr_srgb() {
+        let mut manual = ManualDisplayTargets::default();
+        manual.insert(
+            image_target(1.0),
+            DisplayTarget::SDR_SRGB.with_transfer(DisplayTransfer::Pq),
+        );
+
+        let windows = ExtractedWindows::default();
+        // Same image handle, different scale factor: the key is the whole
+        // `NormalizedRenderTarget`, so this misses.
+        assert_eq!(
+            resolve_display_target(Some(&image_target(2.0)), &windows, &manual),
+            DisplayTarget::SDR_SRGB
+        );
+        assert_eq!(
+            resolve_display_target(
+                Some(&NormalizedRenderTarget::TextureView(
+                    ManualTextureViewHandle(7)
+                )),
+                &windows,
+                &manual
+            ),
+            DisplayTarget::SDR_SRGB
+        );
+        assert_eq!(
+            resolve_display_target(
+                Some(&NormalizedRenderTarget::None {
+                    width: 64,
+                    height: 64
+                }),
+                &windows,
+                &manual
+            ),
+            DisplayTarget::SDR_SRGB
+        );
+        assert_eq!(
+            resolve_display_target(None, &windows, &manual),
+            DisplayTarget::SDR_SRGB
+        );
     }
 }
 
