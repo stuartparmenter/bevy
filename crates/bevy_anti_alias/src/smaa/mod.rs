@@ -32,6 +32,7 @@
 use bevy_app::{App, Plugin};
 use bevy_asset::{embedded_asset, load_embedded_asset, AssetServer, Handle};
 use bevy_core_pipeline::{
+    camera_stack::ViewStackContract,
     schedule::{Core2d, Core2dSystems, Core3d, Core3dSystems},
     tonemapping::tonemapping,
 };
@@ -67,7 +68,7 @@ use bevy_render::{
     },
     renderer::{RenderContext, RenderDevice, RenderQueue, ViewQuery},
     texture::{CachedTexture, GpuImage, TextureCache},
-    view::{ExtractedView, ViewDisplayTarget, ViewTarget},
+    view::{ExtractedView, ViewTarget},
     GpuResourceAppExt, Render, RenderApp, RenderStartup, RenderSystems,
 };
 use bevy_shader::{Shader, ShaderDefVal};
@@ -186,8 +187,8 @@ pub struct SmaaNeighborhoodBlendingPipelineKey {
 pub struct SmaaEdgeDetectionPipelineKey {
     /// The quality preset.
     preset: SmaaPreset,
-    /// Whether the view's resolved display target transfer is HDR; see
-    /// [`ViewDisplayTarget::is_hdr_transfer`].
+    /// Whether the view's display-encoding pass runs; see
+    /// [`ViewStackContract::is_hdr_encode`].
     ///
     /// The post-tonemap input on such views is paper-white-relative
     /// display-linear and exceeds 1.0, which would shift `SMAA_THRESHOLD`'s
@@ -634,15 +635,18 @@ fn prepare_smaa_pipelines(
     pipeline_cache: Res<PipelineCache>,
     mut specialized_render_pipelines: ResMut<SmaaSpecializedRenderPipelines>,
     smaa_pipelines: Res<SmaaPipelines>,
-    cameras: Query<(Entity, &ExtractedView, &Smaa, &ViewDisplayTarget), With<ExtractedCamera>>,
+    cameras: Query<
+        (Entity, &ExtractedView, &Smaa, &ViewStackContract),
+        (With<ExtractedCamera>, With<ViewTarget>),
+    >,
 ) {
-    for (entity, view, smaa, display_target) in &cameras {
+    for (entity, view, smaa, contract) in &cameras {
         let edge_detection_pipeline_id = specialized_render_pipelines.edge_detection.specialize(
             &pipeline_cache,
             &smaa_pipelines.edge_detection,
             SmaaEdgeDetectionPipelineKey {
                 preset: smaa.preset,
-                hdr: display_target.is_hdr_transfer(),
+                hdr: contract.is_hdr_encode(),
             },
         );
 

@@ -2,6 +2,7 @@ use bevy_app::prelude::*;
 use bevy_asset::{embedded_asset, load_embedded_asset, AssetServer, Handle};
 use bevy_camera::{Camera, CompositingSpace};
 use bevy_core_pipeline::{
+    camera_stack::ViewStackContract,
     schedule::{Core2d, Core2dSystems, Core3d, Core3dSystems},
     tonemapping::tonemapping,
     FullscreenShader,
@@ -16,7 +17,7 @@ use bevy_render::{
         *,
     },
     renderer::RenderDevice,
-    view::{ExtractedView, ResolvedCompositingSpace, ViewDisplayTarget},
+    view::{ExtractedView, ViewTarget},
     GpuResourceAppExt, Render, RenderApp, RenderStartup, RenderSystems,
 };
 use bevy_shader::{Shader, ShaderDefVal};
@@ -170,8 +171,8 @@ pub struct FxaaPipelineKey {
     edge_threshold: Sensitivity,
     edge_threshold_min: Sensitivity,
     target_format: TextureFormat,
-    /// Whether the view's resolved display target transfer is HDR; see
-    /// [`ViewDisplayTarget::is_hdr_transfer`].
+    /// Whether the view's display-encoding pass runs; see
+    /// [`ViewStackContract::is_hdr_encode`].
     ///
     /// The post-tonemap input on such views is paper-white-relative
     /// display-linear and exceeds 1.0, which would defeat FXAA's absolute
@@ -181,15 +182,15 @@ pub struct FxaaPipelineKey {
     /// pipeline byte-for-byte.
     hdr: bool,
     /// Whether the view's resolved compositing space is
-    /// [`CompositingSpace::Oklab`] (the phase-1 [`ResolvedCompositingSpace`]
-    /// value, never the camera's raw request).
+    /// [`CompositingSpace::Oklab`] ([`ViewStackContract::compositing_space`],
+    /// never the camera's raw request).
     ///
     /// An Oklab buffer holds Oklab triplets whose a/b chroma channels are
     /// signed, so the Rec.601 luma dot can go negative and the `sqrt`
     /// perceptual proxy then yields a NaN edge metric. Under this flag the
-    /// shader compiles with the `OKLAB_COMPOSITING` def and reads the Oklab L
-    /// channel directly as the edge-detection luma. Non-Oklab views keep the
-    /// def-less pipeline byte-for-byte.
+    /// shader compiles with the `COMPOSITING_SPACE_OKLAB` def and reads the
+    /// Oklab L channel directly as the edge-detection luma. Non-Oklab views
+    /// keep the def-less pipeline byte-for-byte.
     oklab_compositing: bool,
 }
 
@@ -208,7 +209,7 @@ fn fxaa_shader_defs(key: &FxaaPipelineKey) -> Vec<ShaderDefVal> {
         shader_defs.push("HDR_DISPLAY_TARGET".into());
     }
     if key.oklab_compositing {
-        shader_defs.push("OKLAB_COMPOSITING".into());
+        shader_defs.push("COMPOSITING_SPACE_OKLAB".into());
     }
     shader_defs
 }
@@ -243,17 +244,11 @@ pub fn prepare_fxaa_pipelines(
     mut pipelines: ResMut<SpecializedRenderPipelines<FxaaPipeline>>,
     fxaa_pipeline: Res<FxaaPipeline>,
     cameras: Query<
-        (
-            Entity,
-            &ExtractedView,
-            &Fxaa,
-            &ViewDisplayTarget,
-            Option<&ResolvedCompositingSpace>,
-        ),
-        With<ExtractedCamera>,
+        (Entity, &ExtractedView, &Fxaa, &ViewStackContract),
+        (With<ExtractedCamera>, With<ViewTarget>),
     >,
 ) {
-    for (entity, view, fxaa, display_target, resolved_space) in &cameras {
+    for (entity, view, fxaa, contract) in &cameras {
         if !fxaa.enabled {
             continue;
         }
@@ -264,11 +259,10 @@ pub fn prepare_fxaa_pipelines(
                 edge_threshold: fxaa.edge_threshold,
                 edge_threshold_min: fxaa.edge_threshold_min,
                 target_format: view.target_format,
-                hdr: display_target.is_hdr_transfer(),
-                // The phase-1 resolved space, not the camera's raw request: a
+                hdr: contract.is_hdr_encode(),
+                // The resolved space, not the camera's raw request: a
                 // signed-a/b Oklab buffer needs the Oklab-L luma path.
-                oklab_compositing: resolved_space.and_then(|space| space.0)
-                    == Some(CompositingSpace::Oklab),
+                oklab_compositing: contract.compositing_space == Some(CompositingSpace::Oklab),
             },
         );
 
@@ -293,7 +287,7 @@ mod tests {
     }
 
     /// The default `oklab_compositing: false` key produces the same def vector
-    /// as before the field existed, for both `hdr` values: no `OKLAB_COMPOSITING`
+    /// as before the field existed, for both `hdr` values: no `COMPOSITING_SPACE_OKLAB`
     /// def is pushed, so non-Oklab pipelines stay byte-identical.
     #[test]
     fn non_oklab_def_vector_is_byte_identical() {
@@ -305,7 +299,7 @@ mod tests {
                 ShaderDefVal::from("EDGE_THRESH_MIN_HIGH"),
             ]
         );
-        assert!(!sdr.contains(&ShaderDefVal::from("OKLAB_COMPOSITING")));
+        assert!(!sdr.contains(&ShaderDefVal::from("COMPOSITING_SPACE_OKLAB")));
 
         let hdr = fxaa_shader_defs(&base_key(true, false));
         assert_eq!(
@@ -316,10 +310,10 @@ mod tests {
                 ShaderDefVal::from("HDR_DISPLAY_TARGET"),
             ]
         );
-        assert!(!hdr.contains(&ShaderDefVal::from("OKLAB_COMPOSITING")));
+        assert!(!hdr.contains(&ShaderDefVal::from("COMPOSITING_SPACE_OKLAB")));
     }
 
-    /// `oklab_compositing: true` appends exactly the `OKLAB_COMPOSITING` def,
+    /// `oklab_compositing: true` appends exactly the `COMPOSITING_SPACE_OKLAB` def,
     /// independently of the `hdr` flag.
     #[test]
     fn oklab_def_present_only_when_set() {
@@ -329,7 +323,7 @@ mod tests {
             vec![
                 ShaderDefVal::from("EDGE_THRESH_HIGH"),
                 ShaderDefVal::from("EDGE_THRESH_MIN_HIGH"),
-                ShaderDefVal::from("OKLAB_COMPOSITING"),
+                ShaderDefVal::from("COMPOSITING_SPACE_OKLAB"),
             ]
         );
 
@@ -340,7 +334,7 @@ mod tests {
                 ShaderDefVal::from("EDGE_THRESH_HIGH"),
                 ShaderDefVal::from("EDGE_THRESH_MIN_HIGH"),
                 ShaderDefVal::from("HDR_DISPLAY_TARGET"),
-                ShaderDefVal::from("OKLAB_COMPOSITING"),
+                ShaderDefVal::from("COMPOSITING_SPACE_OKLAB"),
             ]
         );
     }

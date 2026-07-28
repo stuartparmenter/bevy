@@ -3,6 +3,7 @@ use bevy_app::prelude::*;
 use bevy_asset::{embedded_asset, load_embedded_asset, AssetServer};
 use bevy_camera::Camera;
 use bevy_core_pipeline::{
+    camera_stack::ViewStackContract,
     schedule::{Core2d, Core2dSystems, Core3d, Core3dSystems},
     FullscreenShader,
 };
@@ -17,7 +18,7 @@ use bevy_render::{
     },
     renderer::RenderDevice,
     sync_component::SyncComponent,
-    view::{ExtractedView, ViewDisplayTarget},
+    view::{ExtractedView, ViewTarget},
     Render, RenderApp, RenderStartup, RenderSystems,
 };
 
@@ -191,8 +192,8 @@ pub fn init_cas_pipeline(
 pub struct CasPipelineKey {
     target_format: TextureFormat,
     denoise: bool,
-    /// Whether the view's resolved display target transfer is HDR; see
-    /// [`ViewDisplayTarget::is_hdr_transfer`].
+    /// Whether the view's display-encoding pass runs; see
+    /// [`ViewStackContract::is_hdr_encode`].
     ///
     /// The post-tonemap input on such views is paper-white-relative
     /// display-linear and exceeds 1.0, which breaks RCAS's `[0, 1]` limiter
@@ -240,9 +241,10 @@ fn prepare_cas_pipelines(
     pipeline_cache: Res<PipelineCache>,
     mut sharpening_pipeline: ResMut<CasPipeline>,
     cameras: Query<
-        (Entity, &ExtractedView, &DenoiseCas, &ViewDisplayTarget),
+        (Entity, &ExtractedView, &DenoiseCas, &ViewStackContract),
         (
             With<ExtractedCamera>,
+            With<ViewTarget>,
             Or<(Added<CasUniform>, Changed<DenoiseCas>)>,
         ),
     >,
@@ -252,13 +254,13 @@ fn prepare_cas_pipelines(
         commands.entity(entity).remove::<ViewCasPipeline>();
     }
 
-    for (entity, view, denoise_cas, display_target) in &cameras {
+    for (entity, view, denoise_cas, contract) in &cameras {
         let pipeline_id = sharpening_pipeline.variants.specialize(
             &pipeline_cache,
             CasPipelineKey {
                 denoise: denoise_cas.0,
                 target_format: view.target_format,
-                hdr: display_target.is_hdr_transfer(),
+                hdr: contract.is_hdr_encode(),
             },
         )?;
 

@@ -401,7 +401,7 @@ pub struct DisplayEncodingPipelineKey {
     /// HDR-transfer target, Rec.709 otherwise.
     ///
     /// Post-tonemap UI converts its Rec.709-authored colors to `source_gamut`
-    /// per view (the `WORKING_COLOR_SPACE_REC2020` writer-encode, keyed off
+    /// per view (the `OUTPUT_GAMUT_REC2020` writer-encode, keyed off
     /// [`ViewStackContract::source_gamut_is_rec2020`]), so saturated UI colors no
     /// longer oversaturate on a Rec.2020 (GT7) HDR view. Pre-tonemap writers (PBR
     /// meshes, 3D gizmos) instead convert off the global `WorkingColorSpace`, so

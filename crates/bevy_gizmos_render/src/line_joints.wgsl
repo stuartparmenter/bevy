@@ -1,13 +1,5 @@
 #import bevy_render::{view::View, maths::affine3_to_square}
-#ifdef SRGB_OUTPUT
-#import bevy_render::color_operations::linear_to_srgb
-#endif
-#ifdef OKLAB_OUTPUT
-#import bevy_render::color_operations::linear_rgb_to_oklab
-#endif
-#ifdef WORKING_COLOR_SPACE_REC2020
-#import bevy_render::working_color_space::rec709_to_rec2020
-#endif
+#import bevy_render::writer_encode::writer_encode
 
 @group(0) @binding(0) var<uniform> view: View;
 
@@ -257,24 +249,8 @@ struct FragmentOutput {
     @location(0) color: vec4<f32>,
 };
 
-// See lines.wgsl: convert the Rec.709 color to the Rec.2020 working primaries
-// when active, then writer-encode into the Srgb/Oklab compositing space (2D
-// only). Default Rec.709 / Linear views compile both steps out.
-fn encode_output(color_in: vec4<f32>) -> vec4<f32> {
-    var color = color_in;
-#ifdef WORKING_COLOR_SPACE_REC2020
-    color = vec4(rec709_to_rec2020(color.rgb), color.a);
-#endif
-#ifdef SRGB_OUTPUT
-    color = vec4(linear_to_srgb(color.rgb), color.a);
-#endif
-#ifdef OKLAB_OUTPUT
-    color = vec4(linear_rgb_to_oklab(color.rgb), color.a);
-#endif
-    return color;
-}
-
+// See lines.wgsl: the writer-side encode is a pass-through on default views.
 @fragment
 fn fragment(in: FragmentInput) -> FragmentOutput {
-    return FragmentOutput(encode_output(in.color));
+    return FragmentOutput(writer_encode(in.color));
 }

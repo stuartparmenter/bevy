@@ -78,30 +78,42 @@ use bevy_gizmos::{
     GizmoAsset, GizmoHandles,
 };
 
-/// Pushes the writer-side color-space shader defs shared by the 2D and 3D gizmo
-/// pipelines.
+/// Pushes the writer-side color-space shader defs for the 3D gizmo pipelines.
 ///
-/// Gizmos render pre-tonemap in the scene working space, so a Rec.2020 working
-/// space gets the `WORKING_COLOR_SPACE_REC2020` gamut-convert def. 2D gizmos
+/// Gizmos render pre-tonemap in the scene working space, so a Rec.2020
+/// working space gets the `OUTPUT_GAMUT_REC2020` writer-encode gamut def. A
+/// default Rec.709 project pushes nothing, keeping the SDR path byte-identical.
+#[cfg(feature = "bevy_pbr")]
+pub(crate) fn push_gizmo_3d_color_space_defs(
+    shader_defs: &mut Vec<bevy_shader::ShaderDefVal>,
+    working_color_space: bevy_render::working_color_space::WorkingColorSpace,
+) {
+    if working_color_space.is_rec2020() {
+        shader_defs.push("OUTPUT_GAMUT_REC2020".into());
+    }
+}
+
+/// Pushes the writer-side color-space shader defs for the 2D gizmo pipelines.
+///
+/// Same `OUTPUT_GAMUT_REC2020` gamut def as the 3D form; 2D gizmos
 /// additionally blend into the camera's compositing-space buffer alongside
-/// sprites, so they pass the resolved `compositing_space` to writer-encode their
-/// output (`SRGB_OUTPUT`/`OKLAB_OUTPUT`); 3D gizmos pass `None`. A default
-/// Rec.709 / Linear view pushes nothing, keeping the SDR path byte-identical.
-#[cfg(any(feature = "bevy_pbr", feature = "bevy_sprite_render"))]
-pub(crate) fn push_gizmo_color_space_defs(
+/// sprites, so the resolved `compositing_space` writer-encodes their output
+/// (`COMPOSITING_SPACE_SRGB`/`COMPOSITING_SPACE_OKLAB`). A default Rec.709 /
+/// Linear view pushes nothing, keeping the SDR path byte-identical.
+#[cfg(feature = "bevy_sprite_render")]
+pub(crate) fn push_gizmo_2d_color_space_defs(
     shader_defs: &mut Vec<bevy_shader::ShaderDefVal>,
     working_color_space: bevy_render::working_color_space::WorkingColorSpace,
     compositing_space: Option<bevy_camera::CompositingSpace>,
 ) {
     use bevy_camera::CompositingSpace;
-    use bevy_render::working_color_space::WORKING_COLOR_SPACE_REC2020_SHADER_DEF;
 
     if working_color_space.is_rec2020() {
-        shader_defs.push(WORKING_COLOR_SPACE_REC2020_SHADER_DEF.into());
+        shader_defs.push("OUTPUT_GAMUT_REC2020".into());
     }
     match compositing_space {
-        Some(CompositingSpace::Srgb) => shader_defs.push("SRGB_OUTPUT".into()),
-        Some(CompositingSpace::Oklab) => shader_defs.push("OKLAB_OUTPUT".into()),
+        Some(CompositingSpace::Srgb) => shader_defs.push("COMPOSITING_SPACE_SRGB".into()),
+        Some(CompositingSpace::Oklab) => shader_defs.push("COMPOSITING_SPACE_OKLAB".into()),
         Some(CompositingSpace::Linear) | None => {}
     }
 }

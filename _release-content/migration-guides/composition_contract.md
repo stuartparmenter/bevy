@@ -50,6 +50,27 @@ gamut.
 per-target stacking index keys on the target alone. Read `ExtractedCamera::hdr`
 on the view entity if you need a camera's raw HDR request.
 
+## Renamed writer-encode shader defs
+
+The writer-side encode defs that 2D pipelines (sprites, 2D meshes and
+materials, gizmos, UI) push into their shaders are renamed, and one shared
+WGSL helper now implements the encode:
+
+- `SRGB_OUTPUT` → `COMPOSITING_SPACE_SRGB` and `OKLAB_OUTPUT` →
+  `COMPOSITING_SPACE_OKLAB`, unifying the writer-side names with the ones the
+  tonemapping and FXAA passes already used for the same resolved
+  `CompositingSpace`.
+- The gamut-convert def in writer shaders is now `OUTPUT_GAMUT_REC2020` ("the
+  buffer I write into has Rec.2020 primaries"). `WORKING_COLOR_SPACE_REC2020`
+  keeps its project-global meaning and is still pushed wherever a pipeline
+  consumes the working-space axis (PBR, skybox, tone mapping, and the 2D
+  pipelines' in-shader tonemapping fold); UI previously pushed that name with
+  a different, per-view meaning, which the split removes.
+
+A custom `Material2d` or UI shader that read the old defs should switch to the
+new names — or import `bevy_render::writer_encode::writer_encode` and call it
+on the composed color, which handles all three defs.
+
 ## Behavior changes
 
 These affect non-default compositing-space and HDR configurations, never default
@@ -92,7 +113,7 @@ SDR cameras.
 - **UI and gizmos convert Rec.709-authored colors to the buffer's working gamut on
   a Rec.2020 (GT7) HDR view.** UI fragment shaders, and the 2D and 3D gizmo
   line/joint shaders, now apply `rec709_to_rec2020` (the shared
-  `WORKING_COLOR_SPACE_REC2020` writer-encode) before the compositing-space encode.
+  `OUTPUT_GAMUT_REC2020` writer-encode) before the compositing-space encode.
   UI keys this per view off the buffer's `source_gamut`; gizmos render pre-tone-map
   and key off the global `WorkingColorSpace` like sprites and meshes. SDR and
   Rec.709 views are byte-identical (no shader def, no conversion).
@@ -101,6 +122,12 @@ SDR cameras.
   sprites, 2D gizmos blend into a `CompositingSpace::Srgb`/`Oklab` buffer, so they
   now encode their output to match it. 3D gizmos render pre-tone-map and are
   unaffected. SDR/linear views are byte-identical.
+
+- **Tilemap chunks writer-encode into the camera's compositing space.** The
+  tilemap chunk material previously wrote linear values into a
+  `CompositingSpace::Srgb`/`Oklab` `Camera2d` buffer, so its tiles decoded
+  wrong next to sprites; it now encodes its output like every other 2D writer.
+  Default/linear views are byte-identical.
 
 - **FXAA on a `CompositingSpace::Oklab` view uses the Oklab L channel for edge
   luma.** FXAA's Rec.601-weighted luma dot can go negative (and NaN under the

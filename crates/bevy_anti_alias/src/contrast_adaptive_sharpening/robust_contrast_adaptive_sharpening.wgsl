@@ -111,6 +111,9 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     let e = vec4<f32>(rcas_range_compress(e_raw.rgb), e_raw.a);
     let f = rcas_range_compress(f_raw);
     let h = rcas_range_compress(h_raw);
+    // The uncompressed neighborhood maximum, bounding the decompressed output
+    // below.
+    let local_max = max(max(b_raw, d_raw), max(max(f_raw, h_raw), e_raw.rgb));
 #else
     let b = textureSample(screenTexture, samp, in.uv, vec2<i32>(0, -1)).rgb;
     let d = textureSample(screenTexture, samp, in.uv, vec2<i32>(-1, 0)).rgb;
@@ -150,7 +153,6 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     // may reach paper white (1.0), and content above paper white may not
     // overshoot beyond the brightest neighborhood value, so decompression
     // can never manufacture out-of-scene highlights (fireflies).
-    let local_max = max(max(b_raw, d_raw), max(max(f_raw, h_raw), e_raw.rgb));
     return vec4<f32>(min(sharpened, max(local_max, vec3<f32>(1.0))), e.w);
 #else
     return vec4<f32>((lobe * b + lobe * d + lobe * f + lobe * h + e.rgb) / (4.0 * lobe + 1.0), e.w);

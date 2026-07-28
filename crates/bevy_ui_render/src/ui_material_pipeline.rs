@@ -146,8 +146,7 @@ where
             ],
         );
         let mut shader_defs = Vec::new();
-        push_compositing_space_defs(&mut shader_defs, key.compositing_space);
-        push_working_gamut_defs(&mut shader_defs, key.source_gamut_rec2020);
+        key.writer_encode.push_shader_defs(&mut shader_defs);
 
         let mut descriptor = RenderPipelineDescriptor {
             vertex: VertexState {
@@ -696,9 +695,11 @@ pub fn queue_ui_material_nodes<M: UiMaterial>(
     pipeline_cache: Res<PipelineCache>,
     render_materials: Res<RenderAssets<PreparedUiMaterial<M>>>,
     mut transparent_render_phases: ResMut<ViewSortedRenderPhases<TransparentUi>>,
-    mut render_views: Query<&UiCameraView, With<ExtractedView>>,
+    render_views: Query<
+        (&UiCameraView, &ViewStackContract),
+        (With<ExtractedView>, With<ViewTarget>),
+    >,
     camera_views: Query<&ExtractedView>,
-    view_contracts: Query<&ViewStackContract>,
 ) where
     M::Data: PartialEq + Eq + Hash + Clone,
 {
@@ -710,8 +711,8 @@ pub fn queue_ui_material_nodes<M: UiMaterial>(
                 continue;
             };
 
-            let Ok(default_camera_view) =
-                render_views.get_mut(extracted_uinode.extracted_camera_entity)
+            let Ok((default_camera_view, contract)) =
+                render_views.get(extracted_uinode.extracted_camera_entity)
             else {
                 continue;
             };
@@ -726,18 +727,13 @@ pub fn queue_ui_material_nodes<M: UiMaterial>(
                 continue;
             };
 
-            let contract = view_contracts
-                .get(extracted_uinode.extracted_camera_entity)
-                .ok();
             let pipeline = pipelines.specialize(
                 &pipeline_cache,
                 &ui_material_pipeline,
                 UiMaterialKey {
                     target_format: view.target_format,
                     bind_group_data: material.key.clone(),
-                    compositing_space: contract.and_then(|contract| contract.compositing_space),
-                    source_gamut_rec2020: contract
-                        .is_some_and(ViewStackContract::source_gamut_is_rec2020),
+                    writer_encode: contract.into(),
                 },
             );
             if transparent_phase.items.capacity() < extracted_uinodes.uinodes.len() {

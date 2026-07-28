@@ -353,8 +353,9 @@ pub struct Mesh2dPipeline {
     /// The project-global working color space, captured at `RenderStartup`.
     /// Under `WorkingColorSpace::Rec2020` the 2D mesh / material fragment
     /// shaders convert their composed colors into the working space
-    /// (`WORKING_COLOR_SPACE_REC2020` shader def, inherited by `Material2d`
-    /// pipelines).
+    /// (`OUTPUT_GAMUT_REC2020` writer-encode def, plus the shared
+    /// `WORKING_COLOR_SPACE_REC2020` def for the in-shader tonemapping fold;
+    /// both inherited by `Material2d` pipelines).
     pub working_color_space: WorkingColorSpace,
 }
 
@@ -641,9 +642,13 @@ impl SpecializedMeshPipeline for Mesh2dPipeline {
 
         // Project-global working-space axis: pushed for every specialization
         // when (and only when) the app opted into the Rec.2020 working
-        // space, so default projects compose byte-identically.
+        // space, so default projects compose byte-identically. Two defs: the
+        // working-space def feeds the in-shader tonemapping fold's entry
+        // conversion, the writer-encode gamut def converts the composed
+        // mesh/material color into the buffer's Rec.2020 primaries.
         if self.working_color_space.is_rec2020() {
             shader_defs.push(WORKING_COLOR_SPACE_REC2020_SHADER_DEF.into());
+            shader_defs.push("OUTPUT_GAMUT_REC2020".into());
         }
 
         if layout.0.contains(Mesh::ATTRIBUTE_POSITION) {
@@ -758,10 +763,10 @@ impl SpecializedMeshPipeline for Mesh2dPipeline {
             shader_defs.push("MAY_DISCARD".into());
         }
         if key.contains(Mesh2dPipelineKey::SRGB_COMPOSITING) {
-            shader_defs.push("SRGB_OUTPUT".into());
+            shader_defs.push("COMPOSITING_SPACE_SRGB".into());
         }
         if key.contains(Mesh2dPipelineKey::OKLAB_COMPOSITING) {
-            shader_defs.push("OKLAB_OUTPUT".into());
+            shader_defs.push("COMPOSITING_SPACE_OKLAB".into());
         }
 
         let vertex_buffer_layout = layout.0.get_layout(&vertex_attributes)?;

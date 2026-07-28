@@ -40,8 +40,10 @@ Under `Rec2020`:
 - Color quantities composed in shaders from Rec.709 factors — PBR base color
   and emissive (material factor × texture × vertex color), lightmap samples,
   environment-map radiance, skybox samples, sprite / `ColorMaterial` /
-  tilemap colors — convert once after composition, under the global
-  `WORKING_COLOR_SPACE_REC2020` shader def. All sampled color textures are
+  tilemap colors — convert once after composition. 3D pipelines key the
+  conversion on the global `WORKING_COLOR_SPACE_REC2020` shader def; 2D
+  writer pipelines on the `OUTPUT_GAMUT_REC2020` writer-encode def, pushed
+  from the same setting. All sampled color textures are
   assumed authored against Rec.709 (this also covers compressed textures, which
   cannot be converted on the CPU). Textures stamped with wide primaries via
   `Image::source_primaries` have no per-texture escape hatch yet, but the stamp

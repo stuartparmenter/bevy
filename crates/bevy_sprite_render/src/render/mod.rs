@@ -60,7 +60,9 @@ pub struct SpritePipeline {
     /// The project-global working color space, captured at `RenderStartup`.
     /// Under `WorkingColorSpace::Rec2020` the sprite fragment shader
     /// converts its composed color (instance tint × texture sample) into the
-    /// working space (`WORKING_COLOR_SPACE_REC2020` shader def).
+    /// working space (`OUTPUT_GAMUT_REC2020` writer-encode def, plus the
+    /// shared `WORKING_COLOR_SPACE_REC2020` def for the in-shader
+    /// tonemapping fold).
     working_color_space: WorkingColorSpace,
 }
 
@@ -213,9 +215,13 @@ impl SpecializedRenderPipeline for SpritePipeline {
 
         // Project-global working-space axis: pushed for every specialization
         // when (and only when) the app opted into the Rec.2020 working
-        // space, so default projects compose byte-identically.
+        // space, so default projects compose byte-identically. Two defs: the
+        // working-space def feeds the in-shader tonemapping fold's entry
+        // conversion, the writer-encode gamut def converts the composed
+        // sprite color into the buffer's Rec.2020 primaries.
         if self.working_color_space.is_rec2020() {
             shader_defs.push(WORKING_COLOR_SPACE_REC2020_SHADER_DEF.into());
+            shader_defs.push("OUTPUT_GAMUT_REC2020".into());
         }
 
         if key.contains(SpritePipelineKey::TONEMAP_IN_SHADER) {
@@ -263,10 +269,10 @@ impl SpecializedRenderPipeline for SpritePipeline {
         }
 
         if key.contains(SpritePipelineKey::SRGB_COMPOSITING) {
-            shader_defs.push("SRGB_OUTPUT".into());
+            shader_defs.push("COMPOSITING_SPACE_SRGB".into());
         }
         if key.contains(SpritePipelineKey::OKLAB_COMPOSITING) {
-            shader_defs.push("OKLAB_OUTPUT".into());
+            shader_defs.push("COMPOSITING_SPACE_OKLAB".into());
         }
 
         let format = key.target_format();

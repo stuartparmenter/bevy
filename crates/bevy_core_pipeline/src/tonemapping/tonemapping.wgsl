@@ -8,10 +8,10 @@
     fullscreen_vertex_shader::FullscreenVertexOutput,
     tonemapping::{tone_mapping, screen_space_dither},
 }
-#ifdef SRGB_COMPOSITING
+#ifdef COMPOSITING_SPACE_SRGB
 #import bevy_render::color_operations::{srgb_to_linear, linear_to_srgb}
 #endif
-#ifdef OKLAB_COMPOSITING
+#ifdef COMPOSITING_SPACE_OKLAB
 #import bevy_render::color_operations::{oklab_to_linear_rgb, linear_rgb_to_oklab}
 #endif
 
@@ -33,9 +33,9 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     // must respect the same buffer convention: decode to scene-linear before
     // tone mapping, and re-encode the tone-mapped result before writing it
     // back.
-#ifdef SRGB_COMPOSITING
+#ifdef COMPOSITING_SPACE_SRGB
     var output_rgb = tone_mapping(vec4(srgb_to_linear(hdr_color.rgb), hdr_color.a), view.color_grading).rgb;
-#else ifdef OKLAB_COMPOSITING
+#else ifdef COMPOSITING_SPACE_OKLAB
     var output_rgb = tone_mapping(vec4(oklab_to_linear_rgb(hdr_color.rgb), hdr_color.a), view.color_grading).rgb;
 #else
     var output_rgb = tone_mapping(hdr_color, view.color_grading).rgb;
@@ -49,10 +49,10 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     output_rgb = powsafe(output_rgb.rgb, 2.2);
 #endif
 
-#ifdef SRGB_COMPOSITING
+#ifdef COMPOSITING_SPACE_SRGB
     output_rgb = linear_to_srgb(output_rgb);
 #endif
-#ifdef OKLAB_COMPOSITING
+#ifdef COMPOSITING_SPACE_OKLAB
     output_rgb = linear_rgb_to_oklab(output_rgb);
 #endif
 

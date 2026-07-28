@@ -233,14 +233,14 @@ bitflags! {
         /// main pass shaders write sRGB-encoded values, so this pass decodes
         /// the input to scene-linear before tone mapping and re-encodes the
         /// result, preserving the buffer convention the upscaling blit
-        /// expects (`SRGB_TO_LINEAR`). Pushes the `SRGB_COMPOSITING` shader
-        /// def.
+        /// expects (`SRGB_TO_LINEAR`). Pushes the `COMPOSITING_SPACE_SRGB`
+        /// shader def.
         const SRGB_COMPOSITING          = 0x20;
         /// The view composites in Oklab space
         /// ([`CompositingSpace::Oklab`](bevy_camera::CompositingSpace::Oklab)).
         /// Like [`Self::SRGB_COMPOSITING`], but decoding/encoding with the
         /// Oklab transforms (the blit's `OKLAB_TO_LINEAR` counterpart).
-        /// Pushes the `OKLAB_COMPOSITING` shader def.
+        /// Pushes the `COMPOSITING_SPACE_OKLAB` shader def.
         const OKLAB_COMPOSITING         = 0x40;
     }
 }
@@ -305,13 +305,13 @@ impl SpecializedRenderPipeline for TonemappingPipeline {
             .flags
             .contains(TonemappingPipelineKeyFlags::SRGB_COMPOSITING)
         {
-            shader_defs.push("SRGB_COMPOSITING".into());
+            shader_defs.push("COMPOSITING_SPACE_SRGB".into());
         }
         if key
             .flags
             .contains(TonemappingPipelineKeyFlags::OKLAB_COMPOSITING)
         {
-            shader_defs.push("OKLAB_COMPOSITING".into());
+            shader_defs.push("COMPOSITING_SPACE_OKLAB".into());
         }
 
         // The GT7-params uniform is additive: only GT7 views (a per-camera

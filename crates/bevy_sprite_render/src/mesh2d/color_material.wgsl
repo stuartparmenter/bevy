@@ -8,15 +8,7 @@
 #ifdef TONEMAP_IN_SHADER
 #import bevy_core_pipeline::tonemapping
 #endif
-#ifdef SRGB_OUTPUT
-#import bevy_render::color_operations::linear_to_srgb
-#endif
-#ifdef OKLAB_OUTPUT
-#import bevy_render::color_operations::linear_rgb_to_oklab
-#endif
-#ifdef WORKING_COLOR_SPACE_REC2020
-#import bevy_render::working_color_space::rec709_to_rec2020
-#endif
+#import bevy_render::writer_encode::writer_encode
 
 struct ColorMaterial {
     color: vec4<f32>,
@@ -97,19 +89,9 @@ fn fragment(
     output_color = tonemapping::tone_mapping(output_color, view.color_grading);
 #endif
 
-#ifdef WORKING_COLOR_SPACE_REC2020
-    // The composed color converts into the Rec.2020 working space once,
-    // after composition (see the working-space release notes).
-    output_color = vec4(rec709_to_rec2020(output_color.rgb), output_color.a);
-#endif
-
-#ifdef SRGB_OUTPUT
-    output_color = vec4(linear_to_srgb(output_color.rgb), output_color.a);
-#endif
-#ifdef OKLAB_OUTPUT
-    output_color = vec4(linear_rgb_to_oklab(output_color.rgb), output_color.a);
-#endif
-    return output_color;
+    // Writer-side gamut convert into a Rec.2020 working buffer and
+    // compositing-space encode; a pass-through on default views.
+    return writer_encode(output_color);
 }
 
 fn alpha_discard(flags: u32, alpha_cutoff: f32, output_color: vec4<f32>) -> vec4<f32> {

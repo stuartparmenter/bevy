@@ -373,6 +373,7 @@ impl Plugin for RenderPlugin {
         load_shader_library!(app, "color_operations.wgsl");
         load_shader_library!(app, "transfer_functions.wgsl");
         load_shader_library!(app, "working_color_space.wgsl");
+        load_shader_library!(app, "writer_encode.wgsl");
         load_shader_library!(app, "bindless.wgsl");
 
         // The working color space is a project-global, immutable axis: insert

@@ -1,15 +1,7 @@
 #ifdef TONEMAP_IN_SHADER
 #import bevy_core_pipeline::tonemapping
 #endif
-#ifdef SRGB_OUTPUT
-#import bevy_render::color_operations::linear_to_srgb
-#endif
-#ifdef OKLAB_OUTPUT
-#import bevy_render::color_operations::linear_rgb_to_oklab
-#endif
-#ifdef WORKING_COLOR_SPACE_REC2020
-#import bevy_render::working_color_space::rec709_to_rec2020
-#endif
+#import bevy_render::writer_encode::writer_encode
 
 #import bevy_render::{
     maths::affine3_to_square,
@@ -68,19 +60,8 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     color = tonemapping::tone_mapping(color, view.color_grading);
 #endif
 
-#ifdef WORKING_COLOR_SPACE_REC2020
-    // The composed sprite color (Rec.709 tint × Rec.709-authored texture)
-    // converts into the Rec.2020 working space once, after composition.
-    color = vec4(rec709_to_rec2020(color.rgb), color.a);
-#endif
-
-#ifdef SRGB_OUTPUT
-    color = vec4(linear_to_srgb(color.rgb), color.a);
-#endif
-
-#ifdef OKLAB_OUTPUT
-    color = vec4(linear_rgb_to_oklab(color.rgb), color.a);
-#endif
-
-    return color;
+    // Writer-side gamut convert (the composed Rec.709 tint × texture color
+    // into a Rec.2020 working buffer) and compositing-space encode; a
+    // pass-through on default views.
+    return writer_encode(color);
 }

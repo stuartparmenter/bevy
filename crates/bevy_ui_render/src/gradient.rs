@@ -138,15 +138,9 @@ pub struct UiGradientPipelineKey {
     anti_alias: bool,
     color_space: InterpolationColorSpace,
     pub target_format: TextureFormat,
-    /// Resolved [`CompositingSpace`](bevy_camera::CompositingSpace) of the view
-    /// this gradient renders into, driving the writer-side encode of the
-    /// fragment output (see
-    /// [`push_compositing_space_defs`](crate::pipeline::push_compositing_space_defs)).
-    compositing_space: Option<bevy_camera::CompositingSpace>,
-    /// Whether the post-tonemap buffer this gradient composites into uses
-    /// Rec.2020 primaries (see
-    /// [`push_working_gamut_defs`](crate::pipeline::push_working_gamut_defs)).
-    source_gamut_rec2020: bool,
+    /// Writer-side encode of the fragment output (see
+    /// [`UiWriterEncodeKey`](crate::pipeline::UiWriterEncodeKey)).
+    writer_encode: UiWriterEncodeKey,
 }
 
 impl SpecializedRenderPipeline for GradientPipeline {
@@ -205,8 +199,7 @@ impl SpecializedRenderPipeline for GradientPipeline {
         } else {
             vec![color_space.into()]
         };
-        push_compositing_space_defs(&mut shader_defs, key.compositing_space);
-        push_working_gamut_defs(&mut shader_defs, key.source_gamut_rec2020);
+        key.writer_encode.push_shader_defs(&mut shader_defs);
 
         RenderPipelineDescriptor {
             vertex: VertexState {
@@ -685,17 +678,19 @@ pub fn queue_gradient(
     gradients_pipeline: Res<GradientPipeline>,
     mut pipelines: ResMut<SpecializedRenderPipelines<GradientPipeline>>,
     mut transparent_render_phases: ResMut<ViewSortedRenderPhases<TransparentUi>>,
-    mut render_views: Query<(&UiCameraView, Option<&UiAntiAlias>), With<ExtractedView>>,
+    render_views: Query<
+        (&UiCameraView, Option<&UiAntiAlias>, &ViewStackContract),
+        (With<ExtractedView>, With<ViewTarget>),
+    >,
     camera_views: Query<&ExtractedView>,
-    view_contracts: Query<&ViewStackContract>,
     pipeline_cache: Res<PipelineCache>,
     draw_functions: Res<DrawFunctions<TransparentUi>>,
 ) {
     let draw_function = draw_functions.read().id::<DrawGradientFns>();
     for (main_entity, sub_gradients) in extracted_gradients.items.iter() {
         for (render_entity, gradient) in sub_gradients.iter() {
-            let Ok((default_camera_view, ui_anti_alias)) =
-                render_views.get_mut(gradient.extracted_camera_entity)
+            let Ok((default_camera_view, ui_anti_alias, contract)) =
+                render_views.get(gradient.extracted_camera_entity)
             else {
                 continue;
             };
@@ -710,7 +705,6 @@ pub fn queue_gradient(
                 continue;
             };
 
-            let contract = view_contracts.get(gradient.extracted_camera_entity).ok();
             let pipeline = pipelines.specialize(
                 &pipeline_cache,
                 &gradients_pipeline,
@@ -718,9 +712,7 @@ pub fn queue_gradient(
                     anti_alias: matches!(ui_anti_alias, None | Some(UiAntiAlias::On)),
                     color_space: gradient.color_space,
                     target_format: view.target_format,
-                    compositing_space: contract.and_then(|contract| contract.compositing_space),
-                    source_gamut_rec2020: contract
-                        .is_some_and(ViewStackContract::source_gamut_is_rec2020),
+                    writer_encode: contract.into(),
                 },
             );
 

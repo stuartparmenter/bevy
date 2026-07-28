@@ -140,15 +140,9 @@ pub fn init_ui_texture_slice_pipeline(mut commands: Commands, asset_server: Res<
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
 pub struct UiTextureSlicePipelineKey {
     pub target_format: TextureFormat,
-    /// Resolved [`CompositingSpace`](bevy_camera::CompositingSpace) of the view
-    /// this slice renders into, driving the writer-side encode of the fragment
-    /// output (see
-    /// [`push_compositing_space_defs`](crate::pipeline::push_compositing_space_defs)).
-    pub compositing_space: Option<bevy_camera::CompositingSpace>,
-    /// Whether the post-tonemap buffer this slice composites into uses Rec.2020
-    /// primaries (see
-    /// [`push_working_gamut_defs`](crate::pipeline::push_working_gamut_defs)).
-    pub source_gamut_rec2020: bool,
+    /// Writer-side encode of the fragment output (see
+    /// [`UiWriterEncodeKey`](crate::pipeline::UiWriterEncodeKey)).
+    pub writer_encode: UiWriterEncodeKey,
 }
 
 impl SpecializedRenderPipeline for UiTextureSlicePipeline {
@@ -175,8 +169,7 @@ impl SpecializedRenderPipeline for UiTextureSlicePipeline {
             ],
         );
         let mut shader_defs = Vec::new();
-        push_compositing_space_defs(&mut shader_defs, key.compositing_space);
-        push_working_gamut_defs(&mut shader_defs, key.source_gamut_rec2020);
+        key.writer_encode.push_shader_defs(&mut shader_defs);
 
         RenderPipelineDescriptor {
             vertex: VertexState {
@@ -410,17 +403,19 @@ pub fn queue_ui_slices(
     ui_slicer_pipeline: Res<UiTextureSlicePipeline>,
     mut pipelines: ResMut<SpecializedRenderPipelines<UiTextureSlicePipeline>>,
     mut transparent_render_phases: ResMut<ViewSortedRenderPhases<TransparentUi>>,
-    mut render_views: Query<&UiCameraView, With<ExtractedView>>,
+    render_views: Query<
+        (&UiCameraView, &ViewStackContract),
+        (With<ExtractedView>, With<ViewTarget>),
+    >,
     camera_views: Query<&ExtractedView>,
-    view_contracts: Query<&ViewStackContract>,
     pipeline_cache: Res<PipelineCache>,
     draw_functions: Res<DrawFunctions<TransparentUi>>,
 ) {
     let draw_function = draw_functions.read().id::<DrawUiTextureSlices>();
     for (main_entity, subslices) in extracted_ui_slicers.slices.iter() {
         for (render_entity, extracted_slicer) in subslices.iter() {
-            let Ok(default_camera_view) =
-                render_views.get_mut(extracted_slicer.extracted_camera_entity)
+            let Ok((default_camera_view, contract)) =
+                render_views.get(extracted_slicer.extracted_camera_entity)
             else {
                 continue;
             };
@@ -435,17 +430,12 @@ pub fn queue_ui_slices(
                 continue;
             };
 
-            let contract = view_contracts
-                .get(extracted_slicer.extracted_camera_entity)
-                .ok();
             let pipeline = pipelines.specialize(
                 &pipeline_cache,
                 &ui_slicer_pipeline,
                 UiTextureSlicePipelineKey {
                     target_format: view.target_format,
-                    compositing_space: contract.and_then(|contract| contract.compositing_space),
-                    source_gamut_rec2020: contract
-                        .is_some_and(ViewStackContract::source_gamut_is_rec2020),
+                    writer_encode: contract.into(),
                 },
             );
 

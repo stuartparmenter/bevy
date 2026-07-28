@@ -130,15 +130,9 @@ pub struct BoxShadowPipelineKey {
     pub target_format: TextureFormat,
     /// Number of samples, a higher value results in better quality shadows.
     pub samples: u32,
-    /// Resolved [`CompositingSpace`](bevy_camera::CompositingSpace) of the view
-    /// this shadow renders into, driving the writer-side encode of the fragment
-    /// output (see
-    /// [`push_compositing_space_defs`](crate::pipeline::push_compositing_space_defs)).
-    pub compositing_space: Option<bevy_camera::CompositingSpace>,
-    /// Whether the post-tonemap buffer this shadow composites into uses
-    /// Rec.2020 primaries (see
-    /// [`push_working_gamut_defs`](crate::pipeline::push_working_gamut_defs)).
-    pub source_gamut_rec2020: bool,
+    /// Writer-side encode of the fragment output (see
+    /// [`UiWriterEncodeKey`](crate::pipeline::UiWriterEncodeKey)).
+    pub writer_encode: crate::pipeline::UiWriterEncodeKey,
 }
 
 impl SpecializedRenderPipeline for BoxShadowPipeline {
@@ -167,8 +161,7 @@ impl SpecializedRenderPipeline for BoxShadowPipeline {
             ],
         );
         let mut shader_defs = vec![ShaderDefVal::UInt("SHADOW_SAMPLES".into(), key.samples)];
-        crate::pipeline::push_compositing_space_defs(&mut shader_defs, key.compositing_space);
-        crate::pipeline::push_working_gamut_defs(&mut shader_defs, key.source_gamut_rec2020);
+        key.writer_encode.push_shader_defs(&mut shader_defs);
 
         RenderPipelineDescriptor {
             vertex: VertexState {
@@ -395,17 +388,19 @@ pub fn queue_shadows(
     box_shadow_pipeline: Res<BoxShadowPipeline>,
     mut pipelines: ResMut<SpecializedRenderPipelines<BoxShadowPipeline>>,
     mut transparent_render_phases: ResMut<ViewSortedRenderPhases<TransparentUi>>,
-    mut render_views: Query<(&UiCameraView, Option<&BoxShadowSamples>), With<ExtractedView>>,
+    render_views: Query<
+        (&UiCameraView, Option<&BoxShadowSamples>, &ViewStackContract),
+        (With<ExtractedView>, With<ViewTarget>),
+    >,
     camera_views: Query<&ExtractedView>,
-    view_contracts: Query<&ViewStackContract>,
     pipeline_cache: Res<PipelineCache>,
     draw_functions: Res<DrawFunctions<TransparentUi>>,
 ) {
     let draw_function = draw_functions.read().id::<DrawBoxShadows>();
     for (main_entity, extracted_sub_shadows) in extracted_box_shadows.box_shadows.iter() {
         for (entity, extracted_shadow) in extracted_sub_shadows.iter() {
-            let Ok((default_camera_view, shadow_samples)) =
-                render_views.get_mut(extracted_shadow.extracted_camera_entity)
+            let Ok((default_camera_view, shadow_samples, contract)) =
+                render_views.get(extracted_shadow.extracted_camera_entity)
             else {
                 continue;
             };
@@ -420,18 +415,13 @@ pub fn queue_shadows(
                 continue;
             };
 
-            let contract = view_contracts
-                .get(extracted_shadow.extracted_camera_entity)
-                .ok();
             let pipeline = pipelines.specialize(
                 &pipeline_cache,
                 &box_shadow_pipeline,
                 BoxShadowPipelineKey {
                     target_format: view.target_format,
                     samples: shadow_samples.copied().unwrap_or_default().0,
-                    compositing_space: contract.and_then(|contract| contract.compositing_space),
-                    source_gamut_rec2020: contract
-                        .is_some_and(ViewStackContract::source_gamut_is_rec2020),
+                    writer_encode: contract.into(),
                 },
             );
 

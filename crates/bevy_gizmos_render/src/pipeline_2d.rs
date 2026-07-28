@@ -121,7 +121,7 @@ impl SpecializedRenderPipeline for LineGizmoPipeline {
             #[cfg(all(feature = "webgl", target_arch = "wasm32", not(feature = "webgpu")))]
             "SIXTEEN_BYTE_ALIGNMENT".into(),
         ];
-        crate::push_gizmo_color_space_defs(
+        crate::push_gizmo_2d_color_space_defs(
             &mut shader_defs,
             self.working_color_space,
             key.compositing_space,
@@ -212,7 +212,7 @@ impl SpecializedRenderPipeline for LineJointGizmoPipeline {
             #[cfg(all(feature = "webgl", target_arch = "wasm32", not(feature = "webgpu")))]
             "SIXTEEN_BYTE_ALIGNMENT".into(),
         ];
-        crate::push_gizmo_color_space_defs(
+        crate::push_gizmo_2d_color_space_defs(
             &mut shader_defs,
             self.working_color_space,
             key.compositing_space,

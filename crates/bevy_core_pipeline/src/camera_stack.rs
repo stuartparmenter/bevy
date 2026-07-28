@@ -166,6 +166,15 @@ impl ViewStackContract {
     pub fn source_gamut_is_rec2020(&self) -> bool {
         matches!(self.source_gamut, DisplayGamut::Rec2020)
     }
+
+    /// Whether this view's display-encoding pass runs. `encoding` is `Some`
+    /// exactly when the view's resolved display target requests an HDR
+    /// transfer ([`resolve_camera_stack_contracts`] asserts the equivalence
+    /// per view), so post-tonemap consumers keying HDR-input math (FXAA,
+    /// SMAA, CAS) can read it here instead of the `ViewDisplayTarget`.
+    pub fn is_hdr_encode(&self) -> bool {
+        self.encoding.is_some()
+    }
 }
 
 /// Per-view input to [`resolve_contracts`].

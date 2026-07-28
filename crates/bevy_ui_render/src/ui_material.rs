@@ -128,15 +128,9 @@ pub trait UiMaterial: AsBindGroup + Asset + Clone + Sized {
 pub struct UiMaterialKey<M: UiMaterial> {
     pub target_format: TextureFormat,
     pub bind_group_data: M::Data,
-    /// Resolved [`CompositingSpace`](bevy_camera::CompositingSpace) of the view
-    /// this material node renders into, driving the writer-side encode of the
-    /// fragment output (see
-    /// [`push_compositing_space_defs`](crate::pipeline::push_compositing_space_defs)).
-    pub compositing_space: Option<bevy_camera::CompositingSpace>,
-    /// Whether the post-tonemap buffer this material node composites into uses
-    /// Rec.2020 primaries (see
-    /// [`push_working_gamut_defs`](crate::pipeline::push_working_gamut_defs)).
-    pub source_gamut_rec2020: bool,
+    /// Writer-side encode of the fragment output (see
+    /// [`UiWriterEncodeKey`](crate::pipeline::UiWriterEncodeKey)).
+    pub writer_encode: crate::pipeline::UiWriterEncodeKey,
 }
 
 impl<M: UiMaterial> Eq for UiMaterialKey<M> where M::Data: PartialEq {}
@@ -148,8 +142,7 @@ where
     fn eq(&self, other: &Self) -> bool {
         self.target_format == other.target_format
             && self.bind_group_data == other.bind_group_data
-            && self.compositing_space == other.compositing_space
-            && self.source_gamut_rec2020 == other.source_gamut_rec2020
+            && self.writer_encode == other.writer_encode
     }
 }
 
@@ -161,8 +154,7 @@ where
         Self {
             target_format: self.target_format,
             bind_group_data: self.bind_group_data.clone(),
-            compositing_space: self.compositing_space,
-            source_gamut_rec2020: self.source_gamut_rec2020,
+            writer_encode: self.writer_encode,
         }
     }
 }
@@ -174,8 +166,7 @@ where
     fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
         self.target_format.hash(state);
         self.bind_group_data.hash(state);
-        self.compositing_space.hash(state);
-        self.source_gamut_rec2020.hash(state);
+        self.writer_encode.hash(state);
     }
 }
 

@@ -156,11 +156,7 @@ impl Specializer<RenderPipeline> for LineGizmoPipelineSpecializer {
             fragment.shader_defs.push("PERSPECTIVE".into());
         }
 
-        crate::push_gizmo_color_space_defs(
-            &mut fragment.shader_defs,
-            self.working_color_space,
-            None,
-        );
+        crate::push_gizmo_3d_color_space_defs(&mut fragment.shader_defs, self.working_color_space);
 
         let format = key.view_key.target_format();
 
@@ -214,7 +210,7 @@ impl SpecializedRenderPipeline for LineJointGizmoPipeline {
             shader_defs.push("PERSPECTIVE".into());
         }
 
-        crate::push_gizmo_color_space_defs(&mut shader_defs, self.working_color_space, None);
+        crate::push_gizmo_3d_color_space_defs(&mut shader_defs, self.working_color_space);
 
         let format = key.view_key.target_format();
 

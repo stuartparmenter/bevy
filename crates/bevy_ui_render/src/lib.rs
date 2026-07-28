@@ -59,7 +59,7 @@ use bevy_render::{
     renderer::{RenderDevice, RenderQueue},
     sync_world::{MainEntity, RenderEntity},
     texture::GpuImage,
-    view::{ExtractedView, RetainedViewEntity, ViewUniforms},
+    view::{ExtractedView, RetainedViewEntity, ViewTarget, ViewUniforms},
     Extract, ExtractSchedule, GpuResourceAppExt, Render, RenderApp, RenderStartup, RenderSystems,
 };
 use bevy_sprite::BorderRect;
@@ -2015,20 +2015,21 @@ pub fn queue_uinodes(
     ui_pipeline: Res<UiPipeline>,
     mut pipelines: ResMut<SpecializedRenderPipelines<UiPipeline>>,
     mut transparent_render_phases: ResMut<ViewSortedRenderPhases<TransparentUi>>,
-    render_views: Query<(&UiCameraView, Option<&UiAntiAlias>), With<ExtractedView>>,
+    render_views: Query<
+        (&UiCameraView, Option<&UiAntiAlias>, &ViewStackContract),
+        (With<ExtractedView>, With<ViewTarget>),
+    >,
     camera_views: Query<&ExtractedView>,
-    view_contracts: Query<&ViewStackContract>,
     pipeline_cache: Res<PipelineCache>,
     draw_functions: Res<DrawFunctions<TransparentUi>>,
 ) {
     let draw_function = draw_functions.read().id::<DrawUi>();
     let mut current_camera_entity = Entity::PLACEHOLDER;
     let mut current_phase = None;
-    // `ViewStackContract` is per-view, so the compositing space and buffer
-    // gamut are constant for a run of nodes sharing a camera; resolve them
-    // once per camera change, not per node.
-    let mut current_compositing_space = None;
-    let mut current_source_gamut_rec2020 = false;
+    // `ViewStackContract` is per-view, so the writer-encode key is constant
+    // for a run of nodes sharing a camera; resolve it once per camera change,
+    // not per node.
+    let mut current_writer_encode = UiWriterEncodeKey::default();
 
     for (main_entity, extracted_sub_uinodes) in extracted_uinodes.uinodes.iter() {
         for (render_entity, extracted_uinode) in extracted_sub_uinodes.iter() {
@@ -2036,7 +2037,8 @@ pub fn queue_uinodes(
                 current_phase = render_views
                     .get(extracted_uinode.extracted_camera_entity)
                     .ok()
-                    .and_then(|(default_camera_view, ui_anti_alias)| {
+                    .and_then(|(default_camera_view, ui_anti_alias, contract)| {
+                        current_writer_encode = UiWriterEncodeKey::from(contract);
                         camera_views
                             .get(default_camera_view.0)
                             .ok()
@@ -2048,13 +2050,6 @@ pub fn queue_uinodes(
                                     })
                             })
                     });
-                let contract = view_contracts
-                    .get(extracted_uinode.extracted_camera_entity)
-                    .ok();
-                current_compositing_space =
-                    contract.and_then(|contract| contract.compositing_space);
-                current_source_gamut_rec2020 =
-                    contract.is_some_and(ViewStackContract::source_gamut_is_rec2020);
                 current_camera_entity = extracted_uinode.extracted_camera_entity;
             }
 
@@ -2068,8 +2063,7 @@ pub fn queue_uinodes(
                 UiPipelineKey {
                     target_format: view.target_format,
                     anti_alias: matches!(ui_anti_alias, None | Some(UiAntiAlias::On)),
-                    compositing_space: current_compositing_space,
-                    source_gamut_rec2020: current_source_gamut_rec2020,
+                    writer_encode: current_writer_encode,
                 },
             );
 

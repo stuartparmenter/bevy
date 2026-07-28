@@ -68,7 +68,7 @@ fn QUALITY(q: i32) -> f32 {
 }
 
 fn rgb2luma(rgb: vec3<f32>) -> f32 {
-#ifdef OKLAB_COMPOSITING
+#ifdef COMPOSITING_SPACE_OKLAB
     // On a resolved-Oklab view the buffer holds Oklab triplets: rgb.x is the
     // perceptual lightness L, rgb.y/rgb.z are the signed a/b chroma channels.
     // The Rec.601 luma dot would mix the signed a/b in and can go negative,
