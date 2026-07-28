@@ -619,7 +619,6 @@ mod tests {
             compositing_space: None,
             loads_previous: false,
             operator: Tonemapping::GranTurismo7,
-            aux_fingerprint: 0,
         }
     }
 
@@ -638,7 +637,6 @@ mod tests {
             compositing_space: None,
             loads_previous: true,
             operator: Tonemapping::None,
-            aux_fingerprint: 0,
         }
     }
 

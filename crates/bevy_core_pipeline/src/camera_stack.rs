@@ -40,25 +40,22 @@ use bevy_ecs::{
     system::{Commands, Query, Res},
 };
 use bevy_log::{info_once, warn_once};
-use bevy_platform::collections::{HashMap, HashSet};
-use bevy_platform::hash::FixedHasher;
+use bevy_platform::collections::HashMap;
 use bevy_render::{
     camera::ExtractedCamera,
     render_resource::TextureId,
     view::{
-        composites_fullscreen, prepare_view_display_targets, prepare_view_targets, ColorGrading,
-        ExtractedView, ResolvedCompositionSpaces, ViewDisplayTarget, ViewTarget,
+        composites_fullscreen, prepare_view_display_targets, prepare_view_targets,
+        ResolvedCompositionSpaces, ViewDisplayTarget, ViewTarget,
     },
     working_color_space::WorkingColorSpace,
     Render, RenderApp, RenderSystems,
 };
 use bevy_window::{DisplayGamut, DisplayTransfer};
-use core::hash::{BuildHasher, Hash, Hasher};
+use core::hash::Hash;
 
 use crate::display_encoding::{is_gamut_contraction, DisplayGamutCompression, OutOfGamutHandling};
-use crate::tonemapping::{
-    effective_tonemapping, tonemap_output_gamut, DebandDither, GranTurismo7Params, Tonemapping,
-};
+use crate::tonemapping::{effective_tonemapping, tonemap_output_gamut, Tonemapping};
 
 /// Registers the phase-2 contract resolver
 /// ([`resolve_camera_stack_contracts`]), which turns the per-frame camera
@@ -175,58 +172,6 @@ impl ViewStackContract {
     }
 }
 
-/// A view participating in the stack analysis for one fullscreen pass.
-pub(crate) struct StackView<K> {
-    pub entity: Entity,
-    /// Identity of the main-texture ping-pong the view renders into. Views
-    /// only form a stack when they share it.
-    pub texture: K,
-    /// The camera's position in its render target's sorted camera order.
-    pub sorted_index: usize,
-    /// Whether the fullscreen pass would run for this view.
-    pub enabled: bool,
-    /// Whether this view composites over the previous camera's output and
-    /// covers the whole target: [`ClearColorConfig::None`] and no viewport.
-    ///
-    /// [`ClearColorConfig::None`]: bevy_camera::ClearColorConfig
-    pub composites_fullscreen: bool,
-}
-
-/// Returns the views whose fullscreen pass must be skipped because a later
-/// camera in the same stack runs it on the composed buffer, mapped to that
-/// finalizing camera's entity.
-///
-/// Within each group of views sharing a main texture, the pass is deferred
-/// to the last enabled view if and only if every enabled view after the
-/// first composites fullscreen (loads the previous content and covers the
-/// whole target with its output). Any other arrangement — clearing cameras,
-/// viewport-scoped cameras — keeps the per-camera behavior, where each
-/// camera's pass only feeds its own region of the final image.
-pub(crate) fn stack_deferred_views<K: Copy + Eq + Hash>(
-    views: impl IntoIterator<Item = StackView<K>>,
-) -> EntityHashMap<Entity> {
-    let mut groups: HashMap<K, Vec<StackView<K>>> = HashMap::default();
-    for view in views {
-        groups.entry(view.texture).or_default().push(view);
-    }
-
-    let mut deferred = EntityHashMap::default();
-    for group in groups.values_mut() {
-        group.sort_unstable_by_key(|view| view.sorted_index);
-        let enabled: Vec<&StackView<K>> = group.iter().filter(|view| view.enabled).collect();
-        let Some((finalizer, earlier)) = enabled.split_last() else {
-            continue;
-        };
-        if earlier.is_empty() || !enabled[1..].iter().all(|view| view.composites_fullscreen) {
-            continue;
-        }
-        for view in earlier {
-            deferred.insert(view.entity, finalizer.entity);
-        }
-    }
-    deferred
-}
-
 /// Per-view input to [`resolve_contracts`].
 pub(crate) struct ContractInput<K> {
     pub entity: Entity,
@@ -262,11 +207,6 @@ pub(crate) struct ContractInput<K> {
     /// operator is compared against the finalizer's for the operator-mismatch
     /// diagnostic.
     pub operator: Tonemapping,
-    /// Fingerprint of the view's `ColorGrading` / `GranTurismo7Params` /
-    /// `DebandDither`; compared against the finalizer's for the
-    /// settings-mismatch diagnostic. The ECS layer hashes; equality is
-    /// decided here.
-    pub aux_fingerprint: u64,
 }
 
 /// Which resolver diagnostics fired for a view. The ECS layer reports each
@@ -288,11 +228,9 @@ pub(crate) struct ContractDiagnostics {
     /// display-encoding pass, so each frame reprocesses last frame's
     /// already-processed output (feedback apps drift).
     pub frame_start_loads_processed_output: bool,
-    /// This deferred member's operator differs from its finalizer's.
-    pub operator_mismatch: bool,
-    /// This deferred member's grading/params/dither fingerprint differs from
-    /// its finalizer's.
-    pub aux_mismatch: bool,
+    /// `Some((own, finalizing))` when this deferred member's operator differs
+    /// from its finalizer's.
+    pub operator_mismatch: Option<(Tonemapping, Tonemapping)>,
 }
 
 /// Per-view output of [`resolve_contracts`]: the [`ViewStackContract`] fields
@@ -337,61 +275,68 @@ pub(crate) fn resolve_contracts<K: Copy + Eq + Hash>(
     outputs
 }
 
-/// Resolves one texture group of sorted members into [`ContractOutput`]s.
-fn resolve_group<K: Copy + Eq + Hash>(
+/// Returns the index of the member that runs one fullscreen pass for the
+/// whole sorted texture group, or `None` when the pass runs per camera.
+///
+/// The pass is deferred to the last enabled member if and only if there are
+/// at least two enabled members and every enabled member after the first
+/// composites fullscreen (loads the previous content and covers the whole
+/// target with its output). Any other arrangement — clearing cameras,
+/// viewport-scoped cameras — keeps the per-camera behavior, where each
+/// camera's pass only feeds its own region of the final image.
+fn pass_finalizer<K>(
     members: &[ContractInput<K>],
-    outputs: &mut EntityHashMap<ContractOutput>,
-) {
+    enabled: impl Fn(&ContractInput<K>) -> bool,
+) -> Option<usize> {
+    let mut tail = members
+        .iter()
+        .enumerate()
+        .filter(|(_, member)| enabled(member));
+    tail.next()?;
+    let mut finalizer = None;
+    for (index, member) in tail {
+        if !member.composites_fullscreen {
+            return None;
+        }
+        finalizer = Some(index);
+    }
+    finalizer
+}
+
+/// Resolves one texture group of sorted members into [`ContractOutput`]s.
+fn resolve_group<K>(members: &[ContractInput<K>], outputs: &mut EntityHashMap<ContractOutput>) {
     let encode_enabled_group = members.iter().any(|member| member.encode_enabled);
     let stack_tonemaps = members.iter().any(|member| member.operator.is_enabled());
 
-    let mut tonemap_deferred = stack_deferred_views(members.iter().map(|member| StackView {
-        entity: member.entity,
-        texture: member.texture,
-        sorted_index: member.sorted_index,
-        enabled: member.operator.is_enabled(),
-        composites_fullscreen: member.composites_fullscreen,
-    }));
-    let encode_deferred = stack_deferred_views(members.iter().map(|member| StackView {
-        entity: member.entity,
-        texture: member.texture,
-        sorted_index: member.sorted_index,
-        enabled: member.encode_enabled,
-        composites_fullscreen: member.composites_fullscreen,
-    }));
+    let mut tonemap_finalizer = pass_finalizer(members, |member| member.operator.is_enabled());
+    let encode_finalizer = pass_finalizer(members, |member| member.encode_enabled);
 
-    // Coherence: on an encode-enabled group the encode-deferred set must be a
-    // superset of the tonemap-deferred set, or a deferring member's own
-    // encode pass would run on the not-yet-tonemapped buffer
-    // (encode-before-tonemap). The deferral only checks the shape of ENABLED
-    // views, so a pass-disabled viewport member is invisible to the tonemap
-    // shape test but shape-breaking for the encode test; when that happens,
-    // tonemap deferral is cancelled and every member tone-maps per camera.
-    // SDR groups (no encode pass) keep tonemap deferral unconditionally.
+    // Coherence: on an encode-enabled group the encode must defer whenever
+    // the tonemap does, or a deferring member's own encode pass would run on
+    // the not-yet-tonemapped buffer (encode-before-tonemap). The deferral
+    // only checks the shape of ENABLED views, so a pass-disabled viewport
+    // member is invisible to the tonemap shape test but shape-breaking for
+    // the encode test; when that happens, tonemap deferral is cancelled and
+    // every member tone-maps per camera. SDR groups (no encode pass) keep
+    // tonemap deferral unconditionally.
     let coherence_cancelled =
-        encode_enabled_group && !tonemap_deferred.is_empty() && encode_deferred.is_empty();
+        encode_enabled_group && tonemap_finalizer.is_some() && encode_finalizer.is_none();
     if coherence_cancelled {
-        tonemap_deferred.clear();
+        tonemap_finalizer = None;
     }
 
-    let tonemap_finalizers: HashSet<Entity> = tonemap_deferred.values().copied().collect();
-    let encode_finalizers: HashSet<Entity> = encode_deferred.values().copied().collect();
-    let role = |member: &ContractInput<K>,
-                deferred: &EntityHashMap<Entity>,
-                finalizers: &HashSet<Entity>| {
-        if let Some(finalizer) = deferred.get(&member.entity) {
-            StackRole::Deferred(*finalizer)
-        } else if finalizers.contains(&member.entity) {
-            StackRole::Finalizer
-        } else {
-            StackRole::Solo
-        }
+    // The finalizer is by construction the last enabled member, so an
+    // enabled member below it defers to it and every other member runs solo.
+    let role = |index: usize, enabled: bool, finalizer: Option<usize>| match finalizer {
+        Some(f) if index == f => StackRole::Finalizer,
+        Some(f) if enabled && index < f => StackRole::Deferred(members[f].entity),
+        _ => StackRole::Solo,
     };
 
     // The gamut of the composed buffer a deferred encode reads: produced by
     // the LAST tonemap-enabled member in sorted order (not the tonemap
-    // finalizer, which does not exist when the tonemap deferral map is
-    // empty), Rec.709 when nothing in the group tone-maps.
+    // finalizer, which does not exist when the tonemap pass does not defer),
+    // Rec.709 when nothing in the group tone-maps.
     let group_gamut = members
         .iter()
         .rev()
@@ -406,18 +351,9 @@ fn resolve_group<K: Copy + Eq + Hash>(
     // finalizer's replace). A `CameraOutputMode::Skip` finalizer never blits,
     // so skipping anyone for it would leave the target unpresented; members
     // then keep their blits.
-    let presenting_finalizer = if tonemap_deferred.is_empty() && encode_deferred.is_empty() {
-        None
-    } else {
-        members
-            .iter()
-            .filter(|member| {
-                tonemap_finalizers.contains(&member.entity)
-                    || encode_finalizers.contains(&member.entity)
-            })
-            .max_by_key(|member| member.sorted_index)
-            .filter(|finalizer| finalizer.output_writes)
-    };
+    let presenting_finalizer = tonemap_finalizer
+        .max(encode_finalizer)
+        .filter(|&finalizer| members[finalizer].output_writes);
 
     let encode_without_tonemap = encode_enabled_group && !stack_tonemaps;
 
@@ -445,16 +381,13 @@ fn resolve_group<K: Copy + Eq + Hash>(
             !member.composites_fullscreen
         }
     };
-    // A member whose enabled pass runs per camera (not deferred, not the
-    // stack-wide finalizer).
+    // A member whose enabled pass runs per camera. When a pass has a
+    // finalizer every enabled member defers to it or is it, so a member's
+    // pass runs per camera exactly when it is enabled and the pass has no
+    // finalizer at all.
     let runs_own_pass = |member: &ContractInput<K>| {
-        let tonemap_solo = member.operator.is_enabled()
-            && !tonemap_deferred.contains_key(&member.entity)
-            && !tonemap_finalizers.contains(&member.entity);
-        let encode_solo = member.encode_enabled
-            && !encode_deferred.contains_key(&member.entity)
-            && !encode_finalizers.contains(&member.entity);
-        tonemap_solo || encode_solo
+        (member.operator.is_enabled() && tonemap_finalizer.is_none())
+            || (member.encode_enabled && encode_finalizer.is_none())
     };
     // A fullscreen `ClearColorConfig::None` member above a shape-breaking
     // member blits the WHOLE target, re-presenting regions whose passes ran
@@ -473,29 +406,20 @@ fn resolve_group<K: Copy + Eq + Hash>(
                 && members[..index].iter().any(&runs_own_pass)
         });
 
-    for member in members {
-        let tonemap = role(member, &tonemap_deferred, &tonemap_finalizers);
-        let encode = role(member, &encode_deferred, &encode_finalizers);
+    for (index, member) in members.iter().enumerate() {
+        let tonemap = role(index, member.operator.is_enabled(), tonemap_finalizer);
+        let encode = role(index, member.encode_enabled, encode_finalizer);
 
         let blit = match presenting_finalizer {
-            None => BlitDisposition::Run {
+            Some(finalizer) if index < finalizer => BlitDisposition::SkipDeferred,
+            Some(finalizer) if index == finalizer => BlitDisposition::Run {
+                force_replace: !member.explicit_blend,
+            },
+            // No finalizer, or a member above it: the blit runs with its auto
+            // `ALPHA_BLENDING` and composites over any earlier present.
+            _ => BlitDisposition::Run {
                 force_replace: false,
             },
-            Some(finalizer) => {
-                if member.sorted_index < finalizer.sorted_index {
-                    BlitDisposition::SkipDeferred
-                } else if member.entity == finalizer.entity {
-                    BlitDisposition::Run {
-                        force_replace: !member.explicit_blend,
-                    }
-                } else {
-                    // Members above the finalizer keep their auto
-                    // `ALPHA_BLENDING` and composite over its present.
-                    BlitDisposition::Run {
-                        force_replace: false,
-                    }
-                }
-            }
         };
 
         let source_gamut = match encode {
@@ -503,18 +427,12 @@ fn resolve_group<K: Copy + Eq + Hash>(
             StackRole::Deferred(_) | StackRole::Finalizer => group_gamut,
         };
 
-        let (operator_mismatch, aux_mismatch) = match tonemap {
-            StackRole::Deferred(finalizer_entity) => {
-                let finalizer = members
-                    .iter()
-                    .find(|candidate| candidate.entity == finalizer_entity)
-                    .expect("a deferral finalizer is always a member of its own group");
-                (
-                    member.operator != finalizer.operator,
-                    member.aux_fingerprint != finalizer.aux_fingerprint,
-                )
+        let operator_mismatch = match (tonemap, tonemap_finalizer) {
+            (StackRole::Deferred(_), Some(finalizer)) => {
+                let finalizing = members[finalizer].operator;
+                (member.operator != finalizing).then_some((member.operator, finalizing))
             }
-            StackRole::Solo | StackRole::Finalizer => (false, false),
+            _ => None,
         };
 
         outputs.insert(
@@ -532,7 +450,6 @@ fn resolve_group<K: Copy + Eq + Hash>(
                     fullscreen_blit_over_per_camera_passes,
                     frame_start_loads_processed_output,
                     operator_mismatch,
-                    aux_mismatch,
                 },
             },
         );
@@ -561,48 +478,14 @@ pub fn resolve_camera_stack_contracts(
     views: Query<(
         Entity,
         &ExtractedCamera,
-        &ExtractedView,
         &ViewTarget,
         Option<&ViewDisplayTarget>,
         Option<&Tonemapping>,
-        Option<&GranTurismo7Params>,
-        Option<&DebandDither>,
     )>,
     resolved_spaces: Res<ResolvedCompositionSpaces>,
     working_color_space: Res<WorkingColorSpace>,
     gamut_compression: Res<DisplayGamutCompression>,
 ) {
-    let mut inputs = Vec::new();
-    let mut operators = EntityHashMap::default();
-    for (entity, camera, view, view_target, view_display_target, tonemapping, gt7_params, dither) in
-        &views
-    {
-        let operator = effective_tonemapping(tonemapping, view_display_target);
-        operators.insert(entity, operator);
-        inputs.push(ContractInput {
-            entity,
-            texture: view_target.main_texture().id(),
-            sorted_index: camera.sorted_camera_index_for_target,
-            composites_fullscreen: composites_fullscreen(camera),
-            encode_enabled: view_display_target.is_some_and(ViewDisplayTarget::is_hdr_transfer),
-            output_writes: !matches!(camera.output_mode, CameraOutputMode::Skip),
-            explicit_blend: matches!(
-                camera.output_mode,
-                CameraOutputMode::Write {
-                    blend_state: Some(_),
-                    ..
-                }
-            ),
-            tonemap_output_gamut: tonemap_output_gamut(tonemapping, view_display_target),
-            compositing_space: resolved_spaces.get(entity, camera.compositing_space),
-            loads_previous: matches!(camera.clear_color, ClearColorConfig::None),
-            operator,
-            aux_fingerprint: aux_fingerprint(&view.color_grading, gt7_params, dither),
-        });
-    }
-
-    let outputs = resolve_contracts(inputs);
-
     // Encode parameters resolve once per texture group: members share one
     // `ViewDisplayTarget` (it resolves per render target, and the target is
     // part of the texture grouping key), so transfer and gamut are uniform
@@ -618,28 +501,46 @@ pub fn resolve_camera_stack_contracts(
     // encoded group with an unencoded out-texture clear.
     let mut group_encodings: HashMap<TextureId, Option<(DisplayTransfer, DisplayGamut)>> =
         HashMap::default();
-    for (_, _, _, view_target, view_display_target, ..) in &views {
-        let encoding = *group_encodings
-            .entry(view_target.main_texture().id())
-            .or_insert_with(|| {
-                resolve_group_encode_parameters(
-                    view_display_target,
-                    view_target,
-                    *working_color_space,
-                )
-            });
+    let mut inputs = Vec::new();
+    for (entity, camera, view_target, view_display_target, tonemapping) in &views {
+        let texture = view_target.main_texture().id();
+        let encode_enabled = view_display_target.is_some_and(ViewDisplayTarget::is_hdr_transfer);
+        let encoding = *group_encodings.entry(texture).or_insert_with(|| {
+            resolve_group_encode_parameters(view_display_target, view_target, *working_color_space)
+        });
         debug_assert_eq!(
             encoding.is_some(),
-            view_display_target.is_some_and(ViewDisplayTarget::is_hdr_transfer),
+            encode_enabled,
             "every member of a texture group must agree on display-encode enablement"
         );
+        inputs.push(ContractInput {
+            entity,
+            texture,
+            sorted_index: camera.sorted_camera_index_for_target,
+            composites_fullscreen: composites_fullscreen(camera),
+            encode_enabled,
+            output_writes: !matches!(camera.output_mode, CameraOutputMode::Skip),
+            explicit_blend: matches!(
+                camera.output_mode,
+                CameraOutputMode::Write {
+                    blend_state: Some(_),
+                    ..
+                }
+            ),
+            tonemap_output_gamut: tonemap_output_gamut(tonemapping, view_display_target),
+            compositing_space: resolved_spaces.get(entity, camera.compositing_space),
+            loads_previous: matches!(camera.clear_color, ClearColorConfig::None),
+            operator: effective_tonemapping(tonemapping, view_display_target),
+        });
     }
 
-    for (entity, _, _, view_target, ..) in &views {
+    let outputs = resolve_contracts(inputs);
+
+    for (entity, _, view_target, ..) in &views {
         let Some(output) = outputs.get(&entity) else {
             continue;
         };
-        emit_contract_diagnostics(entity, output, &operators);
+        emit_contract_diagnostics(&output.diagnostics);
 
         let encoding = group_encodings
             .get(&view_target.main_texture().id())
@@ -797,12 +698,7 @@ fn resolve_out_of_gamut(
 }
 
 /// Reports the resolver diagnostics that fired for one view.
-fn emit_contract_diagnostics(
-    entity: Entity,
-    output: &ContractOutput,
-    operators: &EntityHashMap<Tonemapping>,
-) {
-    let diagnostics = &output.diagnostics;
+fn emit_contract_diagnostics(diagnostics: &ContractDiagnostics) {
     if diagnostics.coherence_cancelled {
         warn_once!(
             "Tone mapping cannot be deferred to the last camera of a stack rendering to \
@@ -840,190 +736,12 @@ fn emit_contract_diagnostics(
             accumulation needs `Tonemapping::None` on an SDR target."
         );
     }
-    if diagnostics.operator_mismatch
-        && let StackRole::Deferred(finalizer) = output.tonemap
-    {
-        let own = operators.get(&entity).copied().unwrap_or(Tonemapping::None);
-        let finalizing = operators
-            .get(&finalizer)
-            .copied()
-            .unwrap_or(Tonemapping::None);
+    if let Some((own, finalizing)) = diagnostics.operator_mismatch {
         warn_once!(
             "Stacked cameras rendering to the same target use different tone-mapping \
             operators ({own:?} and {finalizing:?}). The stack is composed in scene-linear \
-            space and tone-mapped once, by the last camera, so its operator applies to \
-            the whole stack."
-        );
-    }
-    if diagnostics.aux_mismatch {
-        warn_once!(
-            "Stacked cameras rendering to the same target use different ColorGrading, \
-            GranTurismo7Params, or DebandDither settings. The stack is tone-mapped once, \
-            by the last camera, so the finalizing camera's settings apply to the whole \
-            stack."
-        );
-    }
-}
-
-/// Fingerprint of the per-view settings the tonemapping pass folds in beyond
-/// the operator: [`ColorGrading`], [`GranTurismo7Params`], [`DebandDither`].
-/// A deferred member whose fingerprint differs from its finalizer's has its
-/// authored values silently replaced by the finalizer's, which the resolver
-/// diagnoses.
-///
-/// Floats hash by bit pattern, so equal values with distinct bit patterns
-/// (e.g. `-0.0` vs `0.0`) count as a mismatch; acceptable for a diagnostic.
-/// The field lists mirror the structs by hand; a missed field only weakens
-/// the diagnostic, never behavior.
-fn aux_fingerprint(
-    color_grading: &ColorGrading,
-    gt7_params: Option<&GranTurismo7Params>,
-    dither: Option<&DebandDither>,
-) -> u64 {
-    let mut hasher = FixedHasher.build_hasher();
-    let global = &color_grading.global;
-    for value in [
-        global.exposure,
-        global.temperature,
-        global.tint,
-        global.hue,
-        global.post_saturation,
-        global.midtones_range.start,
-        global.midtones_range.end,
-    ] {
-        value.to_bits().hash(&mut hasher);
-    }
-    for section in color_grading.all_sections() {
-        for value in [
-            section.saturation,
-            section.contrast,
-            section.gamma,
-            section.gain,
-            section.lift,
-        ] {
-            value.to_bits().hash(&mut hasher);
-        }
-    }
-    match gt7_params {
-        Some(params) => {
-            true.hash(&mut hasher);
-            for value in [
-                params.blend_ratio,
-                params.fade_start,
-                params.fade_end,
-                params.alpha,
-                params.mid_point,
-                params.linear_section,
-                params.toe_strength,
-            ] {
-                value.to_bits().hash(&mut hasher);
-            }
-        }
-        None => false.hash(&mut hasher),
-    }
-    dither.copied().hash(&mut hasher);
-    hasher.finish()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn view(
-        raw: u32,
-        texture: u32,
-        index: usize,
-        enabled: bool,
-        composites: bool,
-    ) -> StackView<u32> {
-        StackView {
-            entity: Entity::from_raw_u32(raw).unwrap(),
-            texture,
-            sorted_index: index,
-            enabled,
-            composites_fullscreen: composites,
-        }
-    }
-
-    #[test]
-    fn single_camera_is_never_deferred() {
-        let deferred = stack_deferred_views([view(1, 0, 0, true, false)]);
-        assert!(deferred.is_empty());
-    }
-
-    #[test]
-    fn lower_camera_defers_to_compositing_upper_camera() {
-        let deferred =
-            stack_deferred_views([view(1, 0, 0, true, false), view(2, 0, 1, true, true)]);
-        assert_eq!(deferred.len(), 1);
-        assert_eq!(
-            deferred.get(&Entity::from_raw_u32(1).unwrap()),
-            Some(&Entity::from_raw_u32(2).unwrap())
-        );
-    }
-
-    #[test]
-    fn three_camera_stack_defers_to_the_last() {
-        let deferred = stack_deferred_views([
-            view(1, 0, 0, true, false),
-            view(2, 0, 1, true, true),
-            view(3, 0, 2, true, true),
-        ]);
-        assert_eq!(deferred.len(), 2);
-        let finalizer = Entity::from_raw_u32(3).unwrap();
-        assert_eq!(
-            deferred.get(&Entity::from_raw_u32(1).unwrap()),
-            Some(&finalizer)
-        );
-        assert_eq!(
-            deferred.get(&Entity::from_raw_u32(2).unwrap()),
-            Some(&finalizer)
-        );
-    }
-
-    #[test]
-    fn clearing_upper_camera_keeps_per_camera_passes() {
-        // The upper camera clears (does not composite), so no deferral.
-        let deferred =
-            stack_deferred_views([view(1, 0, 0, true, false), view(2, 0, 1, true, false)]);
-        assert!(deferred.is_empty());
-    }
-
-    #[test]
-    fn viewport_scoped_cameras_keep_per_camera_passes() {
-        // Split screen: the later camera only covers its viewport, so each
-        // camera must keep its own pass.
-        let deferred = stack_deferred_views([
-            view(1, 0, 0, true, true),
-            view(2, 0, 1, true, false),
-            view(3, 0, 2, true, true),
-        ]);
-        assert!(deferred.is_empty());
-    }
-
-    #[test]
-    fn disabled_views_do_not_participate() {
-        // The overlay camera has the pass disabled (e.g. `Tonemapping::None`);
-        // the lower camera keeps its own pass.
-        let deferred =
-            stack_deferred_views([view(1, 0, 0, true, false), view(2, 0, 1, false, true)]);
-        assert!(deferred.is_empty());
-    }
-
-    #[test]
-    fn separate_textures_form_separate_stacks() {
-        let deferred =
-            stack_deferred_views([view(1, 0, 0, true, false), view(2, 1, 1, true, true)]);
-        assert!(deferred.is_empty());
-    }
-
-    #[test]
-    fn sorted_index_orders_the_stack_not_insertion_order() {
-        let deferred =
-            stack_deferred_views([view(2, 0, 1, true, true), view(1, 0, 0, true, false)]);
-        assert_eq!(
-            deferred.get(&Entity::from_raw_u32(1).unwrap()),
-            Some(&Entity::from_raw_u32(2).unwrap())
+            space and tone-mapped once, by the last camera, so its operator, ColorGrading, \
+            GranTurismo7Params, and DebandDither settings apply to the whole stack."
         );
     }
 }
@@ -1058,7 +776,6 @@ mod contract_tests {
             compositing_space: None,
             loads_previous: false,
             operator: Tonemapping::TonyMcMapface,
-            aux_fingerprint: 0,
         }
     }
 
@@ -1229,6 +946,26 @@ mod contract_tests {
         assert_silent(&overlay);
     }
 
+    // Three enabled members over one texture defer to the last.
+    #[test]
+    fn three_member_stack_defers_to_the_last() {
+        let outputs = resolve_contracts(vec![clearing(1, 0), compositing(2, 1), compositing(3, 2)]);
+        assert_eq!(output(&outputs, 1).tonemap, StackRole::Deferred(entity(3)));
+        assert_eq!(output(&outputs, 2).tonemap, StackRole::Deferred(entity(3)));
+        assert_eq!(output(&outputs, 3).tonemap, StackRole::Finalizer);
+    }
+
+    // A shape-breaking member in the MIDDLE of the enabled set suppresses
+    // deferral for the whole group: the predicate scans every enabled member
+    // after the first, not just the last.
+    #[test]
+    fn shape_breaking_middle_member_suppresses_deferral() {
+        let outputs = resolve_contracts(vec![compositing(1, 0), viewport(2, 1), compositing(3, 2)]);
+        for raw in 1..=3 {
+            assert_eq!(output(&outputs, raw).tonemap, StackRole::Solo);
+        }
+    }
+
     // E7: viewport splitscreen keeps per-camera passes and per-view source
     // gamuts, silently.
     #[test]
@@ -1390,33 +1127,21 @@ mod contract_tests {
     }
 
     // W13: a deferred member whose operator differs from its finalizer's is
-    // flagged; the finalizer itself is not.
+    // flagged with both operators; the finalizer itself is not.
     #[test]
     fn operator_mismatch_is_flagged_on_the_deferred_member() {
         let mut base = clearing(1, 0);
         base.operator = Tonemapping::AcesFitted;
         let outputs = resolve_contracts(vec![base, compositing(2, 1)]);
-        assert!(output(&outputs, 1).diagnostics.operator_mismatch);
-        assert!(!output(&outputs, 1).diagnostics.aux_mismatch);
-        assert!(!output(&outputs, 2).diagnostics.operator_mismatch);
+        assert_eq!(
+            output(&outputs, 1).diagnostics.operator_mismatch,
+            Some((Tonemapping::AcesFitted, Tonemapping::TonyMcMapface))
+        );
+        assert_eq!(output(&outputs, 2).diagnostics.operator_mismatch, None);
     }
 
-    // W14: a deferred member whose grading/params/dither fingerprint differs
-    // from its finalizer's is flagged.
-    #[test]
-    fn aux_mismatch_is_flagged_on_the_deferred_member() {
-        let mut base = clearing(1, 0);
-        base.aux_fingerprint = 1;
-        let mut finalizer = compositing(2, 1);
-        finalizer.aux_fingerprint = 2;
-        let outputs = resolve_contracts(vec![base, finalizer]);
-        assert!(output(&outputs, 1).diagnostics.aux_mismatch);
-        assert!(!output(&outputs, 1).diagnostics.operator_mismatch);
-        assert!(!output(&outputs, 2).diagnostics.aux_mismatch);
-    }
-
-    // Matching operators and fingerprints stay silent (negative control for
-    // the two mismatch diagnostics).
+    // Matching operators stay silent (negative control for the mismatch
+    // diagnostic).
     #[test]
     fn matching_stack_members_are_silent() {
         let outputs = resolve_contracts(vec![clearing(1, 0), compositing(2, 1)]);
