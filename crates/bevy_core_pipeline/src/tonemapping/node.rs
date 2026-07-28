@@ -57,13 +57,6 @@ pub fn tonemapping(
     let (view_uniform_offset, target, view_tonemapping_pipeline, tonemapping, gt7_params_index) =
         view.into_inner();
 
-    // `Tonemapping::None` is a true opt-out: the pass does not run, the
-    // camera keeps its pre-existing main-texture format, and no color
-    // grading / exposure from `ColorGrading` is applied.
-    if *tonemapping == Tonemapping::None {
-        return;
-    }
-
     // Eligible SDR cameras fold tone mapping into their material shaders (the
     // `TONEMAP_IN_SHADER` path selected in camera extraction) and keep an 8-bit
     // main texture instead of the fp16 intermediate. The 8-bit format is the

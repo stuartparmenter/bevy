@@ -20,9 +20,9 @@
 //! target whose transfer is [`DisplayTransfer::Srgb`]), the exact sRGB OETF is
 //! applied for free by the hardware on the upscaling blit's `*UnormSrgb`
 //! writeback; such views never receive a
-//! [`ViewDisplayEncodingPipeline`] and the node early-returns without touching
-//! the GPU. The shader-side transfer functions (scRGB / PQ / extended-sRGB)
-//! activate only for HDR transfers.
+//! [`ViewDisplayEncodingPipeline`], so the node's `ViewQuery` does not match
+//! and the pass is skipped without touching the GPU. The shader-side transfer
+//! functions (scRGB / PQ / extended-sRGB) activate only for HDR transfers.
 //!
 //! Surface negotiation (`create_surfaces` in `bevy_render::view::window`)
 //! configures the swapchain this pass's output is presented through, using
@@ -501,8 +501,9 @@ impl SpecializedRenderPipeline for DisplayEncodingPipeline {
 ///
 /// Present **only** on views whose resolved display target requests an HDR
 /// transfer function; for everything else (every view on a default SDR sRGB
-/// target) the component is absent and the `display_encoding` node returns
-/// immediately without recording any GPU work.
+/// target) the component is absent, so the `display_encoding` node's
+/// `ViewQuery` does not match and the pass is skipped without recording any
+/// GPU work.
 #[derive(Component)]
 pub struct ViewDisplayEncodingPipeline {
     pipeline_id: CachedRenderPipelineId,
@@ -548,7 +549,12 @@ pub fn prepare_view_display_encoding_pipelines(
     mut pipelines: ResMut<SpecializedRenderPipelines<DisplayEncodingPipeline>>,
     encoding_pipeline: Res<DisplayEncodingPipeline>,
     views: Query<
-        (Entity, &ExtractedView, &ViewStackContract),
+        (
+            Entity,
+            &ExtractedView,
+            &ViewStackContract,
+            Has<ViewDisplayEncodingPipeline>,
+        ),
         // `ViewStackContract` is overwritten in place and never removed, so a
         // view whose `ViewTarget` was dropped keeps a stale contract. This
         // filter is the liveness gate that makes stale contracts unreachable;
@@ -556,16 +562,19 @@ pub fn prepare_view_display_encoding_pipelines(
         With<ViewTarget>,
     >,
 ) {
-    for (entity, view, contract) in &views {
+    for (entity, view, contract, has_pipeline) in &views {
         let Some(key) = display_encoding_key(view.target_format, contract) else {
             // Either an sRGB transfer (hardware encode on the upscaling
             // blit, no pass) or an encode deferred to the stack's finalizer,
             // which encodes the composed buffer; this view must not run the
-            // pass. (Render-world entities are retained, so the component
-            // must be actively removed.)
-            commands
-                .entity(entity)
-                .remove::<ViewDisplayEncodingPipeline>();
+            // pass. (Render-world entities are retained, so a stale
+            // component must be actively removed — but only if present, so
+            // plain SDR views issue no command.)
+            if has_pipeline {
+                commands
+                    .entity(entity)
+                    .remove::<ViewDisplayEncodingPipeline>();
+            }
             continue;
         };
 

@@ -34,13 +34,14 @@ struct CachedBindGroup {
 /// `prepare_view_upscaling_pipelines`).
 ///
 /// Views without a [`ViewDisplayEncodingPipeline`] — every view on a plain
-/// SDR sRGB display target, i.e. all of them by default — return immediately:
-/// no pass, no ping-pong flip, zero overhead.
+/// SDR sRGB display target, i.e. all of them by default — do not match the
+/// `ViewQuery`, so the system is skipped entirely: no pass, no ping-pong
+/// flip, zero overhead.
 pub fn display_encoding(
     view: ViewQuery<(
         &ViewTarget,
-        Option<&ViewDisplayEncodingPipeline>,
-        Option<&DynamicUniformIndex<DisplayTargetUniform>>,
+        &ViewDisplayEncodingPipeline,
+        &DynamicUniformIndex<DisplayTargetUniform>,
     )>,
     pipeline_cache: Res<PipelineCache>,
     encoding_pipeline: Res<DisplayEncodingPipeline>,
@@ -50,23 +51,11 @@ pub fn display_encoding(
 ) {
     let (target, view_encoding_pipeline, display_target_index) = view.into_inner();
 
-    // Plain SDR targets (the default for every existing user) never get the
-    // component; hardware sRGB on the upscaling blit remains their encoder.
-    let Some(view_encoding_pipeline) = view_encoding_pipeline else {
-        return;
-    };
-
     let Some(pipeline) = pipeline_cache.get_render_pipeline(view_encoding_pipeline.pipeline_id)
     else {
         return;
     };
 
-    // Defensive: every view that gets a pipeline also carries a
-    // `DisplayTargetUniform` and so gets an index; bail before flipping the
-    // ping-pong if not.
-    let Some(display_target_index) = display_target_index else {
-        return;
-    };
     let Some(uniforms_buffer) = display_target_uniforms.buffer() else {
         return;
     };
