@@ -343,7 +343,7 @@ fn toggle_tonemapping_method(
 
 /// Cycles the primary window's HDR output: SDR sRGB → scRGB-linear →
 /// extended-sRGB (Rec.709) → extended-sRGB (Display-P3, wide-gamut HDR) →
-/// PQ (HDR10) → back to SDR (and switches the operator to GranTurismo7,
+/// PQ (HDR10) → back to SDR (and switches the operator to `GranTurismo7`,
 /// currently the only HDR-aware one, when leaving SDR).
 ///
 /// On HDR display targets GT7 engages its HDR mode (peak-luminance-aware
