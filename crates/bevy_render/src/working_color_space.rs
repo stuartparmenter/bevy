@@ -95,9 +95,8 @@ impl WorkingColorSpace {
 /// rounded `f32` of the corresponding f64 literal in
 /// `working_color_space.wgsl` / `gt7.wgsl`; the Rust and WGSL constants must
 /// stay bit-identical so CPU code remains an exact parity reference for the
-/// shaders. Bit-identical to `REC_709_TO_REC_2020` in
-/// `bevy_core_pipeline::tonemapping::gt7` (verified by a test there) and
-/// equal to `bevy_color::rgb_to_rgb_matrix(RgbPrimaries::BT709,
+/// shaders (verified by `matrices_match_wgsl_f64_literals`). Equal to
+/// `bevy_color::rgb_to_rgb_matrix(RgbPrimaries::BT709,
 /// RgbPrimaries::BT2020)` within a few ULP (the runtime derivation uses the
 /// chromaticity-derived D65 white, while these constants use the BT.2087
 /// convention; verified by test).
@@ -232,14 +231,45 @@ mod tests {
         }
     }
 
+    /// The Rust literals must round to the same `f32` as the f64 literals in
+    /// `working_color_space.wgsl` and `gt7.wgsl` (which keeps its own
+    /// self-contained, fixture-locked copy): the CPU constants are the parity
+    /// reference for both shaders, so any drift has to be bitwise-visible here
+    /// before it reaches a readback comparison.
+    #[test]
+    fn matrices_match_wgsl_f64_literals() {
+        // Transcribed from the WGSL sources, one column per line.
+        #[rustfmt::skip]
+        let cases: [(&str, Mat3, [f64; 9]); 2] = [
+            ("REC709_TO_REC2020", REC709_TO_REC2020, [
+                0.627403895934699,    0.06909728935823199,   0.016391438875150228,
+                0.32928303837788375,  0.919540395075459,     0.08801330787722578,
+                0.043313065687417246, 0.011362315566309154,  0.895595253247624,
+            ]),
+            ("REC2020_TO_REC709", REC2020_TO_REC709, [
+                1.6604910021084347,   -0.12455047452159052,  -0.01815076335490522,
+                -0.5876411387885496,  1.1328998971259598,    -0.10057889800800739,
+                -0.07284986331988484, -0.008349422604369487, 1.1187296613629125,
+            ]),
+        ];
+        for (name, mat, wgsl) in cases {
+            for (index, (value, wgsl_value)) in mat.to_cols_array().iter().zip(wgsl).enumerate() {
+                assert_eq!(
+                    value.to_bits(),
+                    (wgsl_value as f32).to_bits(),
+                    "{name} entry {index} differs: {value:?} vs {wgsl_value:?}"
+                );
+            }
+        }
+    }
+
     /// The hardcoded BT.2087-derived shortest-f32 literals must agree with
     /// the `bevy_color` runtime derivation to a tight relative tolerance.
     /// They are NOT bit-identical: `rgb_to_rgb_matrix` derives the D65 white
     /// from the (0.3127, 0.3290) chromaticity, while the BT.2087 constants
-    /// (shared bit-for-bit with `gt7.rs`/`gt7.wgsl`/`working_color_space.wgsl`)
+    /// (shared bit-for-bit with `working_color_space.wgsl` and `gt7.wgsl`)
     /// follow the tabulated-white convention; observed disagreement is a few
-    /// ULP (relative ~1e-6). The bitwise gt7-parity test lives in
-    /// `bevy_core_pipeline::tonemapping::gt7`.
+    /// ULP (relative ~1e-6).
     #[test]
     fn matrices_match_bevy_color_primaries_within_tolerance() {
         assert_mat3_rel_eq(

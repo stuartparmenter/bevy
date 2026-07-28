@@ -16,8 +16,8 @@
 // Precomputed parameters for the GT7 tone-mapping pipeline.
 //
 // `k_a`/`k_b`/`k_c` and `peak_ucs` are closed-form products of the user-facing
-// parameters (see `Gt7ToneMappingCurve::new` and `Gt7ToneMapping::new` in
-// gt7.rs); they are computed once on the CPU rather than derived per pixel.
+// parameters (see `Gt7ParamsUniform::from_params` in gt7.rs); they are computed
+// once on the CPU rather than derived per pixel.
 // Under the GT7_PARAMS_UNIFORM shader def this struct is fed per view from
 // the `Gt7ParamsUniform` buffer that `UniformComponentPlugin` packs from the
 // components `queue_gt7_params_uniforms` inserts (gt7.rs — keep the field
@@ -61,7 +61,7 @@ struct Gt7Params {
 // Default SDR-mode parameters (curve defaults alpha = 0.25, mid_point = 0.538,
 // linear_section = 0.444, toe_strength = 1.28 at peak 2.5 fb = 250 nits).
 // Derived constants are f64-precision evaluations of the closed forms in
-// `Gt7ToneMappingCurve::new` / `Gt7ToneMapping::new` (gt7.rs).
+// `Gt7ParamsUniform::from_params` (gt7.rs).
 fn gt7_default_sdr_params() -> Gt7Params {
     var params: Gt7Params;
     params.peak = 2.5;
@@ -96,17 +96,18 @@ const GT7_SDR_PAPER_WHITE: f32 = 250.0;
 // Full-precision linear Rec.709 → Rec.2020 matrix (D65, per ITU-R BT.2087).
 // Bevy's working space is currently scene-linear Rec.709; the operator is
 // native Rec.2020 (unless WORKING_COLOR_SPACE_REC2020 is set, in which case
-// the expansion below is skipped). Keep in sync with `REC_709_TO_REC_2020`
-// in gt7.rs and with the shared `bevy_render::working_color_space` module
-// (identical literals; this module deliberately imports nothing so it stays
-// self-contained and fixture-locked).
+// the expansion below is skipped). Keep in sync with
+// `bevy_render::working_color_space::REC709_TO_REC2020` — identical literals,
+// locked bitwise by `matrices_match_wgsl_f64_literals` there. This module
+// deliberately imports nothing so it stays self-contained and fixture-locked.
 const GT7_REC_709_TO_REC_2020 = mat3x3<f32>(
     0.627403895934699, 0.06909728935823199, 0.016391438875150228,   // column 0
     0.32928303837788375, 0.919540395075459, 0.08801330787722578,    // column 1
     0.043313065687417246, 0.011362315566309154, 0.895595253247624,  // column 2
 );
 
-// Inverse of the above (linear Rec.2020 → Rec.709).
+// Inverse of the above (linear Rec.2020 → Rec.709); same sync contract, with
+// `bevy_render::working_color_space::REC2020_TO_REC709`.
 const GT7_REC_2020_TO_REC_709 = mat3x3<f32>(
     1.6604910021084347, -0.12455047452159052, -0.01815076335490522, // column 0
     -0.5876411387885496, 1.1328998971259598, -0.10057889800800739,  // column 1
@@ -239,9 +240,9 @@ fn gt7_tone_map(rgb: vec3<f32>, params: Gt7Params) -> vec3<f32> {
 
 // Integration seam for Bevy's tone-mapping pass, dispatched as
 // `TONEMAP_METHOD_GRAN_TURISMO_7` from `tone_mapping()` in
-// tonemapping_shared.wgsl. Mirrored on the CPU by the four
-// `Gt7ToneMapping::apply_bevy_scene_linear_*` seam functions (gt7.rs), one
-// per def combination below.
+// tonemapping_shared.wgsl. The CPU reference in gt7.rs covers the operator
+// itself (`cpu_reference::apply`), not the four working-space/output-gamut
+// combinations below; those are unverified until a GPU readback test exists.
 //
 // Contract:
 // 1. Input is Bevy's scene-linear working space (1.0 ≈ SDR paper white). The
@@ -289,8 +290,7 @@ fn tone_mapping_gran_turismo_7(color: vec3<f32>) -> vec3<f32> {
 #endif
 #ifdef WORKING_COLOR_SPACE_REC2020
     // The working space IS the operator's native linear Rec.2020: no input
-    // expansion. Mirrored on the CPU by
-    // `Gt7ToneMapping::apply_bevy_scene_linear_sdr_rec2020_native` (gt7.rs).
+    // expansion.
     let rec2020 = color;
 #else
     let rec2020 = GT7_REC_709_TO_REC_2020 * color;
@@ -300,9 +300,7 @@ fn tone_mapping_gran_turismo_7(color: vec3<f32>) -> vec3<f32> {
 #ifdef TONEMAP_OUTPUT_REC2020
     // HDR-native output: linear Rec.2020 display-referred, paper-white
     // relative; the display encoder consumes it (its input-gamut contract is
-    // keyed by the same predicate that pushed this def). Mirrored on the CPU
-    // by `Gt7ToneMapping::apply_bevy_scene_linear_rec2020_output` /
-    // `apply_bevy_scene_linear_rec2020_native_rec2020_output` (gt7.rs).
+    // keyed by the same predicate that pushed this def).
     return mapped;
 #else
     return saturate(GT7_REC_2020_TO_REC_709 * mapped);

@@ -10,7 +10,7 @@
 //!
 //! All math uses [`bevy_math::ops`] so results are deterministic across
 //! platforms and match the parity policy used by the GT7 CPU reference
-//! (`bevy_core_pipeline::tonemapping::Gt7ToneMapping`).
+//! (`gt7.rs` in `bevy_core_pipeline::tonemapping`).
 
 use bevy_math::ops;
 
