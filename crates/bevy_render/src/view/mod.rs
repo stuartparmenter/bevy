@@ -190,17 +190,12 @@ impl Plugin for ViewPlugin {
             ));
 
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
-            render_app
-                .init_resource::<ResolvedCompositionSpaces>()
-                .add_systems(
-                    Render,
-                    resolve_composition_spaces
-                        .in_set(RenderSystems::CreateViews)
-                        .after(crate::camera::sort_cameras),
-                );
             render_app.add_systems(
                 Render,
                 (
+                    resolve_composition_spaces
+                        .in_set(RenderSystems::CreateViews)
+                        .after(crate::camera::sort_cameras),
                     // `TextureView`s need to be dropped before reconfiguring window surfaces.
                     clear_view_attachments
                         .in_set(RenderSystems::PrepareViews)
@@ -1508,15 +1503,15 @@ pub fn prepare_view_targets(
         &ExtractedView,
         &CameraMainTextureUsages,
         &Msaa,
+        Option<&ResolvedCompositingSpace>,
     )>,
     view_target_attachments: Res<ViewTargetAttachments>,
-    resolved_spaces: Res<ResolvedCompositionSpaces>,
     mut main_texture_atomics: Local<HashMap<MainTextureKey, Weak<AtomicUsize>>>,
 ) {
     main_texture_atomics.retain(|_, weak| weak.strong_count() > 0);
 
     let mut textures = <HashMap<_, _>>::default();
-    for (entity, camera, view, texture_usage, msaa) in cameras.iter() {
+    for (entity, camera, view, texture_usage, msaa, resolved_space) in cameras.iter() {
         let Some(target_size) = camera.physical_target_size else {
             // If we don't have a target size, we can't create the main texture and have to bail
             commands.entity(entity).try_remove::<ViewTarget>();
@@ -1560,7 +1555,7 @@ pub fn prepare_view_targets(
         // The phase-1 resolved space — not the camera's raw request — decides
         // the buffer convention: stack members share one main texture, so the
         // cleared pixels must use the one space the whole stack resolves to.
-        let resolved_space = resolved_spaces.get(entity, camera.compositing_space);
+        let resolved_space = resolved_space.and_then(|space| space.0);
         let converted_clear_color: Option<WgpuColor> =
             clear_color.map(|color| match resolved_space {
                 // If main texture stores Oklab or Srgb, convert Color to it for correct clear.

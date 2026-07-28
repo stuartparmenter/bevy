@@ -7,9 +7,9 @@ Bevy now resolves a camera's `CompositingSpace` request once per frame — after
 render target's cameras are grouped — into shared state that every render stage
 reads instead of re-deriving:
 
-- `ResolvedCompositionSpaces` (render-world resource, built in
-  `RenderSystems::CreateViews` after `sort_cameras`): one
-  `Option<CompositingSpace>` per camera view, after grouping cameras that share a
+- `ResolvedCompositingSpace` (render-world per-view component, seeded at camera
+  extraction and resolved in `RenderSystems::CreateViews` after `sort_cameras`):
+  the view's `Option<CompositingSpace>` after grouping cameras that share a
   main-texture ping-pong.
 - `ViewStackContract` (render-world component, built in
   `RenderSystems::PrepareViews` after `prepare_view_targets` and
@@ -23,8 +23,8 @@ state, and camera stacks using a non-default compositing space or HDR output.
 
 ## Removed API
 
-`ViewTarget::compositing_space` is removed. Read the resolved space from
-`ResolvedCompositionSpaces` (keyed by the render-world view entity) in
+`ViewTarget::compositing_space` is removed. Read the resolved space from the
+`ResolvedCompositingSpace` component on the render-world view entity in
 `bevy_render`, or from `ViewStackContract::compositing_space` in
 `bevy_core_pipeline`. The raw per-camera request remains as
 `ExtractedCamera::compositing_space`, but it feeds only the extract-time
@@ -34,8 +34,8 @@ main-texture format choice — don't consult it for pass or pipeline-key decisio
 // 0.19
 let space = view_target.compositing_space;
 
-// 0.20, in bevy_render (needs `Res<ResolvedCompositionSpaces>` and the view entity)
-let space = resolved_spaces.get(entity, camera.compositing_space);
+// 0.20, in bevy_render (`ResolvedCompositingSpace` component on the view entity)
+let space = resolved_space.0;
 
 // 0.20, in bevy_core_pipeline (per-view contract)
 let space = contract.compositing_space;

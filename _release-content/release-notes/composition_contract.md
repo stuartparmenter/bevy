@@ -14,8 +14,9 @@ cameras.
 Bevy now resolves all of it once per frame, in two phases, and every consumer
 reads the result instead of re-deriving it:
 
-- `ResolvedCompositionSpaces` groups cameras that share a main-texture ping-pong
-  and resolves each group to a single compositing space. A solo camera, or a
+- `ResolvedCompositingSpace`, a per-view component, holds the first phase's
+  result: cameras that share a main-texture ping-pong resolve as one group to a
+  single compositing space. A solo camera, or a
   non-stack shape (cameras that clear or render to a viewport), keeps its own
   request verbatim. A compositing stack collapses to one space: the space its
   members request, or linear (with a warning) if they conflict or if any member

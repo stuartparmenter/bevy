@@ -24,7 +24,7 @@ use bevy_render::{
         ViewSortedRenderPhases,
     },
     render_resource::*,
-    view::{ExtractedView, Msaa, ResolvedCompositionSpaces},
+    view::{ExtractedView, Msaa, ResolvedCompositingSpace},
     working_color_space::WorkingColorSpace,
     Render, RenderApp, RenderSystems,
 };
@@ -309,9 +309,13 @@ fn queue_line_and_joint_gizmos_2d(
     line_gizmos: Query<(Entity, &GizmoMeshConfig)>,
     line_gizmo_assets: Res<RenderAssets<GpuLineGizmo>>,
     line_gizmo_entities: Res<LineGizmoEntities>,
-    resolved_spaces: Res<ResolvedCompositionSpaces>,
     mut transparent_render_phases: ResMut<ViewSortedRenderPhases<Transparent2d>>,
-    mut views: Query<(Entity, &ExtractedView, &Msaa, Option<&RenderLayers>)>,
+    views: Query<(
+        &ExtractedView,
+        &Msaa,
+        Option<&RenderLayers>,
+        Option<&ResolvedCompositingSpace>,
+    )>,
 ) {
     let draw_function = draw_functions.read().get_id::<DrawLineGizmo2d>().unwrap();
     let draw_line_function_strip = draw_functions
@@ -323,13 +327,13 @@ fn queue_line_and_joint_gizmos_2d(
         .get_id::<DrawLineJointGizmo2d>()
         .unwrap();
 
-    for (view_entity, view, msaa, render_layers) in &mut views {
+    for (view, msaa, render_layers, resolved_space) in &views {
         let Some(transparent_phase) = transparent_render_phases.get_mut(&view.retained_view_entity)
         else {
             continue;
         };
 
-        let compositing_space = resolved_spaces.get(view_entity, None);
+        let compositing_space = resolved_space.and_then(|space| space.0);
 
         let mesh_key = Mesh2dPipelineKey::from_msaa_samples(msaa.samples())
             | Mesh2dPipelineKey::from_target_format(view.target_format);

@@ -23,7 +23,7 @@ use bevy_mesh::VertexBufferLayout;
 use bevy_platform::collections::HashMap;
 use bevy_render::{
     camera::ExtractedCamera,
-    view::{RenderVisibleEntities, ResolvedCompositionSpaces, RetainedViewEntity},
+    view::{RenderVisibleEntities, ResolvedCompositingSpace, RetainedViewEntity},
 };
 use bevy_render::{
     render_asset::RenderAssets,
@@ -171,7 +171,7 @@ impl SpritePipelineKey {
     }
 
     /// Key bits for a view's RESOLVED [`CompositingSpace`] (the phase-1
-    /// [`ResolvedCompositionSpaces`] value, never the camera's raw request):
+    /// [`ResolvedCompositingSpace`] value, never the camera's raw request):
     /// `Some(Srgb)` / `Some(Oklab)` select the matching writer-encode bit;
     /// linear views (`Some(Linear)` or no space) set no bits.
     #[inline]
@@ -563,20 +563,21 @@ pub fn queue_sprites(
     pipeline_cache: Res<PipelineCache>,
     extracted_sprites: Res<ExtractedSprites>,
     mut transparent_render_phases: ResMut<ViewSortedRenderPhases<Transparent2d>>,
-    mut cameras: Query<(
-        Entity,
-        &RenderVisibleEntities,
-        &ExtractedCamera,
-        &ExtractedView,
-        &Msaa,
-        Option<&Tonemapping>,
-        Option<&DebandDither>,
-    )>,
-    resolved_spaces: Res<ResolvedCompositionSpaces>,
+    cameras: Query<
+        (
+            &RenderVisibleEntities,
+            &ExtractedView,
+            &Msaa,
+            Option<&Tonemapping>,
+            Option<&DebandDither>,
+            Option<&ResolvedCompositingSpace>,
+        ),
+        With<ExtractedCamera>,
+    >,
 ) {
     let draw_sprite_function = draw_functions.read().id::<DrawSprite>();
 
-    for (entity, visible_entities, camera, view, msaa, tonemapping, dither) in &mut cameras {
+    for (visible_entities, view, msaa, tonemapping, dither, resolved_space) in &cameras {
         let Some(transparent_phase) = transparent_render_phases.get_mut(&view.retained_view_entity)
         else {
             continue;
@@ -584,9 +585,7 @@ pub fn queue_sprites(
 
         let mut view_key = SpritePipelineKey::from_target_format(view.target_format)
             | SpritePipelineKey::from_msaa_samples(msaa.samples())
-            | SpritePipelineKey::from_compositing_space(
-                resolved_spaces.get(entity, camera.compositing_space),
-            );
+            | SpritePipelineKey::from_compositing_space(resolved_space.and_then(|space| space.0));
 
         // In-shader tonemapping fast path: an eligible SDR camera (8-bit
         // main texture) with an active operator folds tonemapping (and

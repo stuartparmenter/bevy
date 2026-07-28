@@ -13,8 +13,8 @@ use crate::{
         display_target_uniform::{resolve_view_display_target, ViewDisplayTarget},
         ColorGrading, ExtractedView, ExtractedWindows, ManualDisplayTargets, Msaa,
         NeedsSceneLinearTarget, NoIndirectDrawing, RenderExtractedVisibleEntities,
-        RenderVisibleEntities, RenderVisibleEntitiesClass, RetainedViewEntity, Tonemapping,
-        ViewUniformOffset, VisibilityExtractionSystemParam,
+        RenderVisibleEntities, RenderVisibleEntitiesClass, ResolvedCompositingSpace,
+        RetainedViewEntity, Tonemapping, ViewUniformOffset, VisibilityExtractionSystemParam,
     },
     Extract, ExtractSchedule, Render, RenderApp, RenderSystems,
 };
@@ -543,6 +543,7 @@ pub fn extract_cameras(
         ExtractedCamera,
         ExtractedView,
         RenderVisibleEntities,
+        ResolvedCompositingSpace,
         TemporalJitter,
         MipBias,
         RenderLayers,
@@ -688,6 +689,9 @@ pub fn extract_cameras(
                     hdr,
                     compositing_space: compositing_space.copied(),
                 },
+                // The raw-request seed; `resolve_composition_spaces` overwrites
+                // it before any consumer reads it.
+                ResolvedCompositingSpace(compositing_space.copied()),
                 ExtractedView {
                     retained_view_entity: RetainedViewEntity::new(main_entity.into(), None, 0),
                     clip_from_view: camera.clip_from_view(),

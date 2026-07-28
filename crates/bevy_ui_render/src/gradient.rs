@@ -687,7 +687,6 @@ pub fn queue_gradient(
     mut transparent_render_phases: ResMut<ViewSortedRenderPhases<TransparentUi>>,
     mut render_views: Query<(&UiCameraView, Option<&UiAntiAlias>), With<ExtractedView>>,
     camera_views: Query<&ExtractedView>,
-    resolved_spaces: Res<ResolvedCompositionSpaces>,
     view_contracts: Query<&ViewStackContract>,
     pipeline_cache: Res<PipelineCache>,
     draw_functions: Res<DrawFunctions<TransparentUi>>,
@@ -711,6 +710,7 @@ pub fn queue_gradient(
                 continue;
             };
 
+            let contract = view_contracts.get(gradient.extracted_camera_entity).ok();
             let pipeline = pipelines.specialize(
                 &pipeline_cache,
                 &gradients_pipeline,
@@ -718,10 +718,9 @@ pub fn queue_gradient(
                     anti_alias: matches!(ui_anti_alias, None | Some(UiAntiAlias::On)),
                     color_space: gradient.color_space,
                     target_format: view.target_format,
-                    compositing_space: resolved_spaces.get(gradient.extracted_camera_entity, None),
-                    source_gamut_rec2020: view_contracts
-                        .get(gradient.extracted_camera_entity)
-                        .is_ok_and(ViewStackContract::source_gamut_is_rec2020),
+                    compositing_space: contract.and_then(|contract| contract.compositing_space),
+                    source_gamut_rec2020: contract
+                        .is_some_and(ViewStackContract::source_gamut_is_rec2020),
                 },
             );
 

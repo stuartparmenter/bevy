@@ -58,7 +58,7 @@ use bevy_render::{
     texture::{FallbackImage, GpuImage},
     view::{
         resolve_composition_spaces, texture_format_from_code, texture_format_to_code,
-        ExtractedView, ResolvedCompositionSpaces, ViewUniform, ViewUniformOffset, ViewUniforms,
+        ExtractedView, ResolvedCompositingSpace, ViewUniform, ViewUniformOffset, ViewUniforms,
     },
     Extract, ExtractSchedule, GpuResourceAppExt, Render, RenderApp, RenderSystems,
 };
@@ -141,25 +141,22 @@ pub struct ViewKeyCache(MainEntityHashMap<Mesh2dPipelineKey>);
 pub fn check_views_need_specialization(
     mut view_key_cache: ResMut<ViewKeyCache>,
     mut dirty_specializations: ResMut<DirtySpecializations>,
-    cameras: Query<(
-        Entity,
-        &MainEntity,
-        &ExtractedView,
-        &ExtractedCamera,
-        &Msaa,
-        Option<&Tonemapping>,
-        Option<&DebandDither>,
-    )>,
-    resolved_spaces: Res<ResolvedCompositionSpaces>,
+    cameras: Query<
+        (
+            &MainEntity,
+            &ExtractedView,
+            &Msaa,
+            Option<&Tonemapping>,
+            Option<&DebandDither>,
+            Option<&ResolvedCompositingSpace>,
+        ),
+        With<ExtractedCamera>,
+    >,
 ) {
-    for (entity, view_entity, view, camera, msaa, tonemapping, dither) in &cameras {
-        // `ResolvedCompositionSpaces` is keyed by the render-world view
-        // entity; `ViewKeyCache` stays `MainEntity`-keyed.
+    for (view_entity, view, msaa, tonemapping, dither, resolved_space) in &cameras {
         let mut view_key = Mesh2dPipelineKey::from_msaa_samples(msaa.samples())
             | Mesh2dPipelineKey::from_target_format(view.target_format)
-            | Mesh2dPipelineKey::from_compositing_space(
-                resolved_spaces.get(entity, camera.compositing_space),
-            );
+            | Mesh2dPipelineKey::from_compositing_space(resolved_space.and_then(|space| space.0));
 
         // In-shader tonemapping fast path: an eligible SDR camera (8-bit
         // main texture) with an active operator folds tonemapping (and
@@ -598,7 +595,7 @@ impl Mesh2dPipelineKey {
     }
 
     /// Key bits for a view's RESOLVED [`CompositingSpace`] (the phase-1
-    /// `ResolvedCompositionSpaces` value, never the camera's raw request):
+    /// `ResolvedCompositingSpace` value, never the camera's raw request):
     /// `Some(Srgb)` / `Some(Oklab)` select the matching writer-encode bit;
     /// linear views (`Some(Linear)` or no space) set no bits.
     #[inline]

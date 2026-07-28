@@ -46,7 +46,7 @@ use bevy_render::{
     render_resource::TextureId,
     view::{
         composites_fullscreen, prepare_view_display_targets, prepare_view_targets,
-        ResolvedCompositionSpaces, ViewDisplayTarget, ViewTarget,
+        ResolvedCompositingSpace, ViewDisplayTarget, ViewTarget,
     },
     working_color_space::WorkingColorSpace,
     Render, RenderApp, RenderSystems,
@@ -146,7 +146,7 @@ pub struct ViewStackContract {
     /// Whether this view's upscaling blit runs.
     pub blit: BlitDisposition,
     /// The resolved compositing space of the buffer this view renders into
-    /// (the phase-1 [`ResolvedCompositionSpaces`] value, copied here so
+    /// (the phase-1 [`ResolvedCompositingSpace`] value, copied here so
     /// consumers need one component).
     pub compositing_space: Option<CompositingSpace>,
     /// Color primaries of the buffer at display-encoding time: the tonemap
@@ -464,7 +464,7 @@ fn resolve_group<K>(members: &[ContractInput<K>], outputs: &mut EntityHashMap<Co
 /// [`RenderSystems::PrepareViews`] after `prepare_view_targets` (the
 /// `ViewTarget` source) and `prepare_view_display_targets` (the
 /// `ViewDisplayTarget` source). Phase-2 texture groups never span phase-1
-/// [`ResolvedCompositionSpaces`] groups: equal main-texture ids imply equal
+/// [`ResolvedCompositingSpace`] groups: equal main-texture ids imply equal
 /// main-texture keys (`prepare_view_targets` dedups allocations on exactly
 /// that key).
 ///
@@ -481,8 +481,8 @@ pub fn resolve_camera_stack_contracts(
         &ViewTarget,
         Option<&ViewDisplayTarget>,
         Option<&Tonemapping>,
+        Option<&ResolvedCompositingSpace>,
     )>,
-    resolved_spaces: Res<ResolvedCompositionSpaces>,
     working_color_space: Res<WorkingColorSpace>,
     gamut_compression: Res<DisplayGamutCompression>,
 ) {
@@ -502,7 +502,7 @@ pub fn resolve_camera_stack_contracts(
     let mut group_encodings: HashMap<TextureId, Option<(DisplayTransfer, DisplayGamut)>> =
         HashMap::default();
     let mut inputs = Vec::new();
-    for (entity, camera, view_target, view_display_target, tonemapping) in &views {
+    for (entity, camera, view_target, view_display_target, tonemapping, resolved_space) in &views {
         let texture = view_target.main_texture().id();
         let encode_enabled = view_display_target.is_some_and(ViewDisplayTarget::is_hdr_transfer);
         let encoding = *group_encodings.entry(texture).or_insert_with(|| {
@@ -528,7 +528,7 @@ pub fn resolve_camera_stack_contracts(
                 }
             ),
             tonemap_output_gamut: tonemap_output_gamut(tonemapping, view_display_target),
-            compositing_space: resolved_spaces.get(entity, camera.compositing_space),
+            compositing_space: resolved_space.and_then(|space| space.0),
             loads_previous: matches!(camera.clear_color, ClearColorConfig::None),
             operator: effective_tonemapping(tonemapping, view_display_target),
         });

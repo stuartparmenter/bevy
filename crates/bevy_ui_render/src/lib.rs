@@ -59,7 +59,7 @@ use bevy_render::{
     renderer::{RenderDevice, RenderQueue},
     sync_world::{MainEntity, RenderEntity},
     texture::GpuImage,
-    view::{ExtractedView, ResolvedCompositionSpaces, RetainedViewEntity, ViewUniforms},
+    view::{ExtractedView, RetainedViewEntity, ViewUniforms},
     Extract, ExtractSchedule, GpuResourceAppExt, Render, RenderApp, RenderStartup, RenderSystems,
 };
 use bevy_sprite::BorderRect;
@@ -2017,7 +2017,6 @@ pub fn queue_uinodes(
     mut transparent_render_phases: ResMut<ViewSortedRenderPhases<TransparentUi>>,
     render_views: Query<(&UiCameraView, Option<&UiAntiAlias>), With<ExtractedView>>,
     camera_views: Query<&ExtractedView>,
-    resolved_spaces: Res<ResolvedCompositionSpaces>,
     view_contracts: Query<&ViewStackContract>,
     pipeline_cache: Res<PipelineCache>,
     draw_functions: Res<DrawFunctions<TransparentUi>>,
@@ -2025,8 +2024,10 @@ pub fn queue_uinodes(
     let draw_function = draw_functions.read().id::<DrawUi>();
     let mut current_camera_entity = Entity::PLACEHOLDER;
     let mut current_phase = None;
-    // `ViewStackContract` is per-view, so the buffer gamut is constant for a run
-    // of nodes sharing a camera; resolve it once per camera change, not per node.
+    // `ViewStackContract` is per-view, so the compositing space and buffer
+    // gamut are constant for a run of nodes sharing a camera; resolve them
+    // once per camera change, not per node.
+    let mut current_compositing_space = None;
     let mut current_source_gamut_rec2020 = false;
 
     for (main_entity, extracted_sub_uinodes) in extracted_uinodes.uinodes.iter() {
@@ -2047,9 +2048,13 @@ pub fn queue_uinodes(
                                     })
                             })
                     });
-                current_source_gamut_rec2020 = view_contracts
+                let contract = view_contracts
                     .get(extracted_uinode.extracted_camera_entity)
-                    .is_ok_and(ViewStackContract::source_gamut_is_rec2020);
+                    .ok();
+                current_compositing_space =
+                    contract.and_then(|contract| contract.compositing_space);
+                current_source_gamut_rec2020 =
+                    contract.is_some_and(ViewStackContract::source_gamut_is_rec2020);
                 current_camera_entity = extracted_uinode.extracted_camera_entity;
             }
 
@@ -2063,8 +2068,7 @@ pub fn queue_uinodes(
                 UiPipelineKey {
                     target_format: view.target_format,
                     anti_alias: matches!(ui_anti_alias, None | Some(UiAntiAlias::On)),
-                    compositing_space: resolved_spaces
-                        .get(extracted_uinode.extracted_camera_entity, None),
+                    compositing_space: current_compositing_space,
                     source_gamut_rec2020: current_source_gamut_rec2020,
                 },
             );

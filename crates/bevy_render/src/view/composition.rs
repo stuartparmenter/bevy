@@ -6,8 +6,8 @@
 //! buffer can only hold values in one space at a time when its cameras
 //! composite over each other. [`resolve_composition_spaces`] groups views by
 //! the shared-main-texture key and resolves one space per compositing stack
-//! into [`ResolvedCompositionSpaces`]; consumers read the resolved value, not
-//! the raw request.
+//! into each view's [`ResolvedCompositingSpace`]; consumers read the resolved
+//! value, not the raw request.
 //!
 //! Phase-1 groups are a superset of the phase-2 texture groups in
 //! `bevy_core_pipeline`: equal main-texture ids imply equal
@@ -18,10 +18,11 @@
 
 use bevy_camera::{Camera2d, CameraMainTextureUsages, ClearColorConfig, CompositingSpace};
 use bevy_ecs::{
+    change_detection::DetectChangesMut,
+    component::Component,
     entity::{Entity, EntityHashMap},
     query::Has,
-    resource::Resource,
-    system::{Query, ResMut},
+    system::Query,
 };
 use bevy_log::warn_once;
 use bevy_platform::collections::HashMap;
@@ -31,15 +32,15 @@ use wgpu::TextureFormat;
 use super::{main_texture_key, ExtractedView, MainTextureKey, Msaa};
 use crate::camera::ExtractedCamera;
 
-/// Per-frame resolved compositing space for every camera view, keyed by the
-/// render-world view entity.
+/// A camera view's per-frame resolved compositing space.
 ///
-/// Built once per frame by [`resolve_composition_spaces`]
+/// Seeded by camera extraction with the camera's raw request, then
+/// overwritten by [`resolve_composition_spaces`]
 /// ([`RenderSystems::CreateViews`](crate::RenderSystems::CreateViews), after
 /// `sort_cameras`). Views that share a main-texture ping-pong and form a
 /// compositing stack (every later member uses `ClearColorConfig::None` with
 /// no viewport) resolve to one shared space; solo views and non-stack shapes
-/// keep their own request. Consumers must read this resource (or the
+/// keep their own request. Consumers must read this component (or the
 /// downstream `ViewStackContract`) instead of
 /// [`ExtractedCamera::compositing_space`]; the raw request only ever feeds
 /// the extract-time main-texture format choice.
@@ -48,22 +49,8 @@ use crate::camera::ExtractedCamera;
 /// camera can flip the base view's resolved space, dirtying its 2d
 /// specializations and rebuilding its tonemapping pipeline on the transition
 /// frame. This is bounded to stacks that request a non-default space.
-#[derive(Resource, Default)]
-pub struct ResolvedCompositionSpaces(pub EntityHashMap<Option<CompositingSpace>>);
-
-impl ResolvedCompositionSpaces {
-    /// The resolved space for a view. Falls back to `fallback` (the camera's
-    /// own request) for views the resolver did not see; with the resolver's
-    /// query covering every extracted camera view, this fallback is
-    /// unreachable in practice and exists as a defensive identity.
-    pub fn get(
-        &self,
-        entity: Entity,
-        fallback: Option<CompositingSpace>,
-    ) -> Option<CompositingSpace> {
-        self.0.get(&entity).copied().unwrap_or(fallback)
-    }
-}
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedCompositingSpace(pub Option<CompositingSpace>);
 
 /// Whether a camera composites over the previous camera's output and covers
 /// the whole target: [`ClearColorConfig::None`] and no viewport.
@@ -279,8 +266,8 @@ fn resolve_per_view<K>(
     }
 }
 
-/// Resolves every camera view's [`CompositingSpace`] request into
-/// [`ResolvedCompositionSpaces`].
+/// Resolves every camera view's [`CompositingSpace`] request into its
+/// [`ResolvedCompositingSpace`].
 ///
 /// Groups views by the shared-main-texture key and orders each group by
 /// `sorted_camera_index_for_target`, so it runs in
@@ -294,20 +281,20 @@ fn resolve_per_view<K>(
 /// without that extraction every view counts as non-2d. `bevy_render` can
 /// name the type because it depends on `bevy_camera`.
 pub fn resolve_composition_spaces(
-    mut resolved: ResMut<ResolvedCompositionSpaces>,
-    views: Query<(
+    mut views: Query<(
         Entity,
         &ExtractedCamera,
         &ExtractedView,
         &CameraMainTextureUsages,
         &Msaa,
         Has<Camera2d>,
+        &mut ResolvedCompositingSpace,
     )>,
 ) {
     let inputs: Vec<SpaceInput<MainTextureKey>> = views
         .iter()
         .map(
-            |(entity, camera, view, texture_usage, msaa, is_camera_2d)| SpaceInput {
+            |(entity, camera, view, texture_usage, msaa, is_camera_2d, _)| SpaceInput {
                 entity,
                 texture: main_texture_key(camera, view, texture_usage, *msaa),
                 sorted_index: camera.sorted_camera_index_for_target,
@@ -323,7 +310,12 @@ pub fn resolve_composition_spaces(
         .collect();
 
     let (spaces, diagnostics) = resolve_spaces(inputs);
-    resolved.0 = spaces;
+    // Every queried view fed the resolver, so the lookup always hits.
+    for (entity, .., mut resolved) in views.iter_mut() {
+        resolved.set_if_neq(ResolvedCompositingSpace(
+            spaces.get(&entity).copied().flatten(),
+        ));
+    }
 
     for diagnostic in diagnostics {
         match diagnostic {
@@ -647,13 +639,5 @@ mod tests {
         assert_eq!(resolved_for(&resolved, 1), SRGB);
         assert_eq!(resolved_for(&resolved, 2), SRGB);
         assert!(diagnostics.is_empty());
-    }
-
-    #[test]
-    fn get_falls_back_for_unseen_views() {
-        let mut spaces = ResolvedCompositionSpaces::default();
-        assert_eq!(spaces.get(entity(1), SRGB), SRGB);
-        spaces.0.insert(entity(1), None);
-        assert_eq!(spaces.get(entity(1), SRGB), None);
     }
 }

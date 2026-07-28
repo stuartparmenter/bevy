@@ -397,7 +397,6 @@ pub fn queue_shadows(
     mut transparent_render_phases: ResMut<ViewSortedRenderPhases<TransparentUi>>,
     mut render_views: Query<(&UiCameraView, Option<&BoxShadowSamples>), With<ExtractedView>>,
     camera_views: Query<&ExtractedView>,
-    resolved_spaces: Res<ResolvedCompositionSpaces>,
     view_contracts: Query<&ViewStackContract>,
     pipeline_cache: Res<PipelineCache>,
     draw_functions: Res<DrawFunctions<TransparentUi>>,
@@ -421,17 +420,18 @@ pub fn queue_shadows(
                 continue;
             };
 
+            let contract = view_contracts
+                .get(extracted_shadow.extracted_camera_entity)
+                .ok();
             let pipeline = pipelines.specialize(
                 &pipeline_cache,
                 &box_shadow_pipeline,
                 BoxShadowPipelineKey {
                     target_format: view.target_format,
                     samples: shadow_samples.copied().unwrap_or_default().0,
-                    compositing_space: resolved_spaces
-                        .get(extracted_shadow.extracted_camera_entity, None),
-                    source_gamut_rec2020: view_contracts
-                        .get(extracted_shadow.extracted_camera_entity)
-                        .is_ok_and(ViewStackContract::source_gamut_is_rec2020),
+                    compositing_space: contract.and_then(|contract| contract.compositing_space),
+                    source_gamut_rec2020: contract
+                        .is_some_and(ViewStackContract::source_gamut_is_rec2020),
                 },
             );
 

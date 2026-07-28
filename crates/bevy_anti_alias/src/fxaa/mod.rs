@@ -16,7 +16,7 @@ use bevy_render::{
         *,
     },
     renderer::RenderDevice,
-    view::{ExtractedView, ResolvedCompositionSpaces, ViewDisplayTarget},
+    view::{ExtractedView, ResolvedCompositingSpace, ViewDisplayTarget},
     GpuResourceAppExt, Render, RenderApp, RenderStartup, RenderSystems,
 };
 use bevy_shader::{Shader, ShaderDefVal};
@@ -181,7 +181,7 @@ pub struct FxaaPipelineKey {
     /// pipeline byte-for-byte.
     hdr: bool,
     /// Whether the view's resolved compositing space is
-    /// [`CompositingSpace::Oklab`] (the phase-1 [`ResolvedCompositionSpaces`]
+    /// [`CompositingSpace::Oklab`] (the phase-1 [`ResolvedCompositingSpace`]
     /// value, never the camera's raw request).
     ///
     /// An Oklab buffer holds Oklab triplets whose a/b chroma channels are
@@ -242,16 +242,18 @@ pub fn prepare_fxaa_pipelines(
     pipeline_cache: Res<PipelineCache>,
     mut pipelines: ResMut<SpecializedRenderPipelines<FxaaPipeline>>,
     fxaa_pipeline: Res<FxaaPipeline>,
-    resolved_spaces: Res<ResolvedCompositionSpaces>,
-    cameras: Query<(
-        Entity,
-        &ExtractedCamera,
-        &ExtractedView,
-        &Fxaa,
-        Option<&ViewDisplayTarget>,
-    )>,
+    cameras: Query<
+        (
+            Entity,
+            &ExtractedView,
+            &Fxaa,
+            Option<&ViewDisplayTarget>,
+            Option<&ResolvedCompositingSpace>,
+        ),
+        With<ExtractedCamera>,
+    >,
 ) {
-    for (entity, camera, view, fxaa, display_target) in &cameras {
+    for (entity, view, fxaa, display_target, resolved_space) in &cameras {
         if !fxaa.enabled {
             continue;
         }
@@ -266,7 +268,7 @@ pub fn prepare_fxaa_pipelines(
                 hdr: display_target.is_some_and(ViewDisplayTarget::is_hdr_transfer),
                 // The phase-1 resolved space, not the camera's raw request: a
                 // signed-a/b Oklab buffer needs the Oklab-L luma path.
-                oklab_compositing: resolved_spaces.get(entity, camera.compositing_space)
+                oklab_compositing: resolved_space.and_then(|space| space.0)
                     == Some(CompositingSpace::Oklab),
             },
         );
