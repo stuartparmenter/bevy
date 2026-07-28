@@ -117,46 +117,6 @@ impl ViewDisplayTarget {
     }
 }
 
-/// Index of [`DisplayGamut::Rec709`] in [`DisplayTargetUniform::gamut`].
-pub const DISPLAY_GAMUT_REC709: u32 = 0;
-/// Index of [`DisplayGamut::DisplayP3`] in [`DisplayTargetUniform::gamut`].
-pub const DISPLAY_GAMUT_DISPLAY_P3: u32 = 1;
-/// Index of [`DisplayGamut::Rec2020`] in [`DisplayTargetUniform::gamut`].
-pub const DISPLAY_GAMUT_REC2020: u32 = 2;
-
-/// Index of [`DisplayTransfer::Srgb`] in [`DisplayTargetUniform::transfer`].
-pub const DISPLAY_TRANSFER_SRGB: u32 = 0;
-/// Index of [`DisplayTransfer::ScRgbLinear`] in [`DisplayTargetUniform::transfer`].
-pub const DISPLAY_TRANSFER_SCRGB_LINEAR: u32 = 1;
-/// Index of [`DisplayTransfer::Pq`] in [`DisplayTargetUniform::transfer`].
-pub const DISPLAY_TRANSFER_PQ: u32 = 2;
-// Index 3 is reserved for a future HLG transfer (see the "HLG output" item in
-// the HDR design doc). `ExtendedSrgb` deliberately keeps index 4 so the GPU
-// contract is unchanged and HLG can be reintroduced without renumbering:
-// pub const DISPLAY_TRANSFER_HLG: u32 = 3;
-/// Index of [`DisplayTransfer::ExtendedSrgb`] in [`DisplayTargetUniform::transfer`].
-pub const DISPLAY_TRANSFER_EXTENDED_SRGB: u32 = 4;
-
-/// Returns the [`DisplayTargetUniform::gamut`] index for a [`DisplayGamut`].
-pub const fn display_gamut_index(gamut: DisplayGamut) -> u32 {
-    match gamut {
-        DisplayGamut::Rec709 => DISPLAY_GAMUT_REC709,
-        DisplayGamut::DisplayP3 => DISPLAY_GAMUT_DISPLAY_P3,
-        DisplayGamut::Rec2020 => DISPLAY_GAMUT_REC2020,
-    }
-}
-
-/// Returns the [`DisplayTargetUniform::transfer`] index for a
-/// [`DisplayTransfer`].
-pub const fn display_transfer_index(transfer: DisplayTransfer) -> u32 {
-    match transfer {
-        DisplayTransfer::Srgb => DISPLAY_TRANSFER_SRGB,
-        DisplayTransfer::ScRgbLinear => DISPLAY_TRANSFER_SCRGB_LINEAR,
-        DisplayTransfer::Pq => DISPLAY_TRANSFER_PQ,
-        DisplayTransfer::ExtendedSrgb => DISPLAY_TRANSFER_EXTENDED_SRGB,
-    }
-}
-
 /// GPU uniform carrying a view's resolved [`DisplayTarget`] calibration.
 ///
 /// The WGSL counterpart is `DisplayTargetUniform` in
@@ -164,8 +124,7 @@ pub const fn display_transfer_index(transfer: DisplayTransfer) -> u32 {
 /// field-for-field in sync.
 ///
 /// The [`gamut`](Self::gamut) and [`transfer`](Self::transfer) enums are
-/// encoded as `u32` indices (see the `DISPLAY_GAMUT_*` /
-/// `DISPLAY_TRANSFER_*` constants, also mirrored in WGSL):
+/// encoded as `u32` indices:
 ///
 /// | `gamut` | meaning | | `transfer` | meaning |
 /// |---|---|---|---|---|
@@ -202,10 +161,10 @@ pub struct DisplayTargetUniform {
     /// [`DisplayTarget::min_luminance_nits`]: the display's black level in
     /// nits.
     pub min_luminance_nits: f32,
-    /// The display gamut as a `DISPLAY_GAMUT_*` index (see the type docs).
+    /// The display gamut as a `u32` index (see the type docs).
     pub gamut: u32,
-    /// The (resolved) transfer function as a `DISPLAY_TRANSFER_*` index (see
-    /// the type docs).
+    /// The (resolved) transfer function as a `u32` index (see the type
+    /// docs).
     pub transfer: u32,
 }
 
@@ -215,8 +174,19 @@ impl From<DisplayTarget> for DisplayTargetUniform {
             paper_white_nits: target.paper_white_nits,
             peak_luminance_nits: target.peak_luminance_nits,
             min_luminance_nits: target.min_luminance_nits,
-            gamut: display_gamut_index(target.gamut),
-            transfer: display_transfer_index(target.transfer),
+            gamut: match target.gamut {
+                DisplayGamut::Rec709 => 0,
+                DisplayGamut::DisplayP3 => 1,
+                DisplayGamut::Rec2020 => 2,
+            },
+            // Index 3 is reserved for a future HLG transfer, so
+            // `ExtendedSrgb` keeps index 4.
+            transfer: match target.transfer {
+                DisplayTransfer::Srgb => 0,
+                DisplayTransfer::ScRgbLinear => 1,
+                DisplayTransfer::Pq => 2,
+                DisplayTransfer::ExtendedSrgb => 4,
+            },
         }
     }
 }
@@ -472,20 +442,6 @@ mod tests {
     }
 
     #[test]
-    fn enum_indices_are_stable() {
-        // These indices are mirrored in display_target.wgsl; they must never
-        // change for existing variants. Index 3 is reserved for a future HLG
-        // transfer, so `ExtendedSrgb` keeps index 4.
-        assert_eq!(display_gamut_index(DisplayGamut::Rec709), 0);
-        assert_eq!(display_gamut_index(DisplayGamut::DisplayP3), 1);
-        assert_eq!(display_gamut_index(DisplayGamut::Rec2020), 2);
-        assert_eq!(display_transfer_index(DisplayTransfer::Srgb), 0);
-        assert_eq!(display_transfer_index(DisplayTransfer::ScRgbLinear), 1);
-        assert_eq!(display_transfer_index(DisplayTransfer::Pq), 2);
-        assert_eq!(display_transfer_index(DisplayTransfer::ExtendedSrgb), 4);
-    }
-
-    #[test]
     fn uniform_copies_display_target_verbatim() {
         let target = DisplayTarget {
             paper_white_nits: 203.0,
@@ -498,8 +454,8 @@ mod tests {
         assert_eq!(uniform.paper_white_nits, 203.0);
         assert_eq!(uniform.peak_luminance_nits, 1000.0);
         assert_eq!(uniform.min_luminance_nits, 0.005);
-        assert_eq!(uniform.gamut, DISPLAY_GAMUT_REC2020);
-        assert_eq!(uniform.transfer, DISPLAY_TRANSFER_SCRGB_LINEAR);
+        assert_eq!(uniform.gamut, 2);
+        assert_eq!(uniform.transfer, 1);
     }
 
     #[test]
@@ -508,8 +464,8 @@ mod tests {
         assert_eq!(uniform.paper_white_nits, 100.0);
         assert_eq!(uniform.peak_luminance_nits, 100.0);
         assert_eq!(uniform.min_luminance_nits, 0.0);
-        assert_eq!(uniform.gamut, DISPLAY_GAMUT_REC709);
-        assert_eq!(uniform.transfer, DISPLAY_TRANSFER_SRGB);
+        assert_eq!(uniform.gamut, 0);
+        assert_eq!(uniform.transfer, 0);
     }
 
     #[test]
