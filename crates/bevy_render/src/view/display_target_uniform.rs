@@ -19,13 +19,15 @@
 //!    fall back to
 //!    [`DisplayTarget::SDR_SRGB`]. All cameras rendering to the same surface
 //!    resolve to the same value by construction.
-//! 2. [`prepare_display_target_uniforms`] runs in
+//! 2. The same system also inserts the [`DisplayTargetUniform`] built from the
+//!    resolved target. [`UniformComponentPlugin`](crate::uniform::UniformComponentPlugin),
+//!    registered for it in [`ViewPlugin`](super::ViewPlugin), packs those
+//!    components into the [`ComponentUniforms<DisplayTargetUniform>`](crate::uniform::ComponentUniforms)
+//!    dynamic uniform buffer during
 //!    [`RenderSystems::PrepareResources`](crate::RenderSystems::PrepareResources)
-//!    and writes a [`DisplayTargetUniform`] per view into the
-//!    [`DisplayTargetUniforms`] dynamic uniform buffer, inserting a
-//!    [`ViewDisplayTargetUniformOffset`] on each view (mirroring how
-//!    [`ViewUniforms`](super::ViewUniforms) /
-//!    [`ViewUniformOffset`](super::ViewUniformOffset) work).
+//!    and gives each view a
+//!    [`DynamicUniformIndex<DisplayTargetUniform>`](crate::uniform::DynamicUniformIndex)
+//!    to address its entry with.
 //!
 //! Only the display-encoding pass binds the uniform and reads it to drive the
 //! transfer OETF, and that pass is scheduled only for HDR-transfer targets.
@@ -48,11 +50,7 @@ use super::{
     },
     ExtractedView,
 };
-use crate::{
-    camera::ExtractedCamera,
-    render_resource::{DynamicUniformBuffer, ShaderType},
-    renderer::{RenderDevice, RenderQueue},
-};
+use crate::{camera::ExtractedCamera, render_resource::ShaderType};
 
 /// Render-world component holding the [`DisplayTarget`] of the surface
 /// (window, image, or manual texture view) a view renders to, in both its
@@ -179,8 +177,8 @@ pub const fn display_transfer_index(transfer: DisplayTransfer) -> u32 {
 /// the gamut-transform stage of the display-encoding pass derives them per
 /// pipeline.
 ///
-/// The [`From<DisplayTarget>`] conversion copies values verbatim, but the
-/// uniform writer ([`prepare_display_target_uniforms`]) sanitizes
+/// The [`From<DisplayTarget>`] conversion copies values verbatim, but
+/// [`prepare_view_display_targets`] sanitizes
 /// [`paper_white_nits`](Self::paper_white_nits) through
 /// [`DisplayTarget::sanitized_paper_white_nits`] before writing — every GPU
 /// consumer that multiplies by paper white (the display encoder's transfer
@@ -191,7 +189,7 @@ pub const fn display_transfer_index(transfer: DisplayTransfer) -> u32 {
 /// would silently disagree with GT7's clamped renormalization). The remaining
 /// fields are unvalidated; consumers with hard numeric requirements (e.g. the
 /// GT7 operator's HDR peak range) sanitize at their own prepare step.
-#[derive(Clone, Copy, Debug, PartialEq, ShaderType)]
+#[derive(Component, Clone, Copy, Debug, PartialEq, ShaderType)]
 pub struct DisplayTargetUniform {
     /// [`DisplayTarget::paper_white_nits`]: the luminance, in nits, that
     /// `1.0` at the tone-map operator output corresponds to.
@@ -219,40 +217,6 @@ impl From<DisplayTarget> for DisplayTargetUniform {
             transfer: display_transfer_index(target.transfer),
         }
     }
-}
-
-/// Resource holding the [`DynamicUniformBuffer`] of per-view
-/// [`DisplayTargetUniform`]s, written each frame by
-/// [`prepare_display_target_uniforms`].
-///
-/// Bind the whole buffer with a dynamic offset and index it per view with
-/// [`ViewDisplayTargetUniformOffset`], exactly like
-/// [`ViewUniforms`](super::ViewUniforms) /
-/// [`ViewUniformOffset`](super::ViewUniformOffset).
-#[derive(Resource)]
-pub struct DisplayTargetUniforms {
-    /// The per-view uniform buffer; entries are addressed with the dynamic
-    /// offset stored in each view's [`ViewDisplayTargetUniformOffset`].
-    pub uniforms: DynamicUniformBuffer<DisplayTargetUniform>,
-}
-
-impl Default for DisplayTargetUniforms {
-    fn default() -> Self {
-        let mut uniforms = DynamicUniformBuffer::default();
-        uniforms.set_label(Some("display_target_uniforms_buffer"));
-        Self { uniforms }
-    }
-}
-
-/// Render-world component holding a view's dynamic offset into
-/// [`DisplayTargetUniforms`].
-///
-/// Inserted by [`prepare_display_target_uniforms`] on every view that has a
-/// [`ViewDisplayTarget`].
-#[derive(Component)]
-pub struct ViewDisplayTargetUniformOffset {
-    /// The dynamic offset to pass to `set_bind_group`.
-    pub offset: u32,
 }
 
 /// Resolves a window view's display target from the transfer the configured
@@ -328,13 +292,17 @@ pub(crate) fn resolve_view_display_target(
     }
 }
 
-/// Resolves and inserts a [`ViewDisplayTarget`] on every extracted view that
-/// has an [`ExtractedCamera`].
+/// Resolves and inserts a [`ViewDisplayTarget`] and its matching
+/// [`DisplayTargetUniform`] on every extracted view that has an
+/// [`ExtractedCamera`].
 ///
 /// Runs in [`RenderSystems::PrepareViews`](crate::RenderSystems::PrepareViews)
 /// — after `create_surfaces`, so the window surface's negotiated transfer is
 /// fresh — so later prepare systems (pipeline specialization, uniform
-/// preparation) can rely on the component being present.
+/// packing) can rely on both components being present. The
+/// [`DisplayTargetUniform`] in particular must be inserted before
+/// [`UniformComponentPlugin`](crate::uniform::UniformComponentPlugin) packs it
+/// in [`RenderSystems::PrepareResources`](crate::RenderSystems::PrepareResources).
 ///
 /// Resolution policy (`resolve_view_display_target`):
 /// - **Window targets** go through surface negotiation; see
@@ -343,6 +311,16 @@ pub(crate) fn resolve_view_display_target(
 /// - **Image / manual-texture-view targets** resolve to the requested value
 ///   unchanged: there is no surface negotiation, the user owns the texture
 ///   and its format.
+///
+/// [`DisplayTargetUniform::paper_white_nits`] is sanitized through
+/// [`DisplayTarget::sanitized_paper_white_nits`] (non-finite / non-positive →
+/// 100 nits, clamped to the 10000-nit PQ ceiling; valid values pass through
+/// bit-for-bit) with a `warn_once!` when the authored value had to be
+/// replaced. This keeps the GPU-side paper white single-sourced with the
+/// value the tone-mapping operators (e.g. GT7's `sdr_correction_factor`)
+/// fold at their own prepare step, so the paper-white factors — operator
+/// output × `100 / paper_white`, encoder × `paper_white / 80` (scRGB) or
+/// `× paper_white` (PQ) — cancel for every authored input.
 pub fn prepare_view_display_targets(
     mut commands: Commands,
     extracted_windows: Res<ExtractedWindows>,
@@ -355,44 +333,6 @@ pub fn prepare_view_display_targets(
             &extracted_windows,
             &manual_display_targets,
         );
-        commands.entity(entity).insert(view_display_target);
-    }
-}
-
-/// Writes one [`DisplayTargetUniform`] per view into
-/// [`DisplayTargetUniforms`] and inserts the matching
-/// [`ViewDisplayTargetUniformOffset`].
-///
-/// [`DisplayTargetUniform::paper_white_nits`] is sanitized through
-/// [`DisplayTarget::sanitized_paper_white_nits`] (non-finite / non-positive →
-/// 100 nits, clamped to the 10000-nit PQ ceiling; valid values pass through
-/// bit-for-bit) with a `warn_once!` when the authored value had to be
-/// replaced. This keeps the GPU-side paper white single-sourced with the
-/// value the tone-mapping operators (e.g. GT7's `sdr_correction_factor`)
-/// fold at their own prepare step, so the paper-white factors — operator
-/// output × `100 / paper_white`, encoder × `paper_white / 80` (scRGB) or
-/// `× paper_white` (PQ) — cancel for every authored input.
-///
-/// Runs in
-/// [`RenderSystems::PrepareResources`](crate::RenderSystems::PrepareResources),
-/// mirroring [`prepare_view_uniforms`](super::prepare_view_uniforms).
-pub fn prepare_display_target_uniforms(
-    mut commands: Commands,
-    render_device: Res<RenderDevice>,
-    render_queue: Res<RenderQueue>,
-    mut display_target_uniforms: ResMut<DisplayTargetUniforms>,
-    views: Query<(Entity, &ViewDisplayTarget)>,
-) {
-    let views_iter = views.iter();
-    let view_count = views_iter.len();
-    let Some(mut writer) =
-        display_target_uniforms
-            .uniforms
-            .get_writer(view_count, &render_device, &render_queue)
-    else {
-        return;
-    };
-    for (entity, view_display_target) in &views {
         let mut uniform = DisplayTargetUniform::from(view_display_target.resolved);
         let sanitized = view_display_target.resolved.sanitized_paper_white_nits();
         // Bit comparison: valid values pass through bit-for-bit, and a NaN
@@ -406,10 +346,9 @@ pub fn prepare_display_target_uniforms(
             );
             uniform.paper_white_nits = sanitized;
         }
-        let offset = writer.write(&uniform);
         commands
             .entity(entity)
-            .insert(ViewDisplayTargetUniformOffset { offset });
+            .insert((view_display_target, uniform));
     }
 }
 

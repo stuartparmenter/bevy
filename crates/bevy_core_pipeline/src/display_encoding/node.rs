@@ -1,12 +1,13 @@
 use bevy_ecs::prelude::*;
 use bevy_render::{
     diagnostic::RecordDiagnostics,
+    extract_component::{ComponentUniforms, DynamicUniformIndex},
     render_resource::{
         BindGroup, BindGroupEntries, BufferId, LoadOp, Operations, PipelineCache,
         RenderPassColorAttachment, RenderPassDescriptor, StoreOp, TextureViewId,
     },
     renderer::{RenderContext, ViewQuery},
-    view::{DisplayTargetUniforms, ViewDisplayTargetUniformOffset, ViewTarget},
+    view::{DisplayTargetUniform, ViewTarget},
 };
 
 use super::{DisplayEncodingPipeline, ViewDisplayEncodingPipeline};
@@ -39,15 +40,15 @@ pub fn display_encoding(
     view: ViewQuery<(
         &ViewTarget,
         Option<&ViewDisplayEncodingPipeline>,
-        Option<&ViewDisplayTargetUniformOffset>,
+        Option<&DynamicUniformIndex<DisplayTargetUniform>>,
     )>,
     pipeline_cache: Res<PipelineCache>,
     encoding_pipeline: Res<DisplayEncodingPipeline>,
-    display_target_uniforms: Res<DisplayTargetUniforms>,
+    display_target_uniforms: Res<ComponentUniforms<DisplayTargetUniform>>,
     mut cache: Local<DisplayEncodingBindGroupCache>,
     mut ctx: RenderContext,
 ) {
-    let (target, view_encoding_pipeline, display_target_offset) = view.into_inner();
+    let (target, view_encoding_pipeline, display_target_index) = view.into_inner();
 
     // Plain SDR targets (the default for every existing user) never get the
     // component; hardware sRGB on the upscaling blit remains their encoder.
@@ -60,12 +61,13 @@ pub fn display_encoding(
         return;
     };
 
-    // Defensive: the same prepare systems that inserted the pipeline also
-    // wrote the uniform; bail before flipping the ping-pong if not.
-    let Some(display_target_offset) = display_target_offset else {
+    // Defensive: every view that gets a pipeline also carries a
+    // `DisplayTargetUniform` and so gets an index; bail before flipping the
+    // ping-pong if not.
+    let Some(display_target_index) = display_target_index else {
         return;
     };
-    let Some(uniforms_buffer) = display_target_uniforms.uniforms.buffer() else {
+    let Some(uniforms_buffer) = display_target_uniforms.buffer() else {
         return;
     };
     let uniforms_buffer_id = uniforms_buffer.id();
@@ -89,7 +91,7 @@ pub fn display_encoding(
                 &BindGroupEntries::sequential((
                     source,
                     &encoding_pipeline.sampler,
-                    &display_target_uniforms.uniforms,
+                    display_target_uniforms.uniforms(),
                 )),
             );
             let cached = cached.insert(CachedBindGroup {
@@ -126,7 +128,7 @@ pub fn display_encoding(
         let mut render_pass = ctx.command_encoder().begin_render_pass(&pass_descriptor);
 
         render_pass.set_pipeline(pipeline);
-        render_pass.set_bind_group(0, bind_group, &[display_target_offset.offset]);
+        render_pass.set_bind_group(0, bind_group, &[display_target_index.index()]);
         render_pass.draw(0..3, 0..1);
     }
 

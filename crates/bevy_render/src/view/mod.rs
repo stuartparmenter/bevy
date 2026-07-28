@@ -15,7 +15,7 @@ pub use window::*;
 
 use crate::{
     camera::{ExtractedCamera, MipBias, NormalizedRenderTargetExt as _, TemporalJitter},
-    extract_component::ExtractComponentPlugin,
+    extract_component::{ExtractComponentPlugin, UniformComponentPlugin},
     occlusion_culling::OcclusionCulling,
     render_asset::RenderAssets,
     render_phase::ViewRangefinder3d,
@@ -183,6 +183,9 @@ impl Plugin for ViewPlugin {
             .add_plugins((
                 ExtractComponentPlugin::<Msaa>::default(),
                 ExtractComponentPlugin::<OcclusionCulling>::default(),
+                // Packs the per-view `DisplayTargetUniform`s that
+                // `prepare_view_display_targets` inserts.
+                UniformComponentPlugin::<DisplayTargetUniform>::default(),
                 RenderVisibilityRangePlugin,
             ));
 
@@ -224,7 +227,6 @@ impl Plugin for ViewPlugin {
                         .in_set(RenderSystems::PrepareViews)
                         .after(create_surfaces)
                         .before(prepare_windows),
-                    prepare_display_target_uniforms.in_set(RenderSystems::PrepareResources),
                     collect_visible_cpu_culled_entities.in_set(RenderSystems::PrepareAssets),
                 ),
             );
@@ -235,7 +237,6 @@ impl Plugin for ViewPlugin {
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
             render_app
                 .init_gpu_resource::<ViewUniforms>()
-                .init_gpu_resource::<DisplayTargetUniforms>()
                 .init_gpu_resource::<ViewTargetAttachments>();
         }
     }

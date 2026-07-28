@@ -58,7 +58,7 @@
 // Per-view display-target calibration (paper white / peak / gamut / transfer
 // indices). Gamut and transfer are compile-time shader defs here; only the
 // luminance fields are read at runtime. `paper_white_nits` is sanitized by
-// the uniform writer (`prepare_display_target_uniforms`: finite, positive,
+// the uniform producer (`prepare_view_display_targets`: finite, positive,
 // <= 10000) with the same rules the tone-map operators fold at prepare time,
 // so the seam scale factors cancel exactly.
 @group(0) @binding(2) var<uniform> display_target: DisplayTargetUniform;
