@@ -12,8 +12,8 @@
 //! All of these are plain data: they carry no renderer types, and the defaults
 //! reproduce Bevy's SDR behavior exactly. A project that touches none of them
 //! renders byte-identically to one that does not know they exist:
-//! [`DisplayCalibrationPolicy`] defaults to all-[`Keep`](AutoField::Keep), under
-//! which the renderer never overwrites a single [`DisplayTarget`] field.
+//! [`DisplayCalibrationPolicy`] defaults to all-manual, under which the
+//! renderer never overwrites a single [`DisplayTarget`] field.
 
 use bevy_ecs::prelude::Component;
 
@@ -124,41 +124,18 @@ pub struct WindowDisplayState {
     pub sdr_white_nits: Option<f32>,
 }
 
-/// Whether the engine may auto-resolve a [`DisplayTarget`] field from sensed
-/// display information, or must keep the user's authored value.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
-#[cfg_attr(
-    feature = "bevy_reflect",
-    derive(Reflect),
-    reflect(Default, Debug, PartialEq, Hash, Clone)
-)]
-#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(
-    all(feature = "serialize", feature = "bevy_reflect"),
-    reflect(Serialize, Deserialize)
-)]
-pub enum AutoField {
-    /// Keep the user's authored [`DisplayTarget`] value verbatim; the engine
-    /// never overwrites it. This is the default, under which calibration
-    /// resolution is an identity pass and output is byte-identical to a project
-    /// that never sensed the display.
-    #[default]
-    Keep,
-    /// Let the engine fill this field from sensed display information when a
-    /// value is available, falling back through the precedence ladder to the
-    /// authored value when nothing is sensed.
-    Auto,
-}
-
 /// Per-field policy companion to [`DisplayTarget`]: which calibration fields the
 /// engine may auto-resolve from sensed display information.
 ///
 /// [`DisplayTarget`] stays user-authoritative — the engine never writes it.
 /// This component instead tells the *resolver* which fields of the derived
 /// [`EffectiveDisplayTarget`] may diverge from the authored target when the OS
-/// or display reports something. The default is all-[`Keep`](AutoField::Keep):
-/// the effective target equals the authored target field-for-field, so a
-/// project that adds this component (or never does) renders identically.
+/// or display reports something. A `true` field is filled from sensed display
+/// information when a value is available, falling back to the authored value
+/// when nothing is sensed; a `false` field keeps the authored value verbatim.
+/// The default is all-`false`: the effective target equals the authored target
+/// field-for-field, so a project that adds this component (or never does)
+/// renders identically.
 ///
 /// [`DisplayTarget::transfer`] is **deliberately absent**: the transfer
 /// function is never auto-resolved, because changing it would force a swapchain
@@ -177,27 +154,27 @@ pub enum AutoField {
 )]
 pub struct DisplayCalibrationPolicy {
     /// Whether to auto-resolve [`DisplayTarget::paper_white_nits`].
-    pub paper_white: AutoField,
+    pub auto_paper_white: bool,
     /// Whether to auto-resolve [`DisplayTarget::peak_luminance_nits`].
-    pub peak_luminance: AutoField,
+    pub auto_peak_luminance: bool,
     /// Whether to auto-resolve [`DisplayTarget::min_luminance_nits`].
-    pub min_luminance: AutoField,
+    pub auto_min_luminance: bool,
     /// Whether to auto-resolve [`DisplayTarget::gamut`].
-    pub gamut: AutoField,
+    pub auto_gamut: bool,
 }
 
 impl DisplayCalibrationPolicy {
-    /// Whether any field opts into [`Auto`](AutoField::Auto).
+    /// Whether any field opts into auto-resolution.
     ///
     /// When this is `false` the resolver is a pure identity pass, so the renderer
     /// has no reason to keep re-reading the live display state for this window —
     /// the gate the render-side poll uses to skip continuous sensing on
-    /// all-[`Keep`](AutoField::Keep) projects.
+    /// all-manual projects.
     pub const fn has_auto(&self) -> bool {
-        matches!(self.paper_white, AutoField::Auto)
-            || matches!(self.peak_luminance, AutoField::Auto)
-            || matches!(self.min_luminance, AutoField::Auto)
-            || matches!(self.gamut, AutoField::Auto)
+        self.auto_paper_white
+            || self.auto_peak_luminance
+            || self.auto_min_luminance
+            || self.auto_gamut
     }
 }
 
@@ -218,19 +195,22 @@ impl DisplayCalibrationPolicy {
     reflect(Serialize, Deserialize)
 )]
 pub enum FieldProvenance {
-    /// The authored [`DisplayTarget`] value (the field's policy is
-    /// [`Keep`](AutoField::Keep), or no higher source applied). This is the
-    /// default and the byte-identity case.
+    /// The authored [`DisplayTarget`] value (the field is not auto-resolved).
+    /// This is the default and the byte-identity case.
     #[default]
     User,
     /// A value sensed from the operating system / display took precedence.
     Os,
-    /// The SDR sRGB fallback, used when an [`Auto`](AutoField::Auto) field had
-    /// nothing to resolve from.
+    /// The SDR sRGB fallback, used when an auto-resolved field had nothing to
+    /// resolve from.
     Default,
 }
 
-/// Which provenance won for each field of an [`EffectiveDisplayTarget`].
+/// Which provenance won for each resolvable field of an
+/// [`EffectiveDisplayTarget`].
+///
+/// [`DisplayTarget::transfer`] has no entry: it is never auto-resolved, so its
+/// provenance is always the authored value.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 #[cfg_attr(
     feature = "bevy_reflect",
@@ -251,9 +231,6 @@ pub struct DisplayProvenance {
     pub min_luminance: FieldProvenance,
     /// Provenance of [`DisplayTarget::gamut`].
     pub gamut: FieldProvenance,
-    /// Provenance of [`DisplayTarget::transfer`]. Always
-    /// [`User`](FieldProvenance::User): the transfer is never auto-resolved.
-    pub transfer: FieldProvenance,
 }
 
 /// The derived display target the render pipeline consumes: the
@@ -261,13 +238,16 @@ pub struct DisplayProvenance {
 /// policy and sensed display information, plus the per-field
 /// [`DisplayProvenance`] of how each value was chosen.
 ///
-/// Computed in the main world (before extraction) so that the identity case —
-/// all-[`Keep`](AutoField::Keep) policy, or a user-set target with no sensing —
-/// has zero frame lag: a user-set-HDR project shows HDR on its first frame with
-/// no SDR pop. The render pipeline reads [`target`](Self::target) in place of
-/// the raw [`DisplayTarget`]; when this component is absent (pre-resolve or
-/// removed) the pipeline falls back to [`DisplayTarget::SDR_SRGB`], exactly as
-/// it falls back for a missing [`DisplayTarget`].
+/// A required component of [`Window`](crate::Window): every window carries one
+/// from spawn (the SDR default), and the resolver rewrites it in place only
+/// when the resolved value changes. Resolution happens in the main world
+/// (before extraction) so that the identity case — an all-manual policy, or a
+/// user-set target with no sensing — has zero frame lag: a user-set-HDR
+/// project shows HDR on its first frame with no SDR pop. The render pipeline
+/// reads [`target`](Self::target) in place of the raw [`DisplayTarget`]; if
+/// the component is removed the pipeline falls back to
+/// [`DisplayTarget::SDR_SRGB`], exactly as it falls back for a missing
+/// [`DisplayTarget`].
 #[derive(Component, Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(
     feature = "bevy_reflect",
@@ -302,24 +282,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn policy_default_is_all_keep() {
+    fn policy_default_is_all_manual() {
         let p = DisplayCalibrationPolicy::default();
-        assert_eq!(p.paper_white, AutoField::Keep);
-        assert_eq!(p.peak_luminance, AutoField::Keep);
-        assert_eq!(p.min_luminance, AutoField::Keep);
-        assert_eq!(p.gamut, AutoField::Keep);
+        assert!(!p.auto_paper_white);
+        assert!(!p.auto_peak_luminance);
+        assert!(!p.auto_min_luminance);
+        assert!(!p.auto_gamut);
     }
 
     #[test]
-    fn has_auto_is_false_for_all_keep_true_for_any_auto() {
+    fn has_auto_is_false_for_all_manual_true_for_any_auto() {
         assert!(!DisplayCalibrationPolicy::default().has_auto());
         assert!(DisplayCalibrationPolicy {
-            peak_luminance: AutoField::Auto,
+            auto_peak_luminance: true,
             ..Default::default()
         }
         .has_auto());
         assert!(DisplayCalibrationPolicy {
-            gamut: AutoField::Auto,
+            auto_gamut: true,
             ..Default::default()
         }
         .has_auto());

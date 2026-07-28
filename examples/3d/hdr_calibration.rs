@@ -103,7 +103,7 @@ fn on_calibration_complete(
     mut next: ResMut<NextState<AppState>>,
 ) {
     let target = complete.target;
-    let peak_source = if complete.policy.peak_luminance == AutoField::Auto {
+    let peak_source = if complete.policy.auto_peak_luminance {
         "OS-sensed"
     } else {
         "manual"
@@ -339,13 +339,7 @@ fn update_data_panel(
     let provenance: &DisplayProvenance = &effective.provenance;
     let capability = on_monitor.and_then(|on_monitor| capabilities.get(on_monitor.0).ok());
 
-    let auto = |field: AutoField| {
-        if field == AutoField::Auto {
-            "Auto"
-        } else {
-            "Keep"
-        }
-    };
+    let auto = |auto: bool| if auto { "auto" } else { "manual" };
 
     let sensed_peak = capability.and_then(|c| c.max_nits);
     let sensed_min = capability.and_then(|c| c.min_nits);
@@ -416,10 +410,10 @@ fn update_data_panel(
 
     ui.push_str(&format!(
         "policy: paper {} | peak {} | min {} | gamut {}\n\n",
-        auto(policy.paper_white),
-        auto(policy.peak_luminance),
-        auto(policy.min_luminance),
-        auto(policy.gamut),
+        auto(policy.auto_paper_white),
+        auto(policy.auto_peak_luminance),
+        auto(policy.auto_min_luminance),
+        auto(policy.auto_gamut),
     ));
 
     match live {

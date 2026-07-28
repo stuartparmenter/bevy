@@ -122,8 +122,8 @@ pub fn resolve_display_target(
 /// in isolation.
 pub(crate) mod policy {
     use bevy_window::{
-        AutoField, DisplayCalibrationPolicy, DisplayProvenance, DisplayTarget,
-        EffectiveDisplayTarget, FieldProvenance, MonitorDisplayCapability, WindowDisplayState,
+        DisplayCalibrationPolicy, DisplayProvenance, DisplayTarget, EffectiveDisplayTarget,
+        FieldProvenance, MonitorDisplayCapability, WindowDisplayState,
     };
 
     /// The sensed inputs the resolver may draw on for one target.
@@ -137,20 +137,20 @@ pub(crate) mod policy {
     /// policy, and sensed inputs.
     ///
     /// Per field, the highest applicable source wins:
-    /// 1. the authored value when the field's policy is [`AutoField::Keep`]
-    ///    (always — `Keep` is absolute and never overridden);
-    /// 2. otherwise, for an [`AutoField::Auto`] field: the OS-sensed value,
-    ///    else the authored value (the SDR default for a default project),
-    ///    tagged [`FieldProvenance::Default`].
+    /// 1. the authored value when the field does not opt into auto-resolution
+    ///    (manual is absolute and never overridden);
+    /// 2. otherwise, for an auto field: the OS-sensed value, else the authored
+    ///    value (the SDR default for a default project), tagged
+    ///    [`FieldProvenance::Default`].
     ///
     /// A platform that pushes calibration at the app would rank an
     /// HDR-game-interface (HGIG) override, then an engine policy, between
-    /// `Keep` and OS-sensed. Neither wgpu nor winit exposes a channel that
+    /// manual and OS-sensed. Neither wgpu nor winit exposes a channel that
     /// could fill them — an HGIG push is console-SDK territory — so the ladder
     /// carries only the rungs something can reach.
     ///
-    /// The transfer is never auto-resolved: it is copied verbatim with
-    /// [`FieldProvenance::User`].
+    /// The transfer is never auto-resolved: it is copied verbatim and carries
+    /// no provenance entry.
     pub(crate) fn resolve(
         target: DisplayTarget,
         policy: DisplayCalibrationPolicy,
@@ -164,14 +164,14 @@ pub(crate) mod policy {
         // the OS-sensed peak is reconstructed as `paper_white * headroom`, so the
         // resolved paper white must be known before peak.
         resolve_f32(
-            policy.paper_white,
+            policy.auto_paper_white,
             &mut out.paper_white_nits,
             &mut prov.paper_white,
             target.paper_white_nits,
             sensed.live.and_then(|l| l.sdr_white_nits),
         );
         resolve_f32(
-            policy.peak_luminance,
+            policy.auto_peak_luminance,
             &mut out.peak_luminance_nits,
             &mut prov.peak_luminance,
             target.peak_luminance_nits,
@@ -181,13 +181,13 @@ pub(crate) mod policy {
             os_peak(&sensed, out.paper_white_nits, out.transfer.is_hdr()),
         );
         resolve_f32(
-            policy.min_luminance,
+            policy.auto_min_luminance,
             &mut out.min_luminance_nits,
             &mut prov.min_luminance,
             target.min_luminance_nits,
             sensed.capability.and_then(|c| c.min_nits),
         );
-        if policy.gamut == AutoField::Auto {
+        if policy.auto_gamut {
             if let Some(g) = sensed.capability.and_then(|c| c.gamut_hint) {
                 out.gamut = g;
                 prov.gamut = FieldProvenance::Os;
@@ -236,13 +236,13 @@ pub(crate) mod policy {
     /// Resolves one `f32` field through the precedence ladder, writing both the
     /// resolved value and its provenance.
     fn resolve_f32(
-        field_policy: AutoField,
+        auto: bool,
         out: &mut f32,
         prov: &mut FieldProvenance,
         authored: f32,
         os: Option<f32>,
     ) {
-        if field_policy == AutoField::Keep {
+        if !auto {
             *out = authored;
             *prov = FieldProvenance::User;
         } else if let Some(v) = os {
@@ -260,39 +260,33 @@ pub(crate) mod policy {
 /// user-set-HDR project shows HDR on its first frame with no SDR pop).
 ///
 /// For each window it merges the authored [`DisplayTarget`] with its
-/// [`DisplayCalibrationPolicy`] (defaulting to all-[`Keep`](bevy_window::AutoField::Keep)),
-/// the [`MonitorDisplayCapability`] of the monitor it is on (resolved through
+/// [`DisplayCalibrationPolicy`] (defaulting to all-manual), the
+/// [`MonitorDisplayCapability`] of the monitor it is on (resolved through
 /// [`OnMonitor`]), and its live [`WindowDisplayState`]. Windows are the only
 /// targets with anything to sense; [`ManualDisplayTargets`] entries reach the
-/// render world as authored. The insert is on-change, so
+/// render world as authored. The write is
+/// [`set_if_neq`](bevy_ecs::change_detection::DetectChangesMut::set_if_neq), so
 /// [`Changed<EffectiveDisplayTarget>`](bevy_ecs::prelude::Changed) stays a
 /// usable signal and a default project is not dirtied every frame.
 pub fn resolve_calibration(
-    mut commands: Commands,
-    windows: Query<
+    mut windows: Query<
         (
-            Entity,
             Option<&DisplayTarget>,
             Option<&DisplayCalibrationPolicy>,
             Option<&WindowDisplayState>,
             Option<&OnMonitor>,
-            Option<&EffectiveDisplayTarget>,
+            &mut EffectiveDisplayTarget,
         ),
         With<Window>,
     >,
     monitors: Query<&MonitorDisplayCapability>,
 ) {
-    for (entity, target, policy, live, on_monitor, existing) in &windows {
+    for (target, policy, live, on_monitor, mut effective) in &mut windows {
         let target = target.copied().unwrap_or_default();
         let policy = policy.copied().unwrap_or_default();
         let capability = on_monitor.and_then(|m| monitors.get(m.0).ok());
         let sensed = policy::SensedInputs { capability, live };
-        let effective = policy::resolve(target, policy, sensed);
-        // Insert-on-change keeps `Changed<EffectiveDisplayTarget>` usable and
-        // avoids a write every frame on default projects.
-        if existing != Some(&effective) {
-            commands.entity(entity).insert(effective);
-        }
+        effective.set_if_neq(policy::resolve(target, policy, sensed));
     }
 }
 
@@ -387,7 +381,7 @@ mod resolve_display_target_tests {
 mod policy_tests {
     use super::policy::*;
     use bevy_window::{
-        AutoField, DisplayCalibrationPolicy, DisplayProvenance, DisplayTarget, DisplayTransfer,
+        DisplayCalibrationPolicy, DisplayProvenance, DisplayTarget, DisplayTransfer,
         FieldProvenance, MonitorDisplayCapability, WindowDisplayState,
     };
 
@@ -399,9 +393,9 @@ mod policy_tests {
     }
 
     #[test]
-    fn keep_is_identity_pass_byte_for_byte() {
+    fn default_policy_is_identity_pass_byte_for_byte() {
         // A non-default authored target, with a capability that WOULD override
-        // an Auto field, under the default all-Keep policy.
+        // an auto field, under the default all-manual policy.
         let target = DisplayTarget::SDR_SRGB
             .with_peak(1000.0)
             .with_paper_white(200.0)
@@ -428,7 +422,7 @@ mod policy_tests {
             .with_peak(1000.0)
             .with_transfer(DisplayTransfer::Pq);
         let policy = DisplayCalibrationPolicy {
-            peak_luminance: AutoField::Auto,
+            auto_peak_luminance: true,
             ..Default::default()
         };
         let cap = cap_with_peak(4000.0);
@@ -452,7 +446,7 @@ mod policy_tests {
         // authored value.
         let target = DisplayTarget::SDR_SRGB.with_peak(1000.0); // Srgb transfer
         let policy = DisplayCalibrationPolicy {
-            peak_luminance: AutoField::Auto,
+            auto_peak_luminance: true,
             ..Default::default()
         };
         let cap = cap_with_peak(270.0);
@@ -472,7 +466,7 @@ mod policy_tests {
     fn auto_with_nothing_sensed_falls_back_to_authored_tagged_default() {
         let target = DisplayTarget::SDR_SRGB.with_peak(1000.0);
         let policy = DisplayCalibrationPolicy {
-            peak_luminance: AutoField::Auto,
+            auto_peak_luminance: true,
             ..Default::default()
         };
         let e = resolve(target, policy, SensedInputs::default());
@@ -483,12 +477,12 @@ mod policy_tests {
     #[test]
     fn transfer_is_never_resolved() {
         let target = DisplayTarget::SDR_SRGB.with_transfer(DisplayTransfer::Pq);
-        // Every field Auto.
+        // Every field auto.
         let policy = DisplayCalibrationPolicy {
-            paper_white: AutoField::Auto,
-            peak_luminance: AutoField::Auto,
-            min_luminance: AutoField::Auto,
-            gamut: AutoField::Auto,
+            auto_paper_white: true,
+            auto_peak_luminance: true,
+            auto_min_luminance: true,
+            auto_gamut: true,
         };
         let cap = cap_with_peak(4000.0);
         let e = resolve(
@@ -499,16 +493,15 @@ mod policy_tests {
                 ..Default::default()
             },
         );
-        // The transfer is unchanged and stays User-provenance.
+        // The transfer is unchanged.
         assert_eq!(e.target.transfer, DisplayTransfer::Pq);
-        assert_eq!(e.provenance.transfer, FieldProvenance::User);
     }
 
     #[test]
     fn auto_paper_white_anchors_on_live_sdr_white() {
         let target = DisplayTarget::SDR_SRGB.with_paper_white(203.0);
         let policy = DisplayCalibrationPolicy {
-            paper_white: AutoField::Auto,
+            auto_paper_white: true,
             ..Default::default()
         };
         let live = WindowDisplayState {
@@ -532,13 +525,13 @@ mod policy_tests {
     fn auto_peak_reconstructs_from_headroom_when_no_absolute_peak() {
         // The Apple path: no capability max_nits (Apple reports no absolute
         // nits), only a live headroom multiplier. The OS peak is reconstructed as
-        // `paper_white * headroom`. Paper white is `Keep` here, so it is the
+        // `paper_white * headroom`. Paper white is manual here, so it is the
         // authored SDR_SRGB default (100 nits): 100 * 5 = 500.
         let target = DisplayTarget::SDR_SRGB
             .with_peak(1000.0)
             .with_transfer(DisplayTransfer::ScRgbLinear);
         let policy = DisplayCalibrationPolicy {
-            peak_luminance: AutoField::Auto,
+            auto_peak_luminance: true,
             ..Default::default()
         };
         let live = WindowDisplayState {
@@ -559,13 +552,13 @@ mod policy_tests {
 
     #[test]
     fn auto_peak_and_paper_white_together_on_apple_path() {
-        // Both Auto on the Apple path: paper white has no absolute SDR white to
+        // Both auto on the Apple path: paper white has no absolute SDR white to
         // draw from (Apple reports none), so it falls back to the authored
         // default (100, tagged Default); peak then reconstructs as 100 * 4 = 400.
         let target = DisplayTarget::SDR_SRGB.with_transfer(DisplayTransfer::ScRgbLinear);
         let policy = DisplayCalibrationPolicy {
-            paper_white: AutoField::Auto,
-            peak_luminance: AutoField::Auto,
+            auto_paper_white: true,
+            auto_peak_luminance: true,
             ..Default::default()
         };
         let live = WindowDisplayState {
@@ -594,15 +587,15 @@ mod policy_tests {
 
     #[test]
     fn peak_uses_the_resolved_paper_white_not_the_authored_one() {
-        // Both Auto: paper white auto-resolves to the sensed SDR white (120),
+        // Both auto: paper white auto-resolves to the sensed SDR white (120),
         // which must then anchor the peak estimate (120 * 3 = 360). If peak
         // resolved BEFORE paper white it would use the authored 100 (-> 300), so
         // this fixture pins the ordering. Synthetic: a live SDR white with no
         // capability max_nits forces the headroom-estimate branch.
         let target = DisplayTarget::SDR_SRGB.with_transfer(DisplayTransfer::ScRgbLinear);
         let policy = DisplayCalibrationPolicy {
-            paper_white: AutoField::Auto,
-            peak_luminance: AutoField::Auto,
+            auto_paper_white: true,
+            auto_peak_luminance: true,
             ..Default::default()
         };
         let live = WindowDisplayState {

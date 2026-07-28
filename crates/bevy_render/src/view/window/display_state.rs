@@ -182,10 +182,9 @@ fn commit(
 ///
 /// The per-frame branch is gated on
 /// [`display_calibration_auto`](super::ExtractedWindow::display_calibration_auto)
-/// and an HDR resolved transfer, so SDR and all-[`Keep`](bevy_window::AutoField::Keep)
-/// projects never pay it. A read on a platform that reports nothing marks the
-/// surface seen (so it is not re-read every frame) but commits nothing — `None`
-/// never means "SDR".
+/// and an HDR resolved transfer, so SDR and all-manual projects never pay it.
+/// A read on a platform that reports nothing marks the surface seen (so it is
+/// not re-read every frame) but commits nothing — `None` never means "SDR".
 pub fn poll_display_state(
     // Apple's relative-headroom query gates on the main thread; pin the system
     // there, matching `create_surfaces`.

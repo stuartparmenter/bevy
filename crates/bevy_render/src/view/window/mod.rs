@@ -160,12 +160,11 @@ pub struct ExtractedWindow {
     /// app to reach it, so a focus regain catches it on return).
     pub request_display_requery: bool,
     /// Whether this window's [`DisplayCalibrationPolicy`] opts any field into
-    /// [`Auto`](bevy_window::AutoField::Auto).
+    /// auto-resolution.
     ///
     /// Gates the continuous (per-frame, Apple) live re-read in
-    /// [`poll_display_state`]: an all-[`Keep`](bevy_window::AutoField::Keep)
-    /// project resolves identically with or without fresh sensing, so it never
-    /// pays the per-frame query.
+    /// [`poll_display_state`]: an all-manual project resolves identically with
+    /// or without fresh sensing, so it never pays the per-frame query.
     pub display_calibration_auto: bool,
     /// Whether this window needs an initial buffer commit.
     ///
@@ -270,9 +269,9 @@ fn extract_windows(
         windows.iter()
     {
         // The renderer consumes the resolved `EffectiveDisplayTarget`. It is
-        // computed in the main world before extraction; when absent (pre-resolve
-        // or removed) fall back to the SDR default, exactly as for a missing
-        // `DisplayTarget`.
+        // computed in the main world before extraction; removing the (required)
+        // component is legal, so when absent fall back to the SDR default
+        // rather than dropping the window from extraction.
         let display_target = effective_display_target
             .map(|effective| effective.target)
             .unwrap_or_default();

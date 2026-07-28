@@ -40,8 +40,8 @@ use bevy::{
     platform::collections::HashSet,
     prelude::*,
     window::{
-        AutoField, DisplayCalibrationPolicy, DisplayTarget, EffectiveDisplayTarget, Monitor,
-        PrimaryWindow, WindowMonitorChanged, WindowSurfaceTransfers,
+        DisplayCalibrationPolicy, DisplayTarget, EffectiveDisplayTarget, Monitor, PrimaryWindow,
+        WindowMonitorChanged, WindowSurfaceTransfers,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -152,16 +152,13 @@ enum CalibrationStrategy {
 impl CalibrationStrategy {
     /// The [`DisplayCalibrationPolicy`] this strategy implies.
     fn policy(self) -> DisplayCalibrationPolicy {
-        let auto = match self {
-            Self::ManualHgig => AutoField::Keep,
-            Self::TrustOs => AutoField::Auto,
-        };
+        let auto = matches!(self, Self::TrustOs);
         DisplayCalibrationPolicy {
             // Paper white is a viewing preference, always manual.
-            paper_white: AutoField::Keep,
-            peak_luminance: auto,
-            min_luminance: auto,
-            gamut: auto,
+            auto_paper_white: false,
+            auto_peak_luminance: auto,
+            auto_min_luminance: auto,
+            auto_gamut: auto,
         }
     }
 }
