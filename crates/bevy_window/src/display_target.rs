@@ -97,8 +97,11 @@ pub struct DisplayTarget {
     ///
     /// `0.0` is a reasonable default; self-emissive displays (OLED) reach
     /// true zero while backlit panels typically bottom out between 0.01 and
-    /// 0.1 nits. Tone-mapping operators may use this to lift shadow detail
-    /// above the display's black floor.
+    /// 0.1 nits.
+    ///
+    /// No engine stage consumes this value yet: it is carried for calibration
+    /// UIs and for HDR10 mastering metadata (SMPTE ST 2086) once wgpu exposes
+    /// an API for it.
     pub min_luminance_nits: f32,
     /// The color gamut (set of primaries) of the display target.
     ///
