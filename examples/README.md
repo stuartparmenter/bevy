@@ -400,6 +400,8 @@ Example | Description
 
 Example | Description
 --- | ---
+[HDR Calibration Helper](../examples/helpers/hdr_calibration.rs) | Reusable guided HDR display-calibration screen that runs inside an app state
+[HDR Helper](../examples/helpers/hdr.rs) | Reusable plugin that requests the best supported HDR output, falling back to SDR
 [Widgets](../examples/helpers/widgets.rs) | Example UI Widgets
 
 ### Input
