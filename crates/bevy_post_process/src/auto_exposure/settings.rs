@@ -1,12 +1,18 @@
 use core::ops::RangeInclusive;
 
-use super::compensation_curve::AutoExposureCompensationCurve;
+use super::{
+    buffers::build_uniform, compensation_curve::AutoExposureCompensationCurve,
+    pipeline::AutoExposureUniform, white_balance::AutoWhiteBalance,
+};
 use bevy_asset::Handle;
 use bevy_camera::Hdr;
-use bevy_ecs::{prelude::Component, reflect::ReflectComponent};
+use bevy_ecs::{prelude::Component, query::QueryItem, reflect::ReflectComponent};
 use bevy_image::Image;
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
-use bevy_render::{extract_component::ExtractComponent, view::NeedsSceneLinearTarget, RenderApp};
+use bevy_render::{
+    extract_component::ExtractComponent, sync_component::SyncComponent,
+    view::NeedsSceneLinearTarget, RenderApp,
+};
 use bevy_utils::{default, once};
 use tracing::warn;
 
@@ -25,10 +31,9 @@ use tracing::warn;
 /// # Usage Notes
 ///
 /// **Auto Exposure requires compute shaders and is not compatible with WebGL2.**
-#[derive(Component, Clone, Reflect, ExtractComponent)]
+#[derive(Component, Clone, Reflect)]
 #[reflect(Component, Default, Clone)]
 #[require(Hdr, NeedsSceneLinearTarget)]
-#[extract_app(RenderApp)]
 pub struct AutoExposure {
     /// The range of exposure values for the histogram.
     ///
@@ -122,6 +127,27 @@ impl Default for AutoExposure {
             metering_bias: 0.0,
             physiological: None,
         }
+    }
+}
+
+impl SyncComponent<RenderApp> for AutoExposure {
+    type Target = (AutoExposure, AutoExposureUniform);
+}
+
+impl ExtractComponent<RenderApp> for AutoExposure {
+    type QueryData = (&'static AutoExposure, Option<&'static AutoWhiteBalance>);
+    type QueryFilter = ();
+    // The settings uniform is derived from two main-world components — the
+    // optional [`AutoWhiteBalance`] is folded into it — so extraction builds
+    // it here. It runs unconditionally every frame, without change detection;
+    // that also covers [`AutoWhiteBalance`] being removed on its own, and the
+    // sanitization warnings in `build_uniform` stay once-only regardless.
+    type Out = (AutoExposure, AutoExposureUniform);
+
+    fn extract_component(
+        (settings, white_balance): QueryItem<'_, '_, Self::QueryData>,
+    ) -> Option<Self::Out> {
+        Some((settings.clone(), build_uniform(settings, white_balance)))
     }
 }
 

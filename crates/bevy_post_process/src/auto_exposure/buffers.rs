@@ -1,10 +1,8 @@
 use bevy_ecs::{entity::EntityHashMap, prelude::*};
 use bevy_platform::collections::hash_map::Entry;
 use bevy_render::{
-    render_resource::{StorageBuffer, UniformBuffer},
+    render_resource::StorageBuffer,
     renderer::{RenderDevice, RenderQueue},
-    sync_world::RenderEntity,
-    Extract,
 };
 use bevy_utils::once;
 use tracing::warn;
@@ -20,133 +18,39 @@ use super::{
 /// in sync.
 const D65_XY: (f32, f32) = (0.31272, 0.32903);
 
+/// The per-view GPU adaptation state, keyed by render-world view entity.
 #[derive(Resource, Default)]
 pub(super) struct AutoExposureBuffers {
-    pub(super) buffers: EntityHashMap<AutoExposureBuffer>,
+    pub(super) buffers: EntityHashMap<StorageBuffer<AutoExposureState>>,
 }
 
-pub(super) struct AutoExposureBuffer {
-    pub(super) state: StorageBuffer<AutoExposureState>,
-    pub(super) settings: UniformBuffer<AutoExposureUniform>,
-}
-
-/// One extracted camera that needs its settings uniform (re)built. Every
-/// metering camera carries [`AutoExposure`]; [`AutoWhiteBalance`] rides along
-/// in the same pass when present.
-type ExtractedCamera = (Entity, AutoExposure, Option<AutoWhiteBalance>);
-
-#[derive(Resource)]
-pub(super) struct ExtractedStateBuffers {
-    changed: Vec<ExtractedCamera>,
-    /// Render-world entities whose camera stopped metering (its
-    /// [`AutoExposure`] was removed while the camera itself stays alive).
-    /// These are *render* entities because [`AutoExposureBuffers`] is keyed
-    /// by render entities; cameras that were despawned outright are handled
-    /// by the liveness sweep in [`prepare_buffers`] instead.
-    removed: Vec<Entity>,
-}
-
-pub(super) fn extract_buffers(
-    mut commands: Commands,
-    changed: Extract<
-        Query<
-            (RenderEntity, &AutoExposure, Option<&AutoWhiteBalance>),
-            Or<(Changed<AutoExposure>, Changed<AutoWhiteBalance>)>,
-        >,
-    >,
-    mut removed: Extract<RemovedComponents<AutoExposure>>,
-    mut removed_white_balance: Extract<RemovedComponents<AutoWhiteBalance>>,
-    cameras: Extract<Query<(RenderEntity, &AutoExposure, Option<&AutoWhiteBalance>)>>,
-    render_entities: Extract<Query<RenderEntity>>,
-) {
-    let mut changed: Vec<ExtractedCamera> = changed
-        .iter()
-        .map(|(entity, settings, white_balance)| (entity, settings.clone(), white_balance.copied()))
-        .collect();
-    let mut fully_removed = Vec::new();
-
-    // Removing one of the components does not trigger the `Changed` filters
-    // above, but the settings uniform must still be rebuilt from whatever is
-    // left on the camera. Read the live component state instead of assuming
-    // the removed component is gone: a remove + re-insert within the same
-    // frame still buffers a removal event, and unconditionally pushing the
-    // component as absent here would override the freshly inserted value
-    // (the `changed` entries above are processed first, in order). Only when
-    // the camera no longer meters at all is the buffer torn down.
-    {
-        let mut handle_removal = |entity: Entity| {
-            if let Ok((render_entity, settings, white_balance)) = cameras.get(entity) {
-                changed.push((render_entity, settings.clone(), white_balance.copied()));
-            } else if let Ok(render_entity) = render_entities.get(entity) {
-                // The camera is still alive but no longer meters: tear its
-                // buffer down by its *render*-world key — the buffer map is
-                // keyed by render entities, so pushing the main-world entity
-                // here would silently leave the buffer (and the metering
-                // dispatches consuming it) alive forever.
-                fully_removed.push(render_entity);
-            }
-            // Otherwise the camera was despawned outright; its render entity
-            // is torn down by the sync machinery and `prepare_buffers`'
-            // liveness sweep drops the buffer.
-        };
-
-        for entity in removed.read() {
-            handle_removal(entity);
-        }
-        for entity in removed_white_balance.read() {
-            handle_removal(entity);
-        }
-    }
-
-    commands.insert_resource(ExtractedStateBuffers {
-        changed,
-        removed: fully_removed,
-    });
-}
-
+/// Creates the adaptation state buffer for views that started metering and
+/// drops the buffer of views that stopped.
+///
+/// An existing state buffer is never rewritten, so the adaptation animation
+/// stays continuous across settings changes; removing and re-adding
+/// [`AutoExposure`] drops and recreates the buffer, resetting the adaptation.
 pub(super) fn prepare_buffers(
     device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
-    mut extracted: ResMut<ExtractedStateBuffers>,
     mut buffers: ResMut<AutoExposureBuffers>,
-    live_entities: Query<()>,
+    views: Query<(Entity, &AutoExposure), With<AutoExposureUniform>>,
 ) {
-    for (entity, settings, white_balance) in extracted.changed.drain(..) {
-        let uniform = build_uniform(&settings, white_balance.as_ref());
-
-        match buffers.buffers.entry(entity) {
-            Entry::Occupied(mut entry) => {
-                // Update the settings buffer, but skip updating the state buffer.
-                // The state buffer is skipped so that the animation stays continuous.
-                let value = entry.get_mut();
-                value.settings.set(uniform);
-                value.settings.write_buffer(&device, &queue);
-            }
-            Entry::Vacant(entry) => {
-                let value = entry.insert(AutoExposureBuffer {
-                    state: StorageBuffer::from(initial_state(&settings)),
-                    settings: UniformBuffer::from(uniform),
-                });
-
-                value.state.write_buffer(&device, &queue);
-                value.settings.write_buffer(&device, &queue);
-            }
+    for (entity, settings) in &views {
+        if let Entry::Vacant(entry) = buffers.buffers.entry(entity) {
+            let state = entry.insert(StorageBuffer::from(initial_state(settings)));
+            state.write_buffer(&device, &queue);
         }
     }
 
     // Dropping the buffer is enough to stop the metering pass: the render node
     // bails out when the view has no entry in this map, so the stale
     // `ViewAutoExposurePipeline` the queue system left behind is inert.
-    for entity in extracted.removed.drain(..) {
-        buffers.buffers.remove(&entity);
-    }
-
-    // Cameras that are despawned outright never make it into the `removed`
-    // list (their main-world entity is gone before the removal events are
-    // read), so sweep out buffers whose render-world entity no longer exists.
-    buffers
-        .buffers
-        .retain(|&entity, _| live_entities.contains(entity));
+    // `AutoExposureUniform` is the liveness anchor because the sync machinery
+    // removes it from the render entity when the main-world camera stops
+    // metering, and a despawned view fails the query as well; the components
+    // the node reads are insert-only and would leak the buffer.
+    buffers.buffers.retain(|&entity, _| views.contains(entity));
 }
 
 /// Builds the settings uniform for one view, sanitizing invalid values.

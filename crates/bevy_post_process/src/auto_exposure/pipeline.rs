@@ -36,7 +36,7 @@ pub struct ViewAutoExposurePipeline {
 
 /// CPU mirror of the `AutoExposure` settings uniform in `auto_exposure.wgsl`.
 /// The field order and types must match the WGSL struct exactly.
-#[derive(ShaderType, Clone, Copy)]
+#[derive(Component, ShaderType, Clone, Copy)]
 pub struct AutoExposureUniform {
     pub(super) min_log_lum: f32,
     pub(super) inv_log_lum_range: f32,
@@ -110,7 +110,7 @@ pub fn init_auto_exposure_pipeline(
                 ShaderStages::COMPUTE,
                 (
                     uniform_buffer::<GlobalsUniform>(false),
-                    uniform_buffer::<AutoExposureUniform>(false),
+                    uniform_buffer::<AutoExposureUniform>(true),
                     texture_2d(TextureSampleType::Float { filterable: false }),
                     texture_2d(TextureSampleType::Float { filterable: false }),
                     texture_1d(TextureSampleType::Float { filterable: false }),

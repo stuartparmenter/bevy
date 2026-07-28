@@ -3,7 +3,9 @@ use bevy_asset::{embedded_asset, AssetApp, Assets, Handle};
 use bevy_ecs::prelude::*;
 use bevy_render::{
     diagnostic::RecordDiagnostics,
-    extract_component::ExtractComponentPlugin,
+    extract_component::{
+        ComponentUniforms, DynamicUniformIndex, ExtractComponentPlugin, UniformComponentPlugin,
+    },
     globals::GlobalsBuffer,
     render_asset::{RenderAssetPlugin, RenderAssets},
     render_resource::{
@@ -13,7 +15,7 @@ use bevy_render::{
     renderer::{RenderContext, RenderDevice, ViewQuery},
     texture::{FallbackImage, GpuImage},
     view::{ExtractedView, ViewTarget, ViewUniform, ViewUniformOffset, ViewUniforms},
-    ExtractSchedule, GpuResourceAppExt, Render, RenderApp, RenderStartup, RenderSystems,
+    GpuResourceAppExt, Render, RenderApp, RenderStartup, RenderSystems,
 };
 
 mod buffers;
@@ -24,9 +26,11 @@ mod settings;
 mod tests;
 mod white_balance;
 
-use buffers::{extract_buffers, prepare_buffers, AutoExposureBuffers};
+use buffers::{prepare_buffers, AutoExposureBuffers};
 pub use compensation_curve::{AutoExposureCompensationCurve, AutoExposureCompensationCurveError};
-use pipeline::{AutoExposurePass, AutoExposurePipeline, ViewAutoExposurePipeline};
+use pipeline::{
+    AutoExposurePass, AutoExposurePipeline, AutoExposureUniform, ViewAutoExposurePipeline,
+};
 pub use settings::{AutoExposure, PhysiologicalAdaptation};
 pub use white_balance::AutoWhiteBalance;
 
@@ -70,6 +74,7 @@ impl Plugin for AutoExposurePlugin {
 
         app.add_plugins((
             ExtractComponentPlugin::<AutoExposure>::default(),
+            UniformComponentPlugin::<AutoExposureUniform>::default(),
             // Also inserts the `ExternalWhiteBalance` marker on the
             // render-world view entity, which keeps the tonemapping pass's
             // `WHITE_BALANCE` shader path active for the GPU-composed
@@ -88,7 +93,6 @@ impl Plugin for AutoExposurePlugin {
                 RenderStartup,
                 (init_auto_exposure_pipeline, init_auto_exposure_resources),
             )
-            .add_systems(ExtractSchedule, extract_buffers)
             .add_systems(
                 Render,
                 (
@@ -150,6 +154,7 @@ fn auto_exposure(
         &ViewTarget,
         &ViewAutoExposurePipeline,
         &ExtractedView,
+        &DynamicUniformIndex<AutoExposureUniform>,
     )>,
     pipeline_cache: Res<PipelineCache>,
     pipeline: Res<AutoExposurePipeline>,
@@ -157,16 +162,22 @@ fn auto_exposure(
     view_uniforms: Res<ViewUniforms>,
     globals_buffer: Res<GlobalsBuffer>,
     auto_exposure_buffers: Res<AutoExposureBuffers>,
+    auto_exposure_uniforms: Res<ComponentUniforms<AutoExposureUniform>>,
     fallback: Res<FallbackImage>,
     gpu_images: Res<RenderAssets<GpuImage>>,
     compensation_curves: Res<RenderAssets<GpuAutoExposureCompensationCurve>>,
     mut ctx: RenderContext,
 ) {
     let view_entity = view.entity();
-    let (view_uniform_offset, view_target, auto_exposure_pipeline, extracted_view) =
-        view.into_inner();
+    let (
+        view_uniform_offset,
+        view_target,
+        auto_exposure_pipeline,
+        extracted_view,
+        auto_exposure_index,
+    ) = view.into_inner();
 
-    let Some(auto_exposure_buffer) = auto_exposure_buffers.buffers.get(&view_entity) else {
+    let Some(state_buffer) = auto_exposure_buffers.buffers.get(&view_entity) else {
         return;
     };
 
@@ -196,13 +207,13 @@ fn auto_exposure(
         &pipeline_cache.get_bind_group_layout(&pipeline.histogram_layout),
         &BindGroupEntries::sequential((
             &globals_buffer.buffer,
-            &auto_exposure_buffer.settings,
+            auto_exposure_uniforms.uniforms(),
             source,
             mask,
             &compensation_curve.texture_view,
             &compensation_curve.extents,
             resources.histogram.as_entire_buffer_binding(),
-            &auto_exposure_buffer.state,
+            state_buffer,
             BufferBinding {
                 buffer: view_uniforms_buffer,
                 size: Some(ViewUniform::min_size()),
@@ -224,7 +235,12 @@ fn auto_exposure(
                 timestamp_writes: None,
             });
 
-        compute_pass.set_bind_group(0, &compute_bind_group, &[view_uniform_offset.offset]);
+        // Dynamic offsets in increasing binding order: settings (1), view (8).
+        compute_pass.set_bind_group(
+            0,
+            &compute_bind_group,
+            &[auto_exposure_index.index(), view_uniform_offset.offset],
+        );
         compute_pass.set_pipeline(histogram_pipeline);
         compute_pass.dispatch_workgroups(
             extracted_view.viewport.z.div_ceil(16),
