@@ -29,15 +29,11 @@ commands.spawn((
 
 Defaults are tuned to real physiological time scales; games will often want faster values.
 `PhysiologicalAdaptation` exposes the long-term speeds (`speed_brighten`/`speed_darken`, EV per
-second per direction), the bounding range (`bound_brighten`/`bound_darken`, EV below/above the
-envelope), and an optional `initial_long_term_ev` to start a camera already adapted to a known
-environment.
+second per direction) and the bounding range (`bound_brighten`/`bound_darken`, EV below/above
+the envelope).
 
-`AutoExposure` also gains the first piece of GT7-style multi-reference metering: a
-`metering_bias` EV offset applied at the metering seam, plus an optional
-`AutoExposureExternalReference` component that blends an externally computed scene-brightness
-estimate (e.g. from sun illuminance or an environment map) into the frame-buffer histogram as a
-weighted average. Engine-computed sky/sun/light-probe references are planned follow-ups feeding
-this same seam.
+`AutoExposure` also gains a `metering_bias`: a constant EV offset applied to the metered scene
+luminance, so the meter can sit above or below what the histogram measured. A positive bias
+meters the scene as brighter than it is, and darkens the final image.
 
 Try it in the `auto_exposure` example with the `P` key.

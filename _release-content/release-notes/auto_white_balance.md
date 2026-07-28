@@ -13,14 +13,15 @@ cast. It is modeled on the system Polyphony Digital presented for Gran Turismo 7
 ```rust
 commands.spawn((
     Camera3d::default(),
+    AutoExposure::default(),
     AutoWhiteBalance::default(),
 ));
 ```
 
 * **Shared metering** — the measurement rides along in the auto-exposure compute pass: the same
   metering-mask weights that build the luminance histogram also accumulate a luminance-weighted
-  average of the scene chromaticity in Yxy space. One dispatch serves both adaptations;
-  `AutoWhiteBalance` also works without `AutoExposure` on the camera.
+  average of the scene chromaticity in Yxy space. One dispatch serves both adaptations, so
+  `AutoWhiteBalance` requires `AutoExposure` and pulls it in when spawned on its own.
 * **Dark-scene stability** — a faint *virtual light* (an ideal D65 source with a configurable
   luminance) is blended in as one more luminance-weighted reference. Its influence scales with the
   inverse of the scene luminance, so near-black scenes anchor at neutral instead of chasing

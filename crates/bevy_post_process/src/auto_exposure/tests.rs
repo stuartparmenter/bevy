@@ -1,23 +1,18 @@
 //! CPU-side tests for the auto exposure and auto white balance adaptation math.
 //!
-//! The functions below are an exact Rust mirror of the metering-reference blend, the
-//! temporal smoothing / two-stage clamp, and the auto white balance measurement /
-//! CCT conversion / von Kries balance matrix in `auto_exposure.wgsl`, operation for
+//! The functions below are an exact Rust mirror of the metering bias, the temporal
+//! smoothing / two-stage clamp, and the auto white balance measurement / CCT
+//! conversion / von Kries balance matrix in `auto_exposure.wgsl`, operation for
 //! operation. If the shader math changes, these mirrors must be updated to match.
 
 use super::{
     buffers::{build_uniform, initial_state},
     pipeline::{AutoExposureState, AutoExposureUniform},
-    AutoExposure, AutoExposureExternalReference, AutoWhiteBalance, PhysiologicalAdaptation,
+    AutoExposure, AutoWhiteBalance, PhysiologicalAdaptation,
 };
 
-/// Mirror of the external-reference blend and metering bias in `compute_average`.
-fn blend_references(avg_lum: f32, settings: &AutoExposureUniform) -> f32 {
-    let mut avg_lum = avg_lum;
-    if settings.external_reference_weight > 0.0 {
-        avg_lum = (avg_lum + settings.external_reference_ev * settings.external_reference_weight)
-            / (1.0 + settings.external_reference_weight);
-    }
+/// Mirror of the metering bias in `compute_average`.
+fn apply_metering_bias(mut avg_lum: f32, settings: &AutoExposureUniform) -> f32 {
     if settings.metering_bias != 0.0 {
         avg_lum += settings.metering_bias;
     }
@@ -93,11 +88,10 @@ const DT: f32 = 1.0 / 60.0;
 
 fn enabled_settings(adaptation: PhysiologicalAdaptation) -> AutoExposureUniform {
     build_uniform(
-        Some(&AutoExposure {
+        &AutoExposure {
             physiological: Some(adaptation),
             ..Default::default()
-        }),
-        None,
+        },
         None,
     )
 }
@@ -128,8 +122,9 @@ fn target_sequence(step: usize) -> f32 {
 fn gpu_struct_layouts_match_the_wgsl_structs() {
     use bevy_render::render_resource::ShaderType;
 
-    // naga computes span=80 for the WGSL `AutoExposure` uniform struct (20 sequential
-    // 4-byte scalars) and span=16 for `AutoExposureState`; the encase layouts must agree.
+    // naga computes span=80 for the WGSL `AutoExposure` uniform struct (17 sequential
+    // 4-byte scalars plus three words of tail padding) and span=16 for
+    // `AutoExposureState`; the encase layouts must agree.
     assert_eq!(AutoExposureUniform::min_size().get(), 80);
     assert_eq!(AutoExposureState::min_size().get(), 16);
 }
@@ -152,7 +147,7 @@ fn default_component_is_configuration_identical_to_legacy() {
 
 #[test]
 fn default_uniform_is_neutral() {
-    let uniform = build_uniform(Some(&AutoExposure::default()), None, None);
+    let uniform = build_uniform(&AutoExposure::default(), None);
 
     // The values the legacy implementation uploaded, unchanged.
     assert_eq!(uniform.min_log_lum, -8.0);
@@ -165,24 +160,23 @@ fn default_uniform_is_neutral() {
     assert_eq!(uniform.exponential_transition_distance, 1.5);
 
     // The new fields are at their neutral values, so the shader skips both the
-    // reference blend and the two-stage clamp.
+    // metering bias and the two-stage clamp.
     assert_eq!(uniform.metering_bias, 0.0);
-    assert_eq!(uniform.external_reference_weight, 0.0);
     assert_eq!(uniform.physiological, 0);
 
     // The initial GPU state matches the legacy initial state (exposure 0, clamped into
     // range), with the envelope starting at the same neutral value.
-    let state = initial_state(Some(&AutoExposure::default()));
+    let state = initial_state(&AutoExposure::default());
     assert_eq!(state.exposure, 0.0);
     assert_eq!(state.long_term, 0.0);
 }
 
 #[test]
 fn disabled_two_stage_is_bit_identical_to_legacy_single_stage() {
-    let settings = build_uniform(Some(&AutoExposure::default()), None, None);
+    let settings = build_uniform(&AutoExposure::default(), None);
     assert_eq!(settings.physiological, 0);
 
-    let mut state = initial_state(Some(&AutoExposure::default()));
+    let mut state = initial_state(&AutoExposure::default());
     let mut legacy_exposure = state.exposure;
 
     for step in 0..1200 {
@@ -334,82 +328,34 @@ fn long_term_envelope_is_rate_limited() {
 }
 
 #[test]
-fn external_reference_blend_math() {
-    let neutral = build_uniform(Some(&AutoExposure::default()), None, None);
-
-    // Without a reference, the metered value passes through bit-identically.
+fn metering_bias_math() {
+    // At the neutral bias, the metered value passes through bit-identically.
+    let neutral = build_uniform(&AutoExposure::default(), None);
     let avg = -3.7f32;
-    assert_eq!(blend_references(avg, &neutral).to_bits(), avg.to_bits());
+    assert_eq!(apply_metering_bias(avg, &neutral).to_bits(), avg.to_bits());
 
-    // A reference with weight 1.0 averages equally with the histogram.
+    // A positive bias meters the scene as brighter than it measured.
     let settings = build_uniform(
-        Some(&AutoExposure::default()),
-        Some(&AutoExposureExternalReference {
-            ev: 5.0,
-            weight: 1.0,
-        }),
-        None,
-    );
-    assert_eq!(blend_references(3.0, &settings), 4.0);
-
-    // A dominant weight pulls the metered value to the reference.
-    let settings = build_uniform(
-        Some(&AutoExposure::default()),
-        Some(&AutoExposureExternalReference {
-            ev: 5.0,
-            weight: 1e6,
-        }),
-        None,
-    );
-    assert!((blend_references(3.0, &settings) - 5.0).abs() < 1e-4);
-
-    // The metering bias is applied after the references are fused.
-    let settings = build_uniform(
-        Some(&AutoExposure {
+        &AutoExposure {
             metering_bias: 1.0,
             ..Default::default()
-        }),
-        Some(&AutoExposureExternalReference {
-            ev: 5.0,
-            weight: 1.0,
-        }),
+        },
         None,
     );
-    assert_eq!(blend_references(3.0, &settings), 5.0);
+    assert_eq!(apply_metering_bias(3.0, &settings), 4.0);
 }
 
 #[test]
 fn invalid_inputs_are_sanitized() {
     // A non-finite metering bias is ignored.
     let settings = build_uniform(
-        Some(&AutoExposure {
+        &AutoExposure {
             metering_bias: f32::NAN,
             ..Default::default()
-        }),
-        None,
+        },
         None,
     );
     assert_eq!(settings.metering_bias, 0.0);
-
-    // Invalid external references are ignored entirely.
-    for reference in [
-        AutoExposureExternalReference {
-            ev: f32::NAN,
-            weight: 1.0,
-        },
-        AutoExposureExternalReference {
-            ev: 1.0,
-            weight: f32::INFINITY,
-        },
-        AutoExposureExternalReference {
-            ev: 1.0,
-            weight: -1.0,
-        },
-    ] {
-        let settings = build_uniform(Some(&AutoExposure::default()), Some(&reference), None);
-        assert_eq!(settings.external_reference_ev, 0.0);
-        assert_eq!(settings.external_reference_weight, 0.0);
-    }
 
     // Invalid physiological fields are reset to their defaults; valid ones are kept.
     let defaults = PhysiologicalAdaptation::default();
@@ -418,7 +364,6 @@ fn invalid_inputs_are_sanitized() {
         speed_darken: -1.0,
         bound_brighten: 4.0,
         bound_darken: f32::INFINITY,
-        initial_long_term_ev: None,
     });
     assert_eq!(settings.physiological, 1);
     assert_eq!(settings.long_term_speed_up, defaults.speed_brighten);
@@ -428,31 +373,19 @@ fn invalid_inputs_are_sanitized() {
 }
 
 #[test]
-fn initial_state_seeds_the_long_term_envelope() {
-    // Without physiological settings, the envelope starts at the neutral exposure.
-    let state = initial_state(Some(&AutoExposure::default()));
+fn initial_state_starts_neutral_inside_the_metering_range() {
+    // The envelope starts at the same neutral exposure as the short-term stage.
+    let state = initial_state(&AutoExposure::default());
+    assert_eq!(state.exposure, 0.0);
     assert_eq!(state.long_term, state.exposure);
 
-    // An explicit initial envelope value is honored.
-    let state = initial_state(Some(&AutoExposure {
-        physiological: Some(PhysiologicalAdaptation {
-            initial_long_term_ev: Some(-4.5),
-            ..Default::default()
-        }),
+    // A metering range that excludes 0 EV clamps both stages into it.
+    let state = initial_state(&AutoExposure {
+        range: 2.0..=8.0,
         ..Default::default()
-    }));
-    assert_eq!(state.exposure, 0.0);
-    assert_eq!(state.long_term, -4.5);
-
-    // A non-finite initial envelope value falls back to the neutral exposure.
-    let state = initial_state(Some(&AutoExposure {
-        physiological: Some(PhysiologicalAdaptation {
-            initial_long_term_ev: Some(f32::NAN),
-            ..Default::default()
-        }),
-        ..Default::default()
-    }));
-    assert_eq!(state.long_term, 0.0);
+    });
+    assert_eq!(state.exposure, 2.0);
+    assert_eq!(state.long_term, 2.0);
 }
 
 // === Auto white balance mirrors =====================================================
@@ -665,7 +598,7 @@ fn awb_adaptation_step(
 }
 
 fn awb_settings(white_balance: AutoWhiteBalance) -> AutoExposureUniform {
-    build_uniform(None, None, Some(&white_balance))
+    build_uniform(&AutoExposure::default(), Some(&white_balance))
 }
 
 // === Auto white balance tests =======================================================
@@ -938,17 +871,13 @@ fn balance_matrix_neutralizes_a_warm_illuminant() {
 #[test]
 fn awb_uniform_defaults_and_sanitization() {
     // Without the component, every auto white balance field is neutral.
-    let uniform = build_uniform(Some(&AutoExposure::default()), None, None);
+    let uniform = build_uniform(&AutoExposure::default(), None);
     assert_eq!(uniform.awb_enabled, 0);
     assert_eq!(uniform.awb_speed, 0.0);
     assert_eq!(uniform.awb_anchor, 0.0);
 
     // With the component, the sanitized values are uploaded.
-    let uniform = build_uniform(
-        Some(&AutoExposure::default()),
-        None,
-        Some(&AutoWhiteBalance::default()),
-    );
+    let uniform = build_uniform(&AutoExposure::default(), Some(&AutoWhiteBalance::default()));
     assert_eq!(uniform.awb_enabled, 1);
     assert_eq!(uniform.awb_speed, AutoWhiteBalance::default().speed);
     assert_eq!(
@@ -958,8 +887,7 @@ fn awb_uniform_defaults_and_sanitization() {
 
     // Invalid fields are reset to their defaults.
     let uniform = build_uniform(
-        None,
-        None,
+        &AutoExposure::default(),
         Some(&AutoWhiteBalance {
             speed: f32::NAN,
             virtual_light_anchor: -1.0,
@@ -974,32 +902,8 @@ fn awb_uniform_defaults_and_sanitization() {
 }
 
 #[test]
-fn awb_only_configuration_is_exposure_neutral() {
-    // A camera with only `AutoWhiteBalance` runs the shared metering pass with both
-    // exposure adaptation speeds forced to zero, so the exposure state can never move
-    // from its neutral initial value and the view write-back adds an exact 0.0.
-    let settings = build_uniform(None, None, Some(&AutoWhiteBalance::default()));
-    assert_eq!(settings.speed_up, 0.0);
-    assert_eq!(settings.speed_down, 0.0);
-    assert_eq!(settings.physiological, 0);
-    assert_eq!(settings.metering_bias, 0.0);
-    assert_eq!(settings.external_reference_weight, 0.0);
-
-    let mut state = initial_state(None);
-    assert_eq!(state.exposure, 0.0);
-
-    // Even with wild metering targets, the zero-speed smoothing is an exact no-op.
-    for step in 0..600 {
-        let applied = adaptation_step(&mut state, target_sequence(step), DT, &settings);
-        assert_eq!(applied.to_bits(), 0.0f32.to_bits());
-    }
-}
-
-#[test]
 fn initial_chromaticity_is_d65() {
-    for settings in [None, Some(AutoExposure::default())] {
-        let state = initial_state(settings.as_ref());
-        assert_eq!(state.chroma_x, AWB_D65_XY[0]);
-        assert_eq!(state.chroma_y, AWB_D65_XY[1]);
-    }
+    let state = initial_state(&AutoExposure::default());
+    assert_eq!(state.chroma_x, AWB_D65_XY[0]);
+    assert_eq!(state.chroma_y, AWB_D65_XY[1]);
 }

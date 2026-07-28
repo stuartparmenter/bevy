@@ -1,4 +1,5 @@
-use bevy_camera::{Camera, Hdr};
+use super::AutoExposure;
+use bevy_camera::Camera;
 use bevy_core_pipeline::tonemapping::ExternalWhiteBalance;
 use bevy_ecs::{prelude::*, query::QueryItem, reflect::ReflectComponent};
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
@@ -17,15 +18,16 @@ use tracing::warn;
 /// and slowly adapts a correction towards a neutral (D65) white point,
 /// mimicking the chromatic adaptation of human vision (and of camera AWB).
 ///
+/// The measurement rides along in [`AutoExposure`]'s metering pass, so this
+/// component requires [`AutoExposure`] and pulls it in when added on its own.
+///
 /// # How it works
 ///
-/// * **Metering** shares the [`AutoExposure`](super::AutoExposure) compute
-///   pass: the same per-pixel metering-mask weights drive both the luminance
-///   histogram and a luminance-weighted average of the scene's CIE 1931 *xy*
-///   chromaticity (a [Yxy] measurement, the blend space Gran Turismo 7
-///   settled on). When both components are present on a camera, one metering
-///   dispatch serves both; `AutoWhiteBalance` also works on its own, in which
-///   case the shared pass runs with neutral auto-exposure settings.
+/// * **Metering** shares the [`AutoExposure`] compute pass: the same
+///   per-pixel metering-mask weights drive both the luminance histogram and a
+///   luminance-weighted average of the scene's CIE 1931 *xy* chromaticity (a
+///   [Yxy] measurement, the blend space Gran Turismo 7 settled on). One
+///   metering dispatch serves both adaptations.
 /// * **Stability**: a faint *virtual light* — an ideal D65 light source of
 ///   luminance [`virtual_light_anchor`](Self::virtual_light_anchor) — is
 ///   blended into the measurement as one more luminance-weighted reference.
@@ -33,8 +35,7 @@ use tracing::warn;
 ///   the white point at neutral instead of chasing measurement noise. This is
 ///   Gran Turismo 7's dark-scene stability mechanism.
 /// * **Adaptation** smooths only the *xy* chromaticity over time at
-///   [`speed`](Self::speed) (luminance adaptation is
-///   [`AutoExposure`](super::AutoExposure)'s job).
+///   [`speed`](Self::speed) (luminance adaptation is [`AutoExposure`]'s job).
 /// * **Output**: the adapted chromaticity is converted to a correlated color
 ///   temperature (the `McCamy` 1992 approximation) plus a tint offset from the
 ///   Planckian locus, the temperature is clamped to the **2500 K – 7000 K**
@@ -55,9 +56,9 @@ use tracing::warn;
 ///
 /// # Usage Notes
 ///
-/// Like [`AutoExposure`](super::AutoExposure), the correction is consumed by
-/// the tonemapping pass, so cameras with `Tonemapping::None` are unaffected,
-/// and the metering runs in a compute shader (**not compatible with WebGL2**).
+/// Like [`AutoExposure`], the correction is consumed by the tonemapping pass,
+/// so cameras with `Tonemapping::None` are unaffected, and the metering runs
+/// in a compute shader (**not compatible with WebGL2**).
 /// Hue-preserving tone-mapping operators (`TonyMcMapface`, `AgX`,
 /// `KhronosPbrNeutral`, `GranTurismo7`) preserve the corrected white point
 /// best; purely per-channel operators (`Reinhard`, `ReinhardLuminance`,
@@ -72,7 +73,7 @@ use tracing::warn;
 /// [Yxy]: https://en.wikipedia.org/wiki/CIE_1931_color_space#CIE_xy_chromaticity_diagram_and_the_CIE_xyY_color_space
 #[derive(Component, Clone, Copy, Debug, PartialEq, Reflect)]
 #[reflect(Component, Default, Clone, PartialEq)]
-#[require(Hdr, NeedsSceneLinearTarget)]
+#[require(AutoExposure, NeedsSceneLinearTarget)]
 pub struct AutoWhiteBalance {
     /// The adaptation speed of the white-point chromaticity, per second.
     ///

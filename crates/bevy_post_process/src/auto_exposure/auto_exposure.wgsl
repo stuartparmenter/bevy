@@ -44,8 +44,6 @@ struct AutoExposure {
     speed_down: f32,
     exponential_transition_distance: f32,
     metering_bias: f32,
-    external_reference_ev: f32,
-    external_reference_weight: f32,
     long_term_speed_up: f32,
     long_term_speed_down: f32,
     long_term_bound_up: f32,
@@ -57,9 +55,12 @@ struct AutoExposure {
     awb_anchor: f32,
     // Non-zero when auto white balance is enabled for this view.
     awb_enabled: u32,
-    // Padding so the struct size stays a multiple of 16 bytes (uniform
-    // address space struct size rounding).
-    awb_pad: u32,
+    // Tail padding to 80 bytes. WGSL rounds a uniform struct's size up to a
+    // multiple of 16 anyway; spelling it out keeps this struct field-for-field
+    // identical to its CPU mirror, which has to pad explicitly.
+    pad_0: u32,
+    pad_1: u32,
+    pad_2: u32,
 }
 
 // The per-view adaptation state, persisted on the GPU from frame to frame.
@@ -425,17 +426,9 @@ fn compute_average(@builtin(local_invocation_index) local_index: u32) {
             + settings.min_log_lum;
     }
 
-    // External metering references — the seam for GT7-style multi-reference metering.
-    // An externally computed scene reference (e.g. sun illuminance, sky dome or light
-    // probe luminance, estimated on the CPU) is fused with the histogram average as a
-    // weighted average, where the histogram always has weight 1.0. A constant metering
-    // bias is then applied to the fused result.
-    // Both statements are skipped entirely at their neutral values: the default
-    // configuration meters from the histogram alone.
-    if settings.external_reference_weight > 0.0 {
-        avg_lum = (avg_lum + settings.external_reference_ev * settings.external_reference_weight)
-            / (1.0 + settings.external_reference_weight);
-    }
+    // A constant EV offset on the metered luminance, applied before the compensation
+    // curve is sampled. The branch keeps the default configuration on the exact
+    // histogram average.
     if settings.metering_bias != 0.0 {
         avg_lum += settings.metering_bias;
     }

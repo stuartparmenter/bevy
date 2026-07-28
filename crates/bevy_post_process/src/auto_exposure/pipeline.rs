@@ -47,8 +47,6 @@ pub struct AutoExposureUniform {
     pub(super) speed_down: f32,
     pub(super) exponential_transition_distance: f32,
     pub(super) metering_bias: f32,
-    pub(super) external_reference_ev: f32,
-    pub(super) external_reference_weight: f32,
     pub(super) long_term_speed_up: f32,
     pub(super) long_term_speed_down: f32,
     pub(super) long_term_bound_up: f32,
@@ -63,9 +61,13 @@ pub struct AutoExposureUniform {
     /// auto-exposure-only configuration runs no white-balance arithmetic at
     /// all.
     pub(super) awb_enabled: u32,
-    /// Padding so the struct size stays a multiple of 16 bytes, matching the
-    /// WGSL uniform address space struct size rounding.
-    pub(super) awb_pad: u32,
+    /// Tail padding to 80 bytes. The seventeen fields above occupy 68, and a
+    /// WGSL uniform struct's size is rounded up to a multiple of 16; encase
+    /// does not apply that rounding, so the mirror has to carry it explicitly
+    /// or the uploaded buffer is smaller than the binding the shader declares.
+    pub(super) pad_0: u32,
+    pub(super) pad_1: u32,
+    pub(super) pad_2: u32,
 }
 
 /// CPU mirror of the per-view `AutoExposureState` storage buffer in `auto_exposure.wgsl`.

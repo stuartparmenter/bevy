@@ -91,15 +91,12 @@ pub struct AutoExposure {
     /// For more information, see [`AutoExposureCompensationCurve`].
     pub compensation_curve: Handle<AutoExposureCompensationCurve>,
 
-    /// A constant bias, in exposure values (EV), added to the metered scene luminance after
-    /// all metering references have been fused.
+    /// A constant bias, in exposure values (EV), added to the metered scene luminance.
     ///
     /// A positive bias makes the meter believe the scene is brighter than it measured, which
     /// results in a *darker* final image; a negative bias results in a brighter image. This is
     /// equivalent to a constant offset in the [`compensation_curve`](Self::compensation_curve),
-    /// but is applied at the metering seam where external references
-    /// (see [`AutoExposureExternalReference`](super::AutoExposureExternalReference))
-    /// are blended in.
+    /// but is applied to the metered luminance itself, before the curve is sampled.
     ///
     /// The default value is 0.0, which leaves the metered value untouched.
     pub metering_bias: f32,
@@ -187,17 +184,6 @@ pub struct PhysiologicalAdaptation {
     ///
     /// The default value is 2.0.
     pub bound_darken: f32,
-
-    /// The initial value of the long-term envelope, in EV, used when the per-camera
-    /// adaptation state is first created (i.e. when auto exposure is first enabled for a
-    /// camera). Use this to start a camera as if it had already adapted to a known
-    /// environment, e.g. bright daylight.
-    ///
-    /// If `None` (the default), the envelope starts at the same neutral initial value as the
-    /// short-term exposure. Changing this value at runtime has no effect on cameras whose
-    /// adaptation state already exists; state is intentionally preserved across settings
-    /// changes to keep the adaptation continuous.
-    pub initial_long_term_ev: Option<f32>,
 }
 
 impl Default for PhysiologicalAdaptation {
@@ -207,7 +193,6 @@ impl Default for PhysiologicalAdaptation {
             speed_darken: 0.01,
             bound_brighten: 3.0,
             bound_darken: 2.0,
-            initial_long_term_ev: None,
         }
     }
 }
@@ -215,9 +200,8 @@ impl Default for PhysiologicalAdaptation {
 impl PhysiologicalAdaptation {
     /// Returns a copy of these settings with invalid fields reset to their default values.
     ///
-    /// Speeds and bounds must be finite and non-negative;
-    /// [`initial_long_term_ev`](Self::initial_long_term_ev) must be finite if present.
-    /// Warns (once) if any field had to be reset.
+    /// Speeds and bounds must be finite and non-negative. Warns (once) if any field had to
+    /// be reset.
     pub(super) fn sanitized(&self) -> Self {
         let defaults = Self::default();
         let mut invalid = false;
@@ -235,13 +219,6 @@ impl PhysiologicalAdaptation {
             speed_darken: sanitize(self.speed_darken, defaults.speed_darken),
             bound_brighten: sanitize(self.bound_brighten, defaults.bound_brighten),
             bound_darken: sanitize(self.bound_darken, defaults.bound_darken),
-            initial_long_term_ev: match self.initial_long_term_ev {
-                Some(ev) if !ev.is_finite() => {
-                    invalid = true;
-                    None
-                }
-                ev => ev,
-            },
         };
 
         if invalid {
@@ -252,62 +229,5 @@ impl PhysiologicalAdaptation {
         }
 
         sanitized
-    }
-}
-
-/// An externally computed metering reference for [`AutoExposure`].
-///
-/// Bevy's auto exposure meters the rendered frame through a luminance histogram. That is
-/// accurate and flexible, but inherently limited to the camera frustum: it cannot anticipate
-/// brightness outside the current view, and it provides no long-term stability across camera
-/// cuts. Gran Turismo 7 addresses this by fusing **five** metering references with fixed
-/// weights: the frame buffer histogram, light probes, the sky dome, direct sun illuminance,
-/// and SH-based sky visibility.
-///
-/// This component is the extensible seam for that multi-reference pattern. A system that can
-/// estimate the scene's brightness from non-frame-buffer data — for example from
-/// `DirectionalLight::illuminance`, an environment map's integrated luminance, or a
-/// procedural sky model — can write its estimate here (typically every frame). The
-/// `(ev, weight)` pair is uploaded with the auto exposure settings, and the metering compute
-/// shader fuses it with the histogram measurement as a weighted average:
-///
-/// ```text
-/// metered_ev = (histogram_ev + ev * weight) / (1.0 + weight)
-/// ```
-///
-/// where the frame buffer histogram always carries a weight of `1.0`.
-///
-/// The component is user-driven, and only a single fused external reference is supported.
-/// If multiple sources need to be combined (e.g. a sky dome, sun illuminance, and light
-/// probe luminance), fuse them into one `ev`/`weight` pair before writing the component.
-///
-/// This component only has an effect on cameras that also have [`AutoExposure`].
-#[derive(Component, Clone, Copy, Debug, PartialEq, Reflect)]
-#[reflect(Component, Default, Clone, PartialEq)]
-pub struct AutoExposureExternalReference {
-    /// The reference's estimate of the scene's average log2 luminance, in the same units as
-    /// the histogram average that [`AutoExposure`] meters from the frame buffer (compare
-    /// [`AutoExposure::range`]). Unlike the histogram average, this value is not clamped to
-    /// [`AutoExposure::range`].
-    ///
-    /// Must be finite; non-finite values cause the reference to be ignored.
-    pub ev: f32,
-
-    /// The weight of this reference relative to the frame buffer histogram, which always has
-    /// a weight of `1.0`. A weight of `0.0` disables the reference, `1.0` averages it equally
-    /// with the histogram, and larger values let it dominate.
-    ///
-    /// Must be finite and non-negative; invalid values cause the reference to be ignored.
-    ///
-    /// The default value is 1.0.
-    pub weight: f32,
-}
-
-impl Default for AutoExposureExternalReference {
-    fn default() -> Self {
-        Self {
-            ev: 0.0,
-            weight: 1.0,
-        }
     }
 }

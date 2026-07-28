@@ -27,7 +27,7 @@ mod white_balance;
 use buffers::{extract_buffers, prepare_buffers, AutoExposureBuffers};
 pub use compensation_curve::{AutoExposureCompensationCurve, AutoExposureCompensationCurveError};
 use pipeline::{AutoExposurePass, AutoExposurePipeline, ViewAutoExposurePipeline};
-pub use settings::{AutoExposure, AutoExposureExternalReference, PhysiologicalAdaptation};
+pub use settings::{AutoExposure, PhysiologicalAdaptation};
 pub use white_balance::AutoWhiteBalance;
 
 use crate::auto_exposure::{
@@ -127,10 +127,7 @@ fn queue_view_auto_exposure_pipelines(
     pipeline_cache: Res<PipelineCache>,
     mut compute_pipelines: ResMut<SpecializedComputePipelines<AutoExposurePipeline>>,
     pipeline: Res<AutoExposurePipeline>,
-    view_targets: Query<
-        (Entity, Option<&AutoExposure>),
-        Or<(With<AutoExposure>, With<AutoWhiteBalance>)>,
-    >,
+    view_targets: Query<(Entity, &AutoExposure)>,
 ) {
     for (entity, auto_exposure) in view_targets.iter() {
         let histogram_pipeline =
@@ -138,17 +135,11 @@ fn queue_view_auto_exposure_pipelines(
         let average_pipeline =
             compute_pipelines.specialize(&pipeline_cache, &pipeline, AutoExposurePass::Average);
 
-        // Cameras running only auto white balance use the default (white)
-        // metering mask and the default (flat) compensation curve.
         commands.entity(entity).insert(ViewAutoExposurePipeline {
             histogram_pipeline,
             mean_luminance_pipeline: average_pipeline,
-            compensation_curve: auto_exposure
-                .map(|auto_exposure| auto_exposure.compensation_curve.clone())
-                .unwrap_or_default(),
-            metering_mask: auto_exposure
-                .map(|auto_exposure| auto_exposure.metering_mask.clone())
-                .unwrap_or_default(),
+            compensation_curve: auto_exposure.compensation_curve.clone(),
+            metering_mask: auto_exposure.metering_mask.clone(),
         });
     }
 }

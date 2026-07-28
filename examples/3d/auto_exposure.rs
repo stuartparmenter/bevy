@@ -227,7 +227,6 @@ fn example_control_system(
                 speed_darken: 0.1,
                 bound_brighten: 2.0,
                 bound_darken: 1.0,
-                initial_long_term_ev: None,
             }),
         };
     }
