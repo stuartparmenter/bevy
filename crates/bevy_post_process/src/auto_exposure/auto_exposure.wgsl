@@ -73,6 +73,11 @@ struct AutoExposureState {
     // balance.
     chroma_x: f32,
     chroma_y: f32,
+    // Fixed-point accumulators for the auto white balance measurement: the
+    // luminance-weighted sums of x, of y, and the luminance weight itself
+    // (Yxy space). Flushed by compute_histogram, drained and cleared by
+    // compute_average.
+    chroma_sums: array<atomic<u32>, 3>,
 }
 
 struct CompensationCurve {
@@ -100,12 +105,6 @@ struct CompensationCurve {
 
 @group(0) @binding(8) var<storage, read_write> view: View;
 
-// Global fixed-point accumulators for the auto white balance measurement:
-// the luminance-weighted sums of x, of y, and the luminance weight itself
-// (Yxy space). Shared across views like the histogram; drained and cleared
-// in compute_average.
-@group(0) @binding(9) var<storage, read_write> chroma: array<atomic<u32>, 3>;
-
 var<workgroup> histogram_shared: array<atomic<u32>, 64>;
 
 var<workgroup> chroma_shared: array<atomic<u32>, 3>;
@@ -117,10 +116,10 @@ var<workgroup> chroma_shared: array<atomic<u32>, 3>;
 // a 256-pixel workgroup stays below 16 * 256 * 2^16 = 2^28 < 2^32.
 const CHROMA_WORKGROUP_SCALE: f32 = 65536.0;
 
-// Fixed-point scale used by the per-workgroup flush into the global chroma
+// Fixed-point scale used by the per-workgroup flush into the state's chroma
 // accumulators. The flushed values are normalized by the total pixel count,
-// so the global sums are bounded by 16 * 2^24 = 2^28 < 2^32.
-const CHROMA_GLOBAL_SCALE: f32 = 16777216.0;
+// so the accumulated sums are bounded by 16 * 2^24 = 2^28 < 2^32.
+const CHROMA_FLUSH_SCALE: f32 = 16777216.0;
 
 // The CIE 1931 xy chromaticity of the D65 white point, matching `D65_XY` in
 // `bevy_render/src/view/mod.rs` (and `D65_XY` in `buffers.rs`); keep in sync.
@@ -374,14 +373,14 @@ fn compute_histogram(
         );
     }
 
-    // Accumulate the workgroup chroma sums into the global accumulators,
-    // converting from the workgroup fixed-point scale to the global one and
-    // normalizing by the total pixel count for headroom (the normalization
-    // cancels out exactly in compute_average).
+    // Accumulate the workgroup chroma sums into the per-view state
+    // accumulators, converting from the workgroup fixed-point scale to the
+    // flush scale and normalizing by the total pixel count for headroom (the
+    // normalization cancels out exactly in compute_average).
     if settings.awb_enabled != 0u && local_invocation_index < 3u {
         let workgroup_sum = f32(atomicLoad(&chroma_shared[local_invocation_index])) / CHROMA_WORKGROUP_SCALE;
         let normalized = workgroup_sum / (f32(dim.x) * f32(dim.y));
-        atomicAdd(&chroma[local_invocation_index], u32(normalized * CHROMA_GLOBAL_SCALE + 0.5));
+        atomicAdd(&state.chroma_sums[local_invocation_index], u32(normalized * CHROMA_FLUSH_SCALE + 0.5));
     }
 }
 
@@ -497,12 +496,12 @@ fn compute_average(@builtin(local_invocation_index) local_index: u32) {
     if settings.awb_enabled != 0u {
         // Drain and clear the fixed-point chroma accumulators (see
         // compute_histogram for the encoding).
-        let sum_yx = f32(atomicLoad(&chroma[0])) / CHROMA_GLOBAL_SCALE;
-        let sum_yy = f32(atomicLoad(&chroma[1])) / CHROMA_GLOBAL_SCALE;
-        let sum_y = f32(atomicLoad(&chroma[2])) / CHROMA_GLOBAL_SCALE;
-        atomicStore(&chroma[0], 0u);
-        atomicStore(&chroma[1], 0u);
-        atomicStore(&chroma[2], 0u);
+        let sum_yx = f32(atomicLoad(&state.chroma_sums[0])) / CHROMA_FLUSH_SCALE;
+        let sum_yy = f32(atomicLoad(&state.chroma_sums[1])) / CHROMA_FLUSH_SCALE;
+        let sum_y = f32(atomicLoad(&state.chroma_sums[2])) / CHROMA_FLUSH_SCALE;
+        atomicStore(&state.chroma_sums[0], 0u);
+        atomicStore(&state.chroma_sums[1], 0u);
+        atomicStore(&state.chroma_sums[2], 0u);
 
         // The mean metered scene luminance in scene-linear units. The sums
         // were normalized by the total pixel count (for fixed-point headroom)

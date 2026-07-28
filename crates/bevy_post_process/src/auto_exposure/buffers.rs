@@ -121,5 +121,8 @@ pub(super) fn initial_state(settings: &AutoExposure) -> AutoExposureState {
         long_term: exposure,
         chroma_x: D65_XY.0,
         chroma_y: D65_XY.1,
+        // The initial upload is the only CPU write that ever zeroes the
+        // accumulator sums; the shader drains them back to zero each frame.
+        chroma_sums: [0; 3],
     }
 }

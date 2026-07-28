@@ -51,13 +51,10 @@ pub struct AutoExposurePlugin;
 
 #[derive(Resource)]
 struct AutoExposureResources {
+    /// The luminance histogram bins, a single global buffer shared by all
+    /// views: each view's `compute_average` dispatch drains and clears it
+    /// before the next view's histogram pass runs.
     histogram: Buffer,
-    /// Fixed-point accumulators for the auto-white-balance chromaticity
-    /// measurement (`x·Y`, `y·Y`, `Y` sums). Like [`Self::histogram`], a
-    /// single global buffer shared by all views: each view's `compute_average`
-    /// dispatch drains and clears it before the next view's histogram pass
-    /// runs.
-    chroma: Buffer,
 }
 
 impl Plugin for AutoExposurePlugin {
@@ -114,12 +111,6 @@ pub fn init_auto_exposure_resources(mut commands: Commands, render_device: Res<R
         histogram: render_device.create_buffer(&BufferDescriptor {
             label: Some("histogram buffer"),
             size: pipeline::HISTOGRAM_BIN_COUNT * 4,
-            usage: BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        }),
-        chroma: render_device.create_buffer(&BufferDescriptor {
-            label: Some("auto white balance chroma buffer"),
-            size: pipeline::CHROMA_ACCUMULATOR_SIZE,
             usage: BufferUsages::STORAGE,
             mapped_at_creation: false,
         }),
@@ -219,7 +210,6 @@ fn auto_exposure(
                 size: Some(ViewUniform::min_size()),
                 offset: 0,
             },
-            resources.chroma.as_entire_buffer_binding(),
         )),
     );
 

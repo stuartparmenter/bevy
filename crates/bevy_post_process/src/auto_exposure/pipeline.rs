@@ -84,6 +84,10 @@ pub struct AutoExposureState {
     /// The adapted white-point chromaticity (CIE 1931 *y*); see
     /// [`Self::chroma_x`].
     pub(super) chroma_y: f32,
+    /// Fixed-point accumulators for the auto-white-balance chromaticity
+    /// measurement (`x·Y`, `y·Y`, and `Y` sums), `array<atomic<u32>, 3>` on
+    /// the GPU. The shader drains them back to zero every frame.
+    pub(super) chroma_sums: [u32; 3],
 }
 
 #[derive(PartialEq, Eq, Hash, Clone)]
@@ -93,10 +97,6 @@ pub enum AutoExposurePass {
 }
 
 pub const HISTOGRAM_BIN_COUNT: u64 = 64;
-
-/// Size in bytes of the global chroma accumulator storage buffer
-/// (three fixed-point `atomic<u32>` sums: `x·Y`, `y·Y`, and `Y`).
-pub const CHROMA_ACCUMULATOR_SIZE: u64 = 12;
 
 pub fn init_auto_exposure_pipeline(
     mut commands: Commands,
@@ -118,7 +118,6 @@ pub fn init_auto_exposure_pipeline(
                     storage_buffer_sized(false, NonZero::<u64>::new(HISTOGRAM_BIN_COUNT * 4)),
                     storage_buffer::<AutoExposureState>(false),
                     storage_buffer::<ViewUniform>(true),
-                    storage_buffer_sized(false, NonZero::<u64>::new(CHROMA_ACCUMULATOR_SIZE)),
                 ),
             ),
         ),
