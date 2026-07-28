@@ -12,9 +12,9 @@ use crate::{
     view::{
         display_target_uniform::{resolve_view_display_target, ViewDisplayTarget},
         ColorGrading, ExtractedView, ExtractedWindows, ManualDisplayTargets, Msaa,
-        NoIndirectDrawing, RenderExtractedVisibleEntities, RenderVisibleEntities,
-        RenderVisibleEntitiesClass, RetainedViewEntity, ViewUniformOffset,
-        VisibilityExtractionSystemParam,
+        NeedsSceneLinearTarget, NoIndirectDrawing, RenderExtractedVisibleEntities,
+        RenderVisibleEntities, RenderVisibleEntitiesClass, RetainedViewEntity, Tonemapping,
+        ViewUniformOffset, VisibilityExtractionSystemParam,
     },
     Extract, ExtractSchedule, Render, RenderApp, RenderSystems,
 };
@@ -26,9 +26,8 @@ use bevy_camera::{
     visibility::{self, RenderLayers, VisibleEntities},
     Camera, Camera2d, Camera3d, CameraMainTextureUsages, CameraOutputMode, CameraUpdateSystems,
     ClearColor, ClearColorConfig, CompositingSpace, Exposure, Hdr, ManualTextureViewHandle,
-    MsaaWriteback, NeedsNodeTonemapping, NeedsSceneLinearAa, NeedsSceneLinearPost,
-    NormalizedRenderTarget, Projection, RenderTarget, RenderTargetInfo, TonemappingEnabled,
-    Viewport,
+    MsaaWriteback, NeedsNodeTonemapping, NormalizedRenderTarget, Projection, RenderTarget,
+    RenderTargetInfo, Viewport,
 };
 use bevy_derive::{Deref, DerefMut};
 use bevy_ecs::{
@@ -494,7 +493,7 @@ pub fn extract_cameras(
             &Frustum,
             (
                 Has<Hdr>,
-                Has<TonemappingEnabled>,
+                Option<&Tonemapping>,
                 Option<&CompositingSpace>,
                 Option<&ColorGrading>,
                 Option<&Exposure>,
@@ -503,8 +502,7 @@ pub fn extract_cameras(
                 Option<&RenderLayers>,
                 Option<&Projection>,
                 Has<NoIndirectDrawing>,
-                Has<NeedsSceneLinearPost>,
-                Has<NeedsSceneLinearAa>,
+                Has<NeedsSceneLinearTarget>,
                 Has<NeedsNodeTonemapping>,
             ),
         )>,
@@ -564,7 +562,7 @@ pub fn extract_cameras(
         frustum,
         (
             hdr,
-            tonemapping_enabled,
+            tonemapping,
             compositing_space,
             color_grading,
             exposure,
@@ -573,8 +571,7 @@ pub fn extract_cameras(
             render_layers,
             projection,
             no_indirect_drawing,
-            needs_scene_linear_post,
-            needs_scene_linear_aa,
+            needs_scene_linear_target,
             needs_node_tonemapping,
         ),
     ) in query.iter()
@@ -657,9 +654,8 @@ pub fn extract_cameras(
             );
             let target_format = main_texture_mode(MainTextureCamera {
                 hdr,
-                tonemapping_enabled,
-                needs_scene_linear_post,
-                needs_scene_linear_aa,
+                tonemapping_enabled: tonemapping.is_some_and(Tonemapping::is_enabled),
+                needs_scene_linear_target,
                 needs_node_tonemapping,
                 compositing_space: compositing_space.copied(),
                 display_target: view_display_target,
@@ -826,10 +822,10 @@ impl MainTextureMode {
 #[derive(Clone, Copy)]
 struct MainTextureCamera<'a> {
     hdr: bool,
-    /// The auto-managed `TonemappingEnabled` marker, i.e. `Tonemapping != None`.
+    /// [`Tonemapping::is_enabled`]; `false` when the camera has no
+    /// [`Tonemapping`] component.
     tonemapping_enabled: bool,
-    needs_scene_linear_post: bool,
-    needs_scene_linear_aa: bool,
+    needs_scene_linear_target: bool,
     needs_node_tonemapping: bool,
     compositing_space: Option<CompositingSpace>,
     display_target: ViewDisplayTarget,
@@ -844,8 +840,7 @@ fn main_texture_mode(camera: MainTextureCamera) -> MainTextureMode {
     let MainTextureCamera {
         hdr,
         tonemapping_enabled,
-        needs_scene_linear_post,
-        needs_scene_linear_aa,
+        needs_scene_linear_target,
         needs_node_tonemapping,
         compositing_space,
         display_target,
@@ -864,8 +859,7 @@ fn main_texture_mode(camera: MainTextureCamera) -> MainTextureMode {
     // like any other SDR view.
     let eligible_in_shader_tonemap = tonemapping_enabled
         && !hdr
-        && !needs_scene_linear_post
-        && !needs_scene_linear_aa
+        && !needs_scene_linear_target
         && !needs_node_tonemapping
         && compositing_space.is_none_or(|s| s == CompositingSpace::Linear)
         && display_target.resolved == DisplayTarget::SDR_SRGB
@@ -1353,8 +1347,7 @@ mod tests {
         MainTextureCamera {
             hdr: false,
             tonemapping_enabled: true,
-            needs_scene_linear_post: false,
-            needs_scene_linear_aa: false,
+            needs_scene_linear_target: false,
             needs_node_tonemapping: false,
             compositing_space: None,
             display_target: ViewDisplayTarget::fulfilled(DisplayTarget::SDR_SRGB),
@@ -1412,17 +1405,9 @@ mod tests {
                 MainTextureMode::SceneLinear,
             ),
             (
-                "NeedsSceneLinearPost",
+                "NeedsSceneLinearTarget",
                 MainTextureCamera {
-                    needs_scene_linear_post: true,
-                    ..base
-                },
-                MainTextureMode::SceneLinear,
-            ),
-            (
-                "NeedsSceneLinearAa",
-                MainTextureCamera {
-                    needs_scene_linear_aa: true,
+                    needs_scene_linear_target: true,
                     ..base
                 },
                 MainTextureMode::SceneLinear,

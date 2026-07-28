@@ -24,7 +24,7 @@
 //! All math is deliberately `f32` to mirror both the C++ reference and the WGSL
 //! port operation-for-operation.
 
-use bevy_camera::Camera;
+use bevy_camera::{Camera, NeedsNodeTonemapping};
 use bevy_ecs::{
     component::Component,
     entity::Entity,
@@ -116,6 +116,10 @@ pub const REC_2020_TO_REC_709: [[f32; 3]; 3] = [
 /// for cameras without the component. Cameras **without** this component on
 /// SDR targets keep using the shader's baked SDR defaults.
 ///
+/// The component requires [`NeedsNodeTonemapping`], which keeps the camera on
+/// the node-side tone-mapping pass: the in-shader SDR fold has no path to bind
+/// the params uniform and would silently run the baked defaults instead.
+///
 /// The operator's mode follows the view's resolved [`DisplayTarget`], with
 /// or without this component: on a target that requests an HDR transfer, the
 /// uniform is computed in HDR mode (peak taken from
@@ -127,6 +131,7 @@ pub const REC_2020_TO_REC_709: [[f32; 3]; 3] = [
 #[extract_component_filter(With<Camera>)]
 #[reflect(Component, Debug, Default, PartialEq, Clone)]
 #[extract_app(RenderApp)]
+#[require(NeedsNodeTonemapping)]
 pub struct GranTurismo7Params {
     /// Mix between the per-channel tone-mapped color and the hue-preserving
     /// UCS (`ICtCp`) processed color. `0.0` = fully per-channel ("camera-like"

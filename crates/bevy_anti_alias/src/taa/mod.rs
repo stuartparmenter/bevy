@@ -35,7 +35,7 @@ use bevy_render::{
     sync_component::{SyncComponent, SyncComponentPlugin},
     sync_world::RenderEntity,
     texture::{CachedTexture, TextureCache},
-    view::{ExtractedView, Msaa, ViewDisplayTarget, ViewTarget},
+    view::{ExtractedView, Msaa, NeedsSceneLinearTarget, ViewDisplayTarget, ViewTarget},
     ExtractSchedule, MainWorld, Render, RenderApp, RenderStartup, RenderSystems,
 };
 use bevy_utils::default;
@@ -111,7 +111,13 @@ impl Plugin for TemporalAntiAliasPlugin {
 /// 2. Render particles after TAA
 #[derive(Component, Reflect, Clone)]
 #[reflect(Component, Default, Clone)]
-#[require(TemporalJitter, MipBias, DepthPrepass, MotionVectorPrepass)]
+#[require(
+    TemporalJitter,
+    MipBias,
+    DepthPrepass,
+    MotionVectorPrepass,
+    NeedsSceneLinearTarget
+)]
 #[doc(alias = "Taa")]
 pub struct TemporalAntiAliasing {
     /// Set to true to delete the saved temporal history (past frames).

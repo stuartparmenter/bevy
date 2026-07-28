@@ -15,10 +15,11 @@ than `Tonemapping::None`) keeps it — per-fragment in-shader tone mapping, its
 (`eligible_in_shader_tonemap` in `bevy_render/src/camera.rs`):
 
 - tone mapping enabled and no `Hdr`,
-- no scene-linear post-processing (`NeedsSceneLinearPost`) or reprojecting
-  anti-aliasing such as TAA (`NeedsSceneLinearAa`),
-- no `NeedsNodeTonemapping` (e.g. `Tonemapping::GranTurismo7` with a
-  `GranTurismo7Params` component),
+- no `bevy_render::view::NeedsSceneLinearTarget`, which bloom, auto exposure,
+  auto white balance, depth of field, motion blur, TAA and DLSS all pull in as a
+  required component,
+- no `bevy_camera::NeedsNodeTonemapping`, which `GranTurismo7Params` pulls in as
+  a required component,
 - `CompositingSpace` absent or `Linear`,
 - resolved `DisplayTarget` is `DisplayTarget::SDR_SRGB`,
 - the render target is a `Window`,
@@ -48,13 +49,23 @@ camera. For those cameras, expect small visual differences:
 - The fp16 intermediate also removes the banding the old 8-bit intermediate
   introduced.
 
-Whether a camera tone-maps at all is tracked by a new auto-managed marker,
-`bevy_camera::TonemappingEnabled` (present whenever `Tonemapping` is not
-`Tonemapping::None`), kept in sync each frame in `PostUpdate`. Treat it as
-read-only; do not insert or remove it. If you match custom render graphs against
-the exact set of components on a camera entity, account for the new marker. On
-WebGL2 the fp16 path requires `EXT_color_buffer_float` (already required for
-`Hdr` cameras and widely supported).
+`Tonemapping` and `DebandDither` moved from `bevy_core_pipeline::tonemapping` to
+`bevy_render::view`, so camera extraction can pick the main-texture format from
+the operator directly. Both are re-exported from their old path and Rust imports
+are unaffected, but their reflected type paths changed to
+`bevy_render::view::Tonemapping` and `bevy_render::view::DebandDither`: update
+scene files and Bevy Remote Protocol component keys that name them.
+
+The two veto markers above, `NeedsSceneLinearTarget` and
+`NeedsNodeTonemapping`, are ordinary required components. Removing an effect
+with `remove_with_requires` also strips the shared marker — which re-enables the
+in-shader fold for any other scene-linear effect still on the camera, and that
+effect then samples a tone-mapped 8-bit buffer. Use plain `remove::<T>()`
+instead; it leaves the marker in place, costing an fp16 intermediate and
+rendering identical pixels. If you match custom render graphs against the exact
+set of components on a camera entity, account for the two markers. On WebGL2 the
+fp16 path requires `EXT_color_buffer_float` (already required for `Hdr` cameras
+and widely supported).
 
 `Tonemapping::None` is a true passthrough: no tonemapping pass runs and no
 `ColorGrading` exposure or post-saturation is applied. If you used `ColorGrading`

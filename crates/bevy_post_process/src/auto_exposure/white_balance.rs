@@ -2,7 +2,10 @@ use bevy_camera::{Camera, Hdr};
 use bevy_core_pipeline::tonemapping::ExternalWhiteBalance;
 use bevy_ecs::{prelude::*, query::QueryItem, reflect::ReflectComponent};
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
-use bevy_render::{extract_component::ExtractComponent, sync_component::SyncComponent, RenderApp};
+use bevy_render::{
+    extract_component::ExtractComponent, sync_component::SyncComponent,
+    view::NeedsSceneLinearTarget, RenderApp,
+};
 use bevy_utils::once;
 use tracing::warn;
 
@@ -69,7 +72,7 @@ use tracing::warn;
 /// [Yxy]: https://en.wikipedia.org/wiki/CIE_1931_color_space#CIE_xy_chromaticity_diagram_and_the_CIE_xyY_color_space
 #[derive(Component, Clone, Copy, Debug, PartialEq, Reflect)]
 #[reflect(Component, Default, Clone, PartialEq)]
-#[require(Hdr)]
+#[require(Hdr, NeedsSceneLinearTarget)]
 pub struct AutoWhiteBalance {
     /// The adaptation speed of the white-point chromaticity, per second.
     ///

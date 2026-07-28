@@ -2,15 +2,14 @@ use bevy_app::prelude::*;
 use bevy_asset::{
     embedded_asset, load_embedded_asset, AssetServer, Assets, Handle, RenderAssetUsages,
 };
-use bevy_camera::{Camera, CompositingSpace, NeedsNodeTonemapping, TonemappingEnabled};
+use bevy_camera::CompositingSpace;
 use bevy_ecs::prelude::*;
 use bevy_image::{CompressedImageFormats, Image, ImageSampler, ImageType};
 #[cfg(not(feature = "tonemapping_luts"))]
 use bevy_log::error;
 use bevy_log::warn_once;
-use bevy_reflect::{std_traits::ReflectDefault, Reflect};
 use bevy_render::{
-    extract_component::{ExtractComponent, ExtractComponentPlugin, UniformComponentPlugin},
+    extract_component::{ExtractComponentPlugin, UniformComponentPlugin},
     extract_resource::{ExtractResource, ExtractResourcePlugin},
     render_asset::RenderAssets,
     render_resource::{
@@ -30,6 +29,10 @@ use bitflags::bitflags;
 mod gt7;
 mod node;
 
+/// The tone-mapping operator and its dither switch live in `bevy_render` so
+/// camera extraction can pick the main-texture format from the operator
+/// directly; the pass that consumes them is here.
+pub use bevy_render::view::{DebandDither, Tonemapping};
 use bevy_utils::default;
 pub use gt7::{
     queue_gt7_params_uniforms, GranTurismo7Params, Gt7ParamsUniform, Gt7ToneMapping,
@@ -108,11 +111,6 @@ impl Plugin for TonemappingPlugin {
             UniformComponentPlugin::<Gt7ParamsUniform>::default(),
         ));
 
-        app.add_systems(
-            PostUpdate,
-            (sync_tonemapping_enabled, sync_needs_node_tonemapping),
-        );
-
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
         };
@@ -167,124 +165,6 @@ pub struct TonemappingPipeline {
     working_color_space: WorkingColorSpace,
 }
 
-/// Optionally enables a tonemapping shader that attempts to map linear input stimulus into a perceptually uniform image for a given [`Camera`] entity.
-///
-/// Feedback and trail effects that load the previous frame's buffer (a camera
-/// with `ClearColorConfig::None` at the bottom of its stack) are only stable
-/// with [`Tonemapping::None`] on an SDR target. Any other operator (or an HDR
-/// target) reprocesses last frame's already tone-mapped and display-encoded
-/// output each frame, so the accumulated image drifts over time. See the
-/// camera-stack resolver (`bevy_core_pipeline::camera_stack`), which reports
-/// this configuration as a diagnostic.
-#[derive(
-    Component, Debug, Hash, Clone, Copy, Reflect, Default, ExtractComponent, PartialEq, Eq,
-)]
-#[extract_component_filter(With<Camera>)]
-#[reflect(Component, Debug, Hash, Default, PartialEq)]
-#[extract_app(RenderApp)]
-pub enum Tonemapping {
-    /// Bypass tonemapping.
-    None,
-    /// Runs the tonemapping pass with no tone curve: scene values pass
-    /// through unchanged, so output is unbounded display-linear.
-    ///
-    /// Unlike [`Tonemapping::None`] — a true opt-out that skips the pass
-    /// entirely — `Linear` still applies [`ColorGrading`] and exposure,
-    /// [`DebandDither`], and (under `WorkingColorSpace::Rec2020`) the
-    /// working-space → display conversion. It is the zero-curve choice for
-    /// cameras that need correct output under the wide working space
-    /// without an artistic operator — typically 2D / UI cameras, whose
-    /// `Tonemapping::None` default skips the conversion and renders
-    /// desaturated there.
-    ///
-    /// [`ColorGrading`]: bevy_render::view::ColorGrading
-    Linear,
-    /// Suffers from lots hue shifting, brights don't desaturate naturally.
-    /// Bright primaries and secondaries don't desaturate at all.
-    Reinhard,
-    /// Suffers from hue shifting. Brights don't desaturate much at all across the spectrum.
-    ReinhardLuminance,
-    /// Same base implementation that Godot 4.0 uses for Tonemap ACES.
-    /// <https://github.com/TheRealMJP/BakingLab/blob/master/BakingLab/ACES.hlsl>
-    /// Not neutral, has a very specific aesthetic, intentional and dramatic hue shifting.
-    /// Bright greens and reds turn orange. Bright blues turn magenta.
-    /// Significantly increased contrast. Brights desaturate across the spectrum.
-    AcesFitted,
-    /// By Troy Sobotka
-    /// <https://github.com/sobotka/AgX>
-    /// Very neutral. Image is somewhat desaturated when compared to other tonemappers.
-    /// Little to no hue shifting. Subtle [Abney shifting](https://en.wikipedia.org/wiki/Abney_effect).
-    /// NOTE: Requires the `tonemapping_luts` cargo feature.
-    AgX,
-    /// By Tomasz Stachowiak
-    /// Has little hue shifting in the darks and mids, but lots in the brights. Brights desaturate across the spectrum.
-    /// Is sort of between Reinhard and `ReinhardLuminance`. Conceptually similar to reinhard-jodie.
-    /// Designed as a compromise if you want e.g. decent skin tones in low light, but can't afford to re-do your
-    /// VFX to look good without hue shifting.
-    SomewhatBoringDisplayTransform,
-    /// Current Bevy default.
-    /// By Tomasz Stachowiak
-    /// <https://github.com/h3r2tic/tony-mc-mapface>
-    /// Very neutral. Subtle but intentional hue shifting. Brights desaturate across the spectrum.
-    /// Comment from author:
-    /// Tony is a display transform intended for real-time applications such as games.
-    /// It is intentionally boring, does not increase contrast or saturation, and stays close to the
-    /// input stimulus where compression isn't necessary.
-    /// Brightness-equivalent luminance of the input stimulus is compressed. The non-linearity resembles Reinhard.
-    /// Color hues are preserved during compression, except for a deliberate [Bezold–Brücke shift](https://en.wikipedia.org/wiki/Bezold%E2%80%93Br%C3%BCcke_shift).
-    /// To avoid posterization, selective desaturation is employed, with care to avoid the [Abney effect](https://en.wikipedia.org/wiki/Abney_effect).
-    /// NOTE: Requires the `tonemapping_luts` cargo feature.
-    #[default]
-    TonyMcMapface,
-    /// Default Filmic Display Transform from blender.
-    /// Somewhat neutral. Suffers from hue shifting. Brights desaturate across the spectrum.
-    /// NOTE: Requires the `tonemapping_luts` cargo feature.
-    BlenderFilmic,
-    /// Despite its name, it is not considered to be neutral.
-    /// Highly saturated colors and tends to produce a very high contrast image.
-    /// Suffers from significant [Abney shifting](https://en.wikipedia.org/wiki/Abney_effect), and tends to crush grays and desaturated colors.
-    /// Designed for e-commerce to faithfully reproduce the colors of brand's logos when used with low brightness grayscale lighting.
-    /// See [the KhronosGroup spec](https://github.com/KhronosGroup/ToneMapping/tree/main/PBR_Neutral) for more information.
-    KhronosPbrNeutral,
-    /// By Polyphony Digital, the operator used in Gran Turismo 7.
-    /// Published with the SIGGRAPH 2025 course "Physically Based Tone Mapping in Gran Turismo 7"
-    /// (MIT License, Copyright (c) 2025 Polyphony Digital Inc.).
-    /// Blends a per-channel filmic curve ("camera-like" highlight skew) with a hue-preserving
-    /// `ICtCp` branch (60% hue-preserving / 40% per-channel by default), with a luminance-driven
-    /// chroma fade near peak white. Natively peak-luminance aware, designed to drive both SDR and
-    /// HDR displays: on a view whose resolved `DisplayTarget` requests an HDR transfer the
-    /// operator runs in HDR mode (tone curve rebuilt around the display's peak luminance) and
-    /// emits its native linear Rec.2020 display-referred output straight into the
-    /// display-encoding pass.
-    /// Algorithmic: does NOT require the `tonemapping_luts` cargo feature.
-    /// Tunable per camera via [`GranTurismo7Params`].
-    GranTurismo7,
-}
-
-impl Tonemapping {
-    pub fn is_enabled(&self) -> bool {
-        *self != Tonemapping::None
-    }
-
-    /// Whether this operator's output is inherently capped at `[0, 1]`
-    /// paper-white-relative range (an "SDR-only" operator): every operator
-    /// except [`Tonemapping::GranTurismo7`] (natively peak-luminance aware),
-    /// [`Tonemapping::Linear`] (no curve, unbounded output), and
-    /// [`Tonemapping::None`] (a true pass-through, not an operator).
-    ///
-    /// On a view whose resolved display target requests an HDR transfer, an
-    /// SDR-only operator would silently cap the image at paper white, leaving
-    /// the display's HDR headroom permanently unused. The substitution
-    /// table ([`effective_tonemapping`]) degrades such views to an
-    /// HDR-capable substitute (with a `warn_once!`) instead.
-    pub fn is_sdr_only(&self) -> bool {
-        !matches!(
-            self,
-            Tonemapping::None | Tonemapping::Linear | Tonemapping::GranTurismo7
-        )
-    }
-}
-
 /// Render-world marker component: the view's white-balance matrix
 /// ([`ColorGradingUniform::balance`](bevy_render::view::ColorGradingUniform))
 /// is composed with an additional correction on the GPU, outside of the
@@ -306,82 +186,6 @@ impl Tonemapping {
 /// unchanged.
 #[derive(Component, Default, Clone, Copy, Debug)]
 pub struct ExternalWhiteBalance;
-
-/// Keeps the auto-managed [`TonemappingEnabled`] marker (in `bevy_camera`,
-/// where [`Tonemapping`] itself is not visible) in sync with each camera's
-/// [`Tonemapping`] component: present iff the operator is not
-/// [`Tonemapping::None`].
-///
-/// The marker is what lets the renderer's camera extraction (in
-/// `bevy_render`, which cannot depend on this crate) select an `Rgba16Float`
-/// intermediate main texture for tone-mapped cameras. Runs in
-/// [`PostUpdate`]; changes made to [`Tonemapping`] after that point are
-/// picked up the next frame.
-pub fn sync_tonemapping_enabled(
-    mut commands: Commands,
-    changed: Query<(Entity, &Tonemapping, Has<TonemappingEnabled>), Changed<Tonemapping>>,
-    mut removed: RemovedComponents<Tonemapping>,
-    still_has: Query<(), With<Tonemapping>>,
-) {
-    for (entity, tonemapping, has_marker) in &changed {
-        if tonemapping.is_enabled() {
-            if !has_marker {
-                commands.entity(entity).insert(TonemappingEnabled);
-            }
-        } else if has_marker {
-            commands.entity(entity).remove::<TonemappingEnabled>();
-        }
-    }
-    for entity in removed.read() {
-        // A buffered removal event may have been superseded by a re-insert
-        // (remove + insert within the same observation window). Read the live
-        // component state instead of assuming `Tonemapping` is gone: the
-        // re-inserted component is `Added` (hence `Changed`), so the loop
-        // above already synced the marker for it, and queueing an
-        // unconditional `remove` here would override that decision — commands
-        // apply in queue order — permanently desyncing the marker (the
-        // consumed change tick means no later run would re-insert it).
-        if still_has.contains(entity) {
-            continue;
-        }
-        // The entity may have been despawned entirely.
-        if let Ok(mut entity_commands) = commands.get_entity(entity) {
-            entity_commands.remove::<TonemappingEnabled>();
-        }
-    }
-}
-
-/// Keeps the auto-managed [`NeedsNodeTonemapping`] marker (in `bevy_camera`)
-/// in sync with cameras whose tone-mapping configuration the in-shader SDR
-/// fast path cannot reproduce: currently a [`Tonemapping::GranTurismo7`]
-/// operator paired with a [`GranTurismo7Params`] component, because the
-/// in-shader fold has no path to bind the per-view GT7 params uniform and
-/// would silently fall back to the baked SDR defaults.
-///
-/// The marker lets the renderer's camera extraction (in `bevy_render`, which
-/// cannot see these components) veto the fast path so the camera keeps the
-/// node-side pass that honors its custom parameters. Runs in [`PostUpdate`].
-pub fn sync_needs_node_tonemapping(
-    mut commands: Commands,
-    cameras: Query<
-        (
-            Entity,
-            &Tonemapping,
-            Has<GranTurismo7Params>,
-            Has<NeedsNodeTonemapping>,
-        ),
-        With<Camera>,
-    >,
-) {
-    for (entity, tonemapping, has_gt7_params, has_marker) in &cameras {
-        let needs = *tonemapping == Tonemapping::GranTurismo7 && has_gt7_params;
-        if needs && !has_marker {
-            commands.entity(entity).insert(NeedsNodeTonemapping);
-        } else if !needs && has_marker {
-            commands.entity(entity).remove::<NeedsNodeTonemapping>();
-        }
-    }
-}
 
 bitflags! {
     /// Various flags describing what tonemapping needs to do.
@@ -1004,18 +808,6 @@ pub fn prepare_view_tonemapping_pipelines(
         });
     }
 }
-/// Enables a debanding shader that applies dithering to mitigate color banding in the final image for a given [`Camera`] entity.
-#[derive(
-    Component, Debug, Hash, Clone, Copy, Reflect, Default, ExtractComponent, PartialEq, Eq,
-)]
-#[extract_component_filter(With<Camera>)]
-#[reflect(Component, Debug, Hash, Default, PartialEq)]
-#[extract_app(RenderApp)]
-pub enum DebandDither {
-    #[default]
-    Disabled,
-    Enabled,
-}
 
 pub fn get_lut_bindings<'a>(
     images: &'a RenderAssets<GpuImage>,
@@ -1103,91 +895,6 @@ pub fn lut_placeholder() -> Image {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bevy_app::{App, Update};
-
-    #[test]
-    fn tonemapping_enabled_marker_syncs_with_tonemapping() {
-        let mut app = App::new();
-        app.add_systems(Update, sync_tonemapping_enabled);
-
-        // Spawning with an active operator inserts the marker.
-        let entity = app.world_mut().spawn(Tonemapping::TonyMcMapface).id();
-        app.update();
-        assert!(app.world().entity(entity).contains::<TonemappingEnabled>());
-
-        // Changing to `None` removes it.
-        *app.world_mut()
-            .entity_mut(entity)
-            .get_mut::<Tonemapping>()
-            .unwrap() = Tonemapping::None;
-        app.update();
-        assert!(!app.world().entity(entity).contains::<TonemappingEnabled>());
-
-        // Changing back to an operator re-inserts it.
-        *app.world_mut()
-            .entity_mut(entity)
-            .get_mut::<Tonemapping>()
-            .unwrap() = Tonemapping::GranTurismo7;
-        app.update();
-        assert!(app.world().entity(entity).contains::<TonemappingEnabled>());
-
-        // Removing `Tonemapping` entirely removes the marker too.
-        app.world_mut().entity_mut(entity).remove::<Tonemapping>();
-        app.update();
-        assert!(!app.world().entity(entity).contains::<TonemappingEnabled>());
-
-        // `Tonemapping::None` from the start never inserts the marker.
-        let none_entity = app.world_mut().spawn(Tonemapping::None).id();
-        app.update();
-        assert!(!app
-            .world()
-            .entity(none_entity)
-            .contains::<TonemappingEnabled>());
-    }
-
-    #[test]
-    fn tonemapping_enabled_marker_survives_same_frame_remove_and_reinsert() {
-        let mut app = App::new();
-        app.add_systems(Update, sync_tonemapping_enabled);
-
-        let entity = app.world_mut().spawn(Tonemapping::TonyMcMapface).id();
-        app.update();
-        assert!(app.world().entity(entity).contains::<TonemappingEnabled>());
-
-        // Remove + re-insert an enabled operator within one update: the
-        // buffered removal event must not strip the marker the re-inserted
-        // component still warrants.
-        app.world_mut()
-            .entity_mut(entity)
-            .remove::<Tonemapping>()
-            .insert(Tonemapping::AgX);
-        app.update();
-        assert!(app.world().entity(entity).contains::<TonemappingEnabled>());
-
-        // The marker must also stay in sync on later, unrelated updates
-        // (the change tick is consumed; nothing may "heal" it afterwards).
-        app.update();
-        assert!(app.world().entity(entity).contains::<TonemappingEnabled>());
-
-        // Remove + re-insert `Tonemapping::None` within one update still
-        // removes the marker (the live component decides, not the event).
-        app.world_mut()
-            .entity_mut(entity)
-            .remove::<Tonemapping>()
-            .insert(Tonemapping::None);
-        app.update();
-        assert!(!app.world().entity(entity).contains::<TonemappingEnabled>());
-
-        // Remove + re-insert an enabled operator when the marker is absent
-        // re-inserts it (the queued insert must win over the removal event).
-        app.world_mut()
-            .entity_mut(entity)
-            .remove::<Tonemapping>()
-            .insert(Tonemapping::GranTurismo7);
-        app.update();
-        assert!(app.world().entity(entity).contains::<TonemappingEnabled>());
-    }
-
     use bevy_window::{DisplayTarget, DisplayTransfer};
 
     const ALL_OPERATORS: [Tonemapping; 10] = [

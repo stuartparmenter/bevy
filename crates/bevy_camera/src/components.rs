@@ -90,87 +90,23 @@ impl From<Camera3dDepthLoadOp> for LoadOp<f32> {
 #[reflect(Component, Default, PartialEq, Hash, Debug)]
 pub struct Hdr;
 
-/// Marker mirroring "this camera has an active tone-mapping operator"
-/// (`Tonemapping` other than `Tonemapping::None`) into a crate the renderer's
-/// camera extraction can see.
+/// Marker requiring a camera's tone mapping to run in the node-side pass
+/// rather than folded into its material shaders.
 ///
-/// **Managed automatically** — do not insert or remove this manually. The
-/// `Tonemapping` component lives in `bevy_core_pipeline`, which `bevy_camera`
-/// and `bevy_render` cannot depend on, so `bevy_core_pipeline`'s
-/// `TonemappingPlugin` keeps this marker in sync with it every frame (in
-/// [`PostUpdate`](https://docs.rs/bevy/latest/bevy/app/struct.PostUpdate.html)).
+/// `GranTurismo7Params` pulls this in as a required component: the in-shader
+/// fold has no path to bind the per-view GT7 params uniform, so it would
+/// silently fall back to the baked SDR defaults and discard the camera's
+/// custom parameters. Keeping such a camera on the node-side path lets it
+/// honor them.
 ///
-/// Cameras with this marker render to an `Rgba16Float` intermediate main
-/// texture (like [`Hdr`] and like cameras on HDR display targets, which both
-/// force it independently), so that the node-side tone-mapping and
-/// display-encoding post-process passes operate over a high-precision buffer
-/// instead of quantizing through an 8-bit intermediate. This includes cameras with an explicit
-/// [`CompositingSpace::Srgb`]/[`CompositingSpace::Oklab`]: shaders still
-/// write encoded values (blending stays in the encoded space), but the
-/// storage is fp16 so scene-referred values above 1.0 survive until the
-/// tone-mapping pass decodes them.
-///
-/// To force the high-precision intermediate on a camera *without* an active
-/// tone-mapping operator, add [`Hdr`] instead.
-#[derive(Component, Default, Copy, Clone, Reflect, PartialEq, Eq, Hash, Debug)]
-#[reflect(Component, Default, PartialEq, Hash, Debug)]
-pub struct TonemappingEnabled;
-
-/// Marker placed on a camera that has a post-process effect requiring a
-/// scene-linear (pre-tone-mapping) HDR buffer: bloom, auto exposure, depth of
-/// field, or motion blur.
-///
-/// **Managed automatically** — do not insert or remove this manually. Those
-/// effect components live in `bevy_post_process`, which `bevy_camera` and
-/// `bevy_render` cannot depend on, so `bevy_post_process` keeps this marker in
-/// sync with them every frame (in
-/// [`PostUpdate`](https://docs.rs/bevy/latest/bevy/app/struct.PostUpdate.html)).
+/// Because it is a required component, it survives the removal of the params
+/// that pulled it in (plain `remove::<GranTurismo7Params>()` leaves it behind)
+/// and it also applies to a camera that carries params under a non-GT7
+/// operator. Both are conservative: the camera keeps its `Rgba16Float`
+/// intermediate and one fullscreen pass, and the pixels are the same.
 ///
 /// Its presence vetoes the SDR in-shader tone-mapping fast path in camera
-/// extraction (which would otherwise keep the camera on an 8-bit intermediate
-/// and fold tone mapping into the material shaders): these effects read the
-/// scene-referred buffer before tone mapping, so the camera must keep its
-/// `Rgba16Float` intermediate. See [`NeedsSceneLinearAa`] for the
-/// anti-aliasing equivalent.
-#[derive(Component, Default, Copy, Clone, Reflect, PartialEq, Eq, Hash, Debug)]
-#[reflect(Component, Default, PartialEq, Hash, Debug)]
-pub struct NeedsSceneLinearPost;
-
-/// Marker placed on a camera that has an anti-aliasing mode requiring a
-/// scene-linear (pre-tone-mapping) HDR buffer: temporal anti-aliasing or DLSS.
-///
-/// **Managed automatically** — do not insert or remove this manually. Those
-/// components live in `bevy_anti_alias`, which `bevy_camera` and `bevy_render`
-/// cannot depend on, so `bevy_anti_alias` keeps this marker in sync with them
-/// every frame (in
-/// [`PostUpdate`](https://docs.rs/bevy/latest/bevy/app/struct.PostUpdate.html)).
-///
-/// Its presence vetoes the SDR in-shader tone-mapping fast path in camera
-/// extraction, exactly like [`NeedsSceneLinearPost`]: these modes reproject
-/// and resolve the scene-referred buffer before tone mapping, so the camera
-/// must keep its `Rgba16Float` intermediate. (FXAA and SMAA operate on the
-/// tone-mapped image and therefore do *not* set this marker.)
-#[derive(Component, Default, Copy, Clone, Reflect, PartialEq, Eq, Hash, Debug)]
-#[reflect(Component, Default, PartialEq, Hash, Debug)]
-pub struct NeedsSceneLinearAa;
-
-/// Marker placed on a camera whose tone-mapping operator configuration cannot
-/// be reproduced by the in-shader fast path and must run node-side.
-///
-/// Currently set when the operator is `Tonemapping::GranTurismo7` together with
-/// a `GranTurismo7Params` component: the in-shader fold has no path to bind the
-/// per-view GT7 params uniform, so it would silently fall back to the baked SDR
-/// defaults and discard the user's custom parameters. Keeping such a camera on
-/// the node-side path lets it honor them.
-///
-/// **Managed automatically** — do not insert or remove this manually. The
-/// `Tonemapping` and `GranTurismo7Params` components live in
-/// `bevy_core_pipeline`, which `bevy_camera` and `bevy_render` cannot depend
-/// on, so `bevy_core_pipeline` keeps this marker in sync with them every frame
-/// (in [`PostUpdate`](https://docs.rs/bevy/latest/bevy/app/struct.PostUpdate.html)).
-///
-/// Its presence vetoes the SDR in-shader tone-mapping fast path in camera
-/// extraction, exactly like [`NeedsSceneLinearPost`] / [`NeedsSceneLinearAa`].
+/// extraction, exactly like `NeedsSceneLinearTarget`.
 #[derive(Component, Default, Copy, Clone, Reflect, PartialEq, Eq, Hash, Debug)]
 #[reflect(Component, Default, PartialEq, Hash, Debug)]
 pub struct NeedsNodeTonemapping;

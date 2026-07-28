@@ -4,8 +4,8 @@ pub mod visibility;
 pub mod window;
 
 use bevy_camera::{
-    primitives::Frustum, CameraMainTextureUsages, ClearColor, ClearColorConfig, CompositingSpace,
-    Exposure, MainPassResolutionOverride, NormalizedRenderTarget,
+    primitives::Frustum, Camera, CameraMainTextureUsages, ClearColor, ClearColorConfig,
+    CompositingSpace, Exposure, MainPassResolutionOverride, NormalizedRenderTarget,
 };
 use bevy_diagnostic::FrameCount;
 pub use composition::*;
@@ -242,7 +242,7 @@ impl Plugin for ViewPlugin {
 }
 
 /// Component for configuring the number of samples for [Multi-Sample Anti-Aliasing](https://en.wikipedia.org/wiki/Multisample_anti-aliasing)
-/// for a [`Camera`](bevy_camera::Camera).
+/// for a [`Camera`].
 ///
 /// Defaults to 4 samples. A higher number of samples results in smoother edges.
 ///
@@ -289,6 +289,160 @@ impl Msaa {
         }
     }
 }
+
+/// Optionally enables a tonemapping shader that attempts to map linear input stimulus into a perceptually uniform image for a given [`Camera`] entity.
+///
+/// Feedback and trail effects that load the previous frame's buffer (a camera
+/// with `ClearColorConfig::None` at the bottom of its stack) are only stable
+/// with [`Tonemapping::None`] on an SDR target. Any other operator (or an HDR
+/// target) reprocesses last frame's already tone-mapped and display-encoded
+/// output each frame, so the accumulated image drifts over time. See the
+/// camera-stack resolver (`bevy_core_pipeline::camera_stack`), which reports
+/// this configuration as a diagnostic.
+///
+/// The tonemapping pass itself lives in `bevy_core_pipeline`; this component
+/// sits here so camera extraction — which picks the main-texture format from
+/// whether an operator is active — can read it directly.
+#[derive(
+    Component, Debug, Hash, Clone, Copy, Reflect, Default, ExtractComponent, PartialEq, Eq,
+)]
+#[extract_component_filter(With<Camera>)]
+#[reflect(Component, Debug, Hash, Default, PartialEq)]
+#[extract_app(RenderApp)]
+pub enum Tonemapping {
+    /// Bypass tonemapping.
+    None,
+    /// Runs the tonemapping pass with no tone curve: scene values pass
+    /// through unchanged, so output is unbounded display-linear.
+    ///
+    /// Unlike [`Tonemapping::None`] — a true opt-out that skips the pass
+    /// entirely — `Linear` still applies [`ColorGrading`] and exposure,
+    /// [`DebandDither`], and (under `WorkingColorSpace::Rec2020`) the
+    /// working-space → display conversion. It is the zero-curve choice for
+    /// cameras that need correct output under the wide working space
+    /// without an artistic operator — typically 2D / UI cameras, whose
+    /// `Tonemapping::None` default skips the conversion and renders
+    /// desaturated there.
+    Linear,
+    /// Suffers from lots hue shifting, brights don't desaturate naturally.
+    /// Bright primaries and secondaries don't desaturate at all.
+    Reinhard,
+    /// Suffers from hue shifting. Brights don't desaturate much at all across the spectrum.
+    ReinhardLuminance,
+    /// Same base implementation that Godot 4.0 uses for Tonemap ACES.
+    /// <https://github.com/TheRealMJP/BakingLab/blob/master/BakingLab/ACES.hlsl>
+    /// Not neutral, has a very specific aesthetic, intentional and dramatic hue shifting.
+    /// Bright greens and reds turn orange. Bright blues turn magenta.
+    /// Significantly increased contrast. Brights desaturate across the spectrum.
+    AcesFitted,
+    /// By Troy Sobotka
+    /// <https://github.com/sobotka/AgX>
+    /// Very neutral. Image is somewhat desaturated when compared to other tonemappers.
+    /// Little to no hue shifting. Subtle [Abney shifting](https://en.wikipedia.org/wiki/Abney_effect).
+    /// NOTE: Requires the `tonemapping_luts` cargo feature.
+    AgX,
+    /// By Tomasz Stachowiak
+    /// Has little hue shifting in the darks and mids, but lots in the brights. Brights desaturate across the spectrum.
+    /// Is sort of between Reinhard and `ReinhardLuminance`. Conceptually similar to reinhard-jodie.
+    /// Designed as a compromise if you want e.g. decent skin tones in low light, but can't afford to re-do your
+    /// VFX to look good without hue shifting.
+    SomewhatBoringDisplayTransform,
+    /// Current Bevy default.
+    /// By Tomasz Stachowiak
+    /// <https://github.com/h3r2tic/tony-mc-mapface>
+    /// Very neutral. Subtle but intentional hue shifting. Brights desaturate across the spectrum.
+    /// Comment from author:
+    /// Tony is a display transform intended for real-time applications such as games.
+    /// It is intentionally boring, does not increase contrast or saturation, and stays close to the
+    /// input stimulus where compression isn't necessary.
+    /// Brightness-equivalent luminance of the input stimulus is compressed. The non-linearity resembles Reinhard.
+    /// Color hues are preserved during compression, except for a deliberate [Bezold–Brücke shift](https://en.wikipedia.org/wiki/Bezold%E2%80%93Br%C3%BCcke_shift).
+    /// To avoid posterization, selective desaturation is employed, with care to avoid the [Abney effect](https://en.wikipedia.org/wiki/Abney_effect).
+    /// NOTE: Requires the `tonemapping_luts` cargo feature.
+    #[default]
+    TonyMcMapface,
+    /// Default Filmic Display Transform from blender.
+    /// Somewhat neutral. Suffers from hue shifting. Brights desaturate across the spectrum.
+    /// NOTE: Requires the `tonemapping_luts` cargo feature.
+    BlenderFilmic,
+    /// Despite its name, it is not considered to be neutral.
+    /// Highly saturated colors and tends to produce a very high contrast image.
+    /// Suffers from significant [Abney shifting](https://en.wikipedia.org/wiki/Abney_effect), and tends to crush grays and desaturated colors.
+    /// Designed for e-commerce to faithfully reproduce the colors of brand's logos when used with low brightness grayscale lighting.
+    /// See [the KhronosGroup spec](https://github.com/KhronosGroup/ToneMapping/tree/main/PBR_Neutral) for more information.
+    KhronosPbrNeutral,
+    /// By Polyphony Digital, the operator used in Gran Turismo 7.
+    /// Published with the SIGGRAPH 2025 course "Physically Based Tone Mapping in Gran Turismo 7"
+    /// (MIT License, Copyright (c) 2025 Polyphony Digital Inc.).
+    /// Blends a per-channel filmic curve ("camera-like" highlight skew) with a hue-preserving
+    /// `ICtCp` branch (60% hue-preserving / 40% per-channel by default), with a luminance-driven
+    /// chroma fade near peak white. Natively peak-luminance aware, designed to drive both SDR and
+    /// HDR displays: on a view whose resolved `DisplayTarget` requests an HDR transfer the
+    /// operator runs in HDR mode (tone curve rebuilt around the display's peak luminance) and
+    /// emits its native linear Rec.2020 display-referred output straight into the
+    /// display-encoding pass.
+    /// Algorithmic: does NOT require the `tonemapping_luts` cargo feature.
+    /// Tunable per camera via `bevy_core_pipeline::tonemapping::GranTurismo7Params`.
+    GranTurismo7,
+}
+
+impl Tonemapping {
+    pub fn is_enabled(&self) -> bool {
+        *self != Tonemapping::None
+    }
+
+    /// Whether this operator's output is inherently capped at `[0, 1]`
+    /// paper-white-relative range (an "SDR-only" operator): every operator
+    /// except [`Tonemapping::GranTurismo7`] (natively peak-luminance aware),
+    /// [`Tonemapping::Linear`] (no curve, unbounded output), and
+    /// [`Tonemapping::None`] (a true pass-through, not an operator).
+    ///
+    /// On a view whose resolved display target requests an HDR transfer, an
+    /// SDR-only operator would silently cap the image at paper white, leaving
+    /// the display's HDR headroom permanently unused. The substitution table
+    /// (`bevy_core_pipeline::tonemapping::effective_tonemapping`) degrades
+    /// such views to an HDR-capable substitute (with a `warn_once!`) instead.
+    pub fn is_sdr_only(&self) -> bool {
+        !matches!(
+            self,
+            Tonemapping::None | Tonemapping::Linear | Tonemapping::GranTurismo7
+        )
+    }
+}
+
+/// Enables a debanding shader that applies dithering to mitigate color banding in the final image for a given [`Camera`] entity.
+#[derive(
+    Component, Debug, Hash, Clone, Copy, Reflect, Default, ExtractComponent, PartialEq, Eq,
+)]
+#[extract_component_filter(With<Camera>)]
+#[reflect(Component, Debug, Hash, Default, PartialEq)]
+#[extract_app(RenderApp)]
+pub enum DebandDither {
+    #[default]
+    Disabled,
+    Enabled,
+}
+
+/// Marker requiring a camera's main texture to be the scene-linear
+/// (pre-tone-mapping) `Rgba16Float` intermediate.
+///
+/// Every effect that reads the scene-referred buffer before tone mapping pulls
+/// this in as a required component: bloom, auto exposure, auto white balance,
+/// depth of field, motion blur, temporal anti-aliasing and DLSS. Its presence
+/// vetoes the SDR in-shader tone-mapping fast path in camera extraction, which
+/// would otherwise keep the camera on an 8-bit intermediate and fold tone
+/// mapping into the material shaders. (FXAA and SMAA run on the tone-mapped
+/// image, so they do not require it.)
+///
+/// Those effects share this one marker, so removing any of them with
+/// `remove_with_requires` takes it along: on a camera carrying a second
+/// scene-linear effect the fold comes back on and the survivor samples a
+/// tone-mapped 8-bit buffer. Prefer plain `remove::<T>()`, which leaves the
+/// marker behind: the camera keeps its fp16 intermediate — extra memory,
+/// identical pixels.
+#[derive(Component, Default, Copy, Clone, Reflect, PartialEq, Eq, Hash, Debug)]
+#[reflect(Component, Default, PartialEq, Hash, Debug)]
+pub struct NeedsSceneLinearTarget;
 
 /// An identifier for a view that is stable across frames.
 ///
@@ -420,10 +574,9 @@ impl ExtractedView {
 
 /// Configures filmic color grading parameters to adjust the image appearance.
 ///
-/// Color grading is applied just before tonemapping for a given
-/// [`Camera`](bevy_camera::Camera) entity, with the sole exception of the
-/// `post_saturation` value in [`ColorGradingGlobal`], which is applied after
-/// tonemapping.
+/// Color grading is applied just before tonemapping for a given [`Camera`]
+/// entity, with the sole exception of the `post_saturation` value in
+/// [`ColorGradingGlobal`], which is applied after tonemapping.
 #[derive(Component, Reflect, Debug, Default, Clone)]
 #[reflect(Component, Default, Debug, Clone)]
 pub struct ColorGrading {
