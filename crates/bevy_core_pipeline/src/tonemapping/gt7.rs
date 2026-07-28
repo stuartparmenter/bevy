@@ -28,24 +28,23 @@ use bevy_camera::Camera;
 use bevy_ecs::{
     component::Component,
     entity::Entity,
-    query::With,
+    query::{Has, With},
     reflect::ReflectComponent,
-    resource::Resource,
-    system::{Commands, Query, Res, ResMut},
+    system::{Commands, Query},
 };
 use bevy_log::warn_once;
 use bevy_math::ops;
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
 use bevy_render::{
     extract_component::ExtractComponent,
-    render_resource::{DynamicUniformBuffer, ShaderType},
-    renderer::{RenderDevice, RenderQueue},
-    view::{ExtractedView, ViewDisplayTarget},
+    render_resource::ShaderType,
+    view::{ViewDisplayTarget, ViewTarget},
     RenderApp,
 };
 use bevy_window::DisplayTarget;
 
 use super::{effective_tonemapping, gt7_params_uniform_active, Tonemapping};
+use crate::camera_stack::{StackRole, ViewStackContract};
 
 /// Physical luminance in cd/m² that a linear frame-buffer value of `1.0`
 /// corresponds to in Gran Turismo's native unit convention.
@@ -111,8 +110,8 @@ pub const REC_2020_TO_REC_709: [[f32; 3]; 3] = [
 /// customize the operator. Whenever the view's tonemapping pipeline binds the
 /// prepared parameters (`gt7_params_uniform_active` in the parent module:
 /// when this component is present, and always on HDR-transfer targets),
-/// [`prepare_gt7_params_uniforms`] validates the values with
-/// [`Self::sanitized`] each frame and uploads a [`Gt7ParamsUniform`] that
+/// [`queue_gt7_params_uniforms`] validates the values with
+/// [`Self::sanitized`] each frame and produces a [`Gt7ParamsUniform`] that
 /// replaces the shader's baked defaults — falling back to [`Self::default`]
 /// for cameras without the component. Cameras **without** this component on
 /// SDR targets keep using the shader's baked SDR defaults.
@@ -199,8 +198,8 @@ impl GranTurismo7Params {
     ///   divisions by zero in the toe).
     /// - `toe_strength` is clamped to be non-negative.
     ///
-    /// Called at prepare time by [`prepare_gt7_params_uniforms`] before the
-    /// parameters are uploaded to the GPU.
+    /// Called by [`queue_gt7_params_uniforms`] before the parameters reach
+    /// the GPU.
     pub fn sanitized(&self) -> Self {
         let defaults = Self::default();
         let mut sanitized = *self;
@@ -710,11 +709,16 @@ fn mat3_mul_vec3(m: &[[f32; 3]; 3], v: [f32; 3]) -> [f32; 3] {
 /// All derived curve constants (`k_a`/`k_b`/`k_c`, `peak_ucs`) are computed
 /// CPU-side (closed forms in [`Gt7ToneMappingCurve::new`] /
 /// [`Gt7ToneMapping::new_sdr_with_params`] and friends) so the shader stays
-/// cheap. Built per view by [`prepare_gt7_params_uniforms`] via
-/// [`Gt7ParamsUniform::new`]; bound to the tonemapping pass only when the
-/// `GT7_PARAMS_UNIFORM` shader def is pushed. Without that def the shader
-/// keeps its baked SDR defaults (`gt7_default_sdr_params()` in `gt7.wgsl`).
-#[derive(Clone, Copy, Debug, PartialEq, ShaderType)]
+/// cheap.
+///
+/// This is also a render-world component: [`queue_gt7_params_uniforms`] puts
+/// one on each view that needs it via [`Gt7ParamsUniform::new`], and
+/// [`UniformComponentPlugin`](bevy_render::extract_component::UniformComponentPlugin)
+/// packs those into the dynamic uniform buffer the tonemapping pass binds —
+/// only when the `GT7_PARAMS_UNIFORM` shader def is pushed. Without that def
+/// the shader keeps its baked SDR defaults (`gt7_default_sdr_params()` in
+/// `gt7.wgsl`).
+#[derive(Component, Clone, Copy, Debug, PartialEq, ShaderType)]
 pub struct Gt7ParamsUniform {
     /// Display peak in frame-buffer units (`peak_nits / 100`).
     pub peak: f32,
@@ -821,8 +825,8 @@ impl Gt7ParamsUniform {
             return Self::from(&tone_mapping);
         }
 
-        // Single-sourced with the display pipeline's uniform writer
-        // (`prepare_display_target_uniforms` in bevy_render): the operator's
+        // Single-sourced with the display pipeline's uniform producer
+        // (`prepare_view_display_targets` in bevy_render): the operator's
         // seam renormalization (× 100 / paper_white) and the display
         // encoder's transfer encoding (× paper_white / 80 for scRGB,
         // × paper_white for PQ) must fold the IDENTICAL paper-white value or
@@ -883,109 +887,87 @@ impl Gt7ParamsUniform {
     }
 }
 
-/// Resource holding the [`DynamicUniformBuffer`] of per-view
-/// [`Gt7ParamsUniform`]s, written each frame by
-/// [`prepare_gt7_params_uniforms`].
-#[derive(Resource)]
-pub struct Gt7ParamsUniforms {
-    /// The per-view uniform buffer; entries are addressed with the dynamic
-    /// offset stored in each view's [`ViewGt7ParamsUniformOffset`].
-    pub uniforms: DynamicUniformBuffer<Gt7ParamsUniform>,
-}
-
-impl Default for Gt7ParamsUniforms {
-    fn default() -> Self {
-        let mut uniforms = DynamicUniformBuffer::default();
-        uniforms.set_label(Some("gt7_params_uniforms_buffer"));
-        Self { uniforms }
-    }
-}
-
-/// Render-world component holding a view's dynamic offset into
-/// [`Gt7ParamsUniforms`].
+/// Gives a [`Gt7ParamsUniform`] to every view whose tonemapping pipeline
+/// binds one, and takes it away from every view that stops qualifying.
 ///
-/// Inserted by [`prepare_gt7_params_uniforms`] on every view whose
-/// *effective* operator (after the SDR-only-operator substitution, see
-/// `effective_tonemapping` in the parent module) is
-/// [`Tonemapping::GranTurismo7`] and that either has an extracted
-/// [`GranTurismo7Params`] or renders to an HDR-transfer target — exactly the
-/// views whose tonemapping pipeline is specialized with the
-/// `GT7_PARAMS_UNIFORM` shader def (`gt7_params_uniform_active` is the
-/// shared predicate).
-#[derive(Component)]
-pub struct ViewGt7ParamsUniformOffset {
-    /// The dynamic offset to pass to `set_bind_group`.
-    pub offset: u32,
-}
-
-/// Prepares a [`Gt7ParamsUniform`] for every view whose tonemapping pipeline
-/// binds it (`gt7_params_uniform_active`, the predicate shared with
-/// `prepare_view_tonemapping_pipelines`):
+/// [`UniformComponentPlugin`](bevy_render::extract_component::UniformComponentPlugin)
+/// — registered for [`Gt7ParamsUniform`] in the tonemapping plugin — packs
+/// the components this system inserts into
+/// [`ComponentUniforms<Gt7ParamsUniform>`](bevy_render::extract_component::ComponentUniforms)
+/// and gives each view a
+/// [`DynamicUniformIndex<Gt7ParamsUniform>`](bevy_render::extract_component::DynamicUniformIndex)
+/// addressing its entry, which the tonemapping node binds as the pass's
+/// dynamic offset.
 ///
-/// * views authored with [`Tonemapping::GranTurismo7`] **and** a
-///   [`GranTurismo7Params`] component — validating the parameters and
-///   selecting SDR/HDR mode from the view's resolved [`ViewDisplayTarget`]
-///   (see [`Gt7ParamsUniform::new`]);
-/// * views on an HDR-transfer target whose effective operator is GT7 —
-///   authored GT7 as well as SDR-only operators substituted with GT7
-///   (`effective_tonemapping`) — using the camera's [`GranTurismo7Params`]
-///   if present and [`GranTurismo7Params::default`] otherwise, so GT7 always
-///   runs in HDR mode driven by the display target's peak luminance instead
-///   of the shader's baked SDR defaults.
+/// A view qualifies when [`gt7_params_uniform_active`] holds for it. The
+/// uniform is then built from the camera's [`GranTurismo7Params`] if present
+/// and [`GranTurismo7Params::default`] otherwise, with the SDR/HDR mode and
+/// the HDR peak taken from the view's resolved [`ViewDisplayTarget`] (see
+/// [`Gt7ParamsUniform::new`]).
 ///
-/// Runs in `RenderSystems::PrepareResources`. Views authored with
-/// `GranTurismo7` but without the component on SDR targets are skipped and
-/// keep the shader's baked SDR defaults.
-pub fn prepare_gt7_params_uniforms(
+/// Views authored with `GranTurismo7` but without the component on SDR
+/// targets keep the shader's baked SDR defaults, and a stack member whose
+/// tone-mapping pass is deferred to its finalizer ([`StackRole::Deferred`])
+/// never runs the pass at all — neither gets a uniform. That absence is what
+/// `prepare_view_tonemapping_pipelines` reads to leave `GT7_PARAMS_UNIFORM`
+/// off the pipeline key, so the two systems cannot disagree about the pass's
+/// bind group layout.
+///
+/// Runs in [`RenderSystems::Queue`](bevy_render::RenderSystems::Queue): after
+/// `PrepareViews`, where [`ViewDisplayTarget`] and [`ViewStackContract`] are
+/// resolved, and before `Prepare`, where the uniform packing and the pipeline
+/// specialization both read what this system wrote.
+pub fn queue_gt7_params_uniforms(
     mut commands: Commands,
-    render_device: Res<RenderDevice>,
-    render_queue: Res<RenderQueue>,
-    mut gt7_params_uniforms: ResMut<Gt7ParamsUniforms>,
     views: Query<
         (
             Entity,
-            &Tonemapping,
+            // Optional so a camera that drops its `Tonemapping` still
+            // reaches the removal branch below instead of keeping a stale
+            // `Gt7ParamsUniform`. `prepare_view_tonemapping_pipelines`, which
+            // reads the resulting flag, likewise defaults a missing component
+            // to `Tonemapping::None`.
+            Option<&Tonemapping>,
             Option<&GranTurismo7Params>,
             Option<&ViewDisplayTarget>,
+            Option<&ViewStackContract>,
+            Has<Gt7ParamsUniform>,
         ),
-        With<ExtractedView>,
+        // The liveness gate for `ViewStackContract`, which is overwritten in
+        // place and never removed; also the view set
+        // `prepare_view_tonemapping_pipelines` specializes over.
+        With<ViewTarget>,
     >,
 ) {
-    let uniform_active =
-        |tonemapping: &Tonemapping,
-         params: Option<&GranTurismo7Params>,
-         view_display_target: Option<&ViewDisplayTarget>| {
-            gt7_params_uniform_active(
-                effective_tonemapping(Some(tonemapping), view_display_target),
+    for (entity, tonemapping, params, view_display_target, contract, has_uniform) in &views {
+        // Cameras stacked on a shared main texture tone-map once, on the
+        // stack's finalizer; the deferred members never run the pass.
+        let deferred =
+            contract.is_some_and(|contract| matches!(contract.tonemap, StackRole::Deferred(_)));
+        let active = !deferred
+            && gt7_params_uniform_active(
+                effective_tonemapping(tonemapping, view_display_target),
                 params.is_some(),
                 view_display_target.is_some_and(ViewDisplayTarget::is_hdr_transfer),
-            )
-        };
-    let view_count = views
-        .iter()
-        .filter(|(_, tonemapping, params, view_display_target)| {
-            uniform_active(tonemapping, *params, *view_display_target)
-        })
-        .count();
-    let Some(mut writer) =
-        gt7_params_uniforms
-            .uniforms
-            .get_writer(view_count, &render_device, &render_queue)
-    else {
-        return;
-    };
-    for (entity, tonemapping, params, view_display_target) in &views {
-        if !uniform_active(tonemapping, params, view_display_target) {
+            );
+
+        if !active {
+            // Render-world entities are retained across frames, so a view
+            // that stops qualifying must have the component actively removed
+            // — but only if it has one, so plain SDR views issue no command.
+            if has_uniform {
+                commands.entity(entity).remove::<Gt7ParamsUniform>();
+            }
             continue;
         }
+
         let display_target = view_display_target
             .map(|view_display_target| view_display_target.resolved)
             .unwrap_or_default();
         let params = params.copied().unwrap_or_default();
-        let offset = writer.write(&Gt7ParamsUniform::new(&display_target, &params));
         commands
             .entity(entity)
-            .insert(ViewGt7ParamsUniformOffset { offset });
+            .insert(Gt7ParamsUniform::new(&display_target, &params));
     }
 }
 

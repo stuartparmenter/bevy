@@ -1,11 +1,12 @@
 use crate::tonemapping::{
-    Gt7ParamsUniforms, TonemappingLuts, TonemappingPipeline, TonemappingPipelineKeyFlags,
-    ViewGt7ParamsUniformOffset, ViewTonemappingPipeline,
+    Gt7ParamsUniform, TonemappingLuts, TonemappingPipeline, TonemappingPipelineKeyFlags,
+    ViewTonemappingPipeline,
 };
 
 use bevy_ecs::prelude::*;
 use bevy_render::{
     diagnostic::RecordDiagnostics,
+    extract_component::{ComponentUniforms, DynamicUniformIndex},
     render_asset::RenderAssets,
     render_resource::{
         BindGroup, BindGroupEntries, BufferId, LoadOp, Operations, PipelineCache,
@@ -41,19 +42,19 @@ pub fn tonemapping(
         &ViewTarget,
         &ViewTonemappingPipeline,
         &Tonemapping,
-        Option<&ViewGt7ParamsUniformOffset>,
+        Option<&DynamicUniformIndex<Gt7ParamsUniform>>,
     )>,
     pipeline_cache: Res<PipelineCache>,
     tonemapping_pipeline: Res<TonemappingPipeline>,
     gpu_images: Res<RenderAssets<GpuImage>>,
     fallback_image: Res<FallbackImage>,
     view_uniforms: Res<ViewUniforms>,
-    gt7_params_uniforms: Res<Gt7ParamsUniforms>,
+    gt7_params_uniforms: Res<ComponentUniforms<Gt7ParamsUniform>>,
     tonemapping_luts: Res<TonemappingLuts>,
     mut cache: Local<TonemappingBindGroupCache>,
     mut ctx: RenderContext,
 ) {
-    let (view_uniform_offset, target, view_tonemapping_pipeline, tonemapping, gt7_params_offset) =
+    let (view_uniform_offset, target, view_tonemapping_pipeline, tonemapping, gt7_params_index) =
         view.into_inner();
 
     // `Tonemapping::None` is a true opt-out: the pass does not run, the
@@ -85,19 +86,19 @@ pub fn tonemapping(
     let view_uniforms_id = view_uniforms_buffer.buffer().unwrap().id();
 
     // Collect the optional GT7 params binding the pipeline was specialized
-    // with. If its buffer or offset is missing (which should not happen — the
-    // same predicate drives specialization and preparation), skip the pass
-    // rather than binding with a mismatched layout.
+    // with. If its buffer or index is missing (which should not happen — the
+    // pipeline was specialized off the presence of the very component the
+    // index addresses), skip the pass rather than binding with a mismatched
+    // layout.
     let needs_gt7_params = view_tonemapping_pipeline
         .flags
         .contains(TonemappingPipelineKeyFlags::GT7_PARAMS_UNIFORM);
 
     let gt7_params_binding = if needs_gt7_params {
-        let (Some(_), Some(offset)) = (gt7_params_uniforms.uniforms.buffer(), gt7_params_offset)
-        else {
+        let (Some(_), Some(index)) = (gt7_params_uniforms.buffer(), gt7_params_index) else {
             return;
         };
-        Some((&gt7_params_uniforms.uniforms, offset.offset))
+        Some((gt7_params_uniforms.uniforms(), index.index()))
     } else {
         None
     };

@@ -19,9 +19,10 @@
 // parameters (see `Gt7ToneMappingCurve::new` and `Gt7ToneMapping::new` in
 // gt7.rs); they are computed once on the CPU rather than derived per pixel.
 // Under the GT7_PARAMS_UNIFORM shader def this struct is fed per view from
-// the `Gt7ParamsUniform` buffer prepared by `prepare_gt7_params_uniforms`
-// (gt7.rs — keep the field order in sync); without the def the baked SDR
-// defaults from `gt7_default_sdr_params()` are used.
+// the `Gt7ParamsUniform` buffer that `UniformComponentPlugin` packs from the
+// components `queue_gt7_params_uniforms` inserts (gt7.rs — keep the field
+// order in sync); without the def the baked SDR defaults from
+// `gt7_default_sdr_params()` are used.
 struct Gt7Params {
     // Display peak in frame-buffer units (peak_nits / 100).
     peak: f32,

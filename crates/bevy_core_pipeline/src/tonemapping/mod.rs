@@ -10,7 +10,7 @@ use bevy_log::error;
 use bevy_log::warn_once;
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
 use bevy_render::{
-    extract_component::{ExtractComponent, ExtractComponentPlugin},
+    extract_component::{ExtractComponent, ExtractComponentPlugin, UniformComponentPlugin},
     extract_resource::{ExtractResource, ExtractResourcePlugin},
     render_asset::RenderAssets,
     render_resource::{
@@ -32,10 +32,9 @@ mod node;
 
 use bevy_utils::default;
 pub use gt7::{
-    prepare_gt7_params_uniforms, GranTurismo7Params, Gt7ParamsUniform, Gt7ParamsUniforms,
-    Gt7ToneMapping, Gt7ToneMappingCurve, ViewGt7ParamsUniformOffset, GRAN_TURISMO_SDR_PAPER_WHITE,
-    GT7_MAX_HDR_PEAK_NITS, GT7_MIN_HDR_PEAK_NITS, REC_2020_TO_REC_709, REC_709_TO_REC_2020,
-    REFERENCE_LUMINANCE,
+    queue_gt7_params_uniforms, GranTurismo7Params, Gt7ParamsUniform, Gt7ToneMapping,
+    Gt7ToneMappingCurve, GRAN_TURISMO_SDR_PAPER_WHITE, GT7_MAX_HDR_PEAK_NITS,
+    GT7_MIN_HDR_PEAK_NITS, REC_2020_TO_REC_709, REC_709_TO_REC_2020, REFERENCE_LUMINANCE,
 };
 pub use node::tonemapping;
 
@@ -103,6 +102,10 @@ impl Plugin for TonemappingPlugin {
             ExtractComponentPlugin::<Tonemapping>::default(),
             ExtractComponentPlugin::<DebandDither>::default(),
             ExtractComponentPlugin::<GranTurismo7Params>::default(),
+            // Packs the per-view `Gt7ParamsUniform`s that
+            // `queue_gt7_params_uniforms` inserts. Views without one — every
+            // view in a default SDR project — leave the buffer unallocated.
+            UniformComponentPlugin::<Gt7ParamsUniform>::default(),
         ));
 
         app.add_systems(
@@ -115,7 +118,6 @@ impl Plugin for TonemappingPlugin {
         };
         render_app
             .init_gpu_resource::<SpecializedRenderPipelines<TonemappingPipeline>>()
-            .init_gpu_resource::<Gt7ParamsUniforms>()
             .add_systems(RenderStartup, init_tonemapping_pipeline)
             .add_systems(
                 Render,
@@ -127,7 +129,13 @@ impl Plugin for TonemappingPlugin {
                     prepare_view_tonemapping_pipelines
                         .in_set(RenderSystems::Prepare)
                         .ambiguous_with_all(),
-                    prepare_gt7_params_uniforms.in_set(RenderSystems::PrepareResources),
+                    // After the `PrepareViews` inputs this reads, before the
+                    // `Prepare` consumers of what it writes
+                    // (`prepare_uniform_components` in `PrepareResources`,
+                    // and `prepare_view_tonemapping_pipelines`, whose
+                    // `ambiguous_with_all` means no ambiguity report would
+                    // catch a missing edge here).
+                    queue_gt7_params_uniforms.in_set(RenderSystems::Queue),
                 ),
             );
     }
@@ -392,12 +400,16 @@ bitflags! {
         /// `GT7_PARAMS_UNIFORM` shader def is pushed, replacing the GT7
         /// operator's baked SDR defaults with prepared per-camera values.
         ///
-        /// Set when the view's *effective* operator
-        /// ([`effective_tonemapping`]) is [`Tonemapping::GranTurismo7`]
-        /// **and** either the camera has a [`GranTurismo7Params`] component
-        /// or the view renders to an HDR-transfer target (where GT7 runs in
-        /// HDR mode regardless of the component, and SDR-only operators are
-        /// substituted with GT7); see [`gt7_params_uniform_active`].
+        /// Set from the presence of the view's [`Gt7ParamsUniform`]
+        /// component, which [`queue_gt7_params_uniforms`] inserts when the
+        /// view's *effective* operator ([`effective_tonemapping`]) is
+        /// [`Tonemapping::GranTurismo7`] **and** either the camera has a
+        /// [`GranTurismo7Params`] component or the view renders to an
+        /// HDR-transfer target (where GT7 runs in HDR mode regardless of the
+        /// component, and SDR-only operators are substituted with GT7); see
+        /// [`gt7_params_uniform_active`]. Reading the component rather than
+        /// re-deriving the predicate is what keeps this flag and the bound
+        /// dynamic offset, which the same component produces, in agreement.
         const GT7_PARAMS_UNIFORM        = 0x10;
         /// The tone-map operator emits its native linear Rec.2020
         /// display-referred output (no Rec.709 back-conversion, no clamp) for
@@ -702,7 +714,7 @@ impl ViewTonemappingPipeline {
 /// The substitution applies to render-world *prepared* state only — the
 /// pipeline key ([`prepare_view_tonemapping_pipelines`], which emits the
 /// `warn_once!` naming the substitute), the GT7 params uniform
-/// ([`prepare_gt7_params_uniforms`], which uploads the camera's
+/// ([`queue_gt7_params_uniforms`], which uses the camera's
 /// [`GranTurismo7Params`] if present and the defaults otherwise), and the
 /// display encoder's input-gamut contract ([`tonemap_output_gamut`]). The
 /// camera's authored [`Tonemapping`] component is never mutated.
@@ -730,12 +742,13 @@ pub fn effective_tonemapping(
 /// [`Gt7ParamsUniform`] (the `GT7_PARAMS_UNIFORM` shader def /
 /// [`TonemappingPipelineKeyFlags::GT7_PARAMS_UNIFORM`]).
 ///
-/// Single source shared by [`prepare_view_tonemapping_pipelines`] (the
-/// shader-def push and layout selection) and [`prepare_gt7_params_uniforms`]
-/// (the uniform write and dynamic-offset insertion), so the pipeline layout
-/// and the bound buffer can never disagree. A view binds the uniform iff its
-/// **effective** operator ([`effective_tonemapping`]) is
-/// [`Tonemapping::GranTurismo7`] and either:
+/// [`queue_gt7_params_uniforms`] is the only caller: it evaluates this once
+/// per view and records the answer as the presence of the view's
+/// [`Gt7ParamsUniform`] component, which is what
+/// [`prepare_view_tonemapping_pipelines`] then keys the shader def and layout
+/// selection on. One evaluation, so the pipeline layout and the bound buffer
+/// cannot disagree. A view binds the uniform iff its **effective** operator
+/// ([`effective_tonemapping`]) is [`Tonemapping::GranTurismo7`] and either:
 ///
 /// * the camera opted in with a [`GranTurismo7Params`] component, or
 /// * the view's resolved display target requests an HDR transfer
@@ -814,13 +827,18 @@ pub fn tonemap_output_gamut(
 /// `compositing_space` must be the RESOLVED space, never the camera's raw
 /// request: stack members share one main texture, so the decode / re-encode
 /// flags must match the one space the whole stack composites in.
+///
+/// `has_gt7_params_uniform` must be the presence of the view's
+/// [`Gt7ParamsUniform`] component, never a re-derivation of
+/// [`gt7_params_uniform_active`]; see
+/// [`TonemappingPipelineKeyFlags::GT7_PARAMS_UNIFORM`].
 fn tonemapping_key_flags(
     color_grading: &ColorGrading,
     external_white_balance: bool,
     compositing_space: Option<CompositingSpace>,
     requested_tonemapping: Tonemapping,
     view_display_target: Option<&ViewDisplayTarget>,
-    has_gt7_params: bool,
+    has_gt7_params_uniform: bool,
 ) -> TonemappingPipelineKeyFlags {
     // As an optimization, we omit parts of the shader that are unneeded.
     let mut flags = TonemappingPipelineKeyFlags::empty();
@@ -857,20 +875,9 @@ fn tonemapping_key_flags(
         compositing_space == Some(CompositingSpace::Oklab),
     );
 
-    // The GT7 params uniform is active exactly when the effective
-    // operator is GT7 and either the camera opted in with a
-    // `GranTurismo7Params` component or the view renders to an
-    // HDR-transfer target — GT7's HDR mode is selected inside the
-    // prepared uniform (`prepare_gt7_params_uniforms` uses the same
-    // shared predicate).
-    let gt7_uniform_active = gt7_params_uniform_active(
-        effective_tonemapping(Some(&requested_tonemapping), view_display_target),
-        has_gt7_params,
-        view_display_target.is_some_and(ViewDisplayTarget::is_hdr_transfer),
-    );
     flags.set(
         TonemappingPipelineKeyFlags::GT7_PARAMS_UNIFORM,
-        gt7_uniform_active,
+        has_gt7_params_uniform,
     );
     // GT7 on an HDR-transfer target (authored or substituted) emits
     // its native Rec.2020 output for the display encoder. This def stays
@@ -900,7 +907,7 @@ pub fn prepare_view_tonemapping_pipelines(
             Option<&Tonemapping>,
             Option<&DebandDither>,
             Option<&ViewDisplayTarget>,
-            Option<&GranTurismo7Params>,
+            Has<Gt7ParamsUniform>,
             Has<ExternalWhiteBalance>,
         ),
         // `ViewStackContract` is overwritten in place and never removed, so a
@@ -918,7 +925,7 @@ pub fn prepare_view_tonemapping_pipelines(
         tonemapping,
         dither,
         view_display_target,
-        gt7_params,
+        has_gt7_params_uniform,
         external_white_balance,
     ) in view_targets.iter()
     {
@@ -973,7 +980,7 @@ pub fn prepare_view_tonemapping_pipelines(
             contract.compositing_space,
             requested_tonemapping,
             view_display_target,
-            gt7_params.is_some(),
+            has_gt7_params_uniform,
         );
 
         let key = TonemappingPipelineKey {
