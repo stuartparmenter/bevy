@@ -248,7 +248,10 @@ pub struct DisplayProvenance {
 /// the component is removed the pipeline falls back to
 /// [`DisplayTarget::SDR_SRGB`], exactly as it falls back for a missing
 /// [`DisplayTarget`].
-#[derive(Component, Debug, Clone, Copy, PartialEq)]
+///
+/// Defaults to the SDR sRGB target with all-[`User`](FieldProvenance::User)
+/// provenance, identical to the [`DisplayTarget`] default.
+#[derive(Component, Debug, Default, Clone, Copy, PartialEq)]
 #[cfg_attr(
     feature = "bevy_reflect",
     derive(Reflect),
@@ -264,17 +267,6 @@ pub struct EffectiveDisplayTarget {
     pub target: DisplayTarget,
     /// Per-field provenance of [`target`](Self::target).
     pub provenance: DisplayProvenance,
-}
-
-impl Default for EffectiveDisplayTarget {
-    /// The SDR sRGB target with all-[`User`](FieldProvenance::User) provenance,
-    /// identical to the [`DisplayTarget`] default.
-    fn default() -> Self {
-        Self {
-            target: DisplayTarget::SDR_SRGB,
-            provenance: DisplayProvenance::default(),
-        }
-    }
 }
 
 #[cfg(test)]
