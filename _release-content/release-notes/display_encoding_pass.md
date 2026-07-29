@@ -51,11 +51,13 @@ The `DisplayGamutCompression` resource controls it:
 - `Clip` — the hue-shifting per-channel clip, kept as a debug fallback for A/B
   comparison.
 
-The transfer functions live in a new importable WGSL library,
-`bevy_render::transfer_functions` (the piecewise sRGB OETF/EOTF, the
-odd-symmetric extended-range sRGB OETF/EOTF, scRGB scaling, and PQ
-inverse-EOTF/EOTF), with CPU mirrors and parity tests in the matching Rust
-module, so you can reuse them in your own shaders.
+The transfer functions the pass encodes with live in a new importable WGSL
+library, `bevy_render::transfer_functions` — the odd-symmetric extended-range
+sRGB OETF, scRGB scaling, and the PQ inverse EOTF — with CPU mirrors and
+parity tests in the matching Rust module, so you can reuse them in your own
+shaders. The decode direction (the extended sRGB and PQ EOTFs) is CPU-only in
+the Rust module, where the screenshot readback path uses it to decode HDR
+captures.
 
 The pass only activates for display targets whose resolved transfer is HDR
 (`ScRgbLinear`, `Pq`, or `ExtendedSrgb`) — exactly when surface selection has
