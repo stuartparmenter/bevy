@@ -124,7 +124,6 @@ bitflags::bitflags! {
         const TONEMAP_METHOD_TONY_MC_MAPFACE    = 6 << Self::TONEMAP_METHOD_SHIFT_BITS;
         const TONEMAP_METHOD_BLENDER_FILMIC     = 7 << Self::TONEMAP_METHOD_SHIFT_BITS;
         const TONEMAP_METHOD_PBR_NEUTRAL        = 8 << Self::TONEMAP_METHOD_SHIFT_BITS;
-        const TONEMAP_METHOD_LINEAR             = 9 << Self::TONEMAP_METHOD_SHIFT_BITS;
         const TONEMAP_METHOD_GRAN_TURISMO_7     = 10 << Self::TONEMAP_METHOD_SHIFT_BITS;
 
     }
@@ -188,8 +187,7 @@ impl SpritePipelineKey {
     #[inline]
     const fn from_tonemapping(tonemapping: Tonemapping) -> Self {
         match tonemapping {
-            Tonemapping::None => Self::TONEMAP_METHOD_NONE,
-            Tonemapping::Linear => Self::TONEMAP_METHOD_LINEAR,
+            Tonemapping::None | Tonemapping::Linear => Self::TONEMAP_METHOD_NONE,
             Tonemapping::Reinhard => Self::TONEMAP_METHOD_REINHARD,
             Tonemapping::ReinhardLuminance => Self::TONEMAP_METHOD_REINHARD_LUMINANCE,
             Tonemapping::AcesFitted => Self::TONEMAP_METHOD_ACES_FITTED,
@@ -234,8 +232,6 @@ impl SpecializedRenderPipeline for SpritePipeline {
 
             if method == SpritePipelineKey::TONEMAP_METHOD_NONE {
                 shader_defs.push("TONEMAP_METHOD_NONE".into());
-            } else if method == SpritePipelineKey::TONEMAP_METHOD_LINEAR {
-                shader_defs.push("TONEMAP_METHOD_LINEAR".into());
             } else if method == SpritePipelineKey::TONEMAP_METHOD_REINHARD {
                 shader_defs.push("TONEMAP_METHOD_REINHARD".into());
             } else if method == SpritePipelineKey::TONEMAP_METHOD_REINHARD_LUMINANCE {
