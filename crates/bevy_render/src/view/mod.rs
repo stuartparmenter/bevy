@@ -430,7 +430,7 @@ impl Tonemapping {
     /// On a view whose resolved display target requests an HDR transfer, an
     /// SDR-only operator would silently cap the image at paper white, leaving
     /// the display's HDR headroom permanently unused. The substitution table
-    /// (`bevy_core_pipeline::tonemapping::effective_tonemapping`) degrades
+    /// (`bevy_core_pipeline::tonemapping::resolve_tonemapping`) degrades
     /// such views to an HDR-capable substitute (with a `warn_once!`) instead.
     pub fn is_sdr_only(&self) -> bool {
         !matches!(

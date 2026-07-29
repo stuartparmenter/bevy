@@ -54,7 +54,7 @@ use bevy_render::{
 use bevy_window::{DisplayGamut, DisplayTransfer};
 use core::hash::Hash;
 
-use crate::tonemapping::{effective_tonemapping, tonemap_output_gamut, Tonemapping};
+use crate::tonemapping::{resolve_tonemapping, Tonemapping};
 
 /// Registers the phase-2 contract resolver
 /// ([`resolve_camera_stack_contracts`]), which turns the per-frame camera
@@ -198,7 +198,7 @@ pub(crate) struct ContractInput<K> {
     /// disposition must never override.
     pub explicit_blend: bool,
     /// This view's own tonemap output gamut
-    /// (`tonemap_output_gamut(own operator, own display target)`).
+    /// (`resolve_tonemapping(own operator, own display target).output_gamut`).
     pub tonemap_output_gamut: DisplayGamut,
     /// The phase-1 resolved compositing space, passed through to the
     /// contract.
@@ -207,7 +207,8 @@ pub(crate) struct ContractInput<K> {
     /// (`ClearColorConfig::None`); distinguishes viewport members from
     /// clearing members in the stack-shape diagnostics.
     pub loads_previous: bool,
-    /// The view's effective tone-mapping operator (`effective_tonemapping(..)`).
+    /// The view's resolved tone-mapping operator
+    /// (`resolve_tonemapping(..).operator`).
     /// [`Tonemapping::is_enabled`] gates the view's tonemapping pass; the
     /// operator is compared against the finalizer's for the operator-mismatch
     /// diagnostic.
@@ -514,6 +515,7 @@ pub fn resolve_camera_stack_contracts(
             encode_enabled,
             "every member of a texture group must agree on display-encode enablement"
         );
+        let resolved = resolve_tonemapping(tonemapping, view_display_target);
         inputs.push(ContractInput {
             entity,
             texture,
@@ -528,10 +530,10 @@ pub fn resolve_camera_stack_contracts(
                     ..
                 }
             ),
-            tonemap_output_gamut: tonemap_output_gamut(tonemapping, view_display_target),
+            tonemap_output_gamut: resolved.output_gamut,
             compositing_space: resolved_space.and_then(|space| space.0),
             loads_previous: matches!(camera.clear_color, ClearColorConfig::None),
-            operator: effective_tonemapping(tonemapping, view_display_target),
+            operator: resolved.operator,
         });
     }
 

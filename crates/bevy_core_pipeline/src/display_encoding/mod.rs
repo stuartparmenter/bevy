@@ -3,10 +3,10 @@
 //! encoding).
 //!
 //! The tone-mapping pass outputs *display-linear* color, scaled so `1.0` =
-//! paper white, in per-view source primaries (Rec.709 for every effective
+//! paper white, in per-view source primaries (Rec.709 for every resolved
 //! operator except `Tonemapping::GranTurismo7` on HDR targets — authored or
-//! substituted for an SDR-only operator (`effective_tonemapping`) — which
-//! emits its native Rec.2020; see `tonemap_output_gamut`); UI then composites in that
+//! substituted for an SDR-only operator — which emits its native
+//! Rec.2020; see `resolve_tonemapping`); UI then composites in that
 //! same space. This pass — scheduled after the UI pass and before the upscaling
 //! blit — converts that buffer into the display's signal: a 3×3 gamut
 //! transform from the source primaries to the display primaries, an
@@ -148,7 +148,7 @@ impl Plugin for DisplayEncodingPlugin {
 /// [`ViewStackContract::source_gamut`]): Rec.2020 when the buffer was
 /// produced by `Tonemapping::GranTurismo7` on an HDR-transfer target —
 /// authored, or substituted for an SDR-only operator
-/// (`effective_tonemapping`) — as the operator emits its native Rec.2020
+/// (`resolve_tonemapping`) — as the operator emits its native Rec.2020
 /// display-referred output; Rec.709 otherwise. Under
 /// [`DisplayGamutCompression::Auto`] the compression is therefore active for
 /// the two reachable contractions: GT7 HDR-native Rec.2020 input onto a
@@ -396,7 +396,7 @@ pub struct DisplayEncodingPipelineKey {
     /// ([`ViewStackContract::source_gamut`]): the tonemap output gamut of the
     /// buffer this view's encode reads — the stack's last tonemap-enabled
     /// member's for deferred encodes, this view's own for solo encodes (see
-    /// [`tonemap_output_gamut`](crate::tonemapping::tonemap_output_gamut)).
+    /// [`ResolvedTonemapping::output_gamut`](crate::tonemapping::ResolvedTonemapping)).
     /// Rec.2020 when that operator is GT7 (authored or substituted) on an
     /// HDR-transfer target, Rec.709 otherwise.
     ///
@@ -471,11 +471,11 @@ impl SpecializedRenderPipeline for DisplayEncodingPipeline {
                 shader_defs.push("GAMUT_REC2020_TO_DISPLAYP3".into());
             }
             // The tonemapping pass never emits a Display-P3 *source* gamut
-            // (`tonemap_output_gamut` yields only Rec.709 or Rec.2020); the
+            // (`resolve_tonemapping` yields only Rec.709 or Rec.2020); the
             // display side is now a real gamut (handled above).
             (DisplayGamut::DisplayP3, _) => unreachable!(
                 "the tonemapping pass never emits a DisplayP3 source gamut \
-                 (tonemap_output_gamut yields only Rec709 or Rec2020)"
+                 (resolve_tonemapping yields only Rec709 or Rec2020)"
             ),
         }
 

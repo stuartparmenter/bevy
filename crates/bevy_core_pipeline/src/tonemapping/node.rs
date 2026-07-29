@@ -1,6 +1,5 @@
 use crate::tonemapping::{
-    Gt7ParamsUniform, TonemappingLuts, TonemappingPipeline, TonemappingPipelineKeyFlags,
-    ViewTonemappingPipeline,
+    Gt7ParamsUniform, TonemappingLuts, TonemappingPipeline, ViewTonemappingPipeline,
 };
 
 use bevy_ecs::prelude::*;
@@ -17,7 +16,7 @@ use bevy_render::{
     view::{ViewTarget, ViewUniformOffset, ViewUniforms},
 };
 
-use super::{get_lut_bindings, Tonemapping};
+use super::{get_lut_bindings, gt7_layout, Tonemapping};
 
 /// Cached bind group state for tonemapping.
 #[derive(Default)]
@@ -41,7 +40,6 @@ pub fn tonemapping(
         &ViewUniformOffset,
         &ViewTarget,
         &ViewTonemappingPipeline,
-        &Tonemapping,
         Option<&DynamicUniformIndex<Gt7ParamsUniform>>,
     )>,
     pipeline_cache: Res<PipelineCache>,
@@ -54,7 +52,7 @@ pub fn tonemapping(
     mut cache: Local<TonemappingBindGroupCache>,
     mut ctx: RenderContext,
 ) {
-    let (view_uniform_offset, target, view_tonemapping_pipeline, tonemapping, gt7_params_index) =
+    let (view_uniform_offset, target, view_tonemapping_pipeline, gt7_params_index) =
         view.into_inner();
 
     // Eligible SDR cameras fold tone mapping into their material shaders (the
@@ -83,9 +81,7 @@ pub fn tonemapping(
     // pipeline was specialized off the presence of the very component the
     // index addresses), skip the pass rather than binding with a mismatched
     // layout.
-    let needs_gt7_params = view_tonemapping_pipeline
-        .flags
-        .contains(TonemappingPipelineKeyFlags::GT7_PARAMS_UNIFORM);
+    let needs_gt7_params = view_tonemapping_pipeline.binds_gt7_params;
 
     let gt7_params_binding = if needs_gt7_params {
         let (Some(_), Some(index)) = (gt7_params_uniforms.buffer(), gt7_params_index) else {
@@ -103,9 +99,10 @@ pub fn tonemapping(
     let source = post_process.source;
     let destination = post_process.destination;
 
-    let tonemapping_changed = cache.last_tonemapping != Some(*tonemapping);
+    let tonemapping = view_tonemapping_pipeline.operator;
+    let tonemapping_changed = cache.last_tonemapping != Some(tonemapping);
     if tonemapping_changed {
-        cache.last_tonemapping = Some(*tonemapping);
+        cache.last_tonemapping = Some(tonemapping);
     }
 
     let bind_group = match &mut cache.cached {
@@ -119,17 +116,15 @@ pub fn tonemapping(
             &cached.bind_group
         }
         cached => {
-            // LUT selection keys on the *authored* operator. For views whose
-            // SDR-only operator was D6-substituted with GT7 (see
-            // `effective_tonemapping`) this binds the authored operator's
-            // LUT, which is harmless: the GT7 shader path never samples the
-            // LUT, and every LUT satisfies the same 3D-texture layout entry.
-            let lut_bindings =
-                get_lut_bindings(&gpu_images, &tonemapping_luts, tonemapping, &fallback_image);
-
-            let layout = pipeline_cache.get_bind_group_layout(
-                view_tonemapping_pipeline.bind_group_layout(&tonemapping_pipeline),
+            let lut_bindings = get_lut_bindings(
+                &gpu_images,
+                &tonemapping_luts,
+                &tonemapping,
+                &fallback_image,
             );
+
+            let layout = pipeline_cache
+                .get_bind_group_layout(gt7_layout(&tonemapping_pipeline, needs_gt7_params));
             let render_device = ctx.render_device();
             let bind_group = match gt7_params_binding {
                 None => render_device.create_bind_group(

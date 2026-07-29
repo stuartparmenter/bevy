@@ -43,7 +43,7 @@ use bevy_render::{
 };
 use bevy_window::DisplayTarget;
 
-use super::{effective_tonemapping, gt7_params_uniform_active, Tonemapping};
+use super::{gt7_params_uniform_active, resolve_tonemapping, Tonemapping};
 use crate::camera_stack::{StackRole, ViewStackContract};
 
 /// Physical luminance in cd/m² that a linear frame-buffer value of `1.0`
@@ -550,7 +550,7 @@ pub fn queue_gt7_params_uniforms(
             contract.is_some_and(|contract| matches!(contract.tonemap, StackRole::Deferred(_)));
         let active = !deferred
             && gt7_params_uniform_active(
-                effective_tonemapping(tonemapping, view_display_target),
+                resolve_tonemapping(tonemapping, view_display_target).operator,
                 params.is_some(),
                 view_display_target.is_hdr_transfer(),
             );

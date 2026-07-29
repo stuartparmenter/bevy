@@ -194,7 +194,7 @@ bitflags! {
         ///
         /// Set from the presence of the view's [`Gt7ParamsUniform`]
         /// component, which [`queue_gt7_params_uniforms`] inserts when the
-        /// view's *effective* operator ([`effective_tonemapping`]) is
+        /// view's *resolved* operator ([`resolve_tonemapping`]) is
         /// [`Tonemapping::GranTurismo7`] **and** either the camera has a
         /// [`GranTurismo7Params`] component or the view renders to an
         /// HDR-transfer target (where GT7 runs in HDR mode regardless of the
@@ -208,12 +208,13 @@ bitflags! {
         /// the display-encoding pass; pushes the `TONEMAP_OUTPUT_REC2020`
         /// shader def.
         ///
-        /// Set exactly when [`tonemap_output_gamut`] returns
-        /// [`DisplayGamut::Rec2020`]: the *effective* operator
-        /// ([`effective_tonemapping`], i.e. after the SDR-only-operator
+        /// Set exactly when the view's resolved output gamut
+        /// ([`ResolvedTonemapping::output_gamut`]) is
+        /// [`DisplayGamut::Rec2020`]: the *resolved* operator
+        /// ([`resolve_tonemapping`], i.e. after the SDR-only-operator
         /// substitution) is [`Tonemapping::GranTurismo7`] **and** the view's
         /// resolved display target requests an HDR transfer. The display
-        /// encoder derives its input-gamut contract from the same function,
+        /// encoder derives its input-gamut contract from the same resolver,
         /// so the two passes can never disagree about the buffer's
         /// primaries. SDR views never set this flag.
         const TONEMAP_OUTPUT_REC2020    = 0x80;
@@ -312,8 +313,8 @@ impl SpecializedRenderPipeline for TonemappingPipeline {
         }
         // GT7 HDR-native output: the operator skips its Rec.2020 → Rec.709
         // back-conversion (and the saturate) and the display encoder treats
-        // the pass output as Rec.2020 (same predicate; see
-        // `tonemap_output_gamut`). Never pushed for SDR views.
+        // the pass output as Rec.2020 (same resolved gamut; see
+        // `resolve_tonemapping`). Never pushed for SDR views.
         if key
             .flags
             .contains(TonemappingPipelineKeyFlags::TONEMAP_OUTPUT_REC2020)
@@ -364,14 +365,12 @@ impl SpecializedRenderPipeline for TonemappingPipeline {
                 shader_defs.push("TONEMAP_METHOD_GRAN_TURISMO_7".into());
             }
         }
-        let bind_group_layout = if key
-            .flags
-            .contains(TonemappingPipelineKeyFlags::GT7_PARAMS_UNIFORM)
-        {
-            self.gt7_params_bind_group.clone()
-        } else {
-            self.texture_bind_group.clone()
-        };
+        let bind_group_layout = gt7_layout(
+            self,
+            key.flags
+                .contains(TonemappingPipelineKeyFlags::GT7_PARAMS_UNIFORM),
+        )
+        .clone();
 
         RenderPipelineDescriptor {
             label: Some("tonemapping pipeline".into()),
@@ -445,9 +444,9 @@ pub fn init_tonemapping_pipeline(
     });
 }
 
-/// The specialized tonemapping pipeline of a view, plus the
-/// [`TonemappingPipelineKeyFlags`] it was specialized with (which the
-/// tonemapping node uses to bind the matching optional uniforms).
+/// The specialized tonemapping pipeline of a view, plus the resolved values
+/// the tonemapping node needs to run it: the operator the pipeline was
+/// specialized with and whether it binds the per-view GT7 params uniform.
 ///
 /// Present **only** on views that run the tonemapping pass. Views that run
 /// no pass — `Tonemapping::None` opt-outs, the in-shader-tonemap SDR fold
@@ -458,31 +457,63 @@ pub fn init_tonemapping_pipeline(
 #[derive(Component)]
 pub struct ViewTonemappingPipeline {
     pipeline_id: CachedRenderPipelineId,
-    flags: TonemappingPipelineKeyFlags,
+    /// The *resolved* operator ([`resolve_tonemapping`]) the pipeline runs;
+    /// selects the LUT and keys the node's bind-group cache.
+    operator: Tonemapping,
+    /// Whether the pipeline's layout binds the per-view [`Gt7ParamsUniform`]
+    /// ([`TonemappingPipelineKeyFlags::GT7_PARAMS_UNIFORM`]).
+    binds_gt7_params: bool,
 }
 
-impl ViewTonemappingPipeline {
-    /// The bind group layout this view's pipeline was specialized with
-    /// (matching the layout selection in
-    /// [`TonemappingPipeline::specialize`](SpecializedRenderPipeline::specialize)).
-    fn bind_group_layout<'a>(
-        &self,
-        pipeline: &'a TonemappingPipeline,
-    ) -> &'a BindGroupLayoutDescriptor {
-        if self
-            .flags
-            .contains(TonemappingPipelineKeyFlags::GT7_PARAMS_UNIFORM)
-        {
-            &pipeline.gt7_params_bind_group
-        } else {
-            &pipeline.texture_bind_group
-        }
+/// Selects between the two tonemapping bind group layouts: the GT7 variant
+/// with the per-view params uniform at binding 5, or the base layout.
+///
+/// Both [`TonemappingPipeline::specialize`](SpecializedRenderPipeline::specialize)
+/// and the tonemapping node select through this function, so the specialized
+/// pipeline and the node's bind group cannot use different layouts.
+fn gt7_layout(
+    pipeline: &TonemappingPipeline,
+    binds_gt7_params: bool,
+) -> &BindGroupLayoutDescriptor {
+    if binds_gt7_params {
+        &pipeline.gt7_params_bind_group
+    } else {
+        &pipeline.texture_bind_group
     }
 }
 
-/// Resolves the tone-mapping operator a view's pipeline actually runs,
-/// applying the "warn + degrade" substitution table for SDR-only operators
-/// on HDR targets.
+/// A view's resolved tone-mapping decisions ([`resolve_tonemapping`]): the
+/// operator its pipeline actually runs and the color primaries of the pass
+/// output.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ResolvedTonemapping {
+    /// The operator the view's pipeline actually runs: the authored operator,
+    /// or [`Tonemapping::GranTurismo7`] after the SDR-only substitution.
+    pub operator: Tonemapping,
+    /// The color primaries of the tonemapping pass's output for the view —
+    /// and therefore the display-encoding pass's *input* gamut.
+    ///
+    /// [`DisplayGamut::Rec2020`] exactly when [`Self::operator`] is
+    /// [`Tonemapping::GranTurismo7`] and the view's resolved display target
+    /// requests an HDR transfer: in that configuration the tonemapping
+    /// pipeline is specialized with the `TONEMAP_OUTPUT_REC2020` shader def
+    /// ([`TonemappingPipelineKeyFlags::TONEMAP_OUTPUT_REC2020`]) and the GT7
+    /// operator emits its native linear Rec.2020 display-referred output
+    /// without the Rec.709 back-conversion (see `gt7.wgsl`). Every other
+    /// configuration — every SDR view, and every other resolved operator
+    /// under any working color space — emits Rec.709 display-linear
+    /// (Rec.709-fit operators receive a Rec.2020 → Rec.709 conversion at the
+    /// pass entry under the Rec.2020 working space; see
+    /// `tonemapping_shared.wgsl`).
+    pub output_gamut: DisplayGamut,
+}
+
+/// Resolves the tone-mapping decisions a view's pipeline actually runs from
+/// its authored operator and resolved display target, applying the
+/// "warn + degrade" substitution table for SDR-only operators on HDR targets
+/// and deriving the pass's output gamut from the substituted result — one
+/// evaluation, so no caller can pair a substituted operator with an
+/// un-substituted gamut.
 ///
 /// An SDR-only operator ([`Tonemapping::is_sdr_only`]) on a view whose
 /// resolved display target requests an HDR transfer
@@ -501,28 +532,48 @@ impl ViewTonemappingPipeline {
 ///    therefore currently unreachable and their peak-parameterized variants
 ///    are not implemented.
 ///
-/// The substitution applies to render-world *prepared* state only — the
-/// pipeline key ([`prepare_view_tonemapping_pipelines`], which emits the
-/// `warn_once!` naming the substitute), the GT7 params uniform
-/// ([`queue_gt7_params_uniforms`], which uses the camera's
-/// [`GranTurismo7Params`] if present and the defaults otherwise), and the
-/// display encoder's input-gamut contract ([`tonemap_output_gamut`]). The
-/// camera's authored [`Tonemapping`] component is never mutated.
-///
-/// Every other configuration returns the operator unchanged: SDR views
+/// Every other configuration keeps the operator unchanged: SDR views
 /// (including HDR requests downgraded at surface negotiation), HDR views
-/// already using [`Tonemapping::GranTurismo7`], and [`Tonemapping::None`]
-/// (a pass-through, not an SDR-only operator; the display encoder warns
-/// about it separately).
-pub fn effective_tonemapping(
+/// already using [`Tonemapping::GranTurismo7`], [`Tonemapping::Linear`]
+/// (unbounded output), and [`Tonemapping::None`] (a pass-through, not an
+/// SDR-only operator; the display encoder warns about it separately). A
+/// missing operator resolves as [`Tonemapping::None`].
+///
+/// This function is the **single source of truth** for both resolved values.
+/// It has exactly three callers, all reading the same extracted
+/// [`Tonemapping`] component and the same [`ViewDisplayTarget`] prepared in
+/// `PrepareViews`: [`prepare_view_tonemapping_pipelines`] (the pipeline key,
+/// and the `warn_once!` naming the substitute), [`queue_gt7_params_uniforms`]
+/// (the GT7 params uniform, built from the camera's [`GranTurismo7Params`]
+/// if present and the defaults otherwise), and the phase-2 stack resolver
+/// (`resolve_camera_stack_contracts`), which derives the display encoder's
+/// per-view source gamut
+/// ([`ViewStackContract::source_gamut`](crate::camera_stack::ViewStackContract))
+/// from [`ResolvedTonemapping::output_gamut`] — so the tonemapping and
+/// display-encoding pipelines can never disagree about the post-tonemap
+/// buffer's primaries within a frame. The resolution applies to render-world
+/// *prepared* state only; the camera's authored [`Tonemapping`] component is
+/// never mutated. Pass the view's **authored** operator: the substitution is
+/// applied internally so all callers stay in lockstep with the pipeline that
+/// actually runs.
+pub fn resolve_tonemapping(
     tonemapping: Option<&Tonemapping>,
     view_display_target: &ViewDisplayTarget,
-) -> Tonemapping {
-    let tonemapping = *tonemapping.unwrap_or(&Tonemapping::None);
-    if tonemapping.is_sdr_only() && view_display_target.is_hdr_transfer() {
+) -> ResolvedTonemapping {
+    let authored = *tonemapping.unwrap_or(&Tonemapping::None);
+    let is_hdr_transfer = view_display_target.is_hdr_transfer();
+    let operator = if authored.is_sdr_only() && is_hdr_transfer {
         Tonemapping::GranTurismo7
     } else {
-        tonemapping
+        authored
+    };
+    ResolvedTonemapping {
+        operator,
+        output_gamut: if operator == Tonemapping::GranTurismo7 && is_hdr_transfer {
+            DisplayGamut::Rec2020
+        } else {
+            DisplayGamut::Rec709
+        },
     }
 }
 
@@ -535,8 +586,8 @@ pub fn effective_tonemapping(
 /// [`Gt7ParamsUniform`] component, which is what
 /// [`prepare_view_tonemapping_pipelines`] then keys the shader def and layout
 /// selection on. One evaluation, so the pipeline layout and the bound buffer
-/// cannot disagree. A view binds the uniform iff its **effective** operator
-/// ([`effective_tonemapping`]) is [`Tonemapping::GranTurismo7`] and either:
+/// cannot disagree. A view binds the uniform iff its **resolved** operator
+/// ([`resolve_tonemapping`]) is [`Tonemapping::GranTurismo7`] and either:
 ///
 /// * the camera opted in with a [`GranTurismo7Params`] component, or
 /// * the view's resolved display target requests an HDR transfer
@@ -547,72 +598,31 @@ pub fn effective_tonemapping(
 ///   defaults otherwise. This matches the source implementation, which
 ///   initializes HDR mode directly from the target's peak luminance, and
 ///   covers both authored GT7 and substituted views
-///   ([`effective_tonemapping`] only ever substitutes on HDR-transfer
+///   ([`resolve_tonemapping`] only ever substitutes on HDR-transfer
 ///   targets).
 ///
 /// A GT7 view on an SDR target without the component binds nothing and keeps
 /// the shader's baked SDR defaults.
 pub fn gt7_params_uniform_active(
-    effective: Tonemapping,
+    resolved: Tonemapping,
     has_params: bool,
     is_hdr_transfer: bool,
 ) -> bool {
-    effective == Tonemapping::GranTurismo7 && (has_params || is_hdr_transfer)
-}
-
-/// The color primaries of the tonemapping pass's output for a view — and
-/// therefore the display-encoding pass's *input* gamut.
-///
-/// Returns [`DisplayGamut::Rec2020`] exactly when the view's **effective**
-/// operator ([`effective_tonemapping`], i.e. after the SDR-only-operator
-/// substitution) is [`Tonemapping::GranTurismo7`] and its resolved display
-/// target requests an HDR transfer
-/// ([`ViewDisplayTarget::is_hdr_transfer`]): in that configuration the
-/// tonemapping pipeline is specialized with the `TONEMAP_OUTPUT_REC2020`
-/// shader def ([`TonemappingPipelineKeyFlags::TONEMAP_OUTPUT_REC2020`]) and
-/// the GT7 operator emits its native linear Rec.2020 display-referred output
-/// without the Rec.709 back-conversion (see `gt7.wgsl`). Every other
-/// configuration — every SDR view, and every other effective operator under
-/// any working color space — emits Rec.709 display-linear (Rec.709-fit
-/// operators receive a Rec.2020 → Rec.709 conversion at the pass entry under
-/// the Rec.2020 working space; see `tonemapping_shared.wgsl`).
-///
-/// This function is the **single source of truth** for that predicate. It
-/// has exactly two callers: `prepare_view_tonemapping_pipelines` (the def
-/// push, keyed off the view's own authored operator) and the phase-2 stack
-/// resolver
-/// (`resolve_camera_stack_contracts`), which derives the display encoder's
-/// per-view source gamut
-/// ([`ViewStackContract::source_gamut`](crate::camera_stack::ViewStackContract))
-/// from it. Both read the same extracted [`Tonemapping`] component and the
-/// same [`ViewDisplayTarget`] prepared in `PrepareViews`, so the tonemapping
-/// and display-encoding pipelines can never disagree about the post-tonemap
-/// buffer's primaries within a frame. Pass the view's **authored** operator;
-/// the substitution is applied internally so all callers stay in lockstep
-/// with the pipeline that actually runs.
-///
-/// A missing or [`Tonemapping::None`] operator emits Rec.709 (pass-through
-/// views never reach the GT7 wrapper).
-pub fn tonemap_output_gamut(
-    tonemapping: Option<&Tonemapping>,
-    view_display_target: &ViewDisplayTarget,
-) -> DisplayGamut {
-    if effective_tonemapping(tonemapping, view_display_target) == Tonemapping::GranTurismo7
-        && view_display_target.is_hdr_transfer()
-    {
-        DisplayGamut::Rec2020
-    } else {
-        DisplayGamut::Rec709
-    }
+    resolved == Tonemapping::GranTurismo7 && (has_params || is_hdr_transfer)
 }
 
 /// Derives a view's [`TonemappingPipelineKeyFlags`] from its color grading,
 /// resolved compositing space (the phase-1 value carried on the view's
-/// `ViewStackContract`), authored operator, and resolved display target.
+/// `ViewStackContract`), and resolved output gamut.
 ///
 /// `compositing_space` must be the RESOLVED space, never the camera's raw
 /// request: stack members share one main texture, so the decode / re-encode
 /// flags must match the one space the whole stack composites in.
+///
+/// `output_gamut` must be the view's resolved
+/// [`ResolvedTonemapping::output_gamut`], so the def push and the display
+/// encoder's source gamut come from the same [`resolve_tonemapping`]
+/// evaluation.
 ///
 /// `has_gt7_params_uniform` must be the presence of the view's
 /// [`Gt7ParamsUniform`] component, never a re-derivation of
@@ -622,8 +632,7 @@ fn tonemapping_key_flags(
     color_grading: &ColorGrading,
     external_white_balance: bool,
     compositing_space: Option<CompositingSpace>,
-    requested_tonemapping: Tonemapping,
-    view_display_target: &ViewDisplayTarget,
+    output_gamut: DisplayGamut,
     has_gt7_params_uniform: bool,
 ) -> TonemappingPipelineKeyFlags {
     // As an optimization, we omit parts of the shader that are unneeded.
@@ -667,15 +676,14 @@ fn tonemapping_key_flags(
     );
     // GT7 on an HDR-transfer target (authored or substituted) emits
     // its native Rec.2020 output for the display encoder. This def stays
-    // keyed off the view's OWN authored operator — it describes what THIS
-    // view's pass emits. `tonemap_output_gamut` is the single source of
+    // keyed off the view's OWN resolved gamut — it describes what THIS
+    // view's pass emits. `resolve_tonemapping` is the single source of
     // truth shared with the phase-2 stack resolver, which derives the
-    // encoder's source gamut from the same function, so def push and
+    // encoder's source gamut from the same resolution, so def push and
     // encoder key agree whenever the view is its own encode source.
     flags.set(
         TonemappingPipelineKeyFlags::TONEMAP_OUTPUT_REC2020,
-        tonemap_output_gamut(Some(&requested_tonemapping), view_display_target)
-            == DisplayGamut::Rec2020,
+        output_gamut == DisplayGamut::Rec2020,
     );
     flags
 }
@@ -732,11 +740,11 @@ pub fn prepare_view_tonemapping_pipelines(
         let requested_tonemapping = *tonemapping.unwrap_or(&Tonemapping::None);
         // Warn + degrade: an SDR-only operator on an HDR-transfer target
         // is substituted with an HDR-capable operator instead of silently
-        // capping the image at paper white. See `effective_tonemapping` for
+        // capping the image at paper white. See `resolve_tonemapping` for
         // the table; the substitution only ever changes prepared render-world
         // state, never the authored component.
-        let tonemapping = effective_tonemapping(Some(&requested_tonemapping), view_display_target);
-        if tonemapping != requested_tonemapping {
+        let resolved = resolve_tonemapping(tonemapping, view_display_target);
+        if resolved.operator != requested_tonemapping {
             warn_once!(
                 "A camera uses `Tonemapping::{requested_tonemapping:?}`, an SDR-only operator \
                 whose output is capped at paper white, but renders to an HDR display target; \
@@ -754,7 +762,7 @@ pub fn prepare_view_tonemapping_pipelines(
         // cameras present raw Rec.2020 coordinates on a Rec.709-encoded
         // chain, which reads as desaturated. Warn instead of degrading
         // silently.
-        if working_color_space.is_rec2020() && tonemapping == Tonemapping::None {
+        if working_color_space.is_rec2020() && resolved.operator == Tonemapping::None {
             warn_once!(
                 "A camera uses `Tonemapping::None` under `WorkingColorSpace::Rec2020`, so \
                 nothing converts its Rec.2020 working colors back to the display gamut and \
@@ -773,7 +781,7 @@ pub fn prepare_view_tonemapping_pipelines(
         // node's `ViewQuery` from matching a view that stops qualifying
         // (render-world entities are retained) — but only if present, so
         // default SDR views issue no command.
-        let no_pass = tonemapping == Tonemapping::None
+        let no_pass = resolved.operator == Tonemapping::None
             || matches!(
                 view.target_format,
                 TextureFormat::Rgba8UnormSrgb | TextureFormat::Rgba8Unorm
@@ -789,15 +797,14 @@ pub fn prepare_view_tonemapping_pipelines(
             &view.color_grading,
             external_white_balance,
             contract.compositing_space,
-            requested_tonemapping,
-            view_display_target,
+            resolved.output_gamut,
             has_gt7_params_uniform,
         );
 
         let key = TonemappingPipelineKey {
             target_format: view.target_format,
             deband_dither: *dither.unwrap_or(&DebandDither::Disabled),
-            tonemapping,
+            tonemapping: resolved.operator,
             flags,
         };
         let pipeline = pipelines.specialize(&pipeline_cache, &upscaling_pipeline, key);
@@ -811,7 +818,8 @@ pub fn prepare_view_tonemapping_pipelines(
 
         commands.entity(entity).insert(ViewTonemappingPipeline {
             pipeline_id: pipeline,
-            flags,
+            operator: resolved.operator,
+            binds_gt7_params: has_gt7_params_uniform,
         });
     }
 }
@@ -936,19 +944,19 @@ mod tests {
     fn sdr_only_operator_substitution_fires_exactly_for_sdr_only_operators_on_hdr_targets() {
         let hdr = hdr_view_display_target();
         for operator in Tonemapping::ALL {
-            let effective = effective_tonemapping(Some(&operator), &hdr);
+            let resolved = resolve_tonemapping(Some(&operator), &hdr).operator;
             if operator.is_sdr_only() {
                 // SDR-only operator + HDR transfer → GT7 substitute (never
                 // `None`, never an operator capped at paper white).
                 assert_eq!(
-                    effective,
+                    resolved,
                     Tonemapping::GranTurismo7,
                     "expected substitution for {operator:?} on an HDR target"
                 );
             } else {
                 // `None` (pass-through, encoder warns separately), `Linear`
                 // (unbounded output), and GT7 itself pass through unchanged.
-                assert_eq!(effective, operator);
+                assert_eq!(resolved, operator);
             }
         }
     }
@@ -959,22 +967,22 @@ mod tests {
             // Plain SDR target — including an HDR request downgraded at
             // surface negotiation, which resolves to the same value.
             assert_eq!(
-                effective_tonemapping(Some(&operator), &sdr_view_display_target()),
+                resolve_tonemapping(Some(&operator), &sdr_view_display_target()).operator,
                 operator
             );
         }
         // Missing operator is `None` (which is never substituted).
         assert_eq!(
-            effective_tonemapping(None, &hdr_view_display_target()),
+            resolve_tonemapping(None, &hdr_view_display_target()).operator,
             Tonemapping::None
         );
     }
 
     #[test]
-    fn tonemap_output_gamut_matches_the_effective_operator() {
+    fn output_gamut_matches_the_resolved_operator() {
         let hdr = hdr_view_display_target();
         for operator in Tonemapping::ALL {
-            // On HDR targets the effective operator is GT7 for everything
+            // On HDR targets the resolved operator is GT7 for everything
             // except `None` and `Linear` (SDR-only operators are substituted,
             // GT7 is authored), so those two are the only Rec.709 outputs.
             let expected = if matches!(operator, Tonemapping::None | Tonemapping::Linear) {
@@ -983,13 +991,13 @@ mod tests {
                 DisplayGamut::Rec2020
             };
             assert_eq!(
-                tonemap_output_gamut(Some(&operator), &hdr),
+                resolve_tonemapping(Some(&operator), &hdr).output_gamut,
                 expected,
                 "output gamut mismatch for {operator:?} on an HDR target"
             );
             // SDR targets (downgraded requests included) are always Rec.709.
             assert_eq!(
-                tonemap_output_gamut(Some(&operator), &sdr_view_display_target()),
+                resolve_tonemapping(Some(&operator), &sdr_view_display_target()).output_gamut,
                 DisplayGamut::Rec709
             );
         }
@@ -1017,12 +1025,12 @@ mod tests {
             if !operator.is_sdr_only() {
                 continue;
             }
-            let effective = effective_tonemapping(Some(&operator), &hdr);
-            assert!(gt7_params_uniform_active(effective, false, true));
-            assert!(gt7_params_uniform_active(effective, true, true));
+            let resolved = resolve_tonemapping(Some(&operator), &hdr).operator;
+            assert!(gt7_params_uniform_active(resolved, false, true));
+            assert!(gt7_params_uniform_active(resolved, true, true));
         }
 
-        // Non-GT7 effective operators never bind it, params or not.
+        // Non-GT7 resolved operators never bind it, params or not.
         for operator in Tonemapping::ALL {
             if operator == gt7 {
                 continue;
@@ -1038,12 +1046,12 @@ mod tests {
     #[test]
     fn solo_sdr_default_keys_empty_flags() {
         for operator in Tonemapping::ALL {
+            let resolved = resolve_tonemapping(Some(&operator), &sdr_view_display_target());
             let flags = tonemapping_key_flags(
                 &ColorGrading::default(),
                 false,
                 None,
-                operator,
-                &sdr_view_display_target(),
+                resolved.output_gamut,
                 false,
             );
             assert_eq!(
@@ -1063,8 +1071,7 @@ mod tests {
                 &ColorGrading::default(),
                 false,
                 space,
-                Tonemapping::None,
-                &sdr_view_display_target(),
+                DisplayGamut::Rec709,
                 false,
             )
         };

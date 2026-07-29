@@ -43,8 +43,10 @@ let space = contract.compositing_space;
 
 `encoder_input_gamut` is removed from `bevy_core_pipeline::display_encoding`. The
 encoder's source gamut now comes from `ViewStackContract::source_gamut`.
-`tonemap_output_gamut` remains the single source of truth for an operator's output
-gamut.
+`bevy_core_pipeline::tonemapping::resolve_tonemapping` is the single source of
+truth for an operator's output gamut (`ResolvedTonemapping::output_gamut`); it
+replaces the separate `effective_tonemapping` and `tonemap_output_gamut`
+functions, resolving the substituted operator and its output gamut together.
 
 `SortedCamera::hdr` is removed: cameras sort by `(order, target)`, and their
 per-target stacking index keys on the target alone. Read `ExtractedCamera::hdr`
