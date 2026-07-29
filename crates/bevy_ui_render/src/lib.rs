@@ -1137,6 +1137,11 @@ pub struct CachedUiViewData {
     extracted_view_entity: Entity,
     /// The unique, stable identifier for the view across frames.
     retained_view_entity: RetainedViewEntity,
+    /// The main-pass texture format the view was last extracted with.
+    ///
+    /// The UI pipelines are specialized on this format, so a cached view must
+    /// be re-extracted whenever it changes, even if the camera itself didn't.
+    target_format: TextureFormat,
 }
 
 /// Extracts all UI elements associated with a camera into the render world.
@@ -1215,8 +1220,17 @@ pub fn extract_ui_camera_view(
             cameras_updated_this_frame.insert(main_entity);
             transparent_render_phases.prepare_for_new_frame(retained_view_entity);
 
-            // If the camera hasn't changed, we're done.
-            if !changed_cameras.contains(&main_entity) {
+            // If the camera hasn't changed and its main-pass texture format is
+            // the same, we're done. The format can flip without any of the
+            // watched components changing (for example, when a post-processing
+            // component that requires a scene-linear target is added, or when
+            // a second camera starts rendering to the same target), so it is
+            // compared directly.
+            if !changed_cameras.contains(&main_entity)
+                && cached_ui_view_data
+                    .get(&main_entity)
+                    .is_some_and(|cached| cached.target_format == target_format)
+            {
                 continue;
             }
 
@@ -1277,6 +1291,7 @@ pub fn extract_ui_camera_view(
                 CachedUiViewData {
                     extracted_view_entity: ui_camera_view,
                     retained_view_entity,
+                    target_format,
                 },
             );
             continue;
