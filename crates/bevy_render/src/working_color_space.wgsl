@@ -3,10 +3,11 @@
 // Bevy's scene-referred working color space is linear Rec.709 by default and
 // linear Rec.2020 when `WorkingColorSpace::Rec2020` is configured on
 // `RenderPlugin` (see `bevy_render::working_color_space` on the Rust side).
-// When the working space is Rec.2020, working-space-aware pipelines receive
-// the `WORKING_COLOR_SPACE_REC2020` shader def; call sites are expected to
-// gate their use of these helpers behind that def so that default (Rec.709)
-// projects compose byte-identically to shaders that predate this module.
+// When the working space is Rec.2020, every shader receives the
+// `WORKING_COLOR_SPACE_REC2020` def globally (via the pipeline cache); call
+// sites are expected to gate their use of these helpers behind that def so
+// that default (Rec.709) projects compose byte-identically to shaders that
+// predate this module.
 //
 // The matrices below are not gated by that def: the display-encoding pass
 // imports all four for its gamut stage, which is keyed by the display target

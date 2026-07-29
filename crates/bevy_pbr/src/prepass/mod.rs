@@ -42,7 +42,6 @@ use bevy_render::{
         ExtractedView, Msaa, RenderVisibilityRanges, RenderVisibleEntities, RetainedViewEntity,
         ViewUniform, ViewUniformOffset, ViewUniforms, VISIBILITY_RANGES_STORAGE_BUFFER_COUNT,
     },
-    working_color_space::{WorkingColorSpace, WORKING_COLOR_SPACE_REC2020_SHADER_DEF},
     Extract, ExtractSchedule, GpuResourceAppExt, Render, RenderApp, RenderDebugFlags,
     RenderStartup, RenderSystems,
 };
@@ -271,13 +270,6 @@ pub struct PrepassPipeline {
     /// current render device.
     pub binding_arrays_are_usable: bool,
     pub material_pipeline: MaterialPipeline,
-
-    /// The project-global working color space, captured at `RenderStartup`.
-    /// See `MeshPipeline::working_color_space`; the prepass needs the same
-    /// `WORKING_COLOR_SPACE_REC2020` def because the deferred G-buffer path
-    /// composes material colors (which convert into the working space) in
-    /// prepass pipelines.
-    pub working_color_space: WorkingColorSpace,
 }
 
 pub fn init_prepass_pipeline(
@@ -287,7 +279,6 @@ pub fn init_prepass_pipeline(
     mesh_pipeline: Res<MeshPipeline>,
     material_pipeline: Res<MaterialPipeline>,
     asset_server: Res<AssetServer>,
-    working_color_space: Res<WorkingColorSpace>,
 ) {
     let visibility_ranges_buffer_binding_type =
         render_device.get_supported_read_only_binding_type(VISIBILITY_RANGES_STORAGE_BUFFER_COUNT);
@@ -356,7 +347,6 @@ pub fn init_prepass_pipeline(
         binding_arrays_are_usable: binding_arrays_are_usable(&render_device, &render_adapter),
         empty_layout: BindGroupLayoutDescriptor::new("prepass_empty_layout", &[]),
         material_pipeline: material_pipeline.clone(),
-        working_color_space: *working_color_space,
     });
 }
 
@@ -429,13 +419,6 @@ impl PrepassPipeline {
         // (PBR code will use this to detect that it's running in deferred mode,
         // since that's the only time it gets called from a prepass pipeline.)
         shader_defs.push("PREPASS_PIPELINE".into());
-
-        // Project-global working-space axis: pushed for every specialization
-        // when (and only when) the app opted into the Rec.2020 working
-        // space, so default projects compose byte-identically.
-        if self.working_color_space.is_rec2020() {
-            shader_defs.push(WORKING_COLOR_SPACE_REC2020_SHADER_DEF.into());
-        }
 
         shader_defs.push(ShaderDefVal::UInt(
             "MATERIAL_BIND_GROUP".into(),

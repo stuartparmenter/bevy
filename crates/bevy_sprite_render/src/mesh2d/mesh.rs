@@ -9,7 +9,7 @@ use bevy_render::{
     },
     mesh::{allocator::MeshSlabId, MeshMetadata, MeshMetadataFallbackBuffer},
     render_resource::binding_types::{storage_buffer_read_only, uniform_buffer_sized},
-    working_color_space::{WorkingColorSpace, WORKING_COLOR_SPACE_REC2020_SHADER_DEF},
+    working_color_space::WorkingColorSpace,
     RenderStartup,
 };
 use bevy_shader::{load_shader_library, Shader, ShaderDefVal, ShaderSettings};
@@ -353,9 +353,8 @@ pub struct Mesh2dPipeline {
     /// The project-global working color space, captured at `RenderStartup`.
     /// Under `WorkingColorSpace::Rec2020` the 2D mesh / material fragment
     /// shaders convert their composed colors into the working space
-    /// (`OUTPUT_GAMUT_REC2020` writer-encode def, plus the shared
-    /// `WORKING_COLOR_SPACE_REC2020` def for the in-shader tonemapping fold;
-    /// both inherited by `Material2d` pipelines).
+    /// (`OUTPUT_GAMUT_REC2020` writer-encode def, inherited by `Material2d`
+    /// pipelines).
     pub working_color_space: WorkingColorSpace,
 }
 
@@ -640,14 +639,11 @@ impl SpecializedMeshPipeline for Mesh2dPipeline {
         let mut shader_defs = Vec::new();
         let mut vertex_attributes = Vec::new();
 
-        // Project-global working-space axis: pushed for every specialization
-        // when (and only when) the app opted into the Rec.2020 working
-        // space, so default projects compose byte-identically. Two defs: the
-        // working-space def feeds the in-shader tonemapping fold's entry
-        // conversion, the writer-encode gamut def converts the composed
+        // Pushed for every specialization when (and only when) the app opted
+        // into the Rec.2020 working space, so default projects compose
+        // byte-identically: the writer-encode gamut def converts the composed
         // mesh/material color into the buffer's Rec.2020 primaries.
         if self.working_color_space.is_rec2020() {
-            shader_defs.push(WORKING_COLOR_SPACE_REC2020_SHADER_DEF.into());
             shader_defs.push("OUTPUT_GAMUT_REC2020".into());
         }
 

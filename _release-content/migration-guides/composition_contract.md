@@ -62,10 +62,10 @@ WGSL helper now implements the encode:
   `CompositingSpace`.
 - The gamut-convert def in writer shaders is now `OUTPUT_GAMUT_REC2020` ("the
   buffer I write into has Rec.2020 primaries"). `WORKING_COLOR_SPACE_REC2020`
-  keeps its project-global meaning and is still pushed wherever a pipeline
-  consumes the working-space axis (PBR, skybox, tone mapping, and the 2D
-  pipelines' in-shader tonemapping fold); UI previously pushed that name with
-  a different, per-view meaning, which the split removes.
+  keeps its project-global meaning and is registered as a global shader def on
+  the `PipelineCache`, visible to every shader without per-pipeline pushes; UI
+  previously pushed that name with a different, per-view meaning, which the
+  split removes.
 
 A custom `Material2d` or UI shader that read the old defs should switch to the
 new names — or import `bevy_render::writer_encode::writer_encode` and call it

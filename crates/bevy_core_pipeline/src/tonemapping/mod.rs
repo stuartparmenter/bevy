@@ -19,7 +19,7 @@ use bevy_render::{
     renderer::RenderDevice,
     texture::{FallbackImage, GpuImage},
     view::{ColorGrading, ExtractedView, ViewDisplayTarget, ViewTarget, ViewUniform},
-    working_color_space::{WorkingColorSpace, WORKING_COLOR_SPACE_REC2020_SHADER_DEF},
+    working_color_space::WorkingColorSpace,
     GpuResourceAppExt, Render, RenderApp, RenderStartup, RenderSystems,
 };
 use bevy_shader::{load_shader_library, Shader, ShaderDefVal};
@@ -151,17 +151,6 @@ pub struct TonemappingPipeline {
     sampler: Sampler,
     fullscreen_shader: FullscreenShader,
     fragment_shader: Handle<Shader>,
-    /// The project-global working color space, captured at `RenderStartup`.
-    ///
-    /// When this is [`WorkingColorSpace::Rec2020`], every specialization
-    /// receives the `WORKING_COLOR_SPACE_REC2020` shader def (the tone
-    /// mapping pass consumes Rec.2020 scene-linear input); when it is the
-    /// default [`WorkingColorSpace::Rec709`], no def is pushed and every
-    /// pipeline composes with no working-space defs. This is deliberately NOT
-    /// part of
-    /// [`TonemappingPipelineKey`]: the working space is immutable for the
-    /// lifetime of the app, so it cannot change a cached pipeline's meaning.
-    working_color_space: WorkingColorSpace,
 }
 
 /// Render-world marker component: the view's white-balance matrix
@@ -258,13 +247,6 @@ impl SpecializedRenderPipeline for TonemappingPipeline {
 
     fn specialize(&self, key: Self::Key) -> RenderPipelineDescriptor {
         let mut shader_defs = Vec::new();
-
-        // Project-global working-space axis: pushed for every specialization
-        // when (and only when) the app opted into the Rec.2020 working
-        // space, so default projects compose with no working-space defs.
-        if self.working_color_space.is_rec2020() {
-            shader_defs.push(WORKING_COLOR_SPACE_REC2020_SHADER_DEF.into());
-        }
 
         shader_defs.push(ShaderDefVal::UInt(
             "TONEMAPPING_LUT_TEXTURE_BINDING_INDEX".into(),
@@ -422,7 +404,6 @@ pub fn init_tonemapping_pipeline(
     render_device: Res<RenderDevice>,
     fullscreen_shader: Res<FullscreenShader>,
     asset_server: Res<AssetServer>,
-    working_color_space: Res<WorkingColorSpace>,
 ) {
     let mut entries = DynamicBindGroupLayoutEntries::new_with_indices(
         ShaderStages::FRAGMENT,
@@ -461,7 +442,6 @@ pub fn init_tonemapping_pipeline(
         sampler,
         fullscreen_shader: fullscreen_shader.clone(),
         fragment_shader: load_embedded_asset!(asset_server.as_ref(), "tonemapping.wgsl"),
-        working_color_space: *working_color_space,
     });
 }
 

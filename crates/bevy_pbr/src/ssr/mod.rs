@@ -38,7 +38,6 @@ use bevy_render::{
     sync_component::SyncComponent,
     texture::GpuImage,
     view::{ExtractedView, ViewTarget},
-    working_color_space::{WorkingColorSpace, WORKING_COLOR_SPACE_REC2020_SHADER_DEF},
     GpuResourceAppExt, Render, RenderApp, RenderStartup, RenderSystems,
 };
 use bevy_shader::{load_shader_library, Shader};
@@ -173,11 +172,6 @@ pub struct ScreenSpaceReflectionsPipeline {
     binding_arrays_are_usable: bool,
     fullscreen_shader: FullscreenShader,
     fragment_shader: Handle<Shader>,
-    /// The project-global working color space, captured at `RenderStartup`.
-    /// When it is Rec.2020, the environment-map fallback's sampled radiance
-    /// must be converted into the working space, exactly as the mesh and
-    /// deferred-lighting pipelines convert it.
-    working_color_space: WorkingColorSpace,
 }
 
 /// A GPU buffer that stores the screen space reflection settings for each view.
@@ -332,7 +326,6 @@ pub fn init_screen_space_reflections_pipeline(
     mesh_view_layouts: Res<MeshPipelineViewLayouts>,
     fullscreen_shader: Res<FullscreenShader>,
     asset_server: Res<AssetServer>,
-    working_color_space: Res<WorkingColorSpace>,
 ) {
     // Create the bind group layout.
     let bind_group_layout = BindGroupLayoutDescriptor::new(
@@ -389,7 +382,6 @@ pub fn init_screen_space_reflections_pipeline(
         // Even though ssr was loaded using load_shader_library, we can still access it like a
         // normal embedded asset (so we can use it as both a library or a kernel).
         fragment_shader: load_embedded_asset!(asset_server.as_ref(), "ssr.wgsl"),
-        working_color_space: *working_color_space,
     });
 }
 
@@ -497,10 +489,6 @@ impl SpecializedRenderPipeline for ScreenSpaceReflectionsPipeline {
             "DEFERRED_PREPASS".into(),
             "SCREEN_SPACE_REFLECTIONS".into(),
         ];
-
-        if self.working_color_space.is_rec2020() {
-            shader_defs.push(WORKING_COLOR_SPACE_REC2020_SHADER_DEF.into());
-        }
 
         if key
             .mesh_pipeline_view_key

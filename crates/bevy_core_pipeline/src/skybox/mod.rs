@@ -23,10 +23,9 @@ use bevy_render::{
     sync_world::RenderEntity,
     texture::GpuImage,
     view::{ExtractedView, Msaa, ViewUniform, ViewUniforms},
-    working_color_space::{WorkingColorSpace, WORKING_COLOR_SPACE_REC2020_SHADER_DEF},
     Extract, ExtractSchedule, GpuResourceAppExt, Render, RenderApp, RenderStartup, RenderSystems,
 };
-use bevy_shader::{Shader, ShaderDefVal};
+use bevy_shader::Shader;
 use bevy_transform::components::Transform;
 use bevy_utils::default;
 
@@ -109,15 +108,10 @@ pub struct SkyboxUniforms {
 struct SkyboxPipeline {
     bind_group_layout: BindGroupLayoutDescriptor,
     shader: Handle<Shader>,
-    /// The project-global working color space, captured at `RenderStartup`.
-    /// Skybox cubemaps are assumed Rec.709-authored; under the Rec.2020
-    /// working space the fragment shader converts samples into the working
-    /// space (`WORKING_COLOR_SPACE_REC2020` shader def).
-    working_color_space: WorkingColorSpace,
 }
 
 impl SkyboxPipeline {
-    fn new(shader: Handle<Shader>, working_color_space: WorkingColorSpace) -> Self {
+    fn new(shader: Handle<Shader>) -> Self {
         Self {
             bind_group_layout: BindGroupLayoutDescriptor::new(
                 "skybox_bind_group_layout",
@@ -133,18 +127,13 @@ impl SkyboxPipeline {
                 ),
             ),
             shader,
-            working_color_space,
         }
     }
 }
 
-fn init_skybox_pipeline(
-    mut commands: Commands,
-    asset_server: Res<AssetServer>,
-    working_color_space: Res<WorkingColorSpace>,
-) {
+fn init_skybox_pipeline(mut commands: Commands, asset_server: Res<AssetServer>) {
     let shader = load_embedded_asset!(asset_server.as_ref(), "skybox.wgsl");
-    commands.insert_resource(SkyboxPipeline::new(shader, *working_color_space));
+    commands.insert_resource(SkyboxPipeline::new(shader));
 }
 
 #[derive(PartialEq, Eq, Hash, Clone, Copy)]
@@ -158,13 +147,6 @@ impl SpecializedRenderPipeline for SkyboxPipeline {
     type Key = SkyboxPipelineKey;
 
     fn specialize(&self, key: Self::Key) -> RenderPipelineDescriptor {
-        // Empty for the default Rec.709 working space, so default projects
-        // compose byte-identically.
-        let shader_defs: Vec<ShaderDefVal> = if self.working_color_space.is_rec2020() {
-            vec![WORKING_COLOR_SPACE_REC2020_SHADER_DEF.into()]
-        } else {
-            Vec::new()
-        };
         RenderPipelineDescriptor {
             label: Some("skybox_pipeline".into()),
             layout: vec![self.bind_group_layout.clone()],
@@ -195,7 +177,6 @@ impl SpecializedRenderPipeline for SkyboxPipeline {
             },
             fragment: Some(FragmentState {
                 shader: self.shader.clone(),
-                shader_defs,
                 targets: vec![Some(ColorTargetState {
                     format: key.target_format,
                     // BlendState::REPLACE is not needed here, and None will be potentially much faster in some cases.

@@ -206,18 +206,6 @@ impl SpecializedRenderPipeline for DeferredLightingLayout {
         // Let the shader code know that it's running in a deferred pipeline.
         shader_defs.push("DEFERRED_LIGHTING_PIPELINE".into());
 
-        // Project-global working-space axis (mirrors `MeshPipeline`): the
-        // deferred lighting pass samples environment maps, which convert
-        // into the working space under this def. Material colors in the
-        // G-buffer were already converted by the (prepass) material
-        // pipelines, so there is no double conversion here. Not pushed for
-        // the default Rec.709 working space.
-        if self.mesh_pipeline.working_color_space.is_rec2020() {
-            shader_defs.push(
-                bevy_render::working_color_space::WORKING_COLOR_SPACE_REC2020_SHADER_DEF.into(),
-            );
-        }
-
         #[cfg(all(feature = "webgl", target_arch = "wasm32", not(feature = "webgpu")))]
         shader_defs.push("WEBGL2".into());
 

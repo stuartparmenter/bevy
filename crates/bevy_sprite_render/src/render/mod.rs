@@ -42,7 +42,7 @@ use bevy_render::{
         texture_format_from_code, texture_format_to_code, ExtractedView, Msaa, ViewUniform,
         ViewUniformOffset, ViewUniforms,
     },
-    working_color_space::{WorkingColorSpace, WORKING_COLOR_SPACE_REC2020_SHADER_DEF},
+    working_color_space::WorkingColorSpace,
     Extract,
 };
 use bevy_shader::{Shader, ShaderDefVal};
@@ -60,9 +60,7 @@ pub struct SpritePipeline {
     /// The project-global working color space, captured at `RenderStartup`.
     /// Under `WorkingColorSpace::Rec2020` the sprite fragment shader
     /// converts its composed color (instance tint × texture sample) into the
-    /// working space (`OUTPUT_GAMUT_REC2020` writer-encode def, plus the
-    /// shared `WORKING_COLOR_SPACE_REC2020` def for the in-shader
-    /// tonemapping fold).
+    /// working space (`OUTPUT_GAMUT_REC2020` writer-encode def).
     working_color_space: WorkingColorSpace,
 }
 
@@ -213,14 +211,11 @@ impl SpecializedRenderPipeline for SpritePipeline {
     fn specialize(&self, key: Self::Key) -> RenderPipelineDescriptor {
         let mut shader_defs = Vec::new();
 
-        // Project-global working-space axis: pushed for every specialization
-        // when (and only when) the app opted into the Rec.2020 working
-        // space, so default projects compose byte-identically. Two defs: the
-        // working-space def feeds the in-shader tonemapping fold's entry
-        // conversion, the writer-encode gamut def converts the composed
+        // Pushed for every specialization when (and only when) the app opted
+        // into the Rec.2020 working space, so default projects compose
+        // byte-identically: the writer-encode gamut def converts the composed
         // sprite color into the buffer's Rec.2020 primaries.
         if self.working_color_space.is_rec2020() {
-            shader_defs.push(WORKING_COLOR_SPACE_REC2020_SHADER_DEF.into());
             shader_defs.push("OUTPUT_GAMUT_REC2020".into());
         }
 

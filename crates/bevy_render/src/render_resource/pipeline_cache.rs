@@ -7,6 +7,7 @@ use smallvec::SmallVec;
 use crate::{
     render_resource::*,
     renderer::{RenderAdapter, RenderDevice, WgpuWrapper},
+    working_color_space::{WorkingColorSpace, WORKING_COLOR_SPACE_REC2020_SHADER_DEF},
     Extract,
 };
 use alloc::{borrow::Cow, sync::Arc};
@@ -241,6 +242,7 @@ impl PipelineCache {
     pub fn new(
         device: RenderDevice,
         render_adapter: RenderAdapter,
+        working_color_space: WorkingColorSpace,
         synchronous_pipeline_compilation: bool,
     ) -> Self {
         let mut global_shader_defs = Vec::new();
@@ -259,6 +261,12 @@ impl PipelineCache {
             "AVAILABLE_STORAGE_BUFFER_BINDINGS".into(),
             device.limits().max_storage_buffers_per_shader_stage,
         ));
+
+        // Project-global working-space axis. Not registered for the default
+        // Rec.709 working space, so default projects compose byte-identically.
+        if working_color_space.is_rec2020() {
+            global_shader_defs.push(WORKING_COLOR_SPACE_REC2020_SHADER_DEF.into());
+        }
 
         Self {
             shader_cache: Arc::new(Mutex::new(ShaderCache::new(

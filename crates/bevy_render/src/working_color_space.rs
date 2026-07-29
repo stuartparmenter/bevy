@@ -10,8 +10,8 @@
 //!
 //! The working color space is configured on
 //! [`RenderPlugin`](crate::RenderPlugin) and is **immutable after the app is
-//! built**: render pipelines are specialized against it exactly once, so
-//! mutating the extracted resource at runtime has no effect.
+//! built**: the shader-side def is registered globally when the renderer
+//! initializes, so mutating the extracted resource at runtime has no effect.
 //!
 //! See the `WORKING_COLOR_SPACE_REC2020` shader def
 //! ([`WORKING_COLOR_SPACE_REC2020_SHADER_DEF`]) and the WGSL helper library
@@ -23,11 +23,13 @@ use bevy_ecs::{reflect::ReflectResource, resource::Resource};
 use bevy_math::{Mat3, Vec3, Vec4};
 use bevy_reflect::{prelude::ReflectDefault, Reflect};
 
-/// The name of the shader def pushed into every working-space-aware render
-/// pipeline when the [`WorkingColorSpace`] is [`WorkingColorSpace::Rec2020`].
+/// The name of the shader def registered as a global shader def on the
+/// [`PipelineCache`](crate::render_resource::PipelineCache) when the
+/// [`WorkingColorSpace`] is [`WorkingColorSpace::Rec2020`], making it visible
+/// to every shader without per-pipeline plumbing.
 ///
 /// When the working color space is [`WorkingColorSpace::Rec709`] (the
-/// default), the def is *not* pushed and every shader composes with no
+/// default), the def is *not* registered and every shader composes with no
 /// working-space def.
 pub const WORKING_COLOR_SPACE_REC2020_SHADER_DEF: &str = "WORKING_COLOR_SPACE_REC2020";
 

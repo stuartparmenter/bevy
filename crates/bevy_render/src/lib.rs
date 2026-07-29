@@ -139,7 +139,7 @@ pub struct RenderPlugin {
     /// conversions are identities. This is a project-global axis read
     /// exactly once, when the plugin builds: changing the extracted
     /// [`WorkingColorSpace`] resource at runtime has no effect, because
-    /// render pipelines are specialized against it at startup.
+    /// the shader def is registered globally when the renderer initializes.
     ///
     /// See [`working_color_space`] for the full semantics of
     /// [`WorkingColorSpace::Rec2020`].
