@@ -37,9 +37,3 @@ Quantization methods (`ColorToPacked::to_u8_array` and friends) still clamp to `
 
 To force colors into SDR range, clamp explicitly, e.g.
 `LinearRgba { red: c.red.clamp(0., 1.), .. }`, or convert through `ColorToPacked`.
-
-## Oklab conversion constants at full precision
-
-The `Oklaba` ↔ `LinearRgba` conversion matrices now use the full-precision constants from the
-reference Oklab implementation instead of truncated literals. Results may differ by about one
-`f32` ULP (~1e-7); exact float comparisons against stored Oklab values may need a small tolerance.

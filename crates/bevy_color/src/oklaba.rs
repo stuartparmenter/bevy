@@ -234,10 +234,6 @@ impl From<Oklaba> for wgpu_types::Color {
 }
 
 impl From<LinearRgba> for Oklaba {
-    #[expect(
-        clippy::excessive_precision,
-        reason = "the constants are kept at the reference implementation's full precision (matching the WGSL duplicates in `bevy_render::color_operations`); the compiler rounds them to the nearest `f32`"
-    )]
     fn from(value: LinearRgba) -> Self {
         let LinearRgba {
             red,
@@ -246,26 +242,21 @@ impl From<LinearRgba> for Oklaba {
             alpha,
         } = value;
         // From https://bottosson.github.io/posts/oklab/#converting-from-linear-srgb-to-oklab
-        // Full-precision constants from the reference implementation; they exceed
-        // `f32` precision and are rounded to the nearest `f32` by the compiler.
-        let l = 0.4122214708 * red + 0.5363325363 * green + 0.0514459929 * blue;
-        let m = 0.2119034982 * red + 0.6806995451 * green + 0.1073969566 * blue;
-        let s = 0.0883024619 * red + 0.2817188376 * green + 0.6299787005 * blue;
+        // Float literals are truncated to avoid excessive precision.
+        let l = 0.41222146 * red + 0.53633255 * green + 0.051445995 * blue;
+        let m = 0.2119035 * red + 0.6806995 * green + 0.10739696 * blue;
+        let s = 0.08830246 * red + 0.28171885 * green + 0.6299787 * blue;
         let l_ = libm_cbrtf(l);
         let m_ = libm_cbrtf(m);
         let s_ = libm_cbrtf(s);
-        let l = 0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_;
-        let a = 1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_;
-        let b = 0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_;
+        let l = 0.21045426 * l_ + 0.7936178 * m_ - 0.004072047 * s_;
+        let a = 1.9779985 * l_ - 2.4285922 * m_ + 0.4505937 * s_;
+        let b = 0.025904037 * l_ + 0.78277177 * m_ - 0.80867577 * s_;
         Oklaba::new(l, a, b, alpha)
     }
 }
 
 impl From<Oklaba> for LinearRgba {
-    #[expect(
-        clippy::excessive_precision,
-        reason = "the constants are kept at the reference implementation's full precision (matching the WGSL duplicates in `bevy_render::color_operations`); the compiler rounds them to the nearest `f32`"
-    )]
     fn from(value: Oklaba) -> Self {
         let Oklaba {
             lightness,
@@ -275,19 +266,18 @@ impl From<Oklaba> for LinearRgba {
         } = value;
 
         // From https://bottosson.github.io/posts/oklab/#converting-from-linear-srgb-to-oklab
-        // Full-precision constants from the reference implementation; they exceed
-        // `f32` precision and are rounded to the nearest `f32` by the compiler.
-        let l_ = lightness + 0.3963377774 * a + 0.2158037573 * b;
-        let m_ = lightness - 0.1055613458 * a - 0.0638541728 * b;
-        let s_ = lightness - 0.0894841775 * a - 1.2914855480 * b;
+        // Float literals are truncated to avoid excessive precision.
+        let l_ = lightness + 0.39633778 * a + 0.21580376 * b;
+        let m_ = lightness - 0.105561346 * a - 0.06385417 * b;
+        let s_ = lightness - 0.08948418 * a - 1.2914855 * b;
 
         let l = l_ * l_ * l_;
         let m = m_ * m_ * m_;
         let s = s_ * s_ * s_;
 
-        let red = 4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s;
-        let green = -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s;
-        let blue = -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s;
+        let red = 4.0767417 * l - 3.3077116 * m + 0.23096994 * s;
+        let green = -1.268438 * l + 2.6097574 * m - 0.34131938 * s;
+        let blue = -0.0041960863 * l - 0.7034186 * m + 1.7076147 * s;
 
         Self {
             red,
