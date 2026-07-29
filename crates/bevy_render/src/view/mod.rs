@@ -383,6 +383,40 @@ pub enum Tonemapping {
 }
 
 impl Tonemapping {
+    /// Every operator, in declaration order, for exhaustive table tests.
+    ///
+    /// The `match` ties this array to the enum: adding a variant fails to
+    /// compile here until the new arm — and a matching array entry, with the
+    /// length bumped — is added.
+    pub const ALL: [Self; 11] = {
+        match Self::None {
+            Self::None
+            | Self::Linear
+            | Self::Reinhard
+            | Self::ReinhardLuminance
+            | Self::AcesFitted
+            | Self::AgX
+            | Self::SomewhatBoringDisplayTransform
+            | Self::TonyMcMapface
+            | Self::BlenderFilmic
+            | Self::KhronosPbrNeutral
+            | Self::GranTurismo7 => {}
+        }
+        [
+            Self::None,
+            Self::Linear,
+            Self::Reinhard,
+            Self::ReinhardLuminance,
+            Self::AcesFitted,
+            Self::AgX,
+            Self::SomewhatBoringDisplayTransform,
+            Self::TonyMcMapface,
+            Self::BlenderFilmic,
+            Self::KhronosPbrNeutral,
+            Self::GranTurismo7,
+        ]
+    };
+
     pub fn is_enabled(&self) -> bool {
         *self != Tonemapping::None
     }

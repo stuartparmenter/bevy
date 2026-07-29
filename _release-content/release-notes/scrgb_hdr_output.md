@@ -64,7 +64,7 @@ panel. Press `O` in the `tonemapping` example (cycles sRGB → scRGB →
 extended-sRGB 709/P3 → PQ) or `T` in the `hdr_calibration` example to try it
 on an HDR-capable display.
 
-SDR-only tone-mapping operators — everything except `GranTurismo7` and `None`,
+SDR-only tone-mapping operators — everything except `GranTurismo7`, `Linear`, and `None`,
 including the `Camera3d` default `TonyMcMapface` — cap their output at paper
 white, leaving an HDR display's headroom unused. A camera using one on an
 HDR-transfer target therefore degrades gracefully instead of silently

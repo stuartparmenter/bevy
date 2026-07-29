@@ -904,19 +904,6 @@ mod tests {
     use super::*;
     use bevy_window::{DisplayTarget, DisplayTransfer};
 
-    const ALL_OPERATORS: [Tonemapping; 10] = [
-        Tonemapping::None,
-        Tonemapping::Reinhard,
-        Tonemapping::ReinhardLuminance,
-        Tonemapping::AcesFitted,
-        Tonemapping::AgX,
-        Tonemapping::SomewhatBoringDisplayTransform,
-        Tonemapping::TonyMcMapface,
-        Tonemapping::BlenderFilmic,
-        Tonemapping::KhronosPbrNeutral,
-        Tonemapping::GranTurismo7,
-    ];
-
     fn hdr_view_display_target() -> ViewDisplayTarget {
         ViewDisplayTarget(DisplayTarget {
             paper_white_nits: 200.0,
@@ -931,9 +918,12 @@ mod tests {
     }
 
     #[test]
-    fn sdr_only_excludes_exactly_none_and_gran_turismo_7() {
-        for operator in ALL_OPERATORS {
-            let expected = !matches!(operator, Tonemapping::None | Tonemapping::GranTurismo7);
+    fn sdr_only_excludes_exactly_none_linear_and_gran_turismo_7() {
+        for operator in Tonemapping::ALL {
+            let expected = !matches!(
+                operator,
+                Tonemapping::None | Tonemapping::Linear | Tonemapping::GranTurismo7
+            );
             assert_eq!(
                 operator.is_sdr_only(),
                 expected,
@@ -945,7 +935,7 @@ mod tests {
     #[test]
     fn sdr_only_operator_substitution_fires_exactly_for_sdr_only_operators_on_hdr_targets() {
         let hdr = hdr_view_display_target();
-        for operator in ALL_OPERATORS {
+        for operator in Tonemapping::ALL {
             let effective = effective_tonemapping(Some(&operator), &hdr);
             if operator.is_sdr_only() {
                 // SDR-only operator + HDR transfer → GT7 substitute (never
@@ -956,8 +946,8 @@ mod tests {
                     "expected substitution for {operator:?} on an HDR target"
                 );
             } else {
-                // `None` (pass-through, encoder warns separately) and GT7
-                // itself pass through unchanged.
+                // `None` (pass-through, encoder warns separately), `Linear`
+                // (unbounded output), and GT7 itself pass through unchanged.
                 assert_eq!(effective, operator);
             }
         }
@@ -965,7 +955,7 @@ mod tests {
 
     #[test]
     fn sdr_only_operator_substitution_never_fires_off_hdr_targets() {
-        for operator in ALL_OPERATORS {
+        for operator in Tonemapping::ALL {
             // Plain SDR target — including an HDR request downgraded at
             // surface negotiation, which resolves to the same value.
             assert_eq!(
@@ -983,10 +973,11 @@ mod tests {
     #[test]
     fn tonemap_output_gamut_matches_the_effective_operator() {
         let hdr = hdr_view_display_target();
-        for operator in ALL_OPERATORS {
-            // On HDR targets: Rec.2020 for GT7 (authored or substituted),
-            // Rec.709 only for the `None` pass-through.
-            let expected = if operator == Tonemapping::None {
+        for operator in Tonemapping::ALL {
+            // On HDR targets the effective operator is GT7 for everything
+            // except `None` and `Linear` (SDR-only operators are substituted,
+            // GT7 is authored), so those two are the only Rec.709 outputs.
+            let expected = if matches!(operator, Tonemapping::None | Tonemapping::Linear) {
                 DisplayGamut::Rec709
             } else {
                 DisplayGamut::Rec2020
@@ -1022,7 +1013,7 @@ mod tests {
 
         // Substituted views resolve to GT7 on an HDR target, so they are
         // covered by the HDR-transfer arm above.
-        for operator in ALL_OPERATORS {
+        for operator in Tonemapping::ALL {
             if !operator.is_sdr_only() {
                 continue;
             }
@@ -1032,7 +1023,7 @@ mod tests {
         }
 
         // Non-GT7 effective operators never bind it, params or not.
-        for operator in ALL_OPERATORS {
+        for operator in Tonemapping::ALL {
             if operator == gt7 {
                 continue;
             }
@@ -1046,7 +1037,7 @@ mod tests {
     /// authored operator — byte-identical to a hand-constructed empty value.
     #[test]
     fn solo_sdr_default_keys_empty_flags() {
-        for operator in ALL_OPERATORS {
+        for operator in Tonemapping::ALL {
             let flags = tonemapping_key_flags(
                 &ColorGrading::default(),
                 false,
