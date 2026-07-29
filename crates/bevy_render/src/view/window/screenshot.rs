@@ -907,16 +907,7 @@ fn decode_pq_screenshot(data: Vec<u8>, format: TextureFormat) -> (Vec<u8>, Textu
                 [rgb.x, rgb.y, rgb.z, (packed >> 30) as f32 / 3.0]
             })
             .collect(),
-        TextureFormat::Rgba16Float => data
-            .chunks_exact(8)
-            .flat_map(|texel| {
-                let channel = |i: usize| {
-                    f16_bits_to_f32(u16::from_le_bytes([texel[2 * i], texel[2 * i + 1]]))
-                };
-                let rgb = decode_rgb(Vec3::new(channel(0), channel(1), channel(2)));
-                [rgb.x, rgb.y, rgb.z, channel(3)]
-            })
-            .collect(),
+        TextureFormat::Rgba16Float => decode_f16_texels(&data, decode_rgb),
         other => {
             warn!(
                 "PQ-encoded screenshot readback in unexpected format {other:?}; \
@@ -966,22 +957,18 @@ fn decode_extended_srgb_screenshot(
         return (data, format);
     };
 
-    let decoded: Vec<f32> = data
-        .chunks_exact(8)
-        .flat_map(|texel| {
-            let channel =
-                |i: usize| f16_bits_to_f32(u16::from_le_bytes([texel[2 * i], texel[2 * i + 1]]));
-            let mut rgb = Vec3::new(
-                srgb_eotf_extended(channel(0)),
-                srgb_eotf_extended(channel(1)),
-                srgb_eotf_extended(channel(2)),
-            );
-            if display_p3 {
-                rgb = DISPLAYP3_TO_REC709 * rgb;
-            }
-            [rgb.x, rgb.y, rgb.z, channel(3)]
-        })
-        .collect();
+    let decoded = decode_f16_texels(&data, |signal| {
+        let rgb = Vec3::new(
+            srgb_eotf_extended(signal.x),
+            srgb_eotf_extended(signal.y),
+            srgb_eotf_extended(signal.z),
+        );
+        if display_p3 {
+            DISPLAYP3_TO_REC709 * rgb
+        } else {
+            rgb
+        }
+    });
 
     (
         decoded
@@ -990,6 +977,19 @@ fn decode_extended_srgb_screenshot(
             .collect(),
         TextureFormat::Rgba32Float,
     )
+}
+
+/// Decodes `Rgba16Float` texels: each RGB triple through `decode_rgb`, alpha
+/// passed through as its plain value.
+fn decode_f16_texels(data: &[u8], decode_rgb: impl Fn(Vec3) -> Vec3) -> Vec<f32> {
+    data.chunks_exact(8)
+        .flat_map(|texel| {
+            let channel =
+                |i: usize| f16_bits_to_f32(u16::from_le_bytes([texel[2 * i], texel[2 * i + 1]]));
+            let rgb = decode_rgb(Vec3::new(channel(0), channel(1), channel(2)));
+            [rgb.x, rgb.y, rgb.z, channel(3)]
+        })
+        .collect()
 }
 
 /// Converts IEEE 754 binary16 bits to an `f32`.
