@@ -1,8 +1,8 @@
 use crate::{
     color_difference::EuclideanDistance, okhsla::Okhsla, okhsva::Okhsva,
-    primaries::rgb_to_rgb_matrix, Alpha, Hsla, Hsva, Hue, Hwba, Laba, Lcha, LinearRec2020,
-    LinearRgba, Luminance, Mix, Oklaba, Oklcha, RgbPrimaries, Saturation, Srgba, StandardColor,
-    Xyza,
+    primaries::rgb_to_rgb_matrix, Alpha, Chromaticity, Hsla, Hsva, Hue, Hwba, Laba, Lcha,
+    LinearRec2020, LinearRgba, Luminance, Mix, Oklaba, Oklcha, RgbPrimaries, Saturation, Srgba,
+    StandardColor, Xyza,
 };
 use bevy_math::{MismatchedUnitsError, TryStableInterpolate, Vec3};
 #[cfg(feature = "bevy_reflect")]
@@ -673,7 +673,7 @@ impl Color {
 
     /// Creates a new [`Color`] object storing a [`Xyza`] color from
     /// [CIE xyY](https://en.wikipedia.org/wiki/CIE_1931_color_space#CIE_xy_chromaticity_diagram_and_the_CIE_xyY_color_space)
-    /// coordinates: a [`Chromaticity`](crate::Chromaticity)-style `(x, y)` position
+    /// coordinates: a [`Chromaticity`]-style `(x, y)` position
     /// plus a luminance `Y`, with an alpha of 1.0.
     ///
     /// This is a gamut-independent way to author colors: any visible chromaticity
@@ -686,12 +686,8 @@ impl Color {
     /// * `y` - CIE 1931 y chromaticity coordinate. Typically (0.0, 0.9]
     /// * `luminance` - Luminance (Y). 1.0 is the reference white luminance; values above 1.0 represent HDR intensities
     pub const fn xy_y(x: f32, y: f32, luminance: f32) -> Self {
-        Self::Xyza(Xyza {
-            x: x / y * luminance,
-            y: luminance,
-            z: (1.0 - x - y) / y * luminance,
-            alpha: 1.0,
-        })
+        let xyz = Chromaticity::new(x, y).to_xyz(luminance);
+        Self::xyz(xyz.x, xyz.y, xyz.z)
     }
 
     /// A fully white [`Color::LinearRgba`] color with an alpha of 1.0.

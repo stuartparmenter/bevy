@@ -1,5 +1,5 @@
 //! CIE 1931 chromaticity coordinates, RGB primary sets, and runtime derivation of
-//! RGB ↔ XYZ and RGB ↔ RGB conversion matrices.
+//! RGB ↔ RGB conversion matrices.
 //!
 //! These are the engine-wide primitives for wide-gamut color support: asset loaders,
 //! display encoders, and the configurable working color space all describe their
@@ -86,9 +86,8 @@ impl Default for Chromaticity {
 /// [`Chromaticity`] coordinates.
 ///
 /// This fully determines the meaning of an RGB triple (up to a transfer function and
-/// a luminance scale): [`RgbPrimaries::rgb_to_xyz_matrix`] derives the matrix taking
-/// linear RGB values in this primary set to CIE 1931 XYZ, and [`rgb_to_rgb_matrix`]
-/// derives the matrix converting linear RGB values between two primary sets.
+/// a luminance scale): [`rgb_to_rgb_matrix`] derives the matrix converting linear
+/// RGB values between two primary sets.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(
     feature = "bevy_reflect",
@@ -160,28 +159,8 @@ impl RgbPrimaries {
         white: Chromaticity::D60,
     };
 
-    /// Returns the 3×3 matrix converting linear RGB values in this primary set to
-    /// CIE 1931 XYZ tristimulus values, derived with the
-    /// [Lindbloom method](http://www.brucelindbloom.com/index.html?Eqn_RGB_XYZ_Matrix.html).
-    ///
-    /// The matrix maps `(1, 1, 1)` to the XYZ value of [`Self::white`] at luminance
-    /// `1.0`. The derivation is performed in `f64` and rounded to `f32` at the end,
-    /// so the result is exact to `f32` precision.
-    ///
-    /// Use with [`Mat3::mul_vec3`] or the `*` operator: `m * rgb`.
-    pub fn rgb_to_xyz_matrix(&self) -> Mat3 {
-        self.rgb_to_xyz_dmat3().as_mat3()
-    }
-
-    /// Returns the 3×3 matrix converting CIE 1931 XYZ tristimulus values to linear
-    /// RGB values in this primary set.
-    ///
-    /// This is the inverse of [`Self::rgb_to_xyz_matrix`].
-    pub fn xyz_to_rgb_matrix(&self) -> Mat3 {
-        self.rgb_to_xyz_dmat3().inverse().as_mat3()
-    }
-
-    /// Derive the RGB → XYZ matrix in `f64` precision.
+    /// Derive the RGB → XYZ matrix in `f64` precision. The matrix maps `(1, 1, 1)`
+    /// to the XYZ value of [`Self::white`] at luminance `1.0`.
     fn rgb_to_xyz_dmat3(&self) -> DMat3 {
         fn xyz_of(c: Chromaticity) -> DVec3 {
             let (x, y) = (c.x as f64, c.y as f64);
@@ -295,7 +274,7 @@ mod tests {
             RgbPrimaries::DISPLAY_P3,
             RgbPrimaries::ACES_CG,
         ] {
-            let white_xyz = primaries.rgb_to_xyz_matrix() * Vec3::ONE;
+            let white_xyz = primaries.rgb_to_xyz_dmat3().as_mat3() * Vec3::ONE;
             let expected = primaries.white.to_xyz(1.0);
             assert_approx_eq!(white_xyz.x, expected.x, 1e-6);
             assert_approx_eq!(white_xyz.y, expected.y, 1e-6);
@@ -314,15 +293,14 @@ mod tests {
             [0.3575761, 0.7151522, 0.119192],
             [0.1804375, 0.072175, 0.9503041],
         ]);
-        let m = RgbPrimaries::BT709.rgb_to_xyz_matrix();
+        let m = RgbPrimaries::BT709.rgb_to_xyz_dmat3().as_mat3();
         assert_mat3_approx_eq(m, expected, 5e-4);
     }
 
     #[test]
     fn xyz_round_trip() {
-        let primaries = RgbPrimaries::BT2020;
-        let m = primaries.xyz_to_rgb_matrix() * primaries.rgb_to_xyz_matrix();
-        assert_mat3_approx_eq(m, Mat3::IDENTITY, 1e-6);
+        let m = RgbPrimaries::BT2020.rgb_to_xyz_dmat3();
+        assert_mat3_approx_eq(m.inverse().as_mat3() * m.as_mat3(), Mat3::IDENTITY, 1e-6);
     }
 
     #[test]
