@@ -13,7 +13,7 @@ use bevy_input::keyboard::{Key, KeyCode, KeyboardFocusLost, KeyboardInput};
 use bevy_window::{
     ClosingWindow, CursorOptions, Monitor, OnMonitor, PrimaryMonitor, RawHandleWrapper, VideoMode,
     Window, WindowClosed, WindowClosing, WindowCreated, WindowEvent, WindowFocused, WindowMode,
-    WindowMonitorChanged, WindowResized, WindowScaleFactorChanged, WindowWrapper,
+    WindowResized, WindowScaleFactorChanged, WindowWrapper,
 };
 use tracing::{error, info, warn};
 
@@ -319,7 +319,6 @@ pub(crate) fn changed_windows(
     monitors: Res<WinitMonitors>,
     mut window_resized: MessageWriter<WindowResized>,
     mut window_event: MessageWriter<WindowEvent>,
-    mut window_monitor_changed: MessageWriter<WindowMonitorChanged>,
     mut window_rescaled: MessageWriter<WindowScaleFactorChanged>,
     _non_send_marker: NonSendMarker,
 ) {
@@ -469,27 +468,15 @@ pub(crate) fn changed_windows(
                         winit_monitor != linked_monitor &&
                         let Some((_, winit_monitor_entity)) = monitors.monitors.iter().find(|(h, _)| h == &winit_monitor) {
                         commands.entity(entity).insert(OnMonitor(winit_monitor_entity.to_owned()));
-                        window_monitor_changed.write(WindowMonitorChanged {
-                            window: entity,
-                            monitor: Some(*winit_monitor_entity),
-                        });
                     }
                 } else {
                     commands.entity(entity).remove::<OnMonitor>();
-                    window_monitor_changed.write(WindowMonitorChanged {
-                        window: entity,
-                        monitor: None,
-                    });
                 }
             } else {
                 if let Some(winit_monitor) = winit_window.current_monitor()
                     && let Some((_, winit_monitor_entity)) = monitors.monitors.iter()
                     .find(|(h, _)| h == &winit_monitor) {
                     commands.entity(entity).insert(OnMonitor(winit_monitor_entity.to_owned()));
-                    window_monitor_changed.write(WindowMonitorChanged {
-                        window: entity,
-                        monitor: Some(*winit_monitor_entity),
-                    });
                 }
             }
 

@@ -17,7 +17,7 @@ settings" screen in your own game.
 `HdrCalibrationPlugin<S>`: drop it into one of your own `States` and it runs a
 guided three-step wizard, persists the result next to the executable, emits a
 `CalibrationComplete` event on confirm, and prompts to recalibrate when the
-window moves to another monitor (`WindowMonitorChanged`). A `CalibrationStrategy`
+window moves to another monitor (watching `OnMonitor`). A `CalibrationStrategy`
 is chosen up front: manual HGIG (you tune every value) or trust-OS (peak, black,
 and gamut auto-resolve from sensed data; you only set paper white).
 `examples/3d/hdr_calibration.rs` is a thin harness around it — it adds the

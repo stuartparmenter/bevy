@@ -41,17 +41,18 @@ the component. For those, the new `ManualDisplayTargets` resource in
 without an entry fall back to `DisplayTarget::SDR_SRGB`.
 
 `DisplayTarget` is user-authoritative: Bevy never overwrites values you set.
-To react to a window being dragged to a different display, the new
-`WindowMonitorChanged` message is sent whenever the monitor a window is on
-changes (including when it first becomes known):
+To react to a window being dragged to a different display, watch the
+`OnMonitor` relationship on the window entity — `bevy_winit` retargets it
+whenever the monitor a window is on changes (including when it first becomes
+known):
 
 ```rust
 fn react_to_monitor_change(
-    mut events: MessageReader<WindowMonitorChanged>,
+    windows: Query<(Entity, &OnMonitor), Changed<OnMonitor>>,
     monitors: Query<&Monitor>,
 ) {
-    for event in events.read() {
-        if let Some(monitor) = event.monitor.and_then(|m| monitors.get(m).ok()) {
+    for (window, on_monitor) in &windows {
+        if let Ok(monitor) = monitors.get(on_monitor.0) {
             // Inspect the new monitor and decide whether to update the
             // window's `DisplayTarget`.
         }

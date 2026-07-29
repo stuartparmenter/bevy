@@ -45,8 +45,8 @@ pub mod prelude {
         CursorEntered, CursorLeft, CursorMoved, DisplayCalibrationPolicy, DisplayGamut,
         DisplayProvenance, DisplayTarget, DisplayTransfer, DisplayTransfers,
         EffectiveDisplayTarget, FileDragAndDrop, Ime, MonitorDisplayCapability, MonitorSelection,
-        VideoModeSelection, Window, WindowDisplayState, WindowMonitorChanged, WindowMoved,
-        WindowPlugin, WindowPosition, WindowResizeConstraints, WindowSurfaceTransfers,
+        VideoModeSelection, Window, WindowDisplayState, WindowMoved, WindowPlugin, WindowPosition,
+        WindowResizeConstraints, WindowSurfaceTransfers,
     };
 }
 
@@ -128,7 +128,6 @@ impl Plugin for WindowPlugin {
             .add_message::<WindowBackendScaleFactorChanged>()
             .add_message::<FileDragAndDrop>()
             .add_message::<WindowMoved>()
-            .add_message::<WindowMonitorChanged>()
             .add_message::<WindowThemeChanged>()
             .add_message::<AppLifecycle>();
 

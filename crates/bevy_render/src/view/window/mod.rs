@@ -13,8 +13,8 @@ use bevy_log::{debug, info, warn, warn_once};
 use bevy_utils::default;
 use bevy_window::{
     CompositeAlphaMode, DisplayCalibrationPolicy, DisplayGamut, DisplayTarget, DisplayTransfer,
-    DisplayTransfers, EffectiveDisplayTarget, PresentMode, PrimaryWindow, RawHandleWrapper, Window,
-    WindowClosing, WindowFocused, WindowMonitorChanged, WindowMoved,
+    DisplayTransfers, EffectiveDisplayTarget, OnMonitor, PresentMode, PrimaryWindow,
+    RawHandleWrapper, Window, WindowClosing, WindowFocused, WindowMoved,
 };
 use core::{
     num::NonZero,
@@ -244,24 +244,28 @@ fn extract_windows(
             Option<&PrimaryWindow>,
         )>,
     >,
-    // Window events that can change the backing display, so `poll_display_state`
+    // Signals that the backing display may have changed, so `poll_display_state`
     // re-reads the live display state in response (the only way the event-less
     // platforms catch a monitor swap or the Windows SDR-brightness slider).
     mut moved: Extract<MessageReader<WindowMoved>>,
     mut focused: Extract<MessageReader<WindowFocused>>,
-    mut monitor_changed: Extract<MessageReader<WindowMonitorChanged>>,
+    changed_monitor: Extract<Query<Entity, Changed<OnMonitor>>>,
+    mut removed_monitor: Extract<RemovedComponents<OnMonitor>>,
     mut removed: Extract<RemovedComponents<RawHandleWrapper>>,
     mut window_surfaces: ResMut<WindowSurfaces>,
 ) {
     // Collect the windows whose backing display may have changed this frame: a
-    // move or monitor change (a possible new display), or a focus regain — the
-    // moment to catch an in-place change made while the app was backgrounded (the
-    // Windows SDR-brightness slider, which fires no OS message and requires
-    // leaving the app to reach).
+    // move or a retargeted/removed `OnMonitor` link (a possible new display), or
+    // a focus regain — the moment to catch an in-place change made while the app
+    // was backgrounded (the Windows SDR-brightness slider, which fires no OS
+    // message and requires leaving the app to reach). Removal readers also fire
+    // for despawned windows; those entities never match the extraction query
+    // below, so they sit inertly in the set.
     let mut display_requery: EntityHashSet = moved
         .read()
         .map(|moved| moved.window)
-        .chain(monitor_changed.read().map(|changed| changed.window))
+        .chain(changed_monitor.iter())
+        .chain(removed_monitor.read())
         .collect();
     display_requery.extend(focused.read().filter(|f| f.focused).map(|f| f.window));
 

@@ -32,9 +32,9 @@ use {bevy_ecs::prelude::ReflectComponent, bevy_reflect::Reflect};
 /// [`Window`](crate::Window); the engine merges sensed capability into the
 /// derived [`EffectiveDisplayTarget`](crate::EffectiveDisplayTarget) only for
 /// fields whose [`DisplayCalibrationPolicy`](crate::DisplayCalibrationPolicy)
-/// opts in. The [`WindowMonitorChanged`](crate::WindowMonitorChanged) event
-/// signals when a window moves to a different monitor and recalibration may be
-/// warranted.
+/// opts in. A change to a window's [`OnMonitor`](crate::OnMonitor)
+/// relationship signals that it moved to a different monitor and
+/// recalibration may be warranted.
 #[derive(Component, Debug, Clone)]
 #[require(HasWindows)]
 #[cfg_attr(

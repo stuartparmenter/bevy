@@ -37,11 +37,10 @@ use std::{fs, path::PathBuf};
 use bevy::{
     camera::{visibility::RenderLayers, Hdr, ScalingMode},
     core_pipeline::tonemapping::Tonemapping,
-    platform::collections::HashSet,
     prelude::*,
     window::{
-        DisplayCalibrationPolicy, DisplayTarget, EffectiveDisplayTarget, Monitor, PrimaryWindow,
-        WindowMonitorChanged, WindowSurfaceTransfers,
+        DisplayCalibrationPolicy, DisplayTarget, EffectiveDisplayTarget, Monitor, OnMonitor,
+        PrimaryWindow, WindowSurfaceTransfers,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -833,29 +832,36 @@ fn update_black_labels(
     }
 }
 
-/// Raises a recalibration notice when the window moves to a different monitor.
-/// Sole owner of the notice countdown. The first event per window only reports
+/// Raises a recalibration notice when the window moves to a different monitor,
+/// by watching the [`OnMonitor`] relationship `bevy_winit` maintains. Sole
+/// owner of the notice countdown. The first insertion per window only reports
 /// the monitor becoming known at startup, so it is logged, not raised.
 fn watch_monitor_changes(
-    mut events: MessageReader<WindowMonitorChanged>,
+    changed: Query<(Entity, Ref<OnMonitor>), Changed<OnMonitor>>,
+    mut removed: RemovedComponents<OnMonitor>,
+    windows: Query<(), With<Window>>,
     monitors: Query<&Monitor>,
     mut notice: ResMut<MonitorChangeNotice>,
     time: Res<Time>,
-    mut known_windows: Local<HashSet<Entity>>,
 ) {
-    for event in events.read() {
-        let name = event
-            .monitor
-            .and_then(|monitor| monitors.get(monitor).ok())
+    for (window, on_monitor) in &changed {
+        let name = monitors
+            .get(on_monitor.0)
+            .ok()
             .and_then(|monitor| monitor.name.clone())
             .unwrap_or_else(|| "<unknown>".into());
-        if known_windows.insert(event.window) {
-            info!("Window {} is on monitor {name}.", event.window);
+        if on_monitor.is_added() {
+            info!("Window {window} is on monitor {name}.");
         } else {
-            info!(
-                "Window {} moved to monitor {name}; recalibration recommended.",
-                event.window
-            );
+            info!("Window {window} moved to monitor {name}; recalibration recommended.");
+            notice.seconds_remaining = 8.0;
+        }
+    }
+    // Removal means the current monitor is no longer known; skip windows whose
+    // relationship went away because the window itself despawned.
+    for window in removed.read() {
+        if windows.contains(window) {
+            info!("Window {window} moved to monitor <unknown>; recalibration recommended.");
             notice.seconds_remaining = 8.0;
         }
     }

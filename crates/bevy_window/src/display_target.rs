@@ -28,10 +28,10 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
 /// tone-mapped, gamut-mapped, and transfer-encoded signal for it.
 ///
 /// This component is **user-authoritative**: Bevy never overwrites values you
-/// set, even when the window moves to a different monitor. When that happens a
-/// [`WindowMonitorChanged`](crate::WindowMonitorChanged) event is emitted so
-/// you (or a future auto-resolution system) can decide whether to update this
-/// component.
+/// set, even when the window moves to a different monitor. When that happens
+/// the window's [`OnMonitor`](crate::OnMonitor) relationship is retargeted, so
+/// you (or a future auto-resolution system) can watch it with
+/// `Changed<OnMonitor>` and decide whether to update this component.
 ///
 /// # Placement
 ///

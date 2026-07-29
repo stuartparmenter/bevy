@@ -424,44 +424,6 @@ pub struct WindowMoved {
     pub position: IVec2,
 }
 
-/// An event that is sent when the monitor a window is on changes.
-///
-/// This includes the moment the window's monitor first becomes known (shortly
-/// after window creation, when the [`OnMonitor`](crate::OnMonitor)
-/// relationship is first inserted) and the case where the monitor becomes
-/// unknown (`monitor` is [`None`]).
-///
-/// Different monitors commonly have different capabilities (resolution, scale
-/// factor, peak luminance, color gamut), so this event is the hook for
-/// reacting to those changes — for example, deciding whether to update the
-/// window's [`DisplayTarget`](crate::DisplayTarget). Bevy itself never
-/// rewrites [`DisplayTarget`](crate::DisplayTarget) in response to this
-/// event: that component is user-authoritative.
-///
-/// Unlike most window events, this is not a direct translation of a `winit`
-/// event (winit has none for monitor changes); it is derived by `bevy_winit`
-/// when it observes that the window's current monitor differs from the linked
-/// [`OnMonitor`](crate::OnMonitor) entity. It is therefore not part of the
-/// ordered [`WindowEvent`] stream.
-#[derive(Message, Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    feature = "bevy_reflect",
-    derive(Reflect),
-    reflect(Debug, PartialEq, Clone, Message)
-)]
-#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(
-    all(feature = "serialize", feature = "bevy_reflect"),
-    reflect(Serialize, Deserialize)
-)]
-pub struct WindowMonitorChanged {
-    /// Window whose monitor changed.
-    pub window: Entity,
-    /// The [`Monitor`](crate::Monitor) entity the window is now on, or
-    /// [`None`] if the window is no longer associated with any known monitor.
-    pub monitor: Option<Entity>,
-}
-
 /// An event sent when the system theme changes for a window.
 ///
 /// This event is only sent when the window is relying on the system theme to control its appearance.

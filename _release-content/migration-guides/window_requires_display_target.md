@@ -29,7 +29,7 @@ Note that:
 - To override the default, insert your own value when spawning, e.g.
   `commands.spawn((Window::default(), DisplayTarget { peak_luminance_nits: 1000.0, ..Default::default() }))`.
 
-A new `WindowMonitorChanged` message is registered by `WindowPlugin` and emitted
-by `bevy_winit` when the monitor a window is on changes. Bevy never mutates
-`DisplayTarget` automatically — the component is user-authoritative — so existing
-code is unaffected unless you listen for the new message.
+Bevy never mutates `DisplayTarget` automatically — the component is
+user-authoritative — so a window moving to a different monitor does not change
+it. To react to monitor moves yourself, watch the existing `OnMonitor`
+relationship with `Changed<OnMonitor>` / `RemovedComponents<OnMonitor>`.
