@@ -18,7 +18,7 @@ use bevy_core_pipeline::{
     tonemapping::tonemapping,
 };
 use bevy_ecs::prelude::*;
-use bevy_math::{ops, UVec2};
+use bevy_math::{ops, AspectRatio, UVec2, UVec4};
 use bevy_render::{
     camera::ExtractedCamera,
     diagnostic::RecordDiagnostics,
@@ -28,7 +28,7 @@ use bevy_render::{
     render_resource::*,
     renderer::{RenderContext, RenderDevice, ViewQuery},
     texture::{CachedTexture, TextureCache},
-    view::{ViewDisplayTarget, ViewTarget},
+    view::{ExtractedView, ViewDisplayTarget, ViewTarget},
     GpuResourceAppExt, Render, RenderApp, RenderStartup, RenderSystems,
 };
 use downsampling_pipeline::{
@@ -57,10 +57,6 @@ const BLOOM_TEXTURE_FORMAT: TextureFormat = TextureFormat::Rg11b10Ufloat;
 /// spent only on views that can actually show the difference. SDR views keep
 /// [`BLOOM_TEXTURE_FORMAT`] bit-for-bit.
 const BLOOM_TEXTURE_FORMAT_HDR: TextureFormat = TextureFormat::Rgba16Float;
-
-/// The paper white assumed when a view has no resolved display target
-/// (mirrors `DisplayTarget::SDR_SRGB.paper_white_nits`).
-const DEFAULT_PAPER_WHITE_NITS: f32 = 100.0;
 
 /// Returns the bloom pyramid texture format for a view, keyed on whether the
 /// view's resolved display target transfer is HDR.
@@ -106,12 +102,9 @@ impl Plugin for BloomPlugin {
             .add_systems(
                 Render,
                 (
-                    // Runs in `Queue`: after `PrepareViews` (so the
-                    // `ViewDisplayTarget` insertions are applied) and before
-                    // `PrepareResources`, where `UniformComponentPlugin`
-                    // writes the (possibly re-resolved) `BloomUniforms`
-                    // components to the GPU.
-                    resolve_bloom_threshold_nits.in_set(RenderSystems::Queue),
+                    prepare_bloom_uniforms
+                        .in_set(RenderSystems::Prepare)
+                        .before(RenderSystems::PrepareResources),
                     prepare_downsampling_pipeline.in_set(RenderSystems::Prepare),
                     prepare_upsampling_pipeline.in_set(RenderSystems::Prepare),
                     prepare_bloom_textures.in_set(RenderSystems::PrepareResources),
@@ -358,30 +351,52 @@ impl BloomTexture {
     }
 }
 
-/// Re-resolves nits-based bloom thresholds
-/// ([`BloomPrefilter::threshold_nits`]) against the paper white of the view's
-/// resolved display target, overwriting the provisional (100-nit) packing
-/// done at extract time.
+/// Builds each bloom view's [`BloomUniforms`] from the extracted view
+/// geometry and the paper white of the view's resolved display target
+/// ([`BloomPrefilter::threshold_nits`] is divided by it to produce the
+/// framebuffer-value threshold the shader uses).
 ///
-/// Must run after the `ViewDisplayTarget` insertions from
-/// `RenderSystems::PrepareViews` are applied and before
-/// `RenderSystems::PrepareResources` writes the [`BloomUniforms`] components
-/// to the GPU; it is therefore scheduled in `RenderSystems::Queue`.
-fn resolve_bloom_threshold_nits(
-    mut views: Query<(&Bloom, &mut BloomUniforms, Option<&ViewDisplayTarget>)>,
+/// Runs after the [`ViewDisplayTarget`] resolution from
+/// `RenderSystems::PrepareViews` is applied and before
+/// `RenderSystems::PrepareResources`, where `UniformComponentPlugin` writes
+/// the [`BloomUniforms`] components to the GPU.
+fn prepare_bloom_uniforms(
+    mut commands: Commands,
+    views: Query<(
+        Entity,
+        &Bloom,
+        &ExtractedCamera,
+        &ExtractedView,
+        &ViewDisplayTarget,
+    )>,
 ) {
-    for (bloom, mut uniforms, display_target) in &mut views {
-        if bloom.prefilter.threshold_nits.is_none() {
-            continue;
-        }
-        let paper_white_nits = display_target
-            .map(|target| target.sanitized_paper_white_nits())
-            .unwrap_or(DEFAULT_PAPER_WHITE_NITS);
-        uniforms.threshold_precomputations = BloomUniforms::threshold_precomputations(
-            bloom.prefilter.resolve_threshold(paper_white_nits),
-            bloom.prefilter.threshold_softness,
-        );
-    }
+    let uniforms = views
+        .iter()
+        .filter_map(|(entity, bloom, camera, view, display_target)| {
+            let target_size = camera.physical_target_size?;
+            // `UVec4(origin.x, origin.y, size.x, size.y)`, in physical pixels;
+            // the size is non-zero (`Bloom` is only extracted for views with a
+            // drawable viewport).
+            let viewport = view.viewport;
+            let uniform = BloomUniforms {
+                threshold_precomputations: BloomUniforms::threshold_precomputations(
+                    bloom
+                        .prefilter
+                        .resolve_threshold(display_target.sanitized_paper_white_nits()),
+                    bloom.prefilter.threshold_softness,
+                ),
+                viewport: viewport.as_vec4()
+                    / UVec4::new(target_size.x, target_size.y, target_size.x, target_size.y)
+                        .as_vec4(),
+                aspect: AspectRatio::try_from_pixels(viewport.z, viewport.w)
+                    .expect("Valid screen size values for Bloom settings")
+                    .ratio(),
+                scale: bloom.scale,
+            };
+            Some((entity, uniform))
+        })
+        .collect::<Vec<_>>();
+    commands.try_insert_batch(uniforms);
 }
 
 fn prepare_bloom_textures(
@@ -586,7 +601,84 @@ fn compute_blend_factor(bloom: &Bloom, mip: f32, max_mip: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bevy_math::Vec2;
+    use bevy_ecs::{schedule::ScheduleLabel, system::RunSystemOnce};
+    use bevy_math::{Mat4, Vec2};
+    use bevy_render::view::RetainedViewEntity;
+
+    /// `prepare_bloom_uniforms` must pack the viewport in target-relative
+    /// units, the aspect from the viewport size, and the threshold against
+    /// the paper white of the view's resolved display target.
+    #[test]
+    fn prepare_bloom_uniforms_packs_reference_uniform() {
+        let mut world = World::new();
+
+        let bloom = Bloom {
+            prefilter: BloomPrefilter {
+                threshold: 0.0,
+                threshold_nits: Some(406.0),
+                threshold_softness: 0.25,
+            },
+            scale: Vec2::new(2.0, 1.0),
+            ..Bloom::NATURAL
+        };
+        let mut display_target = ViewDisplayTarget::default();
+        display_target.0.paper_white_nits = 203.0;
+
+        let entity = world
+            .spawn((
+                bloom,
+                ExtractedCamera {
+                    target: None,
+                    physical_viewport_size: Some(UVec2::new(320, 240)),
+                    physical_target_size: Some(UVec2::new(640, 480)),
+                    viewport: None,
+                    schedule: Core3d.intern(),
+                    order: 0,
+                    output_mode: Default::default(),
+                    msaa_writeback: Default::default(),
+                    clear_color: Default::default(),
+                    sorted_camera_index_for_target: 0,
+                    exposure: 1.0,
+                    hdr: true,
+                    compositing_space: None,
+                },
+                ExtractedView {
+                    retained_view_entity: RetainedViewEntity::new(
+                        Entity::PLACEHOLDER.into(),
+                        None,
+                        0,
+                    ),
+                    clip_from_view: Mat4::IDENTITY,
+                    world_from_view: Default::default(),
+                    clip_from_world: None,
+                    target_format: TextureFormat::Rgba16Float,
+                    viewport: UVec4::new(8, 16, 320, 240),
+                    color_grading: Default::default(),
+                    invert_culling: false,
+                },
+                display_target,
+            ))
+            .id();
+
+        world.run_system_once(prepare_bloom_uniforms).unwrap();
+
+        let uniforms = world.get::<BloomUniforms>(entity).unwrap();
+        assert_eq!(
+            uniforms.threshold_precomputations,
+            // 406 nits against a 203-nit paper white: a threshold of 2.0 in
+            // framebuffer units.
+            BloomUniforms::threshold_precomputations(2.0, 0.25)
+        );
+        assert_eq!(
+            uniforms.viewport,
+            bevy_math::Vec4::new(8.0 / 640.0, 16.0 / 480.0, 320.0 / 640.0, 240.0 / 480.0)
+        );
+        assert_eq!(
+            uniforms.aspect,
+            AspectRatio::try_from_pixels(320, 240).unwrap().ratio()
+        );
+        assert_eq!(uniforms.scale, Vec2::new(2.0, 1.0));
+    }
 
     /// A verbatim copy of the historical `compute_blend_factor` body, used
     /// to lock the default ([`BloomScatterModel::Aesthetic`]) path

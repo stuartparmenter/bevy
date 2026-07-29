@@ -48,8 +48,8 @@ pub struct BloomDownsamplingPipelineKeys {
     texture_format: TextureFormat,
 }
 
-/// The uniform struct extracted from [`Bloom`] attached to a Camera.
-/// Will be available for use in the Bloom shader.
+/// The uniform struct built from [`Bloom`] attached to a Camera by
+/// `prepare_bloom_uniforms`. Will be available for use in the Bloom shader.
 #[derive(Component, ShaderType, Clone)]
 pub struct BloomUniforms {
     // Precomputed values used when thresholding, see https://catlikecoding.com/unity/tutorials/advanced-rendering/bloom/#3.4
@@ -66,8 +66,7 @@ impl BloomUniforms {
     ///
     /// `threshold` is in scene-linear framebuffer units; `threshold_softness`
     /// is clamped to `[0, 1]`. This is the single source of the packing math,
-    /// shared by the extract-time packing and the prepare-time
-    /// `threshold_nits` re-resolution.
+    /// consumed by `prepare_bloom_uniforms`.
     pub(crate) fn threshold_precomputations(threshold: f32, threshold_softness: f32) -> Vec4 {
         let knee = threshold * threshold_softness.clamp(0.0, 1.0);
         Vec4::new(

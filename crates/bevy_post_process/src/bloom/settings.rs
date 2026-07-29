@@ -5,7 +5,7 @@ use bevy_ecs::{
     query::{QueryItem, With},
     reflect::ReflectComponent,
 };
-use bevy_math::{AspectRatio, URect, UVec4, Vec2};
+use bevy_math::Vec2;
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
 use bevy_render::{
     extract_component::ExtractComponent, sync_component::SyncComponent,
@@ -224,7 +224,7 @@ impl Bloom {
     /// energy (a physical point-spread function has no brightness cutoff;
     /// GT7's glare is threshold-free), so any configured prefilter is
     /// ignored under it.
-    pub fn thresholding_active(&self) -> bool {
+    pub(crate) fn thresholding_active(&self) -> bool {
         matches!(self.scatter, BloomScatterModel::Aesthetic) && self.prefilter.is_active()
     }
 
@@ -235,7 +235,7 @@ impl Bloom {
     /// forces [`BloomCompositeMode::EnergyConserving`] regardless of
     /// [`composite_mode`](Self::composite_mode);
     /// [`BloomScatterModel::Aesthetic`] uses the configured mode unchanged.
-    pub fn effective_composite_mode(&self) -> BloomCompositeMode {
+    pub(crate) fn effective_composite_mode(&self) -> BloomCompositeMode {
         match self.scatter {
             BloomScatterModel::Aesthetic => self.composite_mode,
             BloomScatterModel::Gt7Glare { .. } => BloomCompositeMode::EnergyConserving,
@@ -396,42 +396,22 @@ impl SyncComponent<RenderApp> for Bloom {
 impl ExtractComponent<RenderApp> for Bloom {
     type QueryData = (&'static Self, &'static Camera);
     type QueryFilter = With<Hdr>;
-    type Out = (Self, BloomUniforms);
+    type Out = Self;
 
     fn extract_component((bloom, camera): QueryItem<'_, '_, Self::QueryData>) -> Option<Self::Out> {
+        // `prepare_bloom_uniforms` builds the `BloomUniforms` in the render
+        // world, where the view's resolved display target is available. This
+        // guard admits only active cameras with a drawable viewport, so the
+        // uniform math (aspect ratio, viewport normalization) never sees a
+        // zero dimension.
         match (
             camera.physical_viewport_rect(),
             camera.physical_viewport_size(),
             camera.physical_target_size(),
             camera.is_active,
         ) {
-            (Some(URect { min: origin, .. }), Some(size), Some(target_size), true)
-                if size.x != 0 && size.y != 0 =>
-            {
-                // For `threshold_nits` this is a provisional value against the
-                // default 100-nit SDR paper white; `resolve_bloom_threshold_nits`
-                // re-derives it from the view's resolved display target in the
-                // render world, before the uniform is written to the GPU.
-                let threshold = bloom
-                    .prefilter
-                    .resolve_threshold(super::DEFAULT_PAPER_WHITE_NITS);
-                let threshold_softness = bloom.prefilter.threshold_softness;
-
-                let uniform = BloomUniforms {
-                    threshold_precomputations: BloomUniforms::threshold_precomputations(
-                        threshold,
-                        threshold_softness,
-                    ),
-                    viewport: UVec4::new(origin.x, origin.y, size.x, size.y).as_vec4()
-                        / UVec4::new(target_size.x, target_size.y, target_size.x, target_size.y)
-                            .as_vec4(),
-                    aspect: AspectRatio::try_from_pixels(size.x, size.y)
-                        .expect("Valid screen size values for Bloom settings")
-                        .ratio(),
-                    scale: bloom.scale,
-                };
-
-                Some((bloom.clone(), uniform))
+            (Some(_), Some(size), Some(_), true) if size.x != 0 && size.y != 0 => {
+                Some(bloom.clone())
             }
             _ => None,
         }
