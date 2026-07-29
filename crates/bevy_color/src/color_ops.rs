@@ -42,6 +42,18 @@ pub trait Luminance: Sized {
     fn lighter(&self, amount: f32) -> Self;
 }
 
+/// Adds `amount` to a lightness channel, clamping to 1.0 only when the
+/// input is within SDR range — an HDR lightness (> 1.0) is increased,
+/// never pulled down to 1.0.
+pub(crate) fn lighten_hdr_aware(lightness: f32, amount: f32) -> f32 {
+    let out = lightness + amount;
+    if lightness <= 1.0 {
+        out.min(1.0)
+    } else {
+        out
+    }
+}
+
 /// Linear interpolation of two colors within a given color space.
 pub trait Mix: Sized {
     /// Linearly interpolate between this and another color, by factor.

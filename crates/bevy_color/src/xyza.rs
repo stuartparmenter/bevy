@@ -129,9 +129,8 @@ impl Luminance for Xyza {
     }
 
     fn lighter(&self, amount: f32) -> Self {
-        let y = self.y + amount;
         Self {
-            y: if self.y <= 1.0 { y.min(1.) } else { y },
+            y: crate::color_ops::lighten_hdr_aware(self.y, amount),
             ..*self
         }
     }

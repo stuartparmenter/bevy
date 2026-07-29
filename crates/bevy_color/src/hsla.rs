@@ -201,13 +201,8 @@ impl Luminance for Hsla {
     }
 
     fn lighter(&self, amount: f32) -> Self {
-        let lightness = self.lightness + amount;
         Self {
-            lightness: if self.lightness <= 1.0 {
-                lightness.min(1.)
-            } else {
-                lightness
-            },
+            lightness: crate::color_ops::lighten_hdr_aware(self.lightness, amount),
             ..*self
         }
     }

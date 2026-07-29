@@ -149,13 +149,8 @@ impl Luminance for Oklaba {
     }
 
     fn lighter(&self, amount: f32) -> Self {
-        let lightness = self.lightness + amount;
         Self::new(
-            if self.lightness <= 1.0 {
-                lightness.min(1.)
-            } else {
-                lightness
-            },
+            crate::color_ops::lighten_hdr_aware(self.lightness, amount),
             self.a,
             self.b,
             self.alpha,
