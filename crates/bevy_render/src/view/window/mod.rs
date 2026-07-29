@@ -151,7 +151,9 @@ pub struct ExtractedWindow {
     /// can show, never on an unfulfilled request.
     pub resolved_transfer: Option<DisplayTransfer>,
     /// Set for one frame when a window event that can change the backing display
-    /// (a move, a focus regain, or a monitor change) fired this frame, so
+    /// (a move, a focus regain, or a monitor change) fired this frame, or when a
+    /// surface renegotiation changed the resolved transfer (an OS HDR
+    /// enable/disable re-picks the color space with no authored change), so
     /// [`poll_display_state`] re-reads the live display state in response.
     ///
     /// This is how the otherwise event-less platforms catch discrete changes: a
@@ -655,6 +657,8 @@ pub fn prepare_windows(
                     ) {
                         surface_data.transfer_before_renegotiation = Some(previous);
                         window.resolved_transfer = Some(surface_data.resolved_transfer);
+                        window.request_display_requery |=
+                            previous != surface_data.resolved_transfer;
                     }
                 }
                 let surface = &surface_data.surface;
@@ -1239,11 +1243,13 @@ pub fn create_surfaces(
                 // and views key on it from this frame on:
                 // `prepare_view_display_targets` runs after `create_surfaces`,
                 // so no consumer sees the pre-renegotiation transfer.
-                data.renegotiate_if_color_space_lost(
+                if let Some(previous) = data.renegotiate_if_color_space_lost(
                     &caps,
                     window.display_target.transfer,
                     window.display_target.gamut,
-                );
+                ) {
+                    window.request_display_requery |= previous != data.resolved_transfer;
+                }
             }
             render_device.configure_surface(&data.surface, &data.configuration);
         }

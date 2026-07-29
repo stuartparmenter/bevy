@@ -20,8 +20,7 @@
 use bevy_ecs::prelude::*;
 use bevy_platform::collections::HashMap;
 use bevy_window::{
-    DisplayGamut, DisplayTransfer, MonitorDisplayCapability, OnMonitor, WindowDisplayState,
-    WindowSurfaceTransfers,
+    DisplayGamut, MonitorDisplayCapability, OnMonitor, WindowDisplayState, WindowSurfaceTransfers,
 };
 use wgpu::{DisplayGamut as WgpuDisplayGamut, DisplayHdrInfo};
 
@@ -120,12 +119,6 @@ pub(crate) struct DisplayStateStore {
     ///
     /// [`Monitor`]: bevy_window::Monitor
     capabilities: HashMap<Entity, MonitorDisplayCapability>,
-    /// The resolved transfer last seen per surface, so a renegotiation that
-    /// changes it (an OS HDR enable/disable drives the surface `Outdated` and
-    /// re-picks the color space without any authored-transfer change) forces a
-    /// fresh read — otherwise the live state would lag until an unrelated window
-    /// event.
-    last_resolved: HashMap<Entity, DisplayTransfer>,
 }
 
 /// Whether two optional continuous values differ by more than the relative
@@ -176,7 +169,8 @@ fn commit(
 ///   or
 /// - a window event flagged it for re-query
 ///   ([`request_display_requery`](super::ExtractedWindow::request_display_requery)
-///   — a move, focus regain, or monitor change), or
+///   — a move, focus regain, or monitor change, or a surface renegotiation that
+///   changed the resolved transfer), or
 /// - it is auto-calibrating an HDR surface on a platform whose live value drifts
 ///   with no event (Apple EDR headroom), in which case it is read every frame.
 ///
@@ -201,9 +195,6 @@ pub(crate) fn poll_display_state(
     store
         .capabilities
         .retain(|e, _| window_surfaces.surfaces.contains_key(e));
-    store
-        .last_resolved
-        .retain(|e, _| window_surfaces.surfaces.contains_key(e));
 
     for (&entity, surface_data) in window_surfaces.surfaces.iter() {
         let extracted = extracted_windows.get(&entity);
@@ -211,13 +202,7 @@ pub(crate) fn poll_display_state(
         let reconfigured = extracted.is_some_and(|w| w.display_target_transfer_changed);
         let event_requery = extracted.is_some_and(|w| w.request_display_requery);
 
-        // A renegotiation that changed the resolved transfer with no authored
-        // change (OS HDR enable/disable) — re-read so the live state reflects it.
         let resolved = surface_data.resolved_transfer;
-        let resolved_changed = store.last_resolved.get(&entity) != Some(&resolved);
-        if resolved_changed {
-            store.last_resolved.insert(entity, resolved);
-        }
 
         // Continuous live re-read: only where a signal drifts with no event, and
         // only while an HDR surface auto-calibrates — so SDR and all-`Keep`
@@ -228,7 +213,7 @@ pub(crate) fn poll_display_state(
             && resolved.is_hdr()
             && extracted.is_some_and(|w| w.display_calibration_auto);
 
-        if !(first_time || reconfigured || event_requery || resolved_changed || continuous) {
+        if !(first_time || reconfigured || event_requery || continuous) {
             continue;
         }
 
