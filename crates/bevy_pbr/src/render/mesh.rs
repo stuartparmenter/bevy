@@ -98,7 +98,7 @@ use crate::{
 use bevy_core_pipeline::oit::OrderIndependentTransparencySettings;
 use bevy_core_pipeline::prepass::{DeferredPrepass, DepthPrepass, NormalPrepass};
 use bevy_core_pipeline::tonemapping::{DebandDither, Tonemapping};
-use bevy_render::camera::{DirtySpecializations, TemporalJitter};
+use bevy_render::camera::{DirtySpecializations, TemporalJitter, TonemapInShader};
 use bevy_render::prelude::Msaa;
 use bevy_render::sync_world::{MainEntity, MainEntityHashMap};
 use bevy_render::view::{
@@ -363,7 +363,11 @@ pub fn check_views_need_specialization(
     mut views: Query<(
         &ExtractedView,
         &Msaa,
-        (Option<&Tonemapping>, Option<&DebandDither>),
+        (
+            Option<&Tonemapping>,
+            Option<&DebandDither>,
+            Has<TonemapInShader>,
+        ),
         Option<&ShadowFilteringMethod>,
         Has<ScreenSpaceAmbientOcclusion>,
         (
@@ -391,7 +395,7 @@ pub fn check_views_need_specialization(
     for (
         view,
         msaa,
-        (tonemapping, dither),
+        (tonemapping, dither, tonemap_in_shader),
         shadow_filter_method,
         ssao,
         (normal_prepass, depth_prepass, motion_vector_prepass, deferred_prepass),
@@ -474,8 +478,7 @@ pub fn check_views_need_specialization(
             }
         }
 
-        if (view.target_format == TextureFormat::Rgba8UnormSrgb
-            || view.target_format == TextureFormat::Rgba8Unorm)
+        if tonemap_in_shader
             && let Some(tonemapping) = tonemapping
             && *tonemapping != Tonemapping::None
         {

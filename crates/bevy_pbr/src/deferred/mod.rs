@@ -19,6 +19,7 @@ use bevy_core_pipeline::{
 use bevy_ecs::prelude::*;
 use bevy_light::{EnvironmentMapLight, IrradianceVolume, ShadowFilteringMethod};
 use bevy_render::{
+    camera::TonemapInShader,
     extract_component::{
         ComponentUniforms, ExtractComponent, ExtractComponentPlugin, UniformComponentPlugin,
     },
@@ -401,6 +402,7 @@ pub fn prepare_deferred_lighting_pipelines(
         &ExtractedView,
         Option<&Tonemapping>,
         Option<&DebandDither>,
+        Has<TonemapInShader>,
         Option<&ShadowFilteringMethod>,
         (
             Has<ScreenSpaceAmbientOcclusion>,
@@ -426,6 +428,7 @@ pub fn prepare_deferred_lighting_pipelines(
         view,
         tonemapping,
         dither,
+        tonemap_in_shader,
         shadow_filter_method,
         (ssao, ssr, distance_fog),
         (normal_prepass, depth_prepass, motion_vector_prepass, deferred_prepass),
@@ -478,8 +481,7 @@ pub fn prepare_deferred_lighting_pipelines(
         // Always true, since we're in the deferred lighting pipeline
         view_key |= MeshPipelineKey::DEFERRED_PREPASS;
 
-        if (view.target_format == TextureFormat::Rgba8UnormSrgb
-            || view.target_format == TextureFormat::Rgba8Unorm)
+        if tonemap_in_shader
             && let Some(tonemapping) = tonemapping
             && *tonemapping != Tonemapping::None
         {

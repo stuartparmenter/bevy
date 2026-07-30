@@ -22,7 +22,7 @@ use bevy_math::{Affine3A, FloatOrd, Quat, Rect, Vec2, Vec4};
 use bevy_mesh::VertexBufferLayout;
 use bevy_platform::collections::HashMap;
 use bevy_render::{
-    camera::ExtractedCamera,
+    camera::{ExtractedCamera, TonemapInShader},
     view::{RenderVisibleEntities, ResolvedCompositingSpace, RetainedViewEntity},
 };
 use bevy_render::{
@@ -567,6 +567,7 @@ pub fn queue_sprites(
             &Msaa,
             Option<&Tonemapping>,
             Option<&DebandDither>,
+            Has<TonemapInShader>,
             Option<&ResolvedCompositingSpace>,
         ),
         With<ExtractedCamera>,
@@ -574,7 +575,9 @@ pub fn queue_sprites(
 ) {
     let draw_sprite_function = draw_functions.read().id::<DrawSprite>();
 
-    for (visible_entities, view, msaa, tonemapping, dither, resolved_space) in &cameras {
+    for (visible_entities, view, msaa, tonemapping, dither, tonemap_in_shader, resolved_space) in
+        &cameras
+    {
         let Some(transparent_phase) = transparent_render_phases.get_mut(&view.retained_view_entity)
         else {
             continue;
@@ -584,14 +587,11 @@ pub fn queue_sprites(
             | SpritePipelineKey::from_msaa_samples(msaa.samples())
             | SpritePipelineKey::from_compositing_space(resolved_space.and_then(|space| space.0));
 
-        // In-shader tonemapping fast path: an eligible SDR camera (8-bit
-        // main texture) with an active operator folds tonemapping (and
-        // optional debanding) into the sprite shader, skipping the separate
-        // tonemapping pass. Eligibility rides `view.target_format`, which the
-        // extract format fork drives to an 8-bit format only for eligible
-        // cameras.
-        if (view.target_format == TextureFormat::Rgba8UnormSrgb
-            || view.target_format == TextureFormat::Rgba8Unorm)
+        // In-shader tonemapping fast path: an eligible SDR camera
+        // (`TonemapInShader`, 8-bit main texture) with an active operator
+        // folds tonemapping (and optional debanding) into the sprite shader,
+        // skipping the separate tonemapping pass.
+        if tonemap_in_shader
             && let Some(tonemapping) = tonemapping
             && *tonemapping != Tonemapping::None
         {

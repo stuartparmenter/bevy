@@ -3,7 +3,7 @@ use bevy_asset::{embedded_asset, load_embedded_asset, AssetId, AssetServer, Hand
 use bevy_camera::{visibility::ViewVisibility, Camera2d, CompositingSpace};
 use bevy_platform::collections::HashMap;
 use bevy_render::{
-    camera::{DirtySpecializations, ExtractedCamera},
+    camera::{DirtySpecializations, ExtractedCamera, TonemapInShader},
     material_bind_groups::{
         MaterialBindGroupIndex, MaterialBindGroupSlot, MaterialBindingId, RenderMaterialBindings,
     },
@@ -148,24 +148,24 @@ pub fn check_views_need_specialization(
             &Msaa,
             Option<&Tonemapping>,
             Option<&DebandDither>,
+            Has<TonemapInShader>,
             Option<&ResolvedCompositingSpace>,
         ),
         With<ExtractedCamera>,
     >,
 ) {
-    for (view_entity, view, msaa, tonemapping, dither, resolved_space) in &cameras {
+    for (view_entity, view, msaa, tonemapping, dither, tonemap_in_shader, resolved_space) in
+        &cameras
+    {
         let mut view_key = Mesh2dPipelineKey::from_msaa_samples(msaa.samples())
             | Mesh2dPipelineKey::from_target_format(view.target_format)
             | Mesh2dPipelineKey::from_compositing_space(resolved_space.and_then(|space| space.0));
 
-        // In-shader tonemapping fast path: an eligible SDR camera (8-bit
-        // main texture) with an active operator folds tonemapping (and
-        // optional debanding) into the mesh2d / material fragment shaders,
-        // skipping the separate tonemapping pass. Eligibility rides
-        // `view.target_format`, which the extract format fork drives to an
-        // 8-bit format only for eligible cameras.
-        if (view.target_format == TextureFormat::Rgba8UnormSrgb
-            || view.target_format == TextureFormat::Rgba8Unorm)
+        // In-shader tonemapping fast path: an eligible SDR camera
+        // (`TonemapInShader`, 8-bit main texture) with an active operator
+        // folds tonemapping (and optional debanding) into the mesh2d /
+        // material fragment shaders, skipping the separate tonemapping pass.
+        if tonemap_in_shader
             && let Some(tonemapping) = tonemapping
             && *tonemapping != Tonemapping::None
         {

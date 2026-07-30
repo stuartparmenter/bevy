@@ -9,6 +9,7 @@ use bevy_image::{CompressedImageFormats, Image, ImageSampler, ImageType};
 use bevy_log::error;
 use bevy_log::warn_once;
 use bevy_render::{
+    camera::TonemapInShader,
     extract_component::{ExtractComponentPlugin, UniformComponentPlugin},
     extract_resource::{ExtractResource, ExtractResourcePlugin},
     render_asset::RenderAssets,
@@ -705,6 +706,7 @@ pub fn prepare_view_tonemapping_pipelines(
             Has<Gt7ParamsUniform>,
             Has<ExternalWhiteBalance>,
             Has<ViewTonemappingPipeline>,
+            Has<TonemapInShader>,
         ),
         // `ViewStackContract` is overwritten in place and never removed, so a
         // view whose `ViewTarget` was dropped keeps a stale contract. This
@@ -724,6 +726,7 @@ pub fn prepare_view_tonemapping_pipelines(
         has_gt7_params_uniform,
         external_white_balance,
         has_view_tonemapping_pipeline,
+        tonemap_in_shader,
     ) in view_targets.iter()
     {
         // Cameras stacked on a shared main texture tone-map once, on the
@@ -773,20 +776,14 @@ pub fn prepare_view_tonemapping_pipelines(
             );
         }
 
-        // `Tonemapping::None` views opt out of the pass, and views on an
-        // 8-bit main texture fold tone mapping into their material shaders
-        // (the `TONEMAP_IN_SHADER` path selected in camera extraction) — the
-        // node runs for neither, so don't specialize (and synchronously
-        // compile) a pipeline it never binds. The format set must stay
-        // identical to the node's check. Removing a stale component keeps the
+        // `Tonemapping::None` views opt out of the pass, and `TonemapInShader`
+        // views fold tone mapping into their material shaders — the node runs
+        // for neither, so don't specialize (and synchronously compile) a
+        // pipeline it never binds. Removing a stale component keeps the
         // node's `ViewQuery` from matching a view that stops qualifying
         // (render-world entities are retained) — but only if present, so
         // default SDR views issue no command.
-        let no_pass = resolved.operator == Tonemapping::None
-            || matches!(
-                view.target_format,
-                TextureFormat::Rgba8UnormSrgb | TextureFormat::Rgba8Unorm
-            );
+        let no_pass = resolved.operator == Tonemapping::None || tonemap_in_shader;
         if no_pass {
             if has_view_tonemapping_pipeline {
                 commands.entity(entity).remove::<ViewTonemappingPipeline>();

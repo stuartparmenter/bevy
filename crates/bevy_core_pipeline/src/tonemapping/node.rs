@@ -4,6 +4,7 @@ use crate::tonemapping::{
 
 use bevy_ecs::prelude::*;
 use bevy_render::{
+    camera::TonemapInShader,
     diagnostic::RecordDiagnostics,
     extract_component::{ComponentUniforms, DynamicUniformIndex},
     render_asset::RenderAssets,
@@ -41,6 +42,7 @@ pub fn tonemapping(
         &ViewTarget,
         &ViewTonemappingPipeline,
         Option<&DynamicUniformIndex<Gt7ParamsUniform>>,
+        Has<TonemapInShader>,
     )>,
     pipeline_cache: Res<PipelineCache>,
     tonemapping_pipeline: Res<TonemappingPipeline>,
@@ -52,19 +54,27 @@ pub fn tonemapping(
     mut cache: Local<TonemappingBindGroupCache>,
     mut ctx: RenderContext,
 ) {
-    let (view_uniform_offset, target, view_tonemapping_pipeline, gt7_params_index) =
-        view.into_inner();
+    let (
+        view_uniform_offset,
+        target,
+        view_tonemapping_pipeline,
+        gt7_params_index,
+        tonemap_in_shader,
+    ) = view.into_inner();
 
-    // Eligible SDR cameras fold tone mapping into their material shaders (the
-    // `TONEMAP_IN_SHADER` path selected in camera extraction) and keep an 8-bit
-    // main texture instead of the fp16 intermediate. The 8-bit format is the
-    // carried signal: running this node for such a camera would tone-map a
-    // second time, so skip it. (Every camera that runs the node-side operator
-    // is on an `Rgba16Float` intermediate.)
-    if matches!(
-        target.main_texture_format(),
-        TextureFormat::Rgba8UnormSrgb | TextureFormat::Rgba8Unorm
-    ) {
+    // `TonemapInShader` cameras fold tone mapping into their material shaders
+    // (the `TONEMAP_IN_SHADER` path selected in camera extraction) and keep an
+    // 8-bit main texture instead of the fp16 intermediate. Running this node
+    // for such a camera would tone-map a second time, so skip it. The 8-bit
+    // format check is a backstop that keeps the node structurally unable to
+    // operate on an 8-bit buffer. (Every camera that runs the node-side
+    // operator is on an `Rgba16Float` intermediate.)
+    if tonemap_in_shader
+        || matches!(
+            target.main_texture_format(),
+            TextureFormat::Rgba8UnormSrgb | TextureFormat::Rgba8Unorm
+        )
+    {
         return;
     }
 

@@ -549,6 +549,7 @@ pub fn extract_cameras(
         RenderLayers,
         Projection,
         NoIndirectDrawing,
+        TonemapInShader,
         ViewUniformOffset,
     );
 
@@ -653,7 +654,7 @@ pub fn extract_cameras(
                 &extracted_windows,
                 &manual_display_targets,
             );
-            let target_format = main_texture_mode(MainTextureCamera {
+            let mode = main_texture_mode(MainTextureCamera {
                 hdr,
                 tonemapping_enabled: tonemapping.is_some_and(Tonemapping::is_enabled),
                 needs_scene_linear_target,
@@ -665,8 +666,8 @@ pub fn extract_cameras(
                     .as_ref()
                     .and_then(|t| active_cameras_per_target.get(t))
                     .copied(),
-            })
-            .format(output_texture_format);
+            });
+            let target_format = mode.format(output_texture_format);
             main_pass_formats.insert(render_entity, target_format);
 
             let mut commands = commands.entity(render_entity);
@@ -745,6 +746,12 @@ pub fn extract_cameras(
             } else {
                 commands.remove::<NoIndirectDrawing>();
             }
+
+            if mode == MainTextureMode::InShaderTonemapSdr {
+                commands.insert(TonemapInShader);
+            } else {
+                commands.remove::<TonemapInShader>();
+            }
         };
     }
 }
@@ -797,7 +804,8 @@ enum MainTextureMode {
     /// needs the scene-linear HDR buffer, and sole ownership of its target
     /// folds tone mapping into its material shaders (the `TONEMAP_IN_SHADER`
     /// pipeline path) and keeps its 8-bit main texture, reproducing the
-    /// pre-node-side-tone-mapping SDR pipeline exactly.
+    /// pre-node-side-tone-mapping SDR pipeline exactly. Published to
+    /// render-world consumers as the [`TonemapInShader`] marker.
     InShaderTonemapSdr,
     /// The linear-storage `Rgba8Unorm` main texture an explicit
     /// `CompositingSpace::Srgb` camera keeps: its shaders write sRGB-encoded
@@ -821,6 +829,18 @@ impl MainTextureMode {
         }
     }
 }
+
+/// Render-world marker for camera views on the SDR in-shader tone-mapping
+/// fast path (`MainTextureMode::InShaderTonemapSdr`).
+///
+/// [`extract_cameras`] manages it: the marker is present on a camera's
+/// render-world entity exactly when the camera keeps an 8-bit main texture
+/// with an active tone-mapping operator. Pipeline specialization reads it to
+/// fold tone mapping into the camera's material shaders (the
+/// `TONEMAP_IN_SHADER` shader def), and the tonemapping pass reads it to skip
+/// such views — the fold already tone-mapped every fragment.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct TonemapInShader;
 
 /// The camera state that selects a [`MainTextureMode`].
 #[derive(Clone, Copy)]

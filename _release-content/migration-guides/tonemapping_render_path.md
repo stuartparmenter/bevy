@@ -29,6 +29,12 @@ The default `Camera3d` (`TonyMcMapface`, no `Hdr`, sole camera on a plain SDR
 sRGB window) meets these conditions: it keeps its 8-bit path and memory
 footprint and is unchanged from 0.19.
 
+Camera extraction publishes the decision on the camera's render-world entity as
+the `bevy_render::camera::TonemapInShader` marker (auto-managed; do not insert
+or remove it yourself). Render-world code that needs to know which path a view
+took should read that marker instead of inferring it from the main-texture
+format.
+
 A tone-mapped camera that fails any condition instead tone-maps in the
 post-process pass and renders to a scene-linear `Rgba16Float` intermediate.
 Triggers: the `Hdr` marker, scene-linear post-processing or anti-aliasing,
