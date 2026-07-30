@@ -52,9 +52,9 @@ fn main() {
     // calibration patches are gamut-invariant, so `--rec2020` only affects the
     // saturated debug swatches and gizmos.
     let working_color_space = if std::env::args().any(|arg| arg == "--rec2020") {
-        bevy::render::working_color_space::WorkingColorSpace::Rec2020
+        bevy::render::WorkingColorSpace::Rec2020
     } else {
-        bevy::render::working_color_space::WorkingColorSpace::Rec709
+        bevy::render::WorkingColorSpace::Rec709
     };
 
     App::new()

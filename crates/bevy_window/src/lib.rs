@@ -42,11 +42,9 @@ pub use window::*;
 pub mod prelude {
     #[doc(hidden)]
     pub use crate::{
-        CursorEntered, CursorLeft, CursorMoved, DisplayCalibrationPolicy, DisplayGamut,
-        DisplayProvenance, DisplayTarget, DisplayTransfer, DisplayTransfers,
-        EffectiveDisplayTarget, FileDragAndDrop, Ime, MonitorDisplayCapability, MonitorSelection,
-        VideoModeSelection, Window, WindowDisplayState, WindowMoved, WindowPlugin, WindowPosition,
-        WindowResizeConstraints, WindowSurfaceTransfers,
+        CursorEntered, CursorLeft, CursorMoved, DisplayGamut, DisplayTarget, DisplayTransfer,
+        FileDragAndDrop, Ime, MonitorSelection, VideoModeSelection, Window, WindowMoved,
+        WindowPlugin, WindowPosition, WindowResizeConstraints,
     };
 }
 

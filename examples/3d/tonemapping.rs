@@ -26,9 +26,9 @@ fn main() {
     // scene then renders with Rec.2020 primaries (the native input space of
     // `Tonemapping::GranTurismo7`), while SDR output remains Rec.709-encoded.
     let working_color_space = if std::env::args().any(|arg| arg == "--rec2020") {
-        bevy::render::working_color_space::WorkingColorSpace::Rec2020
+        bevy::render::WorkingColorSpace::Rec2020
     } else {
-        bevy::render::working_color_space::WorkingColorSpace::Rec709
+        bevy::render::WorkingColorSpace::Rec709
     };
 
     App::new()

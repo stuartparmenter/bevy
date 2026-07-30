@@ -82,6 +82,7 @@ pub mod prelude {
 
 pub use extract_param::Extract;
 pub use extract_plugin::{ExtractSchedule, MainWorld};
+pub use working_color_space::WorkingColorSpace;
 
 use crate::{
     camera::CameraPlugin,
@@ -97,7 +98,6 @@ use crate::{
     storage::StoragePlugin,
     texture::TexturePlugin,
     view::{ViewPlugin, WindowRenderPlugin},
-    working_color_space::WorkingColorSpace,
 };
 use alloc::sync::Arc;
 use batching::gpu_preprocessing::BatchingPlugin;
