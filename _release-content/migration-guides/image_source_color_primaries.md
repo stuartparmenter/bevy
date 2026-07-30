@@ -52,5 +52,5 @@ glTF loader stamps `Bt709` explicitly, as mandated by the glTF 2.0 specification
 
 The stamp is propagated to `GpuImage::source_primaries` in the render world for use
 by the configurable wide working color space that also ships this release
-(`RenderPlugin::working_color_space` — see the "Wide working color space (Rec.2020,
-opt-in)" release note).
+(`RenderPlugin::working_color_space` — see the "Wide-gamut color" release
+note).

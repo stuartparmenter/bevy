@@ -3,7 +3,7 @@ title: "`AutoExposure` has new `metering_bias` and `physiological` fields"
 pull_requests: []
 ---
 
-The `AutoExposure` component gained two new public fields, `metering_bias: f32` and `physiological: Option<PhysiologicalAdaptation>`, defaulting to a no-op (`0.0` and `None`) — see the "Physiological two-stage auto exposure" release note. `..default()` and `AutoExposure::default()` users need no change; full struct literals must add both fields:
+The `AutoExposure` component gained two new public fields, `metering_bias: f32` and `physiological: Option<PhysiologicalAdaptation>`, defaulting to a no-op (`0.0` and `None`) — see the "Physiological auto exposure and automatic white balance" release note. `..default()` and `AutoExposure::default()` users need no change; full struct literals must add both fields:
 
 ```rust
 // 0.19

@@ -56,13 +56,58 @@ headroom up to `peak_luminance_nits`. Surface negotiation selects a real
   Rec.2020 directly, the display-encoding pass applies the PQ OETF with no
   intermediate gamut round-trip, and the encoded signal is presented as-is.
 
-The display-encoding pass writes the encoded signal (scRGB scaled by
-`paper_white_nits / 80`; PQ from absolute nits) and the final blit hands it to
-the surface unchanged — these formats have no hardware sRGB encode. With GT7
-running in its HDR mode, highlights above paper white finally make it to the
-panel. Press `O` in the `tonemapping` example (cycles sRGB → scRGB →
+Press `O` in the `tonemapping` example (cycles sRGB → scRGB →
 extended-sRGB 709/P3 → PQ) or `T` in the `hdr_calibration` example to try it
 on an HDR-capable display.
+
+## The display-encoding pass
+
+The tone-mapped image has to be converted into the exact signal the display
+expects — the right primaries and the right transfer function — or highlights
+and saturated colors come out wrong. A dedicated display-encoding pass does
+this per view, with no per-camera setup. It runs after the UI pass (UI
+composites in display-linear, paper-white-relative space, so a white UI panel
+lands at `DisplayTarget::paper_white_nits`) and before the final upscaling
+blit. Reading the view's resolved `DisplayTarget`, it performs, in order:
+
+- a full-precision gamut transform from the tone-map operator's output
+  primaries to the display signal's primaries (for example Rec.2020 → Rec.709
+  when `Tonemapping::GranTurismo7` drives an scRGB signal, or Rec.709 →
+  Display-P3 for an `ExtendedDisplayP3` signal);
+- out-of-gamut compression (below), so colors a contraction pushes past the
+  display gamut compress gracefully instead of clipping;
+- the display transfer function selected by the target's `DisplayTransfer` —
+  scRGB scaling (`paper_white_nits / 80`), PQ (SMPTE ST 2084, from absolute
+  nits), or the encoded extended-range sRGB OETF.
+
+The final upscaling blit hands the encoded signal to the surface unchanged —
+these formats have no hardware sRGB encode. With GT7 running in its HDR mode,
+highlights above paper white finally make it to the panel.
+
+A gamut contraction can land the most saturated colors outside what the
+display can show, and a per-channel clip collapses their saturation unevenly
+and shifts hue (the classic `(1500, 1200, 500) → (1000, 1000, 500)` problem —
+a vivid orange reads as a duller one). Instead the pass compresses
+out-of-gamut colors smoothly toward the achromatic axis, in the style of the
+ACES 1.3 Reference Gamut Compression (Academy S-2020-001): in-gamut colors
+pass through unchanged, the most saturated are eased back to the boundary
+along a smooth curve, and brightness and hue are preserved as closely as the
+closed-form mapping allows. The `DisplayGamutCompression` resource controls
+it: `Auto` (default) compresses only when the gamut stage can actually go out
+of gamut (a contraction); `Always` forces it on for every HDR view (this also
+desaturates highly saturated in-gamut colors, so use it only to exercise the
+path); `Clip` keeps the hue-shifting per-channel clip as a debug fallback for
+A/B comparison.
+
+The transfer functions the pass encodes with live in an importable WGSL
+library, `bevy_render::transfer_functions` — the odd-symmetric extended-range
+sRGB OETF, scRGB scaling, and the PQ inverse EOTF — with CPU mirrors and
+parity tests in the matching Rust module, so you can reuse them in your own
+shaders. The decode direction (the extended sRGB and PQ EOTFs) is CPU-only in
+the Rust module, where the screenshot readback path uses it to decode HDR
+captures.
+
+## SDR-only operators degrade gracefully
 
 SDR-only tone-mapping operators — everything except `GranTurismo7`, `Linear`, and `None`,
 including the `Camera3d` default `TonyMcMapface` — cap their output at paper
@@ -75,6 +120,8 @@ modified; set `Tonemapping::GranTurismo7` explicitly to adopt the substitute
 and silence the warning, or switch back to an SDR display target to keep the
 authored operator. `Tonemapping::None` is not substituted — it is a deliberate
 pass-through — but also warns on HDR targets.
+
+## Unfulfillable requests downgrade with a warning
 
 When a request cannot be fulfilled it is **downgraded with a warning at each
 step**: PQ falls back to scRGB-linear where available, and any HDR request
@@ -96,6 +143,17 @@ targets), so HDR output can be toggled from a settings menu. A
 peak, and every other gamut change take effect through per-view uniforms and
 pipeline respecialization without any surface work.
 
+Views on the default `DisplayTarget::SDR_SRGB` (or any sRGB-transfer target)
+never run the encoding pass: it records no GPU work, and the exact sRGB encode
+remains the free hardware conversion on swapchain writeback, byte-identical to
+0.19. A plain single-camera SDR sRGB window with an active operator likewise
+keeps folding tone mapping into its material shaders (the in-shader path) on
+an 8-bit main texture. A camera gets the scene-linear `Rgba16Float`
+intermediate and the node-side tonemapping pass only when it is `Hdr`, renders
+to an HDR-transfer target, or runs an operator the in-shader fold cannot
+reproduce; see the migration guides for the visual implications on those
+previously-SDR cameras.
+
 Screenshots understand the new surfaces too: scRGB (`Rgba16Float`) captures
 read back as display-linear floats, HDR10 captures are decoded from the PQ
 signal through the PQ EOTF, and encoded extended-range sRGB captures are
@@ -104,15 +162,3 @@ Rec.709) — all to the same display-linear Rec.709 scale (1.0 = 80 nits).
 `save_to_disk` writes float images losslessly to float-capable containers
 (OpenEXR `.exr` with Bevy's `exr` feature, Radiance `.hdr`); saving to an
 8-bit format clamps, sRGB-encodes, and warns.
-
-**Caveat: this currently requires a patched wgpu.** The surface color-space
-API (`SurfaceColorSpace`, per-format `format_capabilities`,
-`SurfaceConfiguration::color_space`) has merged upstream but is not in a
-released wgpu; Bevy's workspace carries a temporary `[patch.crates-io]` section
-pinning the wgpu family of crates to gfx-rs/wgpu trunk until the API ships in a
-released wgpu (tracked under
-[wgpu#2920](https://github.com/gfx-rs/wgpu/issues/2920)). Cargo patches only
-apply at the workspace root of the final binary, so an application building
-against this Bevy must copy the same `[patch.crates-io]` entries into its own
-root `Cargo.toml`. The patch — and this caveat — go away once the API ships in
-a wgpu release.
