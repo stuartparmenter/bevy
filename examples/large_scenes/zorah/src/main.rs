@@ -582,12 +582,16 @@ struct MaterialRecord {
 struct BaseMaterialOverrides {
     #[serde(rename = "BlendMode")]
     blend_mode: Option<String>,
+    #[serde(rename = "ShadingModel")]
+    shading_model: Option<String>,
     #[serde(rename = "TwoSided")]
     two_sided: Option<bool>,
     #[serde(rename = "OpacityMaskClipValue")]
     opacity_mask_clip_value: Option<f32>,
     #[serde(rename = "bOverride_BlendMode")]
     override_blend_mode: Option<bool>,
+    #[serde(rename = "bOverride_ShadingModel")]
+    override_shading_model: Option<bool>,
     #[serde(rename = "bOverride_TwoSided")]
     override_two_sided: Option<bool>,
 }
@@ -638,6 +642,7 @@ struct EffectiveMaterial {
     textures: Vec<TextureParameter>,
     emissive: bool,
     blend_mode: SourceBlendMode,
+    shading_model: SourceShadingModel,
     two_sided: bool,
     opacity_mask_clip_value: f32,
 }
@@ -650,6 +655,7 @@ impl Default for EffectiveMaterial {
             textures: Vec::new(),
             emissive: false,
             blend_mode: SourceBlendMode::Opaque,
+            shading_model: SourceShadingModel::DefaultLit,
             two_sided: false,
             opacity_mask_clip_value: 0.3333,
         }
@@ -664,11 +670,30 @@ enum SourceBlendMode {
     Translucent,
 }
 
+/// The `EMaterialShadingModel` values Zorah authors. Every other UE shading
+/// model resolves to `DefaultLit`, which is what `StandardMaterial` already is.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+enum SourceShadingModel {
+    #[default]
+    DefaultLit,
+    Unlit,
+    /// Wrap lighting plus a back-face transmission lobe driven by the material's
+    /// Subsurface Color; `StandardMaterial` has neither.
+    TwoSidedFoliage,
+    /// Screen-space burley subsurface scattering parameterized by a
+    /// `USubsurfaceProfile` asset, which the manifest does not carry.
+    SubsurfaceProfile,
+    /// A lit opaque surface plus an under-water single-scattering medium; needs
+    /// the absorption/scattering/depth parameters item 6 extracts.
+    SingleLayerWater,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct SourceMaterialRenderProperties {
     alpha_mode: AlphaMode,
     double_sided: bool,
     cull_mode: Option<Face>,
+    unlit: bool,
 }
 
 fn default_true() -> bool {
@@ -865,6 +890,12 @@ fn parameter_key(name: &str, association: &str, index: i32) -> (String, String, 
     (name.to_ascii_lowercase(), association.to_string(), index)
 }
 
+/// Drops the `EBlendMode::`-style qualifier CUE4Parse writes ahead of some UE
+/// enum values but not others.
+fn ue_enum_value(value: &str) -> &str {
+    value.rsplit("::").next().unwrap_or(value)
+}
+
 fn merge_effective(parent: &mut EffectiveMaterial, child: &MaterialRecord) {
     if let Some(emissive) = child.emissive {
         parent.emissive = emissive;
@@ -906,12 +937,27 @@ fn merge_effective(parent: &mut EffectiveMaterial, child: &MaterialRecord) {
         parent.blend_mode = SourceBlendMode::Opaque;
     }
     if let Some(blend_mode) = overrides.blend_mode.as_deref() {
-        parent.blend_mode = match blend_mode.rsplit("::").next().unwrap_or(blend_mode) {
+        parent.blend_mode = match ue_enum_value(blend_mode) {
             "BLEND_Masked" => SourceBlendMode::Masked,
             "BLEND_Translucent" | "BLEND_Additive" | "BLEND_Modulate" => {
                 SourceBlendMode::Translucent
             }
             _ => SourceBlendMode::Opaque,
+        };
+    }
+    if overrides.override_shading_model == Some(true) && overrides.shading_model.is_none() {
+        // As above. MSM_Unlit is enum zero but is still written out whenever it
+        // is set (MI_OrbReflect_01 carries the literal name), so the omitted
+        // value is the struct default MSM_DefaultLit, not unlit.
+        parent.shading_model = SourceShadingModel::DefaultLit;
+    }
+    if let Some(shading_model) = overrides.shading_model.as_deref() {
+        parent.shading_model = match ue_enum_value(shading_model) {
+            "MSM_Unlit" => SourceShadingModel::Unlit,
+            "MSM_TwoSidedFoliage" => SourceShadingModel::TwoSidedFoliage,
+            "MSM_SubsurfaceProfile" => SourceShadingModel::SubsurfaceProfile,
+            "MSM_SingleLayerWater" => SourceShadingModel::SingleLayerWater,
+            _ => SourceShadingModel::DefaultLit,
         };
     }
     if overrides.override_two_sided == Some(true) && overrides.two_sided.is_none() {
@@ -974,6 +1020,9 @@ fn source_material_render_properties(
         alpha_mode,
         double_sided: material.two_sided,
         cull_mode: (!material.two_sided).then_some(Face::Back),
+        // The remaining shading models all need shading terms `StandardMaterial`
+        // does not have, so they keep the default lit response for now.
+        unlit: material.shading_model == SourceShadingModel::Unlit,
     }
 }
 
@@ -1466,7 +1515,7 @@ fn build_material_handles(
                 perceptual_roughness
             },
             uv_transform,
-            unlit: unlit_textures,
+            unlit: unlit_textures || render_properties.unlit,
             // Meshlets currently draw only opaque materials. Retaining UE's
             // alpha mode deliberately omits unsupported foliage/translucency
             // instead of turning their cards into solid scene occluders.
@@ -3581,6 +3630,88 @@ mod tests {
         assert_eq!(properties.alpha_mode, AlphaMode::Opaque);
         assert!(!properties.double_sided);
         assert_eq!(properties.cull_mode, Some(Face::Back));
+        assert!(!properties.unlit);
+    }
+
+    #[test]
+    fn unlit_shading_model_override_is_rendered_unlit() {
+        // MI_OrbReflect_01, the nebula orb's ground aura.
+        let record: MaterialRecord = serde_json::from_str(
+            r#"{
+                "object": "orb-aura",
+                "parent": null,
+                "base_overrides": {
+                    "bOverride_ShadingModel": true,
+                    "BlendMode": "BLEND_Translucent",
+                    "ShadingModel": "MSM_Unlit"
+                }
+            }"#,
+        )
+        .unwrap();
+        let records = HashMap::from([(record.object.clone(), record)]);
+        let effective =
+            resolve_effective_material("orb-aura", &records, &mut HashMap::new(), &mut Vec::new());
+
+        assert_eq!(effective.shading_model, SourceShadingModel::Unlit);
+        assert!(source_material_render_properties(&effective).unlit);
+    }
+
+    #[test]
+    fn shading_models_other_than_unlit_stay_lit() {
+        for (name, expected) in [
+            ("MSM_TwoSidedFoliage", SourceShadingModel::TwoSidedFoliage),
+            (
+                "EMaterialShadingModel::MSM_SubsurfaceProfile",
+                SourceShadingModel::SubsurfaceProfile,
+            ),
+            ("MSM_SingleLayerWater", SourceShadingModel::SingleLayerWater),
+            ("MSM_ClearCoat", SourceShadingModel::DefaultLit),
+        ] {
+            let record: MaterialRecord = serde_json::from_str(&format!(
+                r#"{{"object": "m", "parent": null, "base_overrides": {{"ShadingModel": "{name}"}}}}"#
+            ))
+            .unwrap();
+            let records = HashMap::from([(record.object.clone(), record)]);
+            let effective =
+                resolve_effective_material("m", &records, &mut HashMap::new(), &mut Vec::new());
+
+            assert_eq!(effective.shading_model, expected, "{name}");
+            assert!(
+                !source_material_render_properties(&effective).unlit,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn overridden_shading_model_without_a_value_falls_back_to_default_lit() {
+        // M_SoilPatch_Circular_A1 ticks the override but leaves the enum at the
+        // struct default; that is MSM_DefaultLit, not the zero-valued MSM_Unlit.
+        let parent: MaterialRecord = serde_json::from_str(
+            r#"{
+                "object": "parent",
+                "parent": null,
+                "base_overrides": {"ShadingModel": "MSM_Unlit"}
+            }"#,
+        )
+        .unwrap();
+        let child: MaterialRecord = serde_json::from_str(
+            r#"{
+                "object": "child",
+                "parent": "parent",
+                "base_overrides": {"bOverride_ShadingModel": true}
+            }"#,
+        )
+        .unwrap();
+        let records = HashMap::from([
+            (parent.object.clone(), parent),
+            (child.object.clone(), child),
+        ]);
+        let effective =
+            resolve_effective_material("child", &records, &mut HashMap::new(), &mut Vec::new());
+
+        assert_eq!(effective.shading_model, SourceShadingModel::DefaultLit);
+        assert!(!source_material_render_properties(&effective).unlit);
     }
 
     #[test]
