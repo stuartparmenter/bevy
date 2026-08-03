@@ -76,6 +76,48 @@ const UE_UNITLESS_LIGHT_LUMENS: f32 = 100.0;
 /// metres and a component's scale is unitless, so only a length read straight
 /// off a UE property needs this.
 const UE_CENTIMETRES: f32 = 0.01;
+/// A Niagara light renderer ("simple light") writes a raw linear RGB colour
+/// into the same shader field a point light fills with
+/// `LightColor * ComputeLightBrightness()`, applying no unit conversion of its
+/// own. `ComputeLightBrightness` scales an authored candela by `100 * 100` to
+/// get from UE's centimetres to metres, so 10,000 units of simple-light colour
+/// is one candela. Epic documents the same ratio for the legacy unit as
+/// `1 cd = 625 unitless`, and `10000 / 16 = 625`.
+///
+/// APPROXIMATION. The chain above is read from public UE mirrors - 5.3.2 and
+/// 5.5.4 carry a byte-identical `UNiagaraLightRendererProperties` constructor,
+/// and a shipped 5.4.3 reflection dump matches - not from the NVIDIA NvRTX
+/// branch Zorah ships on, which is not public and is not in the sample
+/// download. Zorah demonstrably runs a modified branch: `NS_CandleFlame_04`
+/// serializes `DefaultSourceRadius` and `bCastSampledLightShadows`, neither of
+/// which exists on the stock class. A frame of ThroneRoom rendered in that
+/// build would replace this. Until then it is the single knob: scale it and
+/// every Niagara light in the project moves together.
+const UE_LIGHT_UNITS_PER_CANDELA: f32 = 10_000.0;
+/// `NS_CandleFlame_04`, emitter `Candle_Flame_movement`, verbatim:
+/// `InitializeParticle.Color` and `ScaleColor001.Scale Alpha`.
+/// `bAlphaScalesBrightness` is set and `ColorAdd` is the class default
+/// `(0, 0, 0)`, so the simple light's colour is the product,
+/// `(12000, 5392.44, 2724.0)`. It is already linear - do not sRGB-decode it the
+/// way `light_color` decodes a UE `FColor`. No curve, noise, random or time
+/// input appears anywhere in the chain, so the flames are constant and do not
+/// flicker.
+///
+/// The ratio is CCT 3015 K, the same colour temperature the 22 `SPT_CandleFill`
+/// spots author, not a physical flame's 1670-1900 K. The artist appears to have
+/// picked a display-space flame swatch; UE renders the linear reading. Keep it.
+const UE_CANDLE_FLAME_PARTICLE_COLOR: Vec3 = Vec3::new(5.0, 2.246_849, 1.134_999_8);
+const UE_CANDLE_FLAME_ALPHA: f32 = 2400.0;
+/// The renderer's authored `DefaultSourceRadius`, 0.5 UE units. This path
+/// deliberately skips the 0.05 m proxy-radius floor `spawn_exported_lights`
+/// applies: at 0.05 m the emitter's area is 100x larger and its luminance falls
+/// from 15,279 cd/m2 to 153 cd/m2, below the 307.2 cd/m2 white point at
+/// ThroneRoom's authored EV100 8 - a grey blob rather than a flame.
+const UE_CANDLE_FLAME_RADIUS: f32 = 0.005;
+const UE_CANDLE_FLAME_SYSTEM: &str = "/Game/VFX/Candle/NS_CandleFlame_04.NS_CandleFlame_04";
+/// The nine Blueprint classes `BP_Niagara_CandleFlames_Spawner` collects with
+/// `GetAllActorsOfClass`.
+const UE_CANDLE_ACTOR_PREFIX: &str = "BP_Candle_";
 // UE SkyLight intensity is a multiplier over a captured environment rather
 // than a physical unit. Until Solari supports environment maps directly, use
 // the same source-unit bridge for raster ambient and traced environment light.
@@ -85,6 +127,31 @@ const UE_SKY_LIGHT_LUX_PER_UNIT: f32 = 80.0;
 
 fn ue_sky_light_illuminance(intensity: f32) -> f32 {
     intensity.max(0.0) * UE_SKY_LIGHT_LUX_PER_UNIT
+}
+
+/// Luminous flux for a Niagara simple light, in the convention the emissive
+/// proxies already use: the flux a white light of this magnitude would emit,
+/// which the proxy then multiplies by a peak-normalized tint. Taking the peak
+/// channel as the magnitude mirrors UE's own split of a `<= 1` `LightColor`
+/// times a scalar brightness, and reproduces UE's per-channel intensity
+/// exactly, because a Lambertian proxy sphere emits `tint * flux / 4pi` candela
+/// per channel and `tint * 12000 / 1e4` is the authored colour. Summarizing the
+/// triple by its Rec.709 luminance instead would apply the tint twice and
+/// render the candles 1.8x dimmer than every other converted UE light.
+///
+/// For the candle this is `12000 / 1e4 * 4pi` = 15.08 lm, i.e. 1.2 cd. Two
+/// checks agree that the authored alpha of 2400 is physically calibrated: the
+/// candela was defined from candlepower, so one wax candle is about 1 cd; and
+/// NIST measured a 21 mm paraffin taper at 77 +/- 9 W with a 0.17 radiative
+/// fraction, which is 7-17 lm at a 1700 K sooting spectrum (Hamins, Bundy &
+/// Dillon, J. Fire Prot. Eng. 15 (2005) 265). ThroneRoom's 6,421 candles then
+/// total 96,826 lm against 301,000 lm of authored `SPT_CandleFill`, so the
+/// flames read as a third of the fill rather than replacing it.
+///
+/// The remaining approximations are the peak-channel choice above and treating
+/// the flame as isotropic; a real candle is shadowed downward by its own wax.
+fn ue_simple_light_lumens(color: Vec3) -> f32 {
+    color.max_element().max(0.0) / UE_LIGHT_UNITS_PER_CANDELA * 4.0 * std::f32::consts::PI
 }
 const UE_BLACK_UNLIT_MATERIAL: &str =
     "/Engine/EngineDebugMaterials/BlackUnlitMaterial.BlackUnlitMaterial";
@@ -166,6 +233,10 @@ struct Args {
     #[argh(switch)]
     unlit_textures: bool,
 
+    /// omit the Niagara candle flame emitters, which are on by default
+    #[argh(switch)]
+    no_candle_lights: bool,
+
     /// camera position as Bevy-space x,y,z (overrides the selected level preset)
     #[argh(option)]
     camera_position: Option<String>,
@@ -184,6 +255,7 @@ struct RuntimeOptions {
     raster_only: bool,
     preserve_alpha: bool,
     unlit_textures: bool,
+    candle_lights: bool,
     camera_position: Option<Vec3>,
     camera_target: Option<Vec3>,
     exposure_ev100: Option<f32>,
@@ -302,6 +374,8 @@ struct ActorRecord {
     #[serde(default)]
     hidden: bool,
     components: Vec<ComponentRecord>,
+    #[serde(default)]
+    niagara: Vec<NiagaraRecord>,
     #[serde(default)]
     lights: Vec<LightRecord>,
     #[serde(default)]
@@ -510,6 +584,25 @@ struct ComponentRecord {
     instances: Option<Vec<UeTransform>>,
     #[serde(default)]
     override_materials: Vec<String>,
+}
+
+/// A placed `UNiagaraComponent`. The export also carries the component's
+/// transform, its `override_parameters`, and the meshes each mesh renderer
+/// draws; nothing reads those yet, because the only system the runtime
+/// reproduces is `NS_CandleFlame_04`, whose light positions come from the
+/// candle actors rather than from this component.
+#[derive(Deserialize)]
+struct NiagaraRecord {
+    #[serde(rename = "name")]
+    _name: String,
+    #[serde(default)]
+    asset: Option<String>,
+    #[serde(default = "default_true")]
+    visible: bool,
+    #[serde(default)]
+    hidden_in_game: bool,
+    #[serde(default = "default_true")]
+    auto_activate: bool,
 }
 
 #[derive(Clone, Deserialize)]
@@ -1742,6 +1835,7 @@ fn main() {
             raster_only,
             preserve_alpha: args.preserve_alpha,
             unlit_textures: args.unlit_textures,
+            candle_lights: !args.no_candle_lights,
             camera_position,
             camera_target,
             exposure_ev100: args.exposure_ev100,
@@ -1939,12 +2033,12 @@ fn make_light_proxy_meshes(meshes: &mut Assets<Mesh>) -> (Handle<Mesh>, Handle<M
 fn spawn_exported_lights(
     commands: &mut Commands,
     converted: &ConvertedWorld,
-    meshes: &mut Assets<Mesh>,
+    point_proxy_mesh: &Handle<Mesh>,
+    spot_proxy_mesh: &Handle<Mesh>,
     materials: &mut Assets<StandardMaterial>,
     ambient_light: &mut GlobalAmbientLight,
 ) -> Vec<PendingRaytracingInstance> {
     let has_atmosphere = has_sky_atmosphere(converted);
-    let (point_proxy_mesh, spot_proxy_mesh) = make_light_proxy_meshes(meshes);
     let mut raytracing_instances = Vec::new();
     let mut point_count = 0usize;
     let mut spot_count = 0usize;
@@ -2073,10 +2167,11 @@ fn spawn_exported_lights(
                         ..default()
                     });
                     let mesh = if light.kind == "point" {
-                        point_proxy_mesh.clone()
+                        point_proxy_mesh
                     } else {
-                        spot_proxy_mesh.clone()
-                    };
+                        spot_proxy_mesh
+                    }
+                    .clone();
                     let local_rotation = if light.kind == "spot" {
                         Mat4::from_rotation_y(std::f32::consts::PI)
                     } else {
@@ -2139,6 +2234,135 @@ fn spawn_exported_lights(
         legacy_unit_count,
         solari_emitters = raytracing_instances.len(),
         "spawned exported Zorah lighting"
+    );
+    raytracing_instances
+}
+
+/// Whether the level runs `NS_CandleFlame_04`. ThroneRoom holds the only
+/// instance, on `BP_Niagara_CandleFlames_Spawner`, so the candle actors in any
+/// other level stay unlit exactly as UE leaves them.
+fn candle_flame_system_is_active(converted: &ConvertedWorld) -> bool {
+    converted
+        .actors
+        .iter()
+        .filter(|actor| !actor.hidden)
+        .flat_map(|actor| &actor.niagara)
+        .any(|system| {
+            system.asset.as_deref() == Some(UE_CANDLE_FLAME_SYSTEM)
+                && system.visible
+                && !system.hidden_in_game
+                && system.auto_activate
+        })
+}
+
+/// Where `BP_Niagara_CandleFlames_Spawner` puts one flame on a candle actor: its
+/// "Get Top Of StaticMesh" node takes the horizontal centre of the mesh's
+/// bounds and drops one UE unit below the top. Converted AABBs are already in
+/// Bevy axes and metres, so the rule reads off the partition bounds directly.
+fn candle_flame_anchor(partitions: &[PartitionRecord]) -> Option<Vec3> {
+    let mut min = Vec3::splat(f32::INFINITY);
+    let mut max = Vec3::splat(f32::NEG_INFINITY);
+    for partition in partitions {
+        let (Some(partition_min), Some(partition_max)) = (partition.aabb_min, partition.aabb_max)
+        else {
+            continue;
+        };
+        min = min.min(Vec3::from(partition_min));
+        max = max.max(Vec3::from(partition_max));
+    }
+    (min.is_finite() && max.is_finite()).then(|| {
+        Vec3::new(
+            (min.x + max.x) * 0.5,
+            max.y - UE_CENTIMETRES,
+            (min.z + max.z) * 0.5,
+        )
+    })
+}
+
+/// The Niagara flame lights, as Solari emissive proxies.
+///
+/// The candle actors export empty `lights` arrays because UE draws their light
+/// with a Niagara light renderer rather than a light component, so they cannot
+/// go through `spawn_exported_lights`. Every flame is identical, which is what
+/// makes 6,421 of them affordable: they share the point light's proxy sphere,
+/// adding no BLAS, and one material, so Solari's per-change clone of
+/// `Assets<StandardMaterial>` does not grow. They do add one TLAS instance and
+/// one uniformly sampled light source each.
+///
+/// Like the exported fixtures' proxies they carry no `Mesh3d`, so they light
+/// only the traced image. There is no raster counterpart: `bevy_solari` binds
+/// no punctual lights, and 6,421 clustered `PointLight`s would not survive the
+/// raster warm-up, so `--raster-only` shows the room without its candles.
+fn spawn_candle_flames(
+    commands: &mut Commands,
+    converted: &ConvertedWorld,
+    proxy_mesh: &Handle<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+) -> Vec<PendingRaytracingInstance> {
+    if !candle_flame_system_is_active(converted) {
+        return Vec::new();
+    }
+    let color = UE_CANDLE_FLAME_PARTICLE_COLOR * UE_CANDLE_FLAME_ALPHA;
+    let flux = ue_simple_light_lumens(color);
+    // Derived, never typed, so the authored 5 : 2.246849 : 1.1349998 ratio
+    // survives exactly and the flux carries the whole magnitude.
+    let tint = color / color.max_element();
+    let radius = UE_CANDLE_FLAME_RADIUS;
+    // A Lambertian sphere emits `luminance * pi * 4pi r^2`, the same inversion
+    // the exported point lights use for their proxies.
+    let pi = std::f32::consts::PI;
+    let emissive =
+        LinearRgba::rgb(tint.x, tint.y, tint.z) * (flux / (4.0 * pi * pi * radius * radius));
+    let material = materials.add(StandardMaterial {
+        base_color: Color::BLACK,
+        emissive,
+        perceptual_roughness: 1.0,
+        ..default()
+    });
+    let mut raytracing_instances = Vec::new();
+    let mut without_bounds = 0usize;
+    for actor in &converted.actors {
+        if actor.hidden || !actor.kind.starts_with(UE_CANDLE_ACTOR_PREFIX) {
+            continue;
+        }
+        let actor_matrix = ue_matrix(&actor.transform);
+        for component in &actor.components {
+            if !component.visible || component.hidden_in_game {
+                continue;
+            }
+            let Some(converted_mesh) = component
+                .mesh
+                .as_ref()
+                .and_then(|mesh| converted.geometry.get(mesh))
+            else {
+                continue;
+            };
+            let Some(anchor) = candle_flame_anchor(&converted_mesh.partitions) else {
+                without_bounds += 1;
+                continue;
+            };
+            let world = ue_world_to_bevy(actor_matrix * ue_matrix(&component.transform));
+            let entity = commands
+                .spawn((
+                    Name::new("Candle flame Solari emitter"),
+                    MeshMaterial3d(material.clone()),
+                    Transform::from_translation(world.transform_point(anchor))
+                        .with_scale(Vec3::splat(radius)),
+                ))
+                .id();
+            raytracing_instances.push(PendingRaytracingInstance {
+                entity,
+                mesh: proxy_mesh.clone(),
+                geometry_error: 0.0,
+            });
+        }
+    }
+    info!(
+        candle_flames = raytracing_instances.len(),
+        candles_without_converted_bounds = without_bounds,
+        lumens_each = flux,
+        radius_metres = radius,
+        "spawned Zorah Niagara candle flames"
     );
     raytracing_instances
 }
@@ -2679,13 +2903,23 @@ fn setup(
             }
         }
     }
-    let raytracing_light_instances = spawn_exported_lights(
+    let (point_proxy_mesh, spot_proxy_mesh) = make_light_proxy_meshes(&mut meshes);
+    let mut raytracing_light_instances = spawn_exported_lights(
         &mut commands,
         &converted,
-        &mut meshes,
+        &point_proxy_mesh,
+        &spot_proxy_mesh,
         &mut materials,
         &mut ambient_light,
     );
+    if options.candle_lights {
+        raytracing_light_instances.extend(spawn_candle_flames(
+            &mut commands,
+            &converted,
+            &point_proxy_mesh,
+            &mut materials,
+        ));
+    }
     spawn_exported_decals(
         &mut commands,
         &converted,
@@ -3403,6 +3637,7 @@ mod tests {
             transform,
             hidden: false,
             components: vec![],
+            niagara: vec![],
             lights: vec![],
             decals: vec![],
             atmosphere: Some(SkyAtmosphereRecord {
@@ -3504,10 +3739,140 @@ mod tests {
     }
 
     #[test]
-    fn candle_temperature_is_warm() {
+    fn blackbody_tint_is_warm_at_flame_temperatures() {
         let color = blackbody_srgb(1800.0).to_linear();
         assert!(color.red > color.green);
         assert!(color.green > color.blue);
+    }
+
+    fn test_candle_actor(kind: &str, mesh: Option<&str>) -> ActorRecord {
+        ActorRecord {
+            _name: kind.into(),
+            _label: None,
+            kind: kind.into(),
+            transform: test_transform(),
+            hidden: false,
+            components: mesh
+                .map(|mesh| ComponentRecord {
+                    mesh: Some(mesh.into()),
+                    transform: test_transform(),
+                    visible: true,
+                    hidden_in_game: false,
+                    cast_shadow: true,
+                    instances: None,
+                    override_materials: vec![],
+                })
+                .into_iter()
+                .collect(),
+            niagara: vec![],
+            lights: vec![],
+            decals: vec![],
+            atmosphere: None,
+            height_fog: None,
+            post_process: None,
+        }
+    }
+
+    fn test_candle_partition(aabb_min: [f32; 3], aabb_max: [f32; 3]) -> PartitionRecord {
+        PartitionRecord {
+            geometry: "candle".into(),
+            mesh: None,
+            meshlet: "candle".into(),
+            material_slot: 0,
+            material_index: None,
+            vertices: 0,
+            blas_vertices: 0,
+            blas_achieved_error: 0.0,
+            uv_min: None,
+            uv_max: None,
+            aabb_min: Some(aabb_min),
+            aabb_max: Some(aabb_max),
+        }
+    }
+
+    #[test]
+    fn niagara_simple_light_color_reads_back_as_candle_scale_flux() {
+        let color = UE_CANDLE_FLAME_PARTICLE_COLOR * UE_CANDLE_FLAME_ALPHA;
+        assert!(
+            (color - Vec3::new(12_000.0, 5_392.437_6, 2_724.0))
+                .abs()
+                .max_element()
+                < 0.01
+        );
+
+        // 12000 / 1e4 = 1.2 cd, and an isotropic 1.2 cd emits 1.2 * 4pi lm.
+        let flux = ue_simple_light_lumens(color);
+        assert!((flux - 1.2 * 4.0 * std::f32::consts::PI).abs() < 0.001);
+        assert!(flux.is_finite() && flux > 0.0);
+        // Roughly one real wax candle, which is about 1 cd / 12.6 lm.
+        assert!((10.0..20.0).contains(&flux));
+    }
+
+    #[test]
+    fn candle_flame_tint_preserves_the_authored_niagara_ratio() {
+        let color = UE_CANDLE_FLAME_PARTICLE_COLOR * UE_CANDLE_FLAME_ALPHA;
+        let tint = color / color.max_element();
+        assert_eq!(tint.x, 1.0);
+        let authored = UE_CANDLE_FLAME_PARTICLE_COLOR / UE_CANDLE_FLAME_PARTICLE_COLOR.x;
+        assert!((tint - authored).abs().max_element() < 1.0e-6);
+        // The alpha carries the magnitude only, so it must not move the hue.
+        assert!(tint.x > tint.y && tint.y > tint.z);
+
+        // The proxy emits `tint * flux / 4pi` candela per channel, which is the
+        // authored colour divided by the engine's units-per-candela.
+        let candela = tint * ue_simple_light_lumens(color) / (4.0 * std::f32::consts::PI);
+        assert!(
+            (candela - color / UE_LIGHT_UNITS_PER_CANDELA)
+                .abs()
+                .max_element()
+                < 1.0e-4
+        );
+    }
+
+    #[test]
+    fn candle_flame_sits_one_ue_unit_below_the_top_of_the_candle_mesh() {
+        // The converted bounds of `SM_Candle_A1_1`, verbatim from geometry.json.
+        let partitions = vec![test_candle_partition(
+            [-0.043_278_105, 4.656_613e-9, -0.036_766_455],
+            [0.031_870_31, 0.125_729_78, 0.038_665_25],
+        )];
+        let anchor = candle_flame_anchor(&partitions).expect("bounded candle mesh has an anchor");
+        assert!((anchor.x - (-0.005_703_898)).abs() < 1.0e-6);
+        assert!((anchor.y - 0.115_729_78).abs() < 1.0e-6);
+        assert!((anchor.z - 0.000_949_397_8).abs() < 1.0e-6);
+        // A multi-partition candle uses the union of its partition bounds.
+        let mut wider = partitions;
+        wider.push(test_candle_partition([0.0, 0.0, 0.0], [0.1, 0.2, 0.1]));
+        let anchor = candle_flame_anchor(&wider).expect("bounded candle mesh has an anchor");
+        assert!((anchor.y - 0.19).abs() < 1.0e-6);
+        assert!(candle_flame_anchor(&[]).is_none());
+    }
+
+    #[test]
+    fn candle_flames_follow_the_niagara_spawner_rather_than_the_candle_actors() {
+        let mut spawner = test_candle_actor("BP_Niagara_CandleFlames_Spawner_C", None);
+        spawner.niagara = vec![NiagaraRecord {
+            _name: "NS_CandleFlame_04".into(),
+            asset: Some(UE_CANDLE_FLAME_SYSTEM.into()),
+            visible: true,
+            hidden_in_game: false,
+            auto_activate: true,
+        }];
+        let candle = test_candle_actor("BP_Candle_A1_C", Some("/Game/Test/SM_Candle_A1_1"));
+        let mut converted = ConvertedWorld {
+            level: "ThroneRoom_Level".into(),
+            actors: vec![candle],
+            post_process: None,
+            geometry: HashMap::new(),
+            materials: HashMap::new(),
+            textures: HashMap::new(),
+        };
+        // The candle actors alone carry no flame; the Niagara system does.
+        assert!(!candle_flame_system_is_active(&converted));
+        converted.actors.push(spawner);
+        assert!(candle_flame_system_is_active(&converted));
+        converted.actors[1].niagara[0].auto_activate = false;
+        assert!(!candle_flame_system_is_active(&converted));
     }
 
     #[test]
@@ -3631,6 +3996,7 @@ mod tests {
                     instances: None,
                     override_materials: vec![],
                 }],
+                niagara: vec![],
                 lights: vec![],
                 decals: vec![test_decal(decal_material_name.clone())],
                 atmosphere: None,

@@ -362,12 +362,41 @@ proxy meshes for Solari. Intensities are restated in each consumer's
 convention: UE derives spot candela from the cone solid angle while Bevy
 divides `SpotLight::intensity` by 4pi, so a spot authored in
 `ELightUnits::Lumens` is rescaled for the raster light and left as authored
-total flux for its emissive proxy. The 6,421 Throne Room candle actors share one tiny
-1,800 K flame mesh/material, positioned with the same top-of-static-mesh rule
-used by Zorah's Niagara Blueprint, so they add one BLAS rather than thousands.
+total flux for its emissive proxy.
 The two `BP_HoodLight` spotlight templates are recovered from their Blueprint
 class package because their World Partition instance contains no component
 exports.
+Throne Room's 6,421 candles are lit by a Niagara Light Renderer rather than a
+light component, so their actors export no light at all. The runtime spawns one
+emissive proxy per candle when the level runs `NS_CandleFlame_04`, placed by the
+same "top of static mesh" rule the Niagara Blueprint uses: the horizontal centre
+of the candle's converted bounds, one UE unit below the top. All 6,421 share the
+point light's proxy sphere and one material, so they add no BLAS and no material
+clone, but they do add one TLAS instance and one uniformly sampled Solari light
+source each: Throne Room's 23,189 partitions plus 27 light proxies grow from
+23,216 instances to 29,637, and its 29 light sources (27 proxies, one
+directional, one environment) become 6,450. That is 10x under the 65,535
+light-source ceiling, but `generate_random_light_sample` picks uniformly, so
+every key light becomes 222x rarer to sample. `--no-candle-lights` turns the
+flames off to isolate that cost. Like the other proxies they carry no `Mesh3d`,
+so they light the traced image only and `--raster-only` shows no candlelight.
+
+Their colour is exact and their brightness is not. The particle colour
+`(5, 2.246849, 1.1349998)` and the `2400` alpha that scales it are read verbatim
+from the asset, and the runtime derives the tint from them rather than typing a
+literal, so the authored ratio survives; it is CCT 3015 K, matching the 3000 K
+the level's own `SPT_CandleFill` spots author, not a physical flame's 1700 K.
+The magnitude rests on one engine constant, `1 cd = 10,000 internal light
+units`, which comes from `UPointLightComponent::ComputeLightBrightness` scaling
+candelas by `100 * 100` for UE's centimetre world - read from public 5.3/5.5
+mirrors, because Zorah ships on an NVIDIA NvRTX branch that is not public and is
+not in the sample download. That puts each flame at 1.2 cd / 15.08 lm, against a
+real wax candle's roughly 1 cd. Two further judgement calls are labelled in
+`main.rs`: the RGB triple is collapsed to a scalar by its peak channel, which is
+1.8x brighter than a luminance-weighted reading; and the flame is treated as
+isotropic. `UE_LIGHT_UNITS_PER_CANDELA` is the single knob. A frame of Throne
+Room rendered in Zorah's own build would settle all three.
+
 Source emissive intensity/color/mask parameters are also mapped, and the
 runtime marks emission explicitly from Zorah's authored switches and custom
 emission graphs. Solari exposes large emissive instances as stable logical
@@ -379,8 +408,12 @@ analytical point/spot lights, so their emissive proxies have Lambertian rather
 than exact UE angular profiles. UE IES profiles and procedural light-function
 materials retain uniform-flux proxies but the profiles themselves are not
 evaluated. SkyLight real-time/environment capture is a raster ambient
-approximation and is not yet a traced environment light; Niagara flame
-animation/flicker is not reproduced. UE light-blocker meshes are retained as
+approximation and is not yet a traced environment light. The candle flames do
+not animate, which costs nothing here: `NS_CandleFlame_04` has no curve, noise,
+random or time input anywhere in its chain, so UE's flames do not flicker
+either. The Niagara systems that do animate - the nebula orb's translucent
+shells and the GreenHouse butterflies - are exported but not spawned. UE
+light-blocker meshes are retained as
 ray-tracing occluders but intentionally omitted from camera-visible meshlet
 rasterization. The 225 components UE excludes from the shadow pass (1
 GreenHouse, 216 Restir, 8 Throne Room) become `NotShadowCaster`, which meshlet
