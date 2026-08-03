@@ -1,7 +1,7 @@
 #define_import_path bevy_pbr::pbr_deferred_types
 
 #import bevy_pbr::{
-    mesh_types::MESH_FLAGS_SHADOW_RECEIVER_BIT,
+    mesh_types::{MESH_FLAGS_GEOMETRY_ERROR_CODE_BITS, MESH_FLAGS_GEOMETRY_ERROR_CODE_SHIFT, MESH_FLAGS_SHADOW_RECEIVER_BIT},
     pbr_types::{STANDARD_MATERIAL_FLAGS_FOG_ENABLED_BIT, STANDARD_MATERIAL_FLAGS_UNLIT_BIT},
 }
 
@@ -9,12 +9,16 @@
 const DEFERRED_FLAGS_UNLIT_BIT: u32                 = 1u << 0u;
 const DEFERRED_FLAGS_FOG_ENABLED_BIT: u32           = 1u << 1u;
 const DEFERRED_MESH_FLAGS_SHADOW_RECEIVER_BIT: u32  = 1u << 2u;
+// Bits 3..7 of the flag byte, i.e. the top 5 bits of gbuffer.a.
+const DEFERRED_FLAGS_GEOMETRY_ERROR_CODE_SHIFT: u32 = 3u;
 
 fn deferred_flags_from_mesh_material_flags(mesh_flags: u32, mat_flags: u32) -> u32 {
     var flags = 0u;
     flags |= u32((mesh_flags & MESH_FLAGS_SHADOW_RECEIVER_BIT) != 0u) * DEFERRED_MESH_FLAGS_SHADOW_RECEIVER_BIT;
     flags |= u32((mat_flags & STANDARD_MATERIAL_FLAGS_FOG_ENABLED_BIT) != 0u) * DEFERRED_FLAGS_FOG_ENABLED_BIT;
     flags |= u32((mat_flags & STANDARD_MATERIAL_FLAGS_UNLIT_BIT) != 0u) * DEFERRED_FLAGS_UNLIT_BIT;
+    flags |= ((mesh_flags & MESH_FLAGS_GEOMETRY_ERROR_CODE_BITS) >> MESH_FLAGS_GEOMETRY_ERROR_CODE_SHIFT)
+             << DEFERRED_FLAGS_GEOMETRY_ERROR_CODE_SHIFT;
     return flags;
 }
 
@@ -50,6 +54,15 @@ fn unpack_24bit_normal(packed: u32) -> vec2<f32> {
 
 fn unpack_flags(packed: u32) -> u32 {
     return (packed >> 24u) & 0xFFu;
+}
+
+// Mirrors bevy_pbr::dequantize_geometry_error, and must stay in step with it. Negative means the
+// writer stated no geometry error, leaving the consumer on whatever conservative bound it had.
+fn deferred_geometry_error(gbuffer_a: u32) -> f32 {
+    let code = (unpack_flags(gbuffer_a) >> DEFERRED_FLAGS_GEOMETRY_ERROR_CODE_SHIFT) & 0x1Fu;
+    if code == 0u { return -1.0; }
+    if code == 1u { return 0.0; }
+    return exp2((f32(code) - 2.0) / 3.0 - 10.0);
 }
 
 // The builtin one didn't work in webgl.

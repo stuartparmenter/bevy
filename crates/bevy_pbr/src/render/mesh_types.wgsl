@@ -76,6 +76,9 @@ struct MorphAttributes {
 
 // [2^0, 2^16)
 const MESH_FLAGS_VISIBILITY_RANGE_INDEX_BITS: u32     = (1u << 16u) - 1u;
+// [2^16, 2^21): 5-bit quantized world geometry error code.
+const MESH_FLAGS_GEOMETRY_ERROR_CODE_BITS: u32        = 0x1Fu << 16u;
+const MESH_FLAGS_GEOMETRY_ERROR_CODE_SHIFT: u32       = 16u;
 const MESH_FLAGS_AABB_BASED_VISIBILITY_RANGE_BIT: u32 = 1u << 27u;
 const MESH_FLAGS_NO_FRUSTUM_CULLING_BIT: u32          = 1u << 28u;
 const MESH_FLAGS_SHADOW_RECEIVER_BIT: u32             = 1u << 29u;
