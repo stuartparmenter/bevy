@@ -57,6 +57,32 @@ static class ZorahConvert
         PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
     };
     private const string GeneratedVariableSuffix = "_GEN_VARIABLE";
+    // Slots the runtime binds by parameter name, keyed by the material input the
+    // graph walk follows to reach them. Emitting the runtime name rather than
+    // the authoring one lets a connection-derived texture join the same
+    // selection the parameter families already drive.
+    private static readonly (string Input, string Parameter)[] MaterialGraphTextureInputs =
+    [
+        ("BaseColor", "Base Color"),
+        ("Normal", "Normal"),
+        ("EmissiveColor", "Emissive"),
+    ];
+    private const string MaterialGraphOrmParameter = "ORM";
+    // UE's roughness input and the runtime scalar that scales the packed map
+    // share this one name.
+    private const string RoughnessInput = "Roughness";
+    // UE packs occlusion, roughness and metalness into one texture's R, G and B,
+    // which a MaterialExpressionTextureSample exposes as output indices 1, 2 and
+    // 3. Requiring every connected input to read its own channel of one shared
+    // sample is what separates a packed ORM map from three unrelated textures;
+    // Specular is deliberately absent because a StandardMaterial has no map for
+    // it, only the scalar reflectance.
+    private static readonly (string Input, int OutputIndex)[] MaterialGraphOrmInputs =
+    [
+        ("AmbientOcclusion", 1),
+        (RoughnessInput, 2),
+        ("Metallic", 3),
+    ];
     private static readonly Dictionary<string, Dictionary<string, UObject>> BlueprintComponentTemplates =
         new(StringComparer.Ordinal);
     private static readonly Dictionary<string, UObject> NoComponentTemplates =
@@ -857,12 +883,15 @@ static class ZorahConvert
     )
     {
         var materialPrefix = material.GetPathName() + ":";
+        var owned = exports
+            .Where(candidate =>
+                candidate.GetPathName().StartsWith(materialPrefix, StringComparison.Ordinal))
+            .ToArray();
         var scalars = new List<MaterialParameterRecord>();
         var vectors = new List<MaterialParameterRecord>();
         var textures = new List<MaterialParameterRecord>();
         var staticSwitches = new List<StaticSwitchParameterRecord>();
-        foreach (var expression in exports.Where(candidate =>
-            candidate.GetPathName().StartsWith(materialPrefix, StringComparison.Ordinal) &&
+        foreach (var expression in owned.Where(candidate =>
             candidate.ExportType.StartsWith("MaterialExpression", StringComparison.Ordinal)))
         {
             var parameterName = JsonScalar(GetTaggedValue(expression, "ParameterName"))
@@ -915,12 +944,197 @@ static class ZorahConvert
                 ));
             }
         }
+        var graph = ReadMaterialGraphDefaults(material, owned);
         return new MaterialExpressionDefaults(
-            MergeMaterialParameters([], scalars),
+            MergeMaterialParameters(graph.Scalars, scalars),
             MergeMaterialParameters([], vectors),
-            MergeMaterialParameters([], textures),
+            // Named parameters win over the graph walk: an instance can override
+            // them by name, while a slot resolved through the graph is fixed in
+            // the base material and can only ever carry its authored texture.
+            MergeMaterialParameters(graph.Textures, textures),
             MergeStaticSwitchParameters([], staticSwitches)
         );
+    }
+
+    // A base UMaterial keeps its graph in the MaterialEditorOnlyData export:
+    // every shading input is an FExpressionInput naming the expression it reads
+    // and the output index it takes off that expression. Nodes reached that way
+    // are frequently plain MaterialExpressionTextureSamples with no
+    // ParameterName, which the loop above skips, so a material that samples its
+    // maps directly rather than through parameters otherwise contributes no
+    // textures at all. Only unnamed samples are emitted here; a named one is
+    // already recorded under the name instances override it by.
+    private static MaterialGraphDefaults ReadMaterialGraphDefaults(
+        UObject material,
+        UObject[] owned
+    )
+    {
+        var editorOnlyData = owned.FirstOrDefault(candidate =>
+            candidate.ExportType.Equals("MaterialEditorOnlyData", StringComparison.Ordinal));
+        if (editorOnlyData is null)
+        {
+            return new MaterialGraphDefaults([], []);
+        }
+        var expressions = owned
+            .Where(candidate =>
+                candidate.ExportType.StartsWith("MaterialExpression", StringComparison.Ordinal))
+            .ToDictionary(candidate => candidate.Name, StringComparer.Ordinal);
+        // CustomizedUVs serializes once per channel; every input read below is
+        // written at most once, so the first tag is always the whole value.
+        var inputs = editorOnlyData.Properties
+            .GroupBy(property => property.Name.Text, StringComparer.Ordinal)
+            .ToDictionary(
+                group => group.Key,
+                group => group.First().Tag?.GenericValue,
+                StringComparer.Ordinal
+            );
+        var resolved = inputs.ToDictionary(
+            pair => pair.Key,
+            pair => ResolveGraphTexture(pair.Value, expressions),
+            StringComparer.Ordinal
+        );
+
+        var mapped = new HashSet<string>(StringComparer.Ordinal);
+        var scalars = new List<MaterialParameterRecord>();
+        var textures = new List<MaterialParameterRecord>();
+        foreach (var (input, parameter) in MaterialGraphTextureInputs)
+        {
+            if (resolved.GetValueOrDefault(input) is not
+                { ParameterName: null, Reference: not null } texture)
+            {
+                continue;
+            }
+            mapped.Add(input);
+            textures.Add(new MaterialParameterRecord(parameter, "GlobalParameter", -1, texture.Reference));
+        }
+
+        var packed = MaterialGraphOrmInputs
+            .Select(entry => (entry.Input, entry.OutputIndex, Texture: resolved.GetValueOrDefault(entry.Input)))
+            .Where(entry => entry.Texture is { ParameterName: null, Reference: not null })
+            .ToArray();
+        if (packed.Length != 0 && packed.All(entry =>
+            entry.Texture!.OutputIndex == entry.OutputIndex &&
+            string.Equals(entry.Texture.Reference, packed[0].Texture!.Reference, StringComparison.Ordinal)))
+        {
+            mapped.UnionWith(packed.Select(entry => entry.Input));
+            textures.Add(new MaterialParameterRecord(
+                MaterialGraphOrmParameter,
+                "GlobalParameter",
+                -1,
+                packed[0].Texture!.Reference
+            ));
+            if (ReadGraphRoughnessScale(inputs.GetValueOrDefault(RoughnessInput), expressions)
+                is { } scale)
+            {
+                scalars.Add(new MaterialParameterRecord(RoughnessInput, "GlobalParameter", -1, scale));
+            }
+        }
+
+        var objectPath = material.GetPathName();
+        foreach (var parameter in scalars.Concat(textures))
+        {
+            Console.WriteLine(
+                $"ZORAH_MATERIAL_GRAPH_DEFAULT object={objectPath} " +
+                $"value={parameter.Value} parameter={parameter.Name}"
+            );
+        }
+        foreach (var (input, texture) in resolved.OrderBy(pair => pair.Key, StringComparer.Ordinal))
+        {
+            if (mapped.Contains(input) || texture is not { ParameterName: null, Reference: not null })
+            {
+                continue;
+            }
+            var reason = MaterialGraphOrmInputs.Any(entry => entry.Input == input)
+                ? "not-a-packed-orm-sample"
+                : "no-runtime-texture-slot";
+            Console.Error.WriteLine(
+                $"ZORAH_MATERIAL_GRAPH_UNMAPPED object={objectPath} input={input} " +
+                $"texture={texture.Reference} output_index={texture.OutputIndex} reason={reason}"
+            );
+        }
+        return new MaterialGraphDefaults([.. scalars], [.. textures]);
+    }
+
+    // Bevy multiplies a metallic-roughness map's green channel into
+    // perceptual_roughness, and UE's lerp(0, B, channel) is that same multiply,
+    // so a roughness input that only rescales the packed channel survives as a
+    // scalar and leaves the map itself untouched. UE serializes a property only
+    // when it differs from the class default, so an absent ConstA is the engine's
+    // zero; an absent ConstB is its one, which is the no-op this returns null for.
+    private static object? ReadGraphRoughnessScale(
+        object? input,
+        Dictionary<string, UObject> expressions
+    )
+    {
+        var (name, _) = GraphEdge(input);
+        if (name is null ||
+            expressions.GetValueOrDefault(name) is not { } lerp ||
+            !lerp.ExportType.Equals("MaterialExpressionLinearInterpolate", StringComparison.Ordinal) ||
+            GraphEdge(GetTaggedValue(lerp, "A")).Expression is not null ||
+            GraphEdge(GetTaggedValue(lerp, "B")).Expression is not null ||
+            GetTaggedValue(lerp, "ConstA") is not null)
+        {
+            return null;
+        }
+        return JsonScalar(GetTaggedValue(lerp, "ConstB"));
+    }
+
+    /// The expression an FExpressionInput reads, and the output index it takes
+    /// off it (0 = RGB, 1..4 = the individual RGBA channels of a texture sample).
+    private static (string? Expression, int OutputIndex) GraphEdge(object? input)
+    {
+        var expressionInput = StructValue(input);
+        var name = JsonScalar(GetPublicMember(expressionInput, "ExpressionName"))?.ToString();
+        return (
+            string.IsNullOrEmpty(name) || string.Equals(name, "None", StringComparison.Ordinal)
+                ? null
+                : name,
+            ToNullableInt(GetPublicMember(expressionInput, "OutputIndex")) ?? 0
+        );
+    }
+
+    // Breadth-first, so a texture wired straight into a material input wins over
+    // one further back behind a chain of maths. The reported output index is the
+    // one on the edge that reaches the sample, which is how UE picks a single
+    // channel out of a packed map.
+    private static GraphTexture? ResolveGraphTexture(
+        object? input,
+        Dictionary<string, UObject> expressions
+    )
+    {
+        var visited = new HashSet<string>(StringComparer.Ordinal);
+        var pending = new Queue<(string Expression, int OutputIndex)>();
+        Enqueue(input);
+        while (pending.TryDequeue(out var edge))
+        {
+            if (!expressions.TryGetValue(edge.Expression, out var expression))
+            {
+                continue;
+            }
+            var texture = GetTaggedValue(expression, "Texture");
+            if (texture is not null)
+            {
+                return new GraphTexture(
+                    JsonScalar(GetTaggedValue(expression, "ParameterName"))?.ToString(),
+                    JsonScalar(texture)?.ToString(),
+                    edge.OutputIndex
+                );
+            }
+            foreach (var property in expression.Properties)
+            {
+                Enqueue(property.Tag?.GenericValue);
+            }
+        }
+        return null;
+
+        void Enqueue(object? value)
+        {
+            var (name, outputIndex) = GraphEdge(value);
+            if (name is not null && visited.Add(name))
+            {
+                pending.Enqueue((name, outputIndex));
+            }
+        }
     }
 
     private static MaterialParameterRecord[] MergeMaterialParameters(
@@ -960,14 +1174,13 @@ static class ZorahConvert
             .ToArray();
     }
 
+    /// Unwrap an FScriptStruct to whichever native struct CUE4Parse read into it.
+    private static object? StructValue(object? value) =>
+        GetPublicMember(value, "StructType") ?? value;
+
     private static Dictionary<string, object?> ReadStructFields(object? value)
     {
-        var structType = GetPublicMember(value, "StructType");
-        if (structType is not null)
-        {
-            value = structType;
-        }
-        var properties = GetPublicMember(value, "Properties") as IEnumerable;
+        var properties = GetPublicMember(StructValue(value), "Properties") as IEnumerable;
         var result = new Dictionary<string, object?>(StringComparer.Ordinal);
         if (properties is null)
         {
@@ -2968,6 +3181,16 @@ sealed record StaticSwitchParameterRecord(
 );
 
 sealed record MaterialLayerFunctions(string[] Layers, string[] Blends);
+
+/// A texture reached by walking a base UMaterial's expression graph.
+/// ParameterName is null when the sampling node is not a material parameter, and
+/// OutputIndex is the sample output the reaching edge read (0 = RGB, 1..4 = RGBA).
+sealed record GraphTexture(string? ParameterName, string? Reference, int OutputIndex);
+
+sealed record MaterialGraphDefaults(
+    MaterialParameterRecord[] Scalars,
+    MaterialParameterRecord[] Textures
+);
 
 sealed record MaterialExpressionDefaults(
     MaterialParameterRecord[] Scalars,

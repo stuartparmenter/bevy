@@ -453,6 +453,107 @@ class MaterialBakeTests(unittest.TestCase):
                 constant,
             )
 
+    def test_material_graph_slots_are_selectable_by_the_bake_and_runtime(self):
+        program_cs = Path(__file__).resolve().parent / "Program.cs"
+        main_rs = Path(__file__).resolve().parent.parent / "src" / "main.rs"
+        if not main_rs.is_file():
+            self.skipTest("main.rs is not available next to the converter")
+        extractor = program_cs.read_text(encoding="utf-8")
+        runtime = main_rs.read_text(encoding="utf-8")
+
+        graph_slots = re.search(
+            r"MaterialGraphTextureInputs =\s*\[(.*?)\];", extractor, re.DOTALL
+        )
+        self.assertIsNotNone(graph_slots, "MaterialGraphTextureInputs is missing")
+        emitted = dict(re.findall(r'\("([^"]+)", "([^"]+)"\)', graph_slots.group(1)))
+        orm = re.search(
+            r'MaterialGraphOrmParameter = "([^"]+)"', extractor
+        )
+        self.assertIsNotNone(orm, "MaterialGraphOrmParameter is missing")
+        emitted["Roughness"] = orm.group(1)
+
+        # Every name the graph walk emits has to land in a selection family on
+        # both sides, or a connection-derived texture is written into the source
+        # manifest and then silently dropped.
+        for input_name, families in (
+            ("BaseColor", (material_bake.BASE_NAMES, "BASE_COLOR_TEXTURE_NAMES")),
+            ("Normal", (material_bake.NORMAL_NAMES, "NORMAL_TEXTURE_NAMES")),
+            ("EmissiveColor", (material_bake.EMISSIVE_NAMES, "EMISSIVE_TEXTURE_NAMES")),
+            ("Roughness", (material_bake.SURFACE_NAMES, "ORM_TEXTURE_NAMES")),
+        ):
+            parameter_name = material_bake.normalized(emitted[input_name])
+            bake_family, rust_constant = families
+            self.assertIn(
+                parameter_name,
+                [material_bake.normalized(name) for name in bake_family],
+                input_name,
+            )
+            self.assertIn(f'"{parameter_name}"', runtime, rust_constant)
+        # The folded roughness lerp rides on the scalar the runtime multiplies
+        # into the packed map, and only a name texture_carries_metallic accepts
+        # keeps the metalness channel.
+        self.assertIn('"roughness"', runtime)
+        carries_metallic = re.search(
+            r"fn texture_carries_metallic.*?\n    \}\n", runtime, re.DOTALL
+        )
+        self.assertIsNotNone(carries_metallic)
+        self.assertIn(
+            f'"{material_bake.normalized(emitted["Roughness"])}"',
+            carries_metallic.group(0),
+        )
+
+    def test_graph_derived_mirror_slots_bake_without_regenerating_maps(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            Image.new("RGBA", (4, 4), (200, 200, 200, 255)).save(root / "albedo.png")
+            Image.new("RGBA", (4, 4), (190, 70, 176, 255)).save(root / "orm.png")
+            texture_set = material_bake.TextureSet(
+                root,
+                {
+                    "exported": [
+                        {
+                            "object": "/Game/Mirror_Albedo",
+                            "output": "albedo.png",
+                            "output_size": [4, 4],
+                            "srgb": True,
+                            "normal_map": False,
+                        },
+                        {
+                            "object": "/Game/Mirror_ORM",
+                            "output": "orm.png",
+                            "output_size": [4, 4],
+                            "srgb": False,
+                            "normal_map": False,
+                        },
+                    ]
+                },
+            )
+            # The shape the extractor's graph walk writes for a base UMaterial
+            # that samples its maps through unnamed nodes: canonical slot names
+            # plus the roughness lerp folded into the scalar.
+            material = self.effective_with(
+                scalars=[parameter("Roughness", 0.1)],
+                textures=[
+                    parameter("Base Color", "/Game/Mirror_Albedo"),
+                    parameter("ORM", "/Game/Mirror_ORM"),
+                ],
+            )
+
+            runtime, generated, _ = material_bake.bake_material(
+                material, texture_set, root, 4
+            )
+
+            self.assertEqual(generated, [])
+            self.assertEqual(
+                [(item["name"], item["value"]) for item in runtime["textures"]],
+                [("Base Color", "/Game/Mirror_Albedo"), ("ORM", "/Game/Mirror_ORM")],
+            )
+            self.assertEqual(
+                [(item["name"], item["value"]) for item in runtime["scalars"]],
+                [("Roughness", 0.1)],
+            )
+            self.assertEqual(runtime["vectors"], [])
+
     def test_pass_through_textures_use_the_runtime_parameter_names(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
