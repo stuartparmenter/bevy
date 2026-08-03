@@ -108,7 +108,7 @@ class GeometryCache:
         write_json(
             self.scene,
             {
-                "format": "zorah-scene-manifest-v3",
+                "format": "zorah-scene-manifest-v4",
                 "level": "GreenHouse_Level",
                 "actors": [],
                 "referenced_meshes": meshes,
@@ -306,11 +306,13 @@ class IncrementalConversionTests(unittest.TestCase):
             )
             scene = root / "scene.json"
             override = "/Game/Materials/MI_Override.MI_Override"
+            decal = "/Game/MaterialLibrary/Decals/MI_Decal.MI_Decal"
             write_json(
                 scene,
                 {
                     "actors": [
-                        {"components": [{"override_materials": [override]}]}
+                        {"components": [{"override_materials": [override]}]},
+                        {"components": [], "decals": [{"material": decal}]},
                     ]
                 },
             )
@@ -327,9 +329,11 @@ class IncrementalConversionTests(unittest.TestCase):
                 (loose / "geometry" / "asset" / "parts" / "manifest.json").read_text()
             )["partitions"]
             self.assertEqual(partitions[0]["material_index"], 1)
+            # A DecalActor's material reaches no mesh slot, so the decal
+            # components are the only thing that can request it.
             self.assertEqual(
                 json.loads((loose / "material-input.json").read_text()),
-                [material, override],
+                [decal, material, override],
             )
 
     def test_slot_name_falls_back_to_the_section_index(self):
@@ -653,6 +657,41 @@ class IncrementalConversionTests(unittest.TestCase):
                     },
                 )
                 self.assertFalse(convert.scene_cache_is_current(scenes, [manifest]))
+
+    def test_missing_decal_actors_invalidate_a_cached_scene_manifest(self):
+        level = "GreenHouse_Level"
+        inventory = convert.EXPECTED_SCENE_INVENTORY[level]
+        minimum, maximum, bias = convert.EXPECTED_POST_PROCESS_EXPOSURE[level]
+        volume = {
+            "enabled": True,
+            "unbound": True,
+            "blend_weight": 1.0,
+            "auto_exposure_method": "AEM_Histogram",
+            "auto_exposure_min_ev100": minimum,
+            "auto_exposure_max_ev100": maximum,
+            "auto_exposure_bias": bias,
+        }
+        document = {
+            "format": "zorah-scene-manifest-v4",
+            "level": level,
+            "actor_package_count": inventory["actor_packages"],
+            "unresolved_static_mesh_components": inventory["unresolved_mesh_components"],
+            "referenced_meshes": ["mesh"] * inventory["referenced_meshes"],
+            "decal_components": inventory["decal_components"],
+            "actors": [{"post_process": volume}]
+            + [{}] * (inventory["actors"] - 1),
+            "failures": [],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / f"{level}.json"
+            write_json(manifest, document)
+            self.assertTrue(convert.scene_manifest_is_current(manifest))
+
+            # The shape a manifest exported before DecalActors were converted
+            # has: every other count still matches.
+            document.pop("decal_components")
+            write_json(manifest, document)
+            self.assertFalse(convert.scene_manifest_is_current(manifest))
 
     def test_blueprint_archetype_lights_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:

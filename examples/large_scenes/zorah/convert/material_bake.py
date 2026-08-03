@@ -67,6 +67,16 @@ EMISSIVE_COLOR_NAMES = ("Emissive Color", "Emission Color", "Emission Tint")
 # call the switch "Use_OpacityMask" and only reconcile through its GUID.
 OPACITY_MASK_SWITCH = "Opacity Mask from Base Color Alpha / Separate Texture Toggle"
 OPACITY_MASK_NAMES = ("Opacity Mask Texture",)
+# Every M_LS_Decal_{ColorRough,FullPass,NormalRough}_VT instance packs its
+# surface into one texture bound to a parameter named "ROT", and green is always
+# the channel that reaches 0 - the decal's coverage. Red carries roughness,
+# following the parameter name's own channel order; blue is flat white on half
+# the families and a grunge on the other half, and the graph does not name it,
+# so it is dropped. Green moves into the base color's alpha, which is where both
+# `StandardMaterial` and `ClusteredDecal` read a decal's coverage.
+DECAL_SURFACE_NAME = "rot"
+DECAL_OPACITY_CHANNEL = 1
+DECAL_ROUGHNESS_CHANNEL = 0
 HEX_COLOR = re.compile(r"^([0-9a-fA-F]{6}|[0-9a-fA-F]{8})")
 # MSM_SingleLayerWater has its own parameter family and shares no name with the
 # LS materials above, so the generic selection finds nothing on Zorah's one
@@ -86,7 +96,7 @@ WATER_WAVES = (
 GLOBAL = "GlobalParameter"
 LAYER = "LayerParameter"
 BLEND = "BlendParameter"
-MATERIAL_BAKE_PIPELINE_VERSION = 7
+MATERIAL_BAKE_PIPELINE_VERSION = 8
 LAYER_MATERIAL_BAKE_PIPELINE_VERSION = 5
 # The runtime binds textures by parameter name, so every selected texture is
 # emitted under the name main.rs looks for rather than the authoring name.
@@ -748,16 +758,19 @@ def opacity_mask(
     size: tuple[int, int],
     target_grid: tuple[int, int],
     approximations: set[str],
+    channel: int = 0,
 ) -> np.ndarray:
     """Sample a cutout texture onto the base color layout, in linear light.
 
     The mask lands in the base color image's alpha, so it is sampled with that
     image's scope and layout to stay registered with it.
 
-    Zorah's masks are all single-channel: the three stored as BGRA8 hold the
-    same value in red, green and blue, and the rest are G8 or G16. Red is
-    therefore the mask, and an sRGB-tagged source decodes before the runtime
-    compares it against `OpacityMaskClipValue`.
+    Zorah's cutout masks are all single-channel: the three stored as BGRA8 hold
+    the same value in red, green and blue, and the rest are G8 or G16. Red is
+    therefore the default mask, and an sRGB-tagged source decodes before the
+    runtime compares it against `OpacityMaskClipValue`. A decal instead passes
+    `DECAL_OPACITY_CHANNEL`, because its coverage shares a texture with its
+    roughness.
     """
     record = textures.record(reference)
     image = textures.open(reference)
@@ -772,7 +785,7 @@ def opacity_mask(
         is_srgb=srgb,
         approximations=approximations,
     )
-    mask = pixels[..., 0]
+    mask = pixels[..., channel]
     return srgb_to_linear(mask) if srgb else mask
 
 
@@ -1161,10 +1174,17 @@ def bake_material(
 
         base_reference = selected.get("base", (None, None))[1]
         base_scope = selected_scopes.get("base", (GLOBAL, -1))
+        surface_reference = selected.get("surface", (None, None))[1]
+        surface_scope = selected_scopes.get("surface", (GLOBAL, -1))
+        source_surface_name = source_names.get("surface", "")
+        is_decal_surface = normalized(source_surface_name) == DECAL_SURFACE_NAME
         # A `StandardMaterial` alpha-tests base color alpha, and the packer
         # already keeps that channel straight, so a separate cutout texture
         # only has to reach the runtime composited into the baked base color.
         mask_reference = opacity_mask_reference(material, texture_set)
+        mask_channel = 0
+        if mask_reference is None and is_decal_surface:
+            mask_reference, mask_channel = surface_reference, DECAL_OPACITY_CHANNEL
         if mask_reference is not None and base_reference is None:
             approximations.add("opacity mask dropped: material has no base color texture")
         if base_reference and (
@@ -1199,6 +1219,7 @@ def bake_material(
                     size,
                     grid,
                     approximations,
+                    channel=mask_channel,
                 )
             relative = f"MaterialBakes/{digest}_base.png"
             path = output_root / relative
@@ -1255,30 +1276,43 @@ def bake_material(
             generated.append(record)
             selected["normal"] = ("Normal", object_name)
 
-        surface_reference = selected.get("surface", (None, None))[1]
-        surface_scope = selected_scopes.get("surface", (GLOBAL, -1))
         roughness_offset = material.scalar(("Roughness Offset",), *surface_scope, 0.0)
         roughness_contrast = material.scalar(("Roughness Contrast",), *surface_scope, 0.0)
         occlusion_offset = material.scalar(("Occlusion Offset",), *surface_scope, 0.0)
-        source_surface_name = source_names.get("surface", "")
         if surface_reference and (
             not math.isclose(roughness_offset, 0.0)
             or not math.isclose(roughness_contrast, 0.0)
             or not math.isclose(occlusion_offset, 0.0)
             or normalized(source_surface_name) == "ors"
+            or is_decal_surface
             or not neutral_uv_controls(material, *surface_scope)
         ):
             size, grid = target_layout((surface_reference,), texture_set, maximum_size)
             image = texture_set.open(surface_reference)
             assert image is not None
+            surface_record = texture_set.record(surface_reference)
+            assert surface_record is not None
+            # No packed ORM or ORS source is sRGB-tagged, but most decal ROT
+            # maps are, and UE's sampler decodes whatever the texture says.
+            surface_srgb = bool(surface_record["srgb"])
             pixels = sample_tiled(
                 image,
                 size,
                 uv_controls(material, *surface_scope),
                 source_grid=texture_set.grid(surface_reference),
                 target_grid=grid,
+                is_srgb=surface_srgb,
                 approximations=approximations,
             )
+            if is_decal_surface:
+                # Green is already in the base color's alpha and blue is
+                # unidentified, so only red survives, restated as glTF ORM.
+                roughness = pixels[..., DECAL_ROUGHNESS_CHANNEL].copy()
+                if surface_srgb:
+                    roughness = srgb_to_linear(roughness)
+                pixels[..., 0] = 1.0
+                pixels[..., 1] = roughness
+                pixels[..., 2] = 0.0
             pixels[..., 0] += occlusion_offset
             pixels[..., 1] = (
                 (pixels[..., 1] - 0.5) * max(0.0, 1.0 + roughness_contrast)

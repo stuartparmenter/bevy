@@ -37,18 +37,21 @@ EXPECTED_SCENE_INVENTORY = {
         "actor_packages": 1788,
         "unresolved_mesh_components": 27,
         "referenced_meshes": 299,
+        "decal_components": 232,
     },
     "Restir_Level": {
         "actors": 1924,
         "actor_packages": 1924,
         "unresolved_mesh_components": 0,
         "referenced_meshes": 271,
+        "decal_components": 323,
     },
     "ThroneRoom_Level": {
         "actors": 6773,
         "actor_packages": 6773,
         "unresolved_mesh_components": 0,
         "referenced_meshes": 113,
+        "decal_components": 17,
     },
 }
 CONVERT_DIRECTORY = Path(__file__).resolve().parent
@@ -323,7 +326,7 @@ def scene_manifest_is_current(path: Path) -> bool:
             and actor["post_process"].get("unbound", False)
             and float(actor["post_process"].get("blend_weight", 1.0)) > 0.0
         ]
-        if document.get("format") != "zorah-scene-manifest-v3" or len(records) != 1:
+        if document.get("format") != "zorah-scene-manifest-v4" or len(records) != 1:
             return False
         level = document.get("level")
         inventory = EXPECTED_SCENE_INVENTORY.get(level)
@@ -337,6 +340,8 @@ def scene_manifest_is_current(path: Path) -> bool:
             != inventory["unresolved_mesh_components"]
             or len(document.get("referenced_meshes", []))
             != inventory["referenced_meshes"]
+            or int(document.get("decal_components", -1))
+            != inventory["decal_components"]
         ):
             return False
         record = records[0]
@@ -646,7 +651,7 @@ def reconcile_geometry_cache(
         write_json_if_changed(
             delta_scene,
             {
-                "format": "zorah-scene-manifest-v3",
+                "format": "zorah-scene-manifest-v4",
                 "level": "GeometryDelta",
                 "actors": [],
                 "referenced_meshes": rebuild,
@@ -868,6 +873,14 @@ def apply_exact_mesh_materials(
 
     for scene_path in scene_paths:
         for actor in load_json(scene_path).get("actors", []):
+            # A DecalActor's material is never reachable through a mesh slot, so
+            # it only enters the manifest from the decal component itself.
+            material_objects.update(
+                decal["material"]
+                for decal in actor.get("decals", [])
+                if isinstance(decal.get("material"), str)
+                and decal["material"].startswith("/Game/")
+            )
             for component in actor.get("components", []):
                 material_objects.update(
                     material

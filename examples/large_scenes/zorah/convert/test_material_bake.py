@@ -563,14 +563,14 @@ class MaterialBakeTests(unittest.TestCase):
     def test_pass_through_textures_use_the_runtime_parameter_names(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            Image.new("RGBA", (4, 4), (255, 128, 0, 255)).save(root / "rot.png")
+            Image.new("RGBA", (4, 4), (255, 128, 0, 255)).save(root / "packed.png")
             texture_set = material_bake.TextureSet(
                 root,
                 {
                     "exported": [
                         {
-                            "object": "/Game/Rot",
-                            "output": "rot.png",
+                            "object": "/Game/Packed",
+                            "output": "packed.png",
                             "output_size": [4, 4],
                             "srgb": False,
                             "normal_map": False,
@@ -578,7 +578,11 @@ class MaterialBakeTests(unittest.TestCase):
                     ]
                 },
             )
-            material = self.effective_with(textures=[parameter("ROT", "/Game/Rot")])
+            # An alias that is already packed the way Bevy reads it, unlike the
+            # decals' "ROT", which has to be repacked before it passes through.
+            material = self.effective_with(
+                textures=[parameter("OcclusionRoughnessMetallic", "/Game/Packed")]
+            )
 
             runtime, generated, _ = material_bake.bake_material(
                 material, texture_set, root, 4
@@ -587,7 +591,7 @@ class MaterialBakeTests(unittest.TestCase):
             self.assertEqual(generated, [])
             self.assertEqual(
                 [(item["name"], item["value"]) for item in runtime["textures"]],
-                [("ORM", "/Game/Rot")],
+                [("ORM", "/Game/Packed")],
             )
 
     def test_single_layer_water_exports_its_own_parameter_family(self):
@@ -809,6 +813,76 @@ class MaterialBakeTests(unittest.TestCase):
             self.assertEqual(
                 [item["value"] for item in runtime["textures"]], ["/Game/Base"]
             )
+
+    def bake_decal(self, root: Path, rot_is_srgb: bool) -> tuple[np.ndarray, np.ndarray]:
+        """Bake a decal off a white base color and a ROT map, and read both back."""
+        Image.new("RGBA", (4, 4), (255, 255, 255, 255)).save(root / "base.png")
+        # Roughness 0.8, coverage 0.25, and a blue channel with no meaning.
+        Image.new("RGBA", (4, 4), (204, 64, 176, 255)).save(root / "rot.png")
+        texture_set = material_bake.TextureSet(
+            root,
+            {
+                "exported": [
+                    {
+                        "object": "/Game/Decal_C",
+                        "output": "base.png",
+                        "output_size": [4, 4],
+                        "srgb": True,
+                        "normal_map": False,
+                    },
+                    {
+                        "object": "/Game/Decal_ROT",
+                        "output": "rot.png",
+                        "output_size": [4, 4],
+                        "srgb": rot_is_srgb,
+                        "normal_map": False,
+                    },
+                ]
+            },
+        )
+        material = self.effective_with(
+            textures=[
+                parameter("Base Color", "/Game/Decal_C"),
+                parameter("ROT", "/Game/Decal_ROT"),
+            ],
+        )
+
+        runtime, generated, _ = material_bake.bake_material(
+            material, texture_set, root, 4
+        )
+
+        outputs = {record["object"]: record["output"] for record in generated}
+        emitted = {item["name"]: item["value"] for item in runtime["textures"]}
+        return (
+            np.asarray(Image.open(root / outputs[emitted["Base Color"]])),
+            np.asarray(Image.open(root / outputs[emitted["ORM"]])),
+        )
+
+    def test_decal_rot_map_splits_into_base_alpha_and_gltf_roughness(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base, surface = self.bake_decal(Path(temporary), rot_is_srgb=False)
+
+            np.testing.assert_array_equal(base[..., 3], 64)
+            np.testing.assert_array_equal(base[..., 0], 255)
+            # Occlusion unauthored, roughness moved out of red, metallic cleared
+            # so a `ClusteredDecal` does not read the dropped channel as metal.
+            np.testing.assert_array_equal(surface[..., 0], 255)
+            np.testing.assert_array_equal(surface[..., 1], 204)
+            np.testing.assert_array_equal(surface[..., 2], 0)
+
+    def test_srgb_tagged_decal_rot_map_decodes_before_it_is_repacked(self):
+        # Most of Zorah's ROT maps carry sRGB=true, so UE's sampler decodes
+        # them and both the coverage and the roughness it reads are linear.
+        with tempfile.TemporaryDirectory() as temporary:
+            base, surface = self.bake_decal(Path(temporary), rot_is_srgb=True)
+
+            decoded = np.rint(
+                material_bake.srgb_to_linear(np.array([64.0, 204.0]) / 255.0) * 255.0
+            )
+            np.testing.assert_array_equal(base[..., 3], decoded[0])
+            np.testing.assert_array_equal(surface[..., 1], decoded[1])
+            np.testing.assert_array_equal(surface[..., 0], 255)
+            np.testing.assert_array_equal(surface[..., 2], 0)
 
 
 if __name__ == "__main__":

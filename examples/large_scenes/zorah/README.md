@@ -18,6 +18,8 @@ The source sample resolves to:
 - 436,559,393 full-detail triangles in 5,422 bounded partitions
 - 321 recursive source-material records and 854 source textures
 - 300 runtime materials and 823 runtime textures after exact material baking
+- 572 `DecalActor`s projecting 50 decal materials, which reach no mesh slot and
+  so are additional to both material counts above
 
 The manifests also retain 27 GreenHouse static-mesh components whose referenced
 packages are not present in the downloadable source project. They are marked
@@ -285,8 +287,8 @@ local substitutes for the referenced `/Engine/BasicShapes`, recursive
 material parameters, and common Base Color/Normal/ORM mappings.
 
 This is not a general UE material or Blueprint interpreter. Complex material
-graphs, layer blending, decals, WPO/wind, subsurface profiles, and
-water/translucency remain approximations or gaps.
+graphs, layer blending, WPO/wind, subsurface profiles, and water/translucency
+remain approximations or gaps.
 
 Foliage cutouts are converted but not switched on. `M_LS_Foliage` takes its
 opacity mask either from the base color texture's alpha or from a separate
@@ -328,6 +330,28 @@ dark reflective surface rather than one the bed shows through, and its
 absorption tint and caustics are dropped. UE also layers three wave normals
 over world-space UVs; one normal map and one `uv_transform` leave room for the
 first, applied to UV0.
+
+Every `DecalActor` becomes a `ClusteredDecal`: 232 in GreenHouse, 323 in
+Restir, 17 in Throne Room. Each one serializes a material and a transform and
+nothing else, so all 572 take `UDecalComponent`'s (128, 256, 256) cm class
+default box, and none authors a `SortOrder` or a fade. UE projects along the
+component's X through half-extents of `DecalSize * RelativeScale3D` and reads
+the image off Y and Z; `ue_world_to_bevy` already lands those on the depth and
+image axes of Bevy's unit cube. The three `M_LS_Decal_*_VT` parents pack the
+surface into one `ROT` texture, green the coverage and red the roughness, so
+the bake moves green into the base color's alpha - which is where
+`apply_decals` reads a decal's coverage - and restates red as glTF ORM.
+`MI_Wetness_Puddles_Decal_A1` binds no base color texture at all, so its four
+Restir instances are skipped rather than projected as a no-op.
+
+Decals reach the raster image only. `apply_decals` runs in `pbr.wgsl`, which
+the meshlet material pass shares, so meshlet geometry receives them, but Solari
+traces the surface underneath unchanged. Three authored terms have nowhere to
+land: the `Opacity Angle Fade` switch that 42 of the 53 decal materials tick,
+because `clustered_decal_iterator_next` tests only box containment; the decal
+normal maps, because `apply_decals` blends a tangent-space vector straight into
+the world-space `N` and offers no flip for UE's DirectX-format maps; and
+`SortOrder`, because a cluster's decals are visited in an unspecified order.
 
 The scene manifest preserves UE directional, point, spot, and sky-light
 components, including physical units, colors, temperature, source dimensions,

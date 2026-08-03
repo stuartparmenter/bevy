@@ -23,7 +23,7 @@ use bevy::{
     diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin},
     light::{
         atmosphere::{Falloff, PhaseFunction, ScatteringMedium, ScatteringTerm},
-        Atmosphere, AtmosphereEnvironmentMapLight, NotShadowCaster, SunDisk,
+        Atmosphere, AtmosphereEnvironmentMapLight, ClusteredDecal, NotShadowCaster, SunDisk,
     },
     math::Affine2,
     pbr::experimental::meshlet::{MeshletMesh, MeshletMesh3d, MeshletPlugin},
@@ -72,6 +72,10 @@ const BLAS_PROGRESS_LOG_INTERVAL_FRAMES: u64 = 120;
 // Solari. This scale keeps the converted fixtures in a plausible range while
 // preserving their authored relative brightness.
 const UE_UNITLESS_LIGHT_LUMENS: f32 = 100.0;
+/// UE measures world space in centimetres. Converted geometry is already in
+/// metres and a component's scale is unitless, so only a length read straight
+/// off a UE property needs this.
+const UE_CENTIMETRES: f32 = 0.01;
 // UE SkyLight intensity is a multiplier over a captured environment rather
 // than a physical unit. Until Solari supports environment maps directly, use
 // the same source-unit bridge for raster ambient and traced environment light.
@@ -301,6 +305,8 @@ struct ActorRecord {
     #[serde(default)]
     lights: Vec<LightRecord>,
     #[serde(default)]
+    decals: Vec<DecalRecord>,
+    #[serde(default)]
     atmosphere: Option<SkyAtmosphereRecord>,
     #[serde(default)]
     height_fog: Option<HeightFogRecord>,
@@ -454,6 +460,23 @@ struct LightRecord {
     light_function_material: Option<String>,
     #[serde(default)]
     real_time_capture: bool,
+}
+
+/// A placed `UDecalComponent`. `size` is the projection box's half-extent in
+/// centimetres along the component's own axes, X being the projection depth.
+#[derive(Deserialize)]
+struct DecalRecord {
+    name: String,
+    transform: UeTransform,
+    #[serde(default = "default_true")]
+    visible: bool,
+    #[serde(default)]
+    hidden_in_game: bool,
+    #[serde(default)]
+    material: Option<String>,
+    size: UeVec3,
+    #[serde(default)]
+    sort_order: i32,
 }
 
 #[derive(Deserialize)]
@@ -1244,6 +1267,27 @@ fn used_material_objects(converted: &ConvertedWorld) -> BTreeMap<String, BTreeSe
     used
 }
 
+/// Every decal UE would project, with the actor that places it.
+fn visible_decals(
+    converted: &ConvertedWorld,
+) -> impl Iterator<Item = (&ActorRecord, &DecalRecord)> {
+    converted
+        .actors
+        .iter()
+        .filter(|actor| !actor.hidden)
+        .flat_map(|actor| actor.decals.iter().map(move |decal| (actor, decal)))
+        .filter(|(_, decal)| decal.visible && !decal.hidden_in_game)
+}
+
+/// Every material a visible DecalActor projects. These reach no mesh slot, so
+/// `used_material_objects` never sees them and they need their own texture
+/// bundles selected.
+fn used_decal_materials(converted: &ConvertedWorld) -> BTreeSet<String> {
+    visible_decals(converted)
+        .filter_map(|(_, decal)| decal.material.clone())
+        .collect()
+}
+
 /// Why a material renders as the magenta diagnostic: the project download has
 /// nothing to reproduce. `convert.py`'s `report_diagnostic_materials` prints the
 /// same reasons at conversion time, with the authored slot names.
@@ -1262,7 +1306,10 @@ fn diagnostic_material_reason(
 fn selected_texture_bundle_roots(converted: &ConvertedWorld) -> Vec<String> {
     let mut roots = HashSet::new();
     let mut effective_cache = HashMap::new();
-    for object in used_material_objects(converted).into_keys() {
+    for object in used_material_objects(converted)
+        .into_keys()
+        .chain(used_decal_materials(converted))
+    {
         let effective = resolve_effective_material(
             &object,
             &converted.materials,
@@ -1373,6 +1420,23 @@ fn udim_uv_bounds_are_addressable(bounds: (Vec2, Vec2), columns: u32, rows: u32)
         && max.y <= 1.0 + TOLERANCE
 }
 
+/// Queues one converted texture for loading, counting the ones a failed bundle
+/// download took with it so the caller can report them once.
+fn load_converted_texture(
+    reference: Option<&str>,
+    converted: &ConvertedWorld,
+    asset_server: &AssetServer,
+    failed_texture_bundles: &HashSet<String>,
+    dropped: &mut usize,
+) -> Option<Handle<Image>> {
+    let texture = converted.textures.get(reference?)?;
+    if bundle_root(&texture.output).is_some_and(|root| failed_texture_bundles.contains(root)) {
+        *dropped += 1;
+        return None;
+    }
+    Some(asset_server.load::<Image>(texture.output.clone()))
+}
+
 fn build_material_handles(
     converted: &ConvertedWorld,
     asset_server: &AssetServer,
@@ -1462,14 +1526,13 @@ fn build_material_handles(
         let effective =
             resolve_effective_material(&object, &converted.materials, &mut cache, &mut Vec::new());
         let mut image = |reference: Option<&str>| {
-            let texture = reference.and_then(|reference| converted.textures.get(reference))?;
-            if bundle_root(&texture.output)
-                .is_some_and(|root| failed_texture_bundles.contains(root))
-            {
-                dropped_textures += 1;
-                return None;
-            }
-            Some(asset_server.load::<Image>(texture.output.clone()))
+            load_converted_texture(
+                reference,
+                converted,
+                asset_server,
+                failed_texture_bundles,
+                &mut dropped_textures,
+            )
         };
         let base_color_reference = select_texture(&effective, BASE_COLOR_TEXTURE_NAMES);
         let normal_reference = select_texture(&effective, NORMAL_TEXTURE_NAMES);
@@ -2080,6 +2143,104 @@ fn spawn_exported_lights(
     raytracing_instances
 }
 
+/// The `ClusteredDecal` transform for a placed `UDecalComponent`.
+///
+/// UE projects along the component's X axis through a box whose half-extents
+/// are `DecalSize * RelativeScale3D`, and reads the projected image off the
+/// component's Y and Z. Bevy projects along its own Z through the unit cube, so
+/// the box has to grow to full extents, and the two conventions' axes line up
+/// through `ue_world_to_bevy`, which already maps UE (X, Y, Z) onto Bevy
+/// (-Z, X, Y) - depth onto depth, and the image's two axes onto Bevy's X and Y.
+fn decal_transform(actor_matrix: Mat4, decal: &DecalRecord) -> Transform {
+    let extents = ue_vec3(&decal.size) * 2.0 * UE_CENTIMETRES;
+    ue_world_to_bevy(actor_matrix * ue_matrix(&decal.transform) * Mat4::from_scale(extents))
+}
+
+fn spawn_exported_decals(
+    commands: &mut Commands,
+    converted: &ConvertedWorld,
+    asset_server: &AssetServer,
+    failed_texture_bundles: &HashSet<String>,
+) {
+    let mut cache = HashMap::new();
+    let mut dropped_textures = 0usize;
+    let mut prototypes: HashMap<String, ClusteredDecal> = HashMap::new();
+    for object in used_decal_materials(converted) {
+        let effective =
+            resolve_effective_material(&object, &converted.materials, &mut cache, &mut Vec::new());
+        let mut image = |reference: Option<&str>| {
+            load_converted_texture(
+                reference,
+                converted,
+                asset_server,
+                failed_texture_bundles,
+                &mut dropped_textures,
+            )
+        };
+        let base_color_texture = image(select_texture(&effective, BASE_COLOR_TEXTURE_NAMES));
+        let metallic_roughness_texture = image(select_texture(&effective, ORM_TEXTURE_NAMES));
+        if base_color_texture.is_none() {
+            // `apply_decals` reads coverage from the base color's alpha and
+            // ignores every other map without it, so such a decal is a no-op.
+            warn!(material = %object, "decal material has no base color texture; skipping it");
+            continue;
+        }
+        prototypes.insert(
+            object,
+            ClusteredDecal {
+                base_color_texture,
+                // Deliberately unbound. `ClusteredDecal` documents OpenGL-format
+                // normal maps and offers no per-decal flip for UE's DirectX
+                // ones, and upstream `apply_decals` blends the sampled
+                // tangent-space vector straight into the world-space `N`, which
+                // only lands the perturbation correctly on a +Z-facing surface.
+                normal_map_texture: None,
+                metallic_roughness_texture,
+                // No Zorah decal material sets an emissive term, and
+                // `apply_decals` adds the map with no place for UE's Emissive
+                // Intensity, so there is nothing to bind here.
+                emissive_texture: None,
+                tag: 0,
+            },
+        );
+    }
+
+    let mut spawned = 0usize;
+    let mut unresolved = 0usize;
+    let mut ordered = 0usize;
+    for (actor, decal) in visible_decals(converted) {
+        if decal.sort_order != 0 {
+            ordered += 1;
+        }
+        let Some(prototype) = decal
+            .material
+            .as_deref()
+            .and_then(|object| prototypes.get(object))
+        else {
+            unresolved += 1;
+            continue;
+        };
+        commands.spawn((
+            Name::new(decal.name.clone()),
+            prototype.clone(),
+            decal_transform(ue_matrix(&actor.transform), decal),
+        ));
+        spawned += 1;
+    }
+    if ordered > 0 {
+        // `clustered_decal_iterator_next` walks a cluster's decals in an
+        // unspecified order, so an authored priority cannot be honoured.
+        warn!(decals = ordered, "decals author a non-zero SortOrder");
+    }
+    info!(
+        spawned,
+        materials = prototypes.len(),
+        unresolved,
+        dropped_textures,
+        "spawned exported Zorah decals"
+    );
+}
+
 fn has_sky_atmosphere(converted: &ConvertedWorld) -> bool {
     converted.actors.iter().any(|actor| {
         !actor.hidden
@@ -2525,6 +2686,12 @@ fn setup(
         &mut materials,
         &mut ambient_light,
     );
+    spawn_exported_decals(
+        &mut commands,
+        &converted,
+        &asset_server,
+        &failed_texture_bundles.0,
+    );
 
     let center = if world_min.is_finite() && world_max.is_finite() {
         (world_min + world_max) * 0.5
@@ -2698,20 +2865,20 @@ fn queue_partitions(
     }
 }
 
+fn ue_vec3(value: &UeVec3) -> Vec3 {
+    Vec3::new(value.x, value.y, value.z)
+}
+
 fn ue_matrix(transform: &UeTransform) -> Mat4 {
     Mat4::from_scale_rotation_translation(
-        Vec3::new(transform.scale.x, transform.scale.y, transform.scale.z),
+        ue_vec3(&transform.scale),
         Quat::from_xyzw(
             transform.rotation.x,
             transform.rotation.y,
             transform.rotation.z,
             transform.rotation.w,
         ),
-        Vec3::new(
-            transform.translation.x,
-            transform.translation.y,
-            transform.translation.z,
-        ),
+        ue_vec3(&transform.translation),
     )
 }
 
@@ -2725,9 +2892,9 @@ fn ue_world_to_bevy(ue_world: Mat4) -> Transform {
         Vec4::W,
     );
     let mut bevy_world = basis * ue_world * basis.inverse();
-    bevy_world.w_axis.x *= 0.01;
-    bevy_world.w_axis.y *= 0.01;
-    bevy_world.w_axis.z *= 0.01;
+    bevy_world.w_axis.x *= UE_CENTIMETRES;
+    bevy_world.w_axis.y *= UE_CENTIMETRES;
+    bevy_world.w_axis.z *= UE_CENTIMETRES;
     Transform::from_matrix(bevy_world)
 }
 
@@ -3237,6 +3404,7 @@ mod tests {
             hidden: false,
             components: vec![],
             lights: vec![],
+            decals: vec![],
             atmosphere: Some(SkyAtmosphereRecord {
                 _name: "atmosphere component".into(),
                 transform_mode: Some(transform_mode.into()),
@@ -3244,6 +3412,25 @@ mod tests {
             }),
             height_fog: None,
             post_process: None,
+        }
+    }
+
+    /// A DecalActor as the levels serialize it: the decal component is the
+    /// actor root, so its relative transform is identity and UDecalComponent's
+    /// class-default box is delta-elided down to it.
+    fn test_decal(material: String) -> DecalRecord {
+        DecalRecord {
+            name: "NewDecalComponent".into(),
+            transform: test_transform(),
+            visible: true,
+            hidden_in_game: false,
+            material: Some(material),
+            size: UeVec3 {
+                x: 128.0,
+                y: 256.0,
+                z: 256.0,
+            },
+            sort_order: 0,
         }
     }
 
@@ -3421,8 +3608,10 @@ mod tests {
     fn preloads_only_texture_bundles_used_by_the_selected_scene() {
         let mesh_name = "/Game/Test/SM_Used".to_string();
         let material_name = "/Game/Test/MI_Used".to_string();
+        let decal_material_name = "/Game/Test/MI_Decal".to_string();
         let base_color_name = "/Game/Test/T_Used_Base".to_string();
         let normal_name = "/Game/Test/T_Used_Normal".to_string();
+        let decal_base_color_name = "/Game/Test/T_Decal_Base".to_string();
         let unused_name = "/Game/Test/T_Unused".to_string();
         let converted = ConvertedWorld {
             level: "Test".into(),
@@ -3443,6 +3632,7 @@ mod tests {
                     override_materials: vec![],
                 }],
                 lights: vec![],
+                decals: vec![test_decal(decal_material_name.clone())],
                 atmosphere: None,
                 height_fog: None,
                 post_process: None,
@@ -3467,33 +3657,62 @@ mod tests {
                     material_slots: vec![Some(material_name.clone())],
                 },
             )]),
-            materials: HashMap::from([(
-                material_name.clone(),
-                MaterialRecord {
-                    object: material_name,
-                    kind: None,
-                    parent: None,
-                    emissive: None,
-                    scalars: vec![],
-                    vectors: vec![],
-                    textures: vec![
-                        TextureParameter {
+            materials: HashMap::from([
+                (
+                    material_name.clone(),
+                    MaterialRecord {
+                        object: material_name,
+                        kind: None,
+                        parent: None,
+                        emissive: None,
+                        scalars: vec![],
+                        vectors: vec![],
+                        textures: vec![
+                            TextureParameter {
+                                name: "Base Color".into(),
+                                association: "GlobalParameter".into(),
+                                index: -1,
+                                value: Some(base_color_name.clone()),
+                            },
+                            TextureParameter {
+                                name: "Normal".into(),
+                                association: "GlobalParameter".into(),
+                                index: -1,
+                                value: Some(normal_name.clone()),
+                            },
+                        ],
+                        base_overrides: BaseMaterialOverrides::default(),
+                    },
+                ),
+                (
+                    decal_material_name.clone(),
+                    MaterialRecord {
+                        object: decal_material_name,
+                        kind: None,
+                        parent: None,
+                        emissive: None,
+                        scalars: vec![],
+                        vectors: vec![],
+                        textures: vec![TextureParameter {
                             name: "Base Color".into(),
                             association: "GlobalParameter".into(),
                             index: -1,
-                            value: Some(base_color_name.clone()),
-                        },
-                        TextureParameter {
-                            name: "Normal".into(),
-                            association: "GlobalParameter".into(),
-                            index: -1,
-                            value: Some(normal_name.clone()),
-                        },
-                    ],
-                    base_overrides: BaseMaterialOverrides::default(),
-                },
-            )]),
+                            value: Some(decal_base_color_name.clone()),
+                        }],
+                        base_overrides: BaseMaterialOverrides::default(),
+                    },
+                ),
+            ]),
             textures: HashMap::from([
+                (
+                    decal_base_color_name.clone(),
+                    TextureExportRecord {
+                        object: decal_base_color_name,
+                        output: "bundles/used-c.zorah_bundle#decal".into(),
+                        source_grid_columns: 1,
+                        source_grid_rows: 1,
+                    },
+                ),
                 (
                     base_color_name.clone(),
                     TextureExportRecord {
@@ -3524,13 +3743,80 @@ mod tests {
             ]),
         };
 
+        // A DecalActor's material reaches no mesh slot, so its bundle only gets
+        // selected if the decal components are walked too.
         assert_eq!(
             selected_texture_bundle_roots(&converted),
             vec![
                 "bundles/used-a.zorah_bundle".to_string(),
-                "bundles/used-b.zorah_bundle".to_string()
+                "bundles/used-b.zorah_bundle".to_string(),
+                "bundles/used-c.zorah_bundle".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn decal_box_maps_ue_projection_axes_onto_bevy_ones() {
+        let mut actor = test_transform();
+        actor.scale = UeVec3 {
+            x: 0.5,
+            y: 2.0,
+            z: 4.0,
+        };
+        let decal = test_decal("/Game/Test/MI_Decal".into());
+
+        let matrix = decal_transform(ue_matrix(&actor), &decal).to_matrix();
+
+        // UE's Y and Z carry the projected image and its X the projection
+        // depth; Bevy reads the image off X and Y and projects along Z.
+        assert_eq!(matrix.x_axis.truncate(), Vec3::X * 2.0 * 256.0 * 2.0 * 0.01);
+        assert_eq!(matrix.y_axis.truncate(), Vec3::Y * 2.0 * 256.0 * 4.0 * 0.01);
+        assert_eq!(matrix.z_axis.truncate(), Vec3::Z * 2.0 * 128.0 * 0.5 * 0.01);
+    }
+
+    #[test]
+    fn decal_box_reproduces_the_bounds_ue_saved_with_the_actor() {
+        // DecalActor_UAID_A8A159F1FA82944602_1162180937 in GreenHouse_Level,
+        // and the world bounds its ActorMetaData records, in centimetres. UE
+        // elides UDecalComponent::DecalSize against the class default, so this
+        // is the evidence that the default really is (128, 256, 256).
+        let actor = UeTransform {
+            translation: UeVec3 {
+                x: -4216.251_5,
+                y: 1174.605_3,
+                z: 329.577_15,
+            },
+            rotation: UeQuat {
+                x: 0.693_776_8,
+                y: 0.136_651_95,
+                z: -0.136_651_95,
+                w: -0.693_776_8,
+            },
+            scale: UeVec3 {
+                x: 0.046_519_998,
+                y: 0.598_921,
+                z: 0.378_421,
+            },
+        };
+        let expected_extent = Vec3::new(42.247_4, 91.897_75, 153.323_78);
+
+        let matrix = decal_transform(ue_matrix(&actor), &test_decal("/Game/D".into())).to_matrix();
+
+        // Half of the axis-aligned box the oriented one spans, in the axis
+        // order `ue_world_to_bevy` puts UE's (X, Y, Z) into.
+        let half_extent = 0.5
+            * (matrix.x_axis.truncate().abs()
+                + matrix.y_axis.truncate().abs()
+                + matrix.z_axis.truncate().abs());
+        let expected = Vec3::new(expected_extent.y, expected_extent.z, expected_extent.x) * 0.01;
+        assert!(
+            half_extent.abs_diff_eq(expected, 1.0e-5),
+            "{half_extent:?} != {expected:?}"
+        );
+        assert!(matrix
+            .w_axis
+            .truncate()
+            .abs_diff_eq(Vec3::new(11.746_053, 3.295_771_5, 42.162_514), 1.0e-4));
     }
 
     #[test]

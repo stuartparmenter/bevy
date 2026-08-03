@@ -17,6 +17,8 @@ bevy = { path = "../../..", default-features = false, features = [
   "meshlet",
   "multi_threaded",
   "ktx2",
+  # Zorah's DecalActors spawn as clustered decals, which compile out without it.
+  "pbr_clustered_decals",
   "png",
   "std",
   "zstd_rust",

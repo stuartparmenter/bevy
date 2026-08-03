@@ -717,8 +717,8 @@ def main() -> int:
     scenes = []
     for scene_path in sorted((root / "scenes").glob("*.json")):
         scene = load(scene_path)
-        if scene.get("format") != "zorah-scene-manifest-v3":
-            raise ValueError(f"stale scene manifest without light data: {scene_path}")
+        if scene.get("format") != "zorah-scene-manifest-v4":
+            raise ValueError(f"stale scene manifest without decal data: {scene_path}")
         scenes.append(scene)
         levels.add(scene["level"])
         require_post_process_exposure(scene)
@@ -753,6 +753,13 @@ def main() -> int:
                     raise ValueError(f"invalid light intensity: {light}")
                 if "transform" not in light or "color" not in light:
                     raise ValueError(f"incomplete exported light record: {light}")
+            # A DecalActor projects a material that reaches no mesh slot, so it
+            # is required here or nothing requires it at all.
+            scene_materials.update(
+                decal["material"]
+                for decal in actor.get("decals", [])
+                if str(decal.get("material", "")).startswith("/Game/")
+            )
             for component in actor["components"]:
                 if component.get("mesh") is not None:
                     component_meshes.add(component["mesh"])

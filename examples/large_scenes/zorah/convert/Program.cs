@@ -1637,6 +1637,23 @@ static class ZorahConvert
                     );
                 }
             }
+            if (obj.ExportType == "DecalComponent")
+            {
+                Console.WriteLine(
+                    "ZORAH_DECAL_RECORD " +
+                    JsonSerializer.Serialize(
+                        ConvertDecalComponent(obj, InspectArchetypes(provider, obj, objects)),
+                        JsonOptions
+                    )
+                );
+                foreach (var property in obj.Properties)
+                {
+                    Console.WriteLine(
+                        $"ZORAH_DECAL_PROPERTY name={property.Name.Text} " +
+                        $"value={Describe(property.Tag?.GenericValue)}"
+                    );
+                }
+            }
             if (obj is USceneComponent sceneComponent)
             {
                 var transform = ConvertTransform(sceneComponent.GetRelativeTransform());
@@ -1824,6 +1841,7 @@ static class ZorahConvert
         var actorTypes = new Dictionary<string, int>(StringComparer.Ordinal);
         var componentTypes = new Dictionary<string, int>(StringComparer.Ordinal);
         var referencedMeshes = new HashSet<string>(StringComparer.Ordinal);
+        var referencedDecalMaterials = new HashSet<string>(StringComparer.Ordinal);
         var packagesWithoutActors = 0;
 
         for (var packageIndex = 0; packageIndex < packagePaths.Length; packageIndex++)
@@ -1876,6 +1894,12 @@ static class ZorahConvert
                         .Concat(ConvertKnownBlueprintLights(provider, actor))
                         .ToArray();
 
+                    var decals = owned
+                        .Where(component => component.ExportType == "DecalComponent")
+                        .OrderBy(component => component.Name, StringComparer.Ordinal)
+                        .Select(component => ConvertDecalComponent(component, archetypes))
+                        .ToArray();
+
                     var atmosphere = owned
                         .Where(component => component.ExportType == "SkyAtmosphereComponent")
                         .OrderBy(component => component.Name)
@@ -1895,6 +1919,13 @@ static class ZorahConvert
                             referencedMeshes.Add(component.Mesh);
                         }
                     }
+                    foreach (var decal in decals)
+                    {
+                        if (decal.Material is not null)
+                        {
+                            referencedDecalMaterials.Add(decal.Material);
+                        }
+                    }
 
                     actors.Add(new ActorRecord(
                         Package: packagePath,
@@ -1906,6 +1937,7 @@ static class ZorahConvert
                         Hidden: actor.GetOrDefault("bHidden", false),
                         Components: components,
                         Lights: lights,
+                        Decals: decals,
                         Atmosphere: atmosphere,
                         HeightFog: heightFog,
                         PostProcess: actor.ExportType == "PostProcessVolume"
@@ -1933,7 +1965,7 @@ static class ZorahConvert
         }
 
         var manifest = new SceneManifest(
-            Format: "zorah-scene-manifest-v3",
+            Format: "zorah-scene-manifest-v4",
             EngineVersion: "5.4",
             Level: level,
             SourceMap: $"Levels/{level}.umap",
@@ -1949,6 +1981,10 @@ static class ZorahConvert
                 .SelectMany(actor => actor.Components)
                 .Count(component => component.Mesh is null),
             ReferencedMeshes: referencedMeshes.Order(StringComparer.Ordinal).ToArray(),
+            DecalComponents: actors.Sum(actor => actor.Decals.Length),
+            ReferencedDecalMaterials: referencedDecalMaterials
+                .Order(StringComparer.Ordinal)
+                .ToArray(),
             Actors: actors.OrderBy(actor => actor.Package, StringComparer.Ordinal)
                 .ThenBy(actor => actor.Name, StringComparer.Ordinal)
                 .ToArray(),
@@ -2314,6 +2350,39 @@ static class ZorahConvert
             .ToArray();
     }
 
+    // UDecalComponent's class default, in centimetres. Every DecalActor in the
+    // three levels serializes DecalMaterial and its relative transform and
+    // nothing else, so the box itself is delta-elided against this. Confirmed
+    // against the ActorMetaData each external actor carries, which records the
+    // actor's world bounds: for DecalActor_UAID_A8A159F1FA82944602_1162180937
+    // (MI_Decal_SootStain_A7) |R| * (DecalSize * RelativeScale3D) reproduces the
+    // stored extent (42.24740, 91.89775, 153.32378) to seven figures, which no
+    // other size does.
+    private static readonly FVector DefaultDecalSize = new(128.0f, 256.0f, 256.0f);
+
+    private static DecalComponentRecord ConvertDecalComponent(
+        UObject component,
+        ComponentArchetypes archetypes
+    )
+    {
+        var chain = archetypes.Chain(component);
+        return new DecalComponentRecord(
+            Name: component.Name,
+            Type: component.ExportType,
+            Transform: archetypes.TransformRelativeToActor(component),
+            Visible: ReadBool(chain, "bVisible", true),
+            HiddenInGame: ReadBool(chain, "bHiddenInGame", false),
+            Material: ReadReference(chain, "DecalMaterial"),
+            Size: ReadVector(chain, "DecalSize", DefaultDecalSize),
+            SortOrder: ToNullableInt(ReadTaggedValue(chain, "SortOrder")) ?? 0,
+            FadeScreenSize: ReadDouble(chain, "FadeScreenSize", 0.01),
+            FadeStartDelay: ReadDouble(chain, "FadeStartDelay", 0.0),
+            FadeDuration: ReadDouble(chain, "FadeDuration", 0.0),
+            FadeInStartDelay: ReadDouble(chain, "FadeInStartDelay", 0.0),
+            FadeInDuration: ReadDouble(chain, "FadeInDuration", 0.0)
+        );
+    }
+
     private static PostProcessRecord ConvertPostProcessVolume(UObject actor)
     {
         var settings = ReadStructFields(GetTaggedValue(actor, "Settings"));
@@ -2512,6 +2581,12 @@ static class ZorahConvert
             B: ReadByteMember(value, "B", 255),
             A: ReadByteMember(value, "A", 255)
         );
+    }
+
+    private static Vec3Record ReadVector(UObject[] chain, string name, FVector defaultValue)
+    {
+        var value = ReadStruct(chain, name, defaultValue);
+        return new Vec3Record(value.X, value.Y, value.Z);
     }
 
     private static double ReadDouble(UObject component, string name, double defaultValue)
@@ -2989,6 +3064,8 @@ sealed record SceneManifest(
     Dictionary<string, int> StaticMeshComponentTypeCounts,
     int UnresolvedStaticMeshComponents,
     string[] ReferencedMeshes,
+    int DecalComponents,
+    string[] ReferencedDecalMaterials,
     ActorRecord[] Actors,
     FailureRecord[] Failures
 );
@@ -3030,6 +3107,7 @@ sealed record ActorRecord(
     bool Hidden,
     StaticMeshComponentRecord[] Components,
     LightComponentRecord[] Lights,
+    DecalComponentRecord[] Decals,
     SkyAtmosphereComponentRecord? Atmosphere,
     HeightFogComponentRecord? HeightFog,
     PostProcessRecord? PostProcess
@@ -3133,6 +3211,28 @@ sealed record LightComponentRecord(
     double IesBrightnessScale,
     string? LightFunctionMaterial,
     bool RealTimeCapture
+);
+
+/// <summary>A placed UDecalComponent: the box UE projects DecalMaterial through.</summary>
+/// <remarks>
+/// Size is the box's half-extent in centimetres along the component's own axes,
+/// with X the projection depth, so the projected rectangle measures
+/// 2*Size.Y by 2*Size.Z once the component scale is applied.
+/// </remarks>
+sealed record DecalComponentRecord(
+    string Name,
+    string Type,
+    TransformRecord Transform,
+    bool Visible,
+    bool HiddenInGame,
+    string? Material,
+    Vec3Record Size,
+    int SortOrder,
+    double FadeScreenSize,
+    double FadeStartDelay,
+    double FadeDuration,
+    double FadeInStartDelay,
+    double FadeInDuration
 );
 
 sealed record StaticMeshComponentRecord(

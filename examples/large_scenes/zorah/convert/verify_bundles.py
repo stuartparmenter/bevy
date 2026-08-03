@@ -28,6 +28,11 @@ EXPECTED_UNRESOLVED_COMPONENTS = {
     "Restir_Level": 0,
     "ThroneRoom_Level": 0,
 }
+EXPECTED_DECAL_COMPONENTS = {
+    "GreenHouse_Level": 232,
+    "Restir_Level": 323,
+    "ThroneRoom_Level": 17,
+}
 EXPECTED_ATMOSPHERE_OVERRIDES = {
     "GreenHouse_Level": set(),
     "Restir_Level": {"rayleigh_scattering_per_km", "sky_luminance_factor"},
@@ -128,6 +133,29 @@ def require_post_process_exposure(scene: dict) -> None:
             )
 
 
+def require_decals(scene: dict, materials: dict) -> None:
+    """Every DecalActor keeps its component, and every decal material converted.
+
+    A decal material reaches the manifest only through the decal component, so
+    a break anywhere in that path shows up here as an unconverted material
+    rather than as a silently unprojected decal at runtime.
+    """
+    decals = [decal for actor in scene.get("actors", []) for decal in actor.get("decals", [])]
+    expected = EXPECTED_DECAL_COMPONENTS[scene["level"]]
+    if len(decals) != expected:
+        raise ValueError(
+            f"scene {scene['level']} has {len(decals)} decal components, expected {expected}"
+        )
+    converted = {material["object"] for material in materials.get("materials", [])}
+    missing = sorted(
+        {decal["material"] for decal in decals if decal.get("material")} - converted
+    )
+    if missing:
+        raise ValueError(
+            f"scene {scene['level']} projects unconverted decal materials: {missing}"
+        )
+
+
 def require_atmosphere_and_height_fog(scene: dict) -> None:
     atmosphere_records = [
         actor["atmosphere"]
@@ -166,8 +194,8 @@ def main() -> int:
         for level in ("GreenHouse_Level", "Restir_Level", "ThroneRoom_Level")
     ]
     for scene in scenes:
-        if scene.get("format") != "zorah-scene-manifest-v3":
-            raise ValueError(f"scene {scene.get('level')} predates exported UE lights")
+        if scene.get("format") != "zorah-scene-manifest-v4":
+            raise ValueError(f"scene {scene.get('level')} predates exported decals")
         require_post_process_exposure(scene)
         require_atmosphere_and_height_fog(scene)
         unresolved = [
@@ -191,6 +219,7 @@ def main() -> int:
         for actor in scene.get("actors", []):
             if "lights" not in actor:
                 raise ValueError(f"actor lacks light array: {actor.get('name')}")
+        require_decals(scene, materials)
         light_counts: dict[str, int] = {}
         for actor in scene.get("actors", []):
             for light in actor["lights"]:
