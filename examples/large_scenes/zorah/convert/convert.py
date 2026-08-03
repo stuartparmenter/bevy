@@ -64,6 +64,18 @@ GEOMETRY_PIPELINE_VERSION = 2
 # tree, and source timestamps belong in neither.
 GEOMETRY_INPUTS_FORMAT = "zorah-geometry-inputs-v1"
 GEOMETRY_INPUTS_NAME = "geometry-inputs.json"
+# Scene manifests are pure ZorahConvert output, and scene_manifest_is_current
+# only inspects what the manifest reports about the level. Blueprint-template
+# resolution changed the extractor without moving a single one of those counts,
+# so the cached manifests survived it; the extractor's own content hash is what
+# invalidates them.
+CONVERTER_INPUTS_FORMAT = "zorah-converter-inputs-v1"
+CONVERTER_INPUTS_NAME = "converter-inputs.json"
+# UPointLightComponent's class defaults. A blueprint-embedded light that reaches
+# a manifest with all three at once was read from the class archetype instead of
+# the blueprint's component template.
+ARCHETYPE_LIGHT_INTENSITY = 3.1415927410125732
+ARCHETYPE_LIGHT_ATTENUATION_RADIUS = 1000.0
 ENGINE_PRIMITIVES = {
     "/Engine/BasicShapes/Cube.Cube",
     "/Engine/EngineMeshes/Cube.Cube",
@@ -341,6 +353,80 @@ def scene_manifest_is_current(path: Path) -> bool:
         return False
 
 
+def converter_fingerprint() -> str:
+    """Content hash of the ZorahConvert sources that produce scene manifests.
+
+    The sources rather than the built assembly: this is the same tree the
+    --skip-dotnet-build path assumes is already compiled, and it stays stable
+    across rebuilds that change nothing.
+    """
+    sources = sorted(
+        [*CONVERT_DIRECTORY.glob("*.cs"), PROJECT], key=lambda path: path.name
+    )
+    return stable_hash(
+        [(path.name, hashlib.sha256(path.read_bytes()).hexdigest()) for path in sources]
+    )
+
+
+def scene_cache_is_current(scene_directory: Path, scene_paths: list[Path]) -> bool:
+    """Accept cached scene manifests only if today's extractor wrote them."""
+    try:
+        stamp = load_json(scene_directory / CONVERTER_INPUTS_NAME)
+    except (OSError, TypeError, ValueError):
+        return False
+    return (
+        stamp.get("format") == CONVERTER_INPUTS_FORMAT
+        and stamp.get("converter") == converter_fingerprint()
+        and all(scene_manifest_is_current(path) for path in scene_paths)
+    )
+
+
+def stamp_scene_cache(scene_directory: Path) -> None:
+    write_json_if_changed(
+        scene_directory / CONVERTER_INPUTS_NAME,
+        {"format": CONVERTER_INPUTS_FORMAT, "converter": converter_fingerprint()},
+    )
+
+
+def is_archetype_light(light: dict) -> bool:
+    """True for a light record still at UPointLightComponent's class defaults.
+
+    Intensity PI, a 1000 uu attenuation radius and an identity relative
+    transform together are the class archetype, never an authored lamp.
+    """
+    transform = light.get("transform", {})
+    translation = transform.get("translation", {})
+    rotation = transform.get("rotation", {})
+    scale = transform.get("scale", {})
+    return (
+        float(light.get("intensity", 0.0)) == ARCHETYPE_LIGHT_INTENSITY
+        and float(light.get("attenuation_radius", 0.0))
+        == ARCHETYPE_LIGHT_ATTENUATION_RADIUS
+        and all(float(translation.get(axis, 0.0)) == 0.0 for axis in "xyz")
+        and all(float(rotation.get(axis, 0.0)) == 0.0 for axis in "xyz")
+        and float(rotation.get("w", 1.0)) == 1.0
+        and all(float(scale.get(axis, 1.0)) == 1.0 for axis in "xyz")
+    )
+
+
+def validate_blueprint_light_archetypes(scene_paths: list[Path]) -> None:
+    """Reject lights whose blueprint component template was never merged in.
+
+    Catches a manifest exported before LoadBlueprintComponentTemplates existed
+    as well as a regression in the archetype chain itself.
+    """
+    for scene_path in scene_paths:
+        for actor in load_json(scene_path).get("actors", []):
+            for light in actor.get("lights", []):
+                if is_archetype_light(light):
+                    raise RuntimeError(
+                        f"{scene_path.name} actor "
+                        f"{actor.get('label') or actor.get('name')} light "
+                        f"{light.get('name')} carries un-merged blueprint archetype "
+                        "defaults; re-export the scene manifests"
+                    )
+
+
 def install_scene_manifests(
     next_paths: list[Path], work: Path, loose: Path, output: Path
 ) -> None:
@@ -355,6 +441,7 @@ def install_scene_manifests(
         if loose.is_dir():
             (loose / "scenes").mkdir(exist_ok=True)
             shutil.copy2(path, loose / "scenes" / path.name)
+    stamp_scene_cache(work / "scenes")
     (output / "scenes").mkdir(exist_ok=True)
     for path in next_paths:
         os.replace(path, output / "scenes" / path.name)
@@ -1177,6 +1264,7 @@ def main() -> int:
         next_paths = [next_scene_directory / f"{level}.json" for level in LEVELS]
         if not all(scene_manifest_is_current(path) for path in next_paths):
             raise RuntimeError("scene-only export did not produce current light manifests")
+        validate_blueprint_light_archetypes(next_paths)
         install_scene_manifests(next_paths, work, loose, output)
         next_scene_directory.rmdir()
         verify_runtime(output, cargo, audit_capacity=True)
@@ -1186,7 +1274,7 @@ def main() -> int:
     scene_directory = work / "scenes"
     scene_paths = [scene_directory / f"{level}.json" for level in LEVELS]
     scene_directory.mkdir(parents=True, exist_ok=True)
-    if args.refresh_source or not all(scene_manifest_is_current(path) for path in scene_paths):
+    if args.refresh_source or not scene_cache_is_current(scene_directory, scene_paths):
         next_scene_directory = work / "scenes.next"
         next_scene_paths = [
             next_scene_directory / f"{level}.json" for level in LEVELS
@@ -1200,6 +1288,7 @@ def main() -> int:
         for level, path in zip(LEVELS, scene_paths):
             os.replace(next_scene_directory / f"{level}.json", path)
         next_scene_directory.rmdir()
+        stamp_scene_cache(scene_directory)
 
     if args.rebuild_geometry:
         # Scoped to geometry: exported textures and material bakes in the same
@@ -1222,6 +1311,7 @@ def main() -> int:
     for level, path in zip(LEVELS, scene_paths):
         shutil.copy2(path, loose / "scenes" / f"{level}.json")
     validate_engine_primitive_overrides(scene_paths)
+    validate_blueprint_light_archetypes(scene_paths)
 
     geometry_document = load_json(loose / "geometry.json")
     mesh_material_input = work / "mesh-material-input.json"

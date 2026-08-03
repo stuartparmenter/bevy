@@ -152,6 +152,17 @@ class GeometryCache:
 
 
 @contextmanager
+def stub_manifest_inventory():
+    """Accept any scene manifest, leaving only the converter stamp under test."""
+    original = convert.scene_manifest_is_current
+    convert.scene_manifest_is_current = lambda path: True
+    try:
+        yield
+    finally:
+        convert.scene_manifest_is_current = original
+
+
+@contextmanager
 def stub_geometry_delta(cache: GeometryCache):
     """Run the delta stage without invoking convert_geometry.py."""
     calls: list[list[str]] = []
@@ -548,6 +559,69 @@ class IncrementalConversionTests(unittest.TestCase):
                 scene = json.loads((tree / "scenes" / "Restir_Level.json").read_text())
                 self.assertEqual(scene["level"], "fresh")
             self.assertFalse(staged.exists())
+            with stub_manifest_inventory():
+                self.assertTrue(
+                    convert.scene_cache_is_current(
+                        work / "scenes", [work / "scenes" / "Restir_Level.json"]
+                    )
+                )
+
+    def test_changed_extractor_invalidates_cached_scene_manifests(self):
+        with tempfile.TemporaryDirectory() as directory:
+            scenes = Path(directory) / "scenes"
+            manifest = scenes / "Restir_Level.json"
+            write_json(manifest, {"level": "Restir_Level"})
+            stamp = scenes / convert.CONVERTER_INPUTS_NAME
+
+            with stub_manifest_inventory():
+                # An unstamped cache predates the fingerprint and is unknown work.
+                self.assertFalse(convert.scene_cache_is_current(scenes, [manifest]))
+                convert.stamp_scene_cache(scenes)
+                self.assertTrue(convert.scene_cache_is_current(scenes, [manifest]))
+                write_json(
+                    stamp,
+                    {
+                        "format": convert.CONVERTER_INPUTS_FORMAT,
+                        "converter": "extractor-changed",
+                    },
+                )
+                self.assertFalse(convert.scene_cache_is_current(scenes, [manifest]))
+
+    def test_blueprint_archetype_lights_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            scene = Path(directory) / "Restir_Level.json"
+            light = {
+                "name": "PointLight",
+                "intensity": convert.ARCHETYPE_LIGHT_INTENSITY,
+                "attenuation_radius": convert.ARCHETYPE_LIGHT_ATTENUATION_RADIUS,
+                "transform": {
+                    "translation": {"x": 0, "y": 0, "z": 0},
+                    "rotation": {"x": 0, "y": 0, "z": 0, "w": 1},
+                    "scale": {"x": 1, "y": 1, "z": 1},
+                },
+            }
+            write_json(scene, {"actors": [{"label": "Lamp", "lights": [light]}]})
+            with self.assertRaisesRegex(RuntimeError, "un-merged blueprint archetype"):
+                convert.validate_blueprint_light_archetypes([scene])
+
+            # Any one of the three authored values means a merged template.
+            for key, value in (
+                ("intensity", 180.0),
+                ("attenuation_radius", 800.0),
+            ):
+                write_json(
+                    scene, {"actors": [{"lights": [{**light, key: value}]}]}
+                )
+                convert.validate_blueprint_light_archetypes([scene])
+            placed = {
+                **light,
+                "transform": {
+                    **light["transform"],
+                    "translation": {"x": 0, "y": 0, "z": 112.5},
+                },
+            }
+            write_json(scene, {"actors": [{"lights": [placed]}]})
+            convert.validate_blueprint_light_archetypes([scene])
 
     def test_interrupted_install_promotes_the_packed_tree(self):
         with tempfile.TemporaryDirectory() as directory:
