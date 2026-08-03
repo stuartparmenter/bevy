@@ -285,15 +285,19 @@ struct VisibilityRay {
     origin: vec3<f32>,
     direction: vec3<f32>,
     t_max: f32,
-    // False when the two points settle the query on their own and no ray is needed.
+    // False when the two endpoints settle the query on their own and no ray is needed.
     trace: bool,
     // Visibility to report when `trace` is false.
     visibility: f32,
 }
 
+fn visibility_without_tracing(visibility: f32) -> VisibilityRay {
+    return VisibilityRay(vec3(0.0), vec3(0.0), 0.0, false, visibility);
+}
+
 fn setup_visibility_ray(ray_origin_in: vec3<f32>, origin_world_normal: vec3<f32>, point: vec4<f32>, ray_origin_bias: f32) -> VisibilityRay {
     let toward_light = select(point.xyz, point.xyz - ray_origin_in, point.w == 1.0);
-    if !isfinite3(toward_light) { return VisibilityRay(ray_origin_in, vec3(0.0), 0.0, false, 0.0); }
+    if !isfinite3(toward_light) { return visibility_without_tracing(0.0); }
 
     // Lift the origin clear of its own instance's simplified BLAS first, then measure the ray from
     // where it actually starts, so the bias is spent once instead of at both ends.
@@ -306,11 +310,12 @@ fn setup_visibility_ray(ray_origin_in: vec3<f32>, origin_world_normal: vec3<f32>
 
     let ray = point.xyz - ray_origin;
     let dist = length(ray);
+    if !isfinite(dist) { return visibility_without_tracing(0.0); }
+
     let t_max = dist - max(RAY_T_MIN, LIGHT_SAMPLE_END_EPSILON_RELATIVE * dist);
-    if !isfinite(dist) { return VisibilityRay(ray_origin, vec3(0.0), 0.0, false, 0.0); }
     // The light sits inside the shell the origin was lifted into, so nothing can lie between the
     // two points. Reporting that as occluded is what stopped a candle body being lit by its flame.
-    if dist <= RAY_T_MIN || t_max < RAY_T_MIN { return VisibilityRay(ray_origin, vec3(0.0), 0.0, false, 1.0); }
+    if t_max < RAY_T_MIN { return visibility_without_tracing(1.0); }
 
     return VisibilityRay(ray_origin, ray / dist, t_max, true, 0.0);
 }

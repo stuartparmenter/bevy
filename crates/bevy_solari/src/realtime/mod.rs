@@ -234,9 +234,9 @@ mod shader_source_tests {
 
         // A light inside the offset shell has nothing between it and the surface, so it is visible.
         // Reporting it occluded is what stopped emitters lighting the geometry they sit on.
-        assert!(sampling.contains(
-            "if dist <= RAY_T_MIN || t_max < RAY_T_MIN { return VisibilityRay(ray_origin, vec3(0.0), 0.0, false, 1.0); }"
-        ));
+        assert!(
+            sampling.contains("if t_max < RAY_T_MIN { return visibility_without_tracing(1.0); }")
+        );
     }
 
     #[test]
