@@ -355,7 +355,8 @@ the world-space `N` and offers no flip for UE's DirectX-format maps; and
 
 The scene manifest preserves UE directional, point, spot, and sky-light
 components, including physical units, colors, temperature, source dimensions,
-cone/source angles, range, transforms, and IES/light-function references.
+cone/source angles, range, transforms, and IES/light-function references with
+the light function's scale, fade distance and disabled brightness.
 Directional lights feed Solari directly. Point and spot lights use Bevy's
 analytical lights for the responsive raster warm-up and two shared emissive
 proxy meshes for Solari. Intensities are restated in each consumer's
@@ -366,6 +367,16 @@ total flux for its emissive proxy. A legacy `Unitless` intensity becomes lumens
 over the whole sphere, so a `Unitless` spot's proxy takes cone flux off that
 same candela; skipping the restatement made the emissive disk radiate exactly
 4x the punctual light's on-axis intensity for any cone.
+Neither renderer evaluates an IES profile or a light function, but a uniform
+proxy can still carry a light function's mean, the factor UE multiplies the
+light by on average. The converter measures that mean per material and exports
+it; an unmeasured light function keeps its whole flux and is counted in
+`unsupported_profiles`. Throne Room's "Caustics" light is the one measured case:
+`LF_LIghtCaustics_01_Inst` multiplies two panning samples of the sparse
+`T_Caustics_01_MSK` ripple, whose emissive averages 0.0081, so 250,000 cd that
+read as 67% of the room's emitted flux now contribute 25,447 lm. The pattern
+itself is still missing, so that region shows flat light where UE shows moving
+filaments reaching 6x the local mean.
 The two `BP_HoodLight` spotlight templates are recovered from their Blueprint
 class package because their World Partition instance contains no component
 exports.

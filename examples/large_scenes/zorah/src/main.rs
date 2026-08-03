@@ -558,6 +558,11 @@ struct LightRecord {
     ies_texture: Option<String>,
     #[serde(default)]
     light_function_material: Option<String>,
+    /// Spatial and temporal mean of `light_function_material`'s emissive
+    /// output, measured by the converter. Absent whenever the converter has no
+    /// measurement for that material.
+    #[serde(default)]
+    light_function_mean: Option<f32>,
     #[serde(default)]
     real_time_capture: bool,
 }
@@ -2221,6 +2226,7 @@ fn spawn_exported_lights(
     let mut sky_count = 0usize;
     let mut environment_count = 0usize;
     let mut unsupported_profiles = 0usize;
+    let mut scaled_light_functions = 0usize;
     let mut legacy_unit_count = 0usize;
     let mut sky_brightness = 0.0f32;
     for actor in &converted.actors {
@@ -2246,10 +2252,16 @@ fn spawn_exported_lights(
             {
                 continue;
             }
-            let has_unsupported_profile =
-                light.ies_texture.is_some() || light.light_function_material.is_some();
-            if has_unsupported_profile {
+            // A light function the converter has measured is still unsupported
+            // as a pattern, but its flux is no longer wrong; one it has not
+            // measured keeps its whole flux and is the loud case.
+            if light.ies_texture.is_some()
+                || (light.light_function_material.is_some() && light.light_function_mean.is_none())
+            {
                 unsupported_profiles += 1;
+            }
+            if light.light_function_mean.is_some() {
+                scaled_light_functions += 1;
             }
             if normalized_light_units(&light.intensity_units).eq_ignore_ascii_case("Unitless") {
                 legacy_unit_count += 1;
@@ -2326,8 +2338,9 @@ fn spawn_exported_lights(
                     // Both proxy meshes are shared, so this adds two BLAS total.
                     // IES and light-function profiles are not evaluated yet,
                     // but omitting those emitters makes the traced scene lose
-                    // authored key lights entirely. Keep their total flux as a
-                    // uniform proxy until Solari can bind the profiles.
+                    // authored key lights entirely, so the proxy spreads their
+                    // flux uniformly. A measured light function still scales
+                    // that flux by its mean; see `emitted_light_flux`.
                     let flux = emitted_light_flux(light, outer_angle);
                     let area_denominator = if light.kind == "point" {
                         4.0 * std::f32::consts::PI.powi(2) * source_radius.powi(2)
@@ -2406,6 +2419,7 @@ fn spawn_exported_lights(
         sky_count,
         environment_count,
         unsupported_profiles,
+        scaled_light_functions,
         legacy_unit_count,
         solari_emitters = raytracing_instances.len(),
         "spawned exported Zorah lighting"
@@ -3310,14 +3324,13 @@ fn queue_partitions(
             .mesh
             .clone()
             .unwrap_or_else(|| format!("{}#Mesh0/Primitive0", partition.geometry));
-        let material_object = partition_material(partition, material_slots, overrides);
         // `raytracing_only` is `is_lightblocker_mesh`. A blocker is an occluder
         // in UE rather than a surface, so it contributes no radiance to the
         // BVH; see `occluder_material`.
         let material = if raytracing_only {
             occluder_material
         } else {
-            match material_object {
+            match partition_material(partition, material_slots, overrides) {
                 Some(object) => material_handles.get(object).unwrap_or_else(|| {
                     panic!("converted material has no runtime handle: {object}")
                 }),
@@ -3426,6 +3439,12 @@ fn emitted_light_flux(light: &LightRecord, outer_angle_radians: f32) -> f32 {
         _ => light.intensity,
     }
     .max(0.0)
+    // UE multiplies the light per-pixel by its light function material, so a
+    // fixture's effective average output is its flux times that material's
+    // mean. A uniform proxy carries no spatial modulation, only the mean.
+    // Throne Room's "Caustics" light runs a sparse ripple averaging 0.0081,
+    // which is what made 250,000 cd of it 67% of the room's emitted flux.
+    * light.light_function_mean.unwrap_or(1.0).clamp(0.0, 1.0)
 }
 
 fn blackbody_srgb(temperature: f32) -> Color {
@@ -3949,6 +3968,7 @@ mod tests {
             light_source_angle: 0.5357,
             ies_texture: None,
             light_function_material: None,
+            light_function_mean: None,
             real_time_capture: false,
         }
     }
@@ -4348,10 +4368,21 @@ mod tests {
     }
 
     #[test]
-    fn profiled_lights_keep_flux_for_the_uniform_solari_proxy() {
+    fn unmeasured_light_functions_keep_flux_for_the_uniform_solari_proxy() {
         let mut light = test_light("point", 250_000.0, "ELightUnits::Candelas");
-        light.light_function_material = Some("/Game/VFX/LF_Caustics".into());
+        light.light_function_material = Some("/Game/VFX/LF_Unknown".into());
         assert!(emitted_light_flux(&light, 1.0) > 3_000_000.0);
+    }
+
+    #[test]
+    fn measured_light_functions_scale_the_proxy_by_their_mean() {
+        // Throne Room's "Caustics" light: 250,000 cd through
+        // LF_LIghtCaustics_01_Inst, whose emissive averages 0.0081.
+        let mut light = test_light("point", 250_000.0, "ELightUnits::Candelas");
+        light.light_function_material =
+            Some("/Game/VFX/NebulaOrb/LF_LIghtCaustics_01_Inst.LF_LIghtCaustics_01_Inst".into());
+        light.light_function_mean = Some(0.0081);
+        assert!((emitted_light_flux(&light, 1.0) - 25_447.0).abs() < 1.0);
     }
 
     #[test]

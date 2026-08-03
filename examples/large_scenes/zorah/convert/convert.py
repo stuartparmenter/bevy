@@ -333,7 +333,7 @@ def scene_manifest_is_current(path: Path) -> bool:
             and actor["post_process"].get("unbound", False)
             and float(actor["post_process"].get("blend_weight", 1.0)) > 0.0
         ]
-        if document.get("format") != "zorah-scene-manifest-v4" or len(records) != 1:
+        if document.get("format") != "zorah-scene-manifest-v5" or len(records) != 1:
             return False
         level = document.get("level")
         inventory = EXPECTED_SCENE_INVENTORY.get(level)
@@ -660,7 +660,7 @@ def reconcile_geometry_cache(
         write_json_if_changed(
             delta_scene,
             {
-                "format": "zorah-scene-manifest-v4",
+                "format": "zorah-scene-manifest-v5",
                 "level": "GeometryDelta",
                 "actors": [],
                 "referenced_meshes": rebuild,

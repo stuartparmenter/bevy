@@ -194,7 +194,7 @@ def main() -> int:
         for level in ("GreenHouse_Level", "Restir_Level", "ThroneRoom_Level")
     ]
     for scene in scenes:
-        if scene.get("format") != "zorah-scene-manifest-v4":
+        if scene.get("format") != "zorah-scene-manifest-v5":
             raise ValueError(f"scene {scene.get('level')} predates exported decals")
         require_post_process_exposure(scene)
         require_atmosphere_and_height_fog(scene)

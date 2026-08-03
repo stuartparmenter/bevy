@@ -306,7 +306,7 @@ def load_scene_manifests(paths: list[Path]) -> tuple[list[dict], list[str], list
     material_overrides: set[str] = set()
     for path in paths:
         scene = json.loads(path.read_text(encoding="utf-8"))
-        if scene.get("format") != "zorah-scene-manifest-v4":
+        if scene.get("format") != "zorah-scene-manifest-v5":
             raise ValueError(f"not a Zorah scene manifest: {path}")
         scenes.append({
             "level": scene["level"],

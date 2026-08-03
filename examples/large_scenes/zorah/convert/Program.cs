@@ -2186,7 +2186,7 @@ static class ZorahConvert
         }
 
         var manifest = new SceneManifest(
-            Format: "zorah-scene-manifest-v4",
+            Format: "zorah-scene-manifest-v5",
             EngineVersion: "5.4",
             Level: level,
             SourceMap: $"Levels/{level}.umap",
@@ -2250,6 +2250,10 @@ static class ZorahConvert
             $"unresolved_mesh_components={manifest.UnresolvedStaticMeshComponents} " +
             $"niagara={manifest.NiagaraComponents} " +
             $"niagara_missing={manifest.MissingNiagaraAssets.Length} " +
+            $"light_functions_without_mean={manifest.Actors
+                .SelectMany(actor => actor.Lights)
+                .Count(light => light.LightFunctionMaterial is not null
+                    && light.LightFunctionMean is null)} " +
             $"output={outputPath}"
         );
         return failures.Count == 0 ? 0 : 1;
@@ -2497,6 +2501,37 @@ static class ZorahConvert
         return ConvertTransform(new FTransform(rotation, location, scale));
     }
 
+    /// <summary>
+    /// Spatial and temporal mean of a light function material's emissive
+    /// output, by material path.
+    /// </summary>
+    /// <remarks>
+    /// UE multiplies a light per-pixel by its light function material, so the
+    /// light's effective average output is its flux times this mean. A uniform
+    /// emissive proxy carries no spatial modulation, and the mean is the only
+    /// part of the pattern it can express.
+    ///
+    /// LF_LIghtCaustics_01 overrides nothing on its parent, whose EmissiveColor
+    /// is 2*C(uv_a, t) * 3*C(uv_b, t) for C = T_Caustics_01_MSK (4096^2,
+    /// TSF_G16, SRGB=false, so already linear) read through Panners at
+    /// (0.003, -0.02) and (0.005, 0.03) tiles/s. E[C] = 0.037083 over all
+    /// 16.7M texels. The two samples decorrelate: the FFT autocorrelation
+    /// averaged along the real relative-pan trajectory is 0.0013759 against
+    /// E[C]^2 = 0.0013751, so E[6 C_a C_b] = 6 E[C]^2 = 0.008255. UE writes
+    /// light functions through an 8-bit UNORM attenuation buffer, an implicit
+    /// saturate retaining 98.24%, which lands at 0.00811.
+    /// </remarks>
+    private static readonly Dictionary<string, double> LightFunctionMeans =
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["/Game/VFX/NebulaOrb/LF_LIghtCaustics_01_Inst.LF_LIghtCaustics_01_Inst"] = 0.0081,
+        };
+
+    private static double? MeasuredLightFunctionMean(string? material) =>
+        material is not null && LightFunctionMeans.TryGetValue(material, out var mean)
+            ? mean
+            : null;
+
     private static LightComponentRecord ConvertLightComponent(
         UObject component,
         ComponentArchetypes archetypes
@@ -2522,6 +2557,7 @@ static class ZorahConvert
             _ => 5000.0,
         };
         var defaultUnits = type == "directional" ? "Lux" : "Unitless";
+        var lightFunctionMaterial = ReadReference(chain, "LightFunctionMaterial");
         return new LightComponentRecord(
             Name: component.Name,
             Type: type,
@@ -2548,7 +2584,20 @@ static class ZorahConvert
             IesTexture: ReadReference(chain, "IESTexture"),
             UseIesBrightness: ReadBool(chain, "bUseIESBrightness", false),
             IesBrightnessScale: ReadDouble(chain, "IESBrightnessScale", 1.0),
-            LightFunctionMaterial: ReadReference(chain, "LightFunctionMaterial"),
+            LightFunctionMaterial: lightFunctionMaterial,
+            LightFunctionMean: MeasuredLightFunctionMean(lightFunctionMaterial),
+            // ULightComponent CDO defaults. Nothing in the sample overrides
+            // them, so they are exported to make that visible rather than
+            // assumed: at a 1 km fade distance in a 28 m room the distance fade
+            // never runs, which is what keeps DisabledBrightness out of the
+            // light function's effective output.
+            LightFunctionScale: ReadVector(
+                chain,
+                "LightFunctionScale",
+                new FVector(1024.0f, 1024.0f, 1024.0f)
+            ),
+            LightFunctionFadeDistance: ReadDouble(chain, "LightFunctionFadeDistance", 100000.0),
+            DisabledBrightness: ReadDouble(chain, "DisabledBrightness", 0.5),
             RealTimeCapture: ReadBool(chain, "bRealTimeCapture", false)
         );
     }
@@ -3546,6 +3595,10 @@ sealed record LightComponentRecord(
     bool UseIesBrightness,
     double IesBrightnessScale,
     string? LightFunctionMaterial,
+    double? LightFunctionMean,
+    Vec3Record LightFunctionScale,
+    double LightFunctionFadeDistance,
+    double DisabledBrightness,
     bool RealTimeCapture
 );
 

@@ -108,7 +108,7 @@ class GeometryCache:
         write_json(
             self.scene,
             {
-                "format": "zorah-scene-manifest-v4",
+                "format": "zorah-scene-manifest-v5",
                 "level": "GreenHouse_Level",
                 "actors": [],
                 "referenced_meshes": meshes,
@@ -672,7 +672,7 @@ class IncrementalConversionTests(unittest.TestCase):
             "auto_exposure_bias": bias,
         }
         document = {
-            "format": "zorah-scene-manifest-v4",
+            "format": "zorah-scene-manifest-v5",
             "level": level,
             "actor_package_count": inventory["actor_packages"],
             "unresolved_static_mesh_components": inventory["unresolved_mesh_components"],
