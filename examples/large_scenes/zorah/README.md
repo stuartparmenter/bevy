@@ -285,8 +285,36 @@ local substitutes for the referenced `/Engine/BasicShapes`, recursive
 material parameters, and common Base Color/Normal/ORM mappings.
 
 This is not a general UE material or Blueprint interpreter. Complex material
-graphs, layer blending, decals, WPO/wind, subsurface profiles,
-water/translucency, and meshlet alpha masking remain approximations or gaps.
+graphs, layer blending, decals, WPO/wind, subsurface profiles, and
+water/translucency remain approximations or gaps.
+
+Foliage cutouts are converted but not switched on. `M_LS_Foliage` takes its
+opacity mask either from the base color texture's alpha or from a separate
+mask texture, chosen by one static switch; eleven instances pick the separate
+texture, and the bake composites it into the alpha channel of the baked base
+color, where a `StandardMaterial` alpha-tests it against
+`OpacityMaskClipValue`. Instances on the base-color-alpha side keep whatever
+alpha their albedo carries, which in this sample is opaque everywhere -
+including `MI_Tree_A1_Atlas` and the two `MI_Flowers_Atlas_A0*` materials,
+whose "atlas" is UV packing over fully modelled geometry rather than
+billboards.
+
+`--preserve-alpha` turns the masks on. Non-opaque partitions then spawn as
+`Mesh3d` instead of `MeshletMesh3d`, because meshlets rasterize into the
+visibility buffer before any material runs and
+`meshlet/material_pipeline_prepare.rs` collects only opaque materials, so a
+masked meshlet would write depth and never be shaded. Both paths draw the
+plain `Mesh` the BLAS already loads, so the switch costs no extra conversion
+and no extra GPU memory. It moves 1,365 of GreenHouse's 8,832 partitions, 392
+of Restir's 27,394, and 31 of Throne Room's 23,190.
+
+It stays off by default because Solari would still trace those instances
+opaque and disagree with the raster image. Making it the default needs, in
+`bevy_solari`: an alpha (and `OpacityMaskClipValue`) field on `GpuMaterial` in
+`scene/binder.rs`, a `rayQueryProceed` candidate loop in
+`raytracing_scene_bindings.wgsl` that samples base color alpha and rejects
+clipped hits, and dropping the hardcoded
+`AccelerationStructureGeometryFlags::OPAQUE` in `scene/blas.rs`.
 
 The sample's one water surface, the GreenHouse reflecting pond, is
 `MSM_SingleLayerWater`. Its own parameter family is mapped to the four terms

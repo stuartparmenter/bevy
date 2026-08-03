@@ -812,7 +812,8 @@ static class ZorahConvert
                 Name: parameterName,
                 Association: JsonScalar(info.GetValueOrDefault("Association"))?.ToString(),
                 Index: ToNullableInt(info.GetValueOrDefault("Index")),
-                Value: JsonScalar(fields.GetValueOrDefault("ParameterValue"))
+                Value: JsonScalar(fields.GetValueOrDefault("ParameterValue")),
+                ExpressionGuid: ReadGuid(fields.GetValueOrDefault("ExpressionGUID"))
             ));
         }
         return result.OrderBy(parameter => parameter.Name, StringComparer.Ordinal).ToArray();
@@ -840,7 +841,8 @@ static class ZorahConvert
                 Association: JsonScalar(info.GetValueOrDefault("Association"))?.ToString(),
                 Index: ToNullableInt(info.GetValueOrDefault("Index")),
                 Value: ToBool(fields.GetValueOrDefault("Value"), false),
-                Override: ToBool(fields.GetValueOrDefault("bOverride"), false)
+                Override: ToBool(fields.GetValueOrDefault("bOverride"), false),
+                ExpressionGuid: ReadGuid(fields.GetValueOrDefault("ExpressionGUID"))
             ));
         }
         return result
@@ -904,7 +906,8 @@ static class ZorahConvert
                 Name: parameterName,
                 Association: "GlobalParameter",
                 Index: -1,
-                Value: null
+                Value: null,
+                ExpressionGuid: ReadGuid(GetTaggedValue(expression, "ExpressionGUID"))
             );
             if (expression.ExportType.Contains("ScalarParameter", StringComparison.Ordinal))
             {
@@ -940,7 +943,8 @@ static class ZorahConvert
                     Association: "GlobalParameter",
                     Index: -1,
                     Value: ToBool(GetTaggedValue(expression, "DefaultValue"), false),
-                    Override: false
+                    Override: false,
+                    ExpressionGuid: parameter.ExpressionGuid
                 ));
             }
         }
@@ -1177,6 +1181,22 @@ static class ZorahConvert
     /// Unwrap an FScriptStruct to whichever native struct CUE4Parse read into it.
     private static object? StructValue(object? value) =>
         GetPublicMember(value, "StructType") ?? value;
+
+    /// A parameter's ExpressionGUID as 32 uppercase hex digits.
+    ///
+    /// UE reconciles a material instance's overrides with its master by GUID and
+    /// only falls back to the name, so an instance authored against an older
+    /// revision keeps a name the master no longer has. An all-zero GUID is the
+    /// unset value and is reported as absent.
+    private static string? ReadGuid(object? value)
+    {
+        var text = new string(
+            (StructValue(value)?.ToString() ?? "")
+                .Where(char.IsAsciiLetterOrDigit)
+                .ToArray()
+        ).ToUpperInvariant();
+        return text.Length == 0 || text.All(character => character == '0') ? null : text;
+    }
 
     private static Dictionary<string, object?> ReadStructFields(object? value)
     {
@@ -3165,11 +3185,15 @@ sealed record MaterialRecord(
     Dictionary<string, object?> BaseOverrides
 );
 
+/// ExpressionGuid is null for a parameter that has none to carry: a texture
+/// reached by walking a base material's graph, and the diagnostic stand-ins for
+/// materials whose package is missing.
 sealed record MaterialParameterRecord(
     string Name,
     string? Association,
     int? Index,
-    object? Value
+    object? Value,
+    string? ExpressionGuid = null
 );
 
 sealed record StaticSwitchParameterRecord(
@@ -3177,7 +3201,8 @@ sealed record StaticSwitchParameterRecord(
     string? Association,
     int? Index,
     bool Value,
-    bool Override
+    bool Override,
+    string? ExpressionGuid = null
 );
 
 sealed record MaterialLayerFunctions(string[] Layers, string[] Blends);

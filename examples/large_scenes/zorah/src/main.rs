@@ -220,6 +220,7 @@ struct PendingScene {
     warmup_started_at: Option<Instant>,
     unique_blas_vertices: u64,
     spawned: usize,
+    mesh_raster: usize,
     failed: usize,
     reported_done: bool,
 }
@@ -1041,11 +1042,23 @@ fn runtime_alpha_mode(material: &EffectiveMaterial, preserve_alpha: bool) -> Alp
         source_material_render_properties(material).alpha_mode
     } else {
         // Solari currently traces the same geometry as opaque and does not
-        // evaluate texture alpha. Keeping meshlet raster opaque as well avoids
-        // disappearing cards and raster/raytracing disagreement while the
-        // alpha-tested ray-query path is still missing.
+        // evaluate texture alpha. Keeping raster opaque as well avoids
+        // raster/raytracing disagreement while the alpha-tested ray-query path
+        // is still missing; see the README for what it needs.
         AlphaMode::Opaque
     }
+}
+
+/// Whether a partition has to leave the meshlet path to be shaded at all.
+///
+/// Meshlets rasterize into the visibility buffer before any material runs, and
+/// `meshlet::material_pipeline_prepare` collects only opaque materials, so a
+/// masked or translucent meshlet writes depth and is never shaded. `Mesh3d`
+/// draws the same plain `Mesh` the BLAS already loads, through phases that
+/// handle both, so the detour costs no extra conversion and no extra GPU
+/// memory.
+fn needs_mesh_raster(alpha_mode: AlphaMode) -> bool {
+    alpha_mode != AlphaMode::Opaque
 }
 
 fn select_texture<'a>(material: &'a EffectiveMaterial, desired_names: &[&str]) -> Option<&'a str> {
@@ -1567,9 +1580,10 @@ fn build_material_handles(
             uv_transform,
             reflectance,
             unlit: unlit_textures || render_properties.unlit,
-            // Meshlets currently draw only opaque materials. Retaining UE's
-            // alpha mode deliberately omits unsupported foliage/translucency
-            // instead of turning their cards into solid scene occluders.
+            // Raster honours a mask once `--preserve-alpha` sets one, because
+            // masked partitions spawn as `Mesh3d` rather than meshlets. Solari
+            // still traces every instance opaque, so the two renderers disagree
+            // about the cutout until it gains alpha-tested ray queries.
             alpha_mode: if unlit_textures {
                 AlphaMode::Opaque
             } else {
@@ -1603,7 +1617,7 @@ fn build_material_handles(
             warn!(
                 masked_materials,
                 translucent_materials,
-                "preserving source alpha modes; meshlet raster and Solari cannot yet render these materials consistently"
+                "preserving source alpha modes; masked partitions leave the meshlet path, and Solari still traces every one of them opaque"
             );
         } else {
             info!(
@@ -2565,6 +2579,7 @@ fn setup(
         warmup_started_at: None,
         unique_blas_vertices,
         spawned: 0,
+        mesh_raster: 0,
         failed: 0,
         reported_done: false,
     });
@@ -2811,6 +2826,7 @@ fn spawn_partitions_when_ready(
     asset_server: Res<AssetServer>,
     mut pending: ResMut<PendingScene>,
     meshes: Res<Assets<Mesh>>,
+    materials: Res<Assets<StandardMaterial>>,
     options: Res<RuntimeOptions>,
     render_device: Res<RenderDevice>,
     mut next_state: ResMut<NextState<ZorahState>>,
@@ -2827,6 +2843,7 @@ fn spawn_partitions_when_ready(
         failed_meshes,
         raytracing_instances,
         spawned: total_spawned,
+        mesh_raster: total_mesh_raster,
         failed: total_failed,
         reported_done,
         expected_blas,
@@ -2866,6 +2883,7 @@ fn spawn_partitions_when_ready(
     let mut loads_started = 0usize;
     let mut geometry_vertices = 0usize;
     let mut spawned = 0usize;
+    let mut mesh_raster_spawned = 0usize;
     let mut failed = 0usize;
     for partition in partitions.iter_mut() {
         if partition.spawned {
@@ -2954,15 +2972,27 @@ fn spawn_partitions_when_ready(
                 ))
                 .id()
         } else {
-            let mut entity = commands.spawn((
-                MeshletMesh3d(assets.meshlet.clone()),
-                MeshMaterial3d(partition.material.clone()),
-                partition.transform,
-            ));
+            let mesh_raster = materials
+                .get(&partition.material)
+                .is_some_and(|material| needs_mesh_raster(material.alpha_mode));
+            mesh_raster_spawned += usize::from(mesh_raster);
+            let mut entity = if mesh_raster {
+                commands.spawn((
+                    Mesh3d(assets.mesh.clone()),
+                    MeshMaterial3d(partition.material.clone()),
+                    partition.transform,
+                ))
+            } else {
+                commands.spawn((
+                    MeshletMesh3d(assets.meshlet.clone()),
+                    MeshMaterial3d(partition.material.clone()),
+                    partition.transform,
+                ))
+            };
             // UE hides several surfaces from the shadow pass, most visibly the
             // GreenHouse pond, whose own shadow otherwise darkens the bed it
-            // reflects. Only meshlet raster reads this: Solari shadows come
-            // from the TLAS, which carries every instance unconditionally.
+            // reflects. Only raster reads this: Solari shadows come from the
+            // TLAS, which carries every instance unconditionally.
             if !partition.cast_shadow {
                 entity.insert(NotShadowCaster);
             }
@@ -2981,6 +3011,7 @@ fn spawn_partitions_when_ready(
         spawned += 1;
     }
     *total_spawned += spawned;
+    *total_mesh_raster += mesh_raster_spawned;
     *total_failed += failed;
     // Do not overlap another archive decode with the entity creation and GPU
     // upload burst from the bundle that just completed. In particular, a
@@ -3028,8 +3059,8 @@ fn spawn_partitions_when_ready(
                 );
             }
             info!(
-                "Zorah raster-only level ready: spawned={} failed={}",
-                *total_spawned, *total_failed,
+                "Zorah raster-only level ready: spawned={} mesh_raster={} failed={}",
+                *total_spawned, *total_mesh_raster, *total_failed,
             );
             next_state.set(ZorahState::Running);
             return;
@@ -3047,6 +3078,7 @@ fn spawn_partitions_when_ready(
         *warmup_started_at = Some(Instant::now());
         info!(
             spawned = *total_spawned,
+            mesh_raster = *total_mesh_raster,
             failed = *total_failed,
             expected_blas = *expected_blas,
             diagnostic_timeout_frames = *warmup_frames_remaining,
@@ -3690,6 +3722,10 @@ mod tests {
         ));
         assert!(properties.double_sided);
         assert_eq!(properties.cull_mode, None);
+        // Forcing parity keeps the partition on the meshlet path; preserving
+        // the mask has to move it, or the meshlet renders unshaded.
+        assert!(!needs_mesh_raster(runtime_alpha_mode(&effective, false)));
+        assert!(needs_mesh_raster(runtime_alpha_mode(&effective, true)));
     }
 
     #[test]

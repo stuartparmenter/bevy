@@ -21,6 +21,12 @@ def parameter(name, value, association="GlobalParameter", index=-1):
     }
 
 
+def guid_parameter(name, value, expression_guid, association="GlobalParameter", index=-1):
+    return parameter(name, value, association, index) | {
+        "expression_guid": expression_guid
+    }
+
+
 class MaterialBakeTests(unittest.TestCase):
     def effective_with(self, *, object_name="/Game/Test.Test", scalars=(), vectors=(), textures=(), switches=()):
         material = material_bake.EffectiveMaterial(
@@ -682,6 +688,127 @@ class MaterialBakeTests(unittest.TestCase):
         self.assertEqual(
             approximations, {"bilinear sampling minifies without a prefilter"}
         )
+
+    def foliage_manifest(self, *, switch_name, switch_value):
+        """A master plus one instance that renamed both of its overrides."""
+        return {
+            "materials": [
+                {
+                    "package": "Master.uasset",
+                    "object": "/Game/Master.Master",
+                    "type": "Material",
+                    "scalars": [],
+                    "vectors": [],
+                    "textures": [
+                        guid_parameter("Base Color Texture", "/Game/Default", "BCEB"),
+                        guid_parameter("Opacity Mask Texture", "/Game/White", "FA32"),
+                    ],
+                    "static_switches": [
+                        guid_parameter(
+                            material_bake.OPACITY_MASK_SWITCH, False, "69A5"
+                        )
+                    ],
+                    "layers": [],
+                    "blends": [],
+                    "base_overrides": {},
+                },
+                {
+                    "package": "Instance.uasset",
+                    "object": "/Game/Instance.Instance",
+                    "type": "MaterialInstanceConstant",
+                    "parent": "/Game/Master.Master",
+                    "scalars": [],
+                    "vectors": [],
+                    "textures": [
+                        guid_parameter("Diffuse Texture", "/Game/Base", "BCEB"),
+                        guid_parameter("Opacity Mask Texture", "/Game/Mask", "FA32"),
+                    ],
+                    "static_switches": [
+                        guid_parameter(switch_name, switch_value, "69A5")
+                    ],
+                    "layers": [],
+                    "blends": [],
+                    "base_overrides": {},
+                },
+            ]
+        }
+
+    def test_renamed_master_parameters_reconcile_through_their_guid(self):
+        manifest = self.foliage_manifest(switch_name="Use_OpacityMask", switch_value=True)
+        effective = material_bake.Resolver(manifest).resolve("/Game/Instance.Instance")
+        reference, name = material_bake.texture_reference(
+            effective, material_bake.BASE_NAMES, "GlobalParameter", -1
+        )
+        # The stale "Diffuse Texture" would otherwise leave the master's default
+        # in the higher-priority "Base Color Texture" slot.
+        self.assertEqual(reference, "/Game/Base")
+        self.assertEqual(name, "Base Color Texture")
+        self.assertTrue(effective.switch((material_bake.OPACITY_MASK_SWITCH,)))
+
+    def opacity_texture_set(self, root):
+        Image.new("RGBA", (4, 4), (255, 0, 0, 255)).save(root / "base.png")
+        Image.fromarray(
+            np.tile(np.asarray([0, 0, 255, 255], dtype=np.uint8), (4, 1)), "L"
+        ).save(root / "mask.png")
+        return material_bake.TextureSet(
+            root,
+            {
+                "exported": [
+                    {
+                        "object": name,
+                        "output": f"{filename}.png",
+                        "output_size": [4, 4],
+                        "srgb": srgb,
+                        "normal_map": False,
+                    }
+                    for name, filename, srgb in (
+                        ("/Game/Base", "base", True),
+                        ("/Game/Mask", "mask", False),
+                    )
+                ]
+            },
+        )
+
+    def test_separate_opacity_mask_composites_into_base_color_alpha(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            texture_set = self.opacity_texture_set(root)
+            manifest = self.foliage_manifest(
+                switch_name="Use_OpacityMask", switch_value=True
+            )
+            effective = material_bake.Resolver(manifest).resolve("/Game/Instance.Instance")
+
+            runtime, generated, _ = material_bake.bake_material(
+                effective, texture_set, root, 4
+            )
+
+            self.assertEqual(
+                [item["value"] for item in runtime["textures"]],
+                [generated[0]["object"]],
+            )
+            baked = np.asarray(Image.open(root / generated[0]["output"]))
+            np.testing.assert_array_equal(baked[0, :, 3], [0, 0, 255, 255])
+            np.testing.assert_array_equal(baked[..., 0], 255)
+
+    def test_base_color_alpha_side_of_the_switch_keeps_the_source_texture(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            texture_set = self.opacity_texture_set(root)
+            manifest = self.foliage_manifest(
+                switch_name="Use_OpacityMask", switch_value=False
+            )
+            effective = material_bake.Resolver(manifest).resolve("/Game/Instance.Instance")
+
+            runtime, generated, _ = material_bake.bake_material(
+                effective, texture_set, root, 4
+            )
+
+            # Nothing to composite, so the albedo passes through unbaked and
+            # keeps whatever alpha it already carries.
+            self.assertEqual(generated, [])
+            self.assertEqual(
+                [item["value"] for item in runtime["textures"]], ["/Game/Base"]
+            )
 
 
 if __name__ == "__main__":

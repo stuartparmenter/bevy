@@ -61,6 +61,12 @@ EMISSIVE_INTENSITY_NAMES = (
     "Emission Intensity",
 )
 EMISSIVE_COLOR_NAMES = ("Emissive Color", "Emission Color", "Emission Tint")
+# M_LS_Foliage samples a cutout from its own texture only when this switch is
+# on. With it off the mask is the base color texture's alpha, which the bake
+# already carries through, so nothing has to be composited. Six instances still
+# call the switch "Use_OpacityMask" and only reconcile through its GUID.
+OPACITY_MASK_SWITCH = "Opacity Mask from Base Color Alpha / Separate Texture Toggle"
+OPACITY_MASK_NAMES = ("Opacity Mask Texture",)
 HEX_COLOR = re.compile(r"^([0-9a-fA-F]{6}|[0-9a-fA-F]{8})")
 # MSM_SingleLayerWater has its own parameter family and shares no name with the
 # LS materials above, so the generic selection finds nothing on Zorah's one
@@ -80,7 +86,7 @@ WATER_WAVES = (
 GLOBAL = "GlobalParameter"
 LAYER = "LayerParameter"
 BLEND = "BlendParameter"
-MATERIAL_BAKE_PIPELINE_VERSION = 6
+MATERIAL_BAKE_PIPELINE_VERSION = 7
 LAYER_MATERIAL_BAKE_PIPELINE_VERSION = 5
 # The runtime binds textures by parameter name, so every selected texture is
 # emitted under the name main.rs looks for rather than the authoring name.
@@ -151,8 +157,27 @@ class EffectiveMaterial:
             ("textures", self.textures),
             ("static_switches", self.switches),
         ):
+            inherited = {
+                (parameter["expression_guid"], key[1], key[2]): key
+                for key, parameter in target.items()
+                if parameter.get("expression_guid")
+            }
             for parameter in record.get(field_name, []):
-                target[parameter_key(parameter)] = parameter
+                key = parameter_key(parameter)
+                # UE matches an instance's overrides to its master by GUID and
+                # only falls back to the name, so an instance authored against
+                # an older revision still carries a name the master dropped.
+                # Rename it to the master's, which is what the families below
+                # and the runtime look for.
+                renamed = (
+                    None
+                    if key in target
+                    else inherited.get((parameter.get("expression_guid"), key[1], key[2]))
+                )
+                if renamed is None:
+                    target[key] = parameter
+                else:
+                    target[renamed] = dict(parameter, name=target[renamed]["name"])
         self.base_overrides.update(record.get("base_overrides", {}))
 
     def merge_scoped(self, source: "EffectiveMaterial", association: str, index: int) -> None:
@@ -704,6 +729,53 @@ def blend_mask(
     return np.clip(mask, 0.0, 1.0)
 
 
+def opacity_mask_reference(material: EffectiveMaterial, textures: TextureSet) -> str | None:
+    """The cutout texture UE samples for this material's opacity mask."""
+    for scope in ((GLOBAL, -1), (LAYER, 0)):
+        if not material.switch((OPACITY_MASK_SWITCH,), *scope):
+            continue
+        reference, _ = texture_reference(material, OPACITY_MASK_NAMES, *scope)
+        if reference in textures.records:
+            return reference
+    return None
+
+
+def opacity_mask(
+    material: EffectiveMaterial,
+    reference: str,
+    textures: TextureSet,
+    scope: tuple[str, int],
+    size: tuple[int, int],
+    target_grid: tuple[int, int],
+    approximations: set[str],
+) -> np.ndarray:
+    """Sample a cutout texture onto the base color layout, in linear light.
+
+    The mask lands in the base color image's alpha, so it is sampled with that
+    image's scope and layout to stay registered with it.
+
+    Zorah's masks are all single-channel: the three stored as BGRA8 hold the
+    same value in red, green and blue, and the rest are G8 or G16. Red is
+    therefore the mask, and an sRGB-tagged source decodes before the runtime
+    compares it against `OpacityMaskClipValue`.
+    """
+    record = textures.record(reference)
+    image = textures.open(reference)
+    assert record is not None and image is not None
+    srgb = bool(record["srgb"])
+    pixels = sample_tiled(
+        image,
+        size,
+        uv_controls(material, *scope),
+        source_grid=textures.grid(reference),
+        target_grid=target_grid,
+        is_srgb=srgb,
+        approximations=approximations,
+    )
+    mask = pixels[..., 0]
+    return srgb_to_linear(mask) if srgb else mask
+
+
 def layer_pixels(
     material: EffectiveMaterial,
     layer_index: int,
@@ -1089,11 +1161,20 @@ def bake_material(
 
         base_reference = selected.get("base", (None, None))[1]
         base_scope = selected_scopes.get("base", (GLOBAL, -1))
+        # A `StandardMaterial` alpha-tests base color alpha, and the packer
+        # already keeps that channel straight, so a separate cutout texture
+        # only has to reach the runtime composited into the baked base color.
+        mask_reference = opacity_mask_reference(material, texture_set)
+        if mask_reference is not None and base_reference is None:
+            approximations.add("opacity mask dropped: material has no base color texture")
         if base_reference and (
-            not neutral_base_controls(material, *base_scope)
+            mask_reference is not None
+            or not neutral_base_controls(material, *base_scope)
             or not neutral_uv_controls(material, *base_scope)
         ):
-            size, grid = target_layout((base_reference,), texture_set, maximum_size)
+            size, grid = target_layout(
+                (base_reference, mask_reference), texture_set, maximum_size
+            )
             image = texture_set.open(base_reference)
             assert image is not None
             pixels = apply_base_color_controls(
@@ -1109,6 +1190,16 @@ def bake_material(
                 material,
                 *base_scope,
             )
+            if mask_reference is not None:
+                pixels[..., 3] = opacity_mask(
+                    material,
+                    mask_reference,
+                    texture_set,
+                    base_scope,
+                    size,
+                    grid,
+                    approximations,
+                )
             relative = f"MaterialBakes/{digest}_base.png"
             path = output_root / relative
             save_pixels(path, pixels)
