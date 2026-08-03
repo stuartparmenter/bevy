@@ -824,14 +824,30 @@ fn scene_mesh_usage(source: &Path) -> Result<HashMap<String, u8>, Box<dyn std::e
             .as_array()
             .ok_or_else(|| format!("scene {level} has no actors array"))?;
         for actor in actors {
-            let Some(components) = actor["components"].as_array() else {
-                continue;
-            };
-            for component in components {
-                let Some(mesh) = component["mesh"].as_str() else {
-                    continue;
-                };
+            let mut mark = |mesh: &str| {
                 *usage.entry(mesh.to_string()).or_insert(0) |= 1 << level_index;
+            };
+            if let Some(components) = actor["components"].as_array() {
+                for component in components {
+                    if let Some(mesh) = component["mesh"].as_str() {
+                        mark(mesh);
+                    }
+                }
+            }
+            // Niagara mesh renderers keep their meshes off the component list,
+            // so count them here or packing rejects geometry the converter was
+            // asked to extract.
+            let niagara = actor["niagara"].as_array().into_iter().flatten();
+            for renderer in niagara.filter_map(|component| component["mesh_renderers"].as_array()) {
+                for mesh in renderer
+                    .iter()
+                    .filter_map(|renderer| renderer["meshes"].as_array())
+                    .flatten()
+                {
+                    if let Some(mesh) = mesh["mesh"].as_str() {
+                        mark(mesh);
+                    }
+                }
             }
         }
     }
