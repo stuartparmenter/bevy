@@ -3782,8 +3782,8 @@ mod tests {
         // is the evidence that the default really is (128, 256, 256).
         let actor = UeTransform {
             translation: UeVec3 {
-                x: -4216.251_5,
-                y: 1174.605_3,
+                x: -4_216.251_5,
+                y: 1_174.605_3,
                 z: 329.577_15,
             },
             rotation: UeQuat {
@@ -3793,7 +3793,7 @@ mod tests {
                 w: -0.693_776_8,
             },
             scale: UeVec3 {
-                x: 0.046_519_998,
+                x: 0.046_52,
                 y: 0.598_921,
                 z: 0.378_421,
             },
