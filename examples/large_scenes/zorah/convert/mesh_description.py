@@ -36,6 +36,7 @@ except ImportError:
 PACKAGE_TAG = 0x9E2A83C1
 COMPRESSED_BUFFER_MAGIC = 0xB7756362
 COMPRESSED_BUFFER_HEADER_SIZE = 64
+NONE_METHOD = 0
 OODLE_METHOD = 3
 
 TYPE_SIZES = {
@@ -161,12 +162,34 @@ class OodleBlockReader:
         compressed_size = struct.unpack_from(">Q", compressed_header, 24)[0]
         if magic != COMPRESSED_BUFFER_MAGIC:
             raise ValueError(f"bad FCompressedBuffer magic 0x{magic:08x}")
-        if method != OODLE_METHOD:
-            raise ValueError(f"unsupported compression method {method}; expected Oodle")
-        if block_size_exponent <= 0 or block_size_exponent >= 32:
-            raise ValueError(f"invalid block-size exponent {block_size_exponent}")
+        if method not in (NONE_METHOD, OODLE_METHOD):
+            raise ValueError(f"unsupported compression method {method}")
         if compressed_size > payloads_length:
             raise ValueError("compressed buffer extends beyond trailer payload")
+
+        if method == NONE_METHOD:
+            # An uncompressed payload stores no block-size table: the raw bytes
+            # follow the header directly, so the whole payload is one block.
+            expected_size = COMPRESSED_BUFFER_HEADER_SIZE + raw_size
+            if expected_size != compressed_size:
+                raise ValueError(
+                    f"uncompressed size mismatch: header={compressed_size}, "
+                    f"raw={expected_size}"
+                )
+            return (
+                CompressedBufferInfo(
+                    method=method,
+                    block_size=raw_size,
+                    block_count=1,
+                    raw_size=raw_size,
+                    compressed_size=compressed_size,
+                    payload_offset=payload_offset,
+                ),
+                [raw_size],
+            )
+
+        if block_size_exponent <= 0 or block_size_exponent >= 32:
+            raise ValueError(f"invalid block-size exponent {block_size_exponent}")
 
         sizes_data = self.file.read(block_count * 4)
         if len(sizes_data) != block_count * 4:
