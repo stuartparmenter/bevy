@@ -362,7 +362,10 @@ proxy meshes for Solari. Intensities are restated in each consumer's
 convention: UE derives spot candela from the cone solid angle while Bevy
 divides `SpotLight::intensity` by 4pi, so a spot authored in
 `ELightUnits::Lumens` is rescaled for the raster light and left as authored
-total flux for its emissive proxy.
+total flux for its emissive proxy. A legacy `Unitless` intensity becomes lumens
+over the whole sphere, so a `Unitless` spot's proxy takes cone flux off that
+same candela; skipping the restatement made the emissive disk radiate exactly
+4x the punctual light's on-axis intensity for any cone.
 The two `BP_HoodLight` spotlight templates are recovered from their Blueprint
 class package because their World Partition instance contains no component
 exports.

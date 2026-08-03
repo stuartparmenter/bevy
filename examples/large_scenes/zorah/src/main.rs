@@ -3412,6 +3412,16 @@ fn emitted_light_flux(light: &LightRecord, outer_angle_radians: f32) -> f32 {
             light.intensity * spot_solid_angle(outer_angle_radians)
         }
         "candelas" | "candela" => light.intensity * std::f32::consts::TAU * 2.0,
+        // `UE_UNITLESS_LIGHT_LUMENS` restates the legacy scalar as lumens over
+        // the whole sphere, which is the convention `bevy_light_lumens` hands
+        // straight to Bevy. A spot's proxy carries cone flux instead, so it has
+        // to come off the same candela: without the restatement the emissive
+        // disk radiates exactly 4x the punctual light's on-axis intensity, for
+        // any unitless spot, whatever its radius or cone angle.
+        "unitless" if light.kind == "spot" => {
+            light.intensity * UE_UNITLESS_LIGHT_LUMENS / (std::f32::consts::TAU * 2.0)
+                * spot_solid_angle(outer_angle_radians)
+        }
         "unitless" => light.intensity * UE_UNITLESS_LIGHT_LUMENS,
         _ => light.intensity,
     }
@@ -3976,9 +3986,24 @@ mod tests {
 
     #[test]
     fn legacy_unitless_lights_do_not_become_firefly_emitters() {
+        let outer = 60.0_f32.to_radians();
         let light = test_light("spot", 2_000.0, "Unitless");
-        assert_eq!(bevy_light_lumens(&light, 60.0_f32.to_radians()), 200_000.0);
-        assert_eq!(emitted_light_flux(&light, 60.0_f32.to_radians()), 200_000.0);
+        assert_eq!(bevy_light_lumens(&light, outer), 200_000.0);
+        assert_eq!(emitted_light_flux(&light, outer), 50_000.0);
+        // Both functions have to describe the same UE candela. They disagreed
+        // by exactly 4.000x while the spot proxy kept the sphere-equivalent
+        // lumens as if they were cone flux, and the ratio did not depend on the
+        // cone: SPT_CandleFill2/3 open to 70 degrees, BP_HoodLight2 to 44.
+        for degrees in [44.0_f32, 60.0, 70.0] {
+            let outer = degrees.to_radians();
+            let bevy_candela = bevy_light_lumens(&light, outer) / (4.0 * std::f32::consts::PI);
+            let proxy_candela = emitted_light_flux(&light, outer) / spot_solid_angle(outer);
+            assert!((proxy_candela - bevy_candela).abs() < 0.5);
+        }
+        // Point lights already share Bevy's whole-sphere convention.
+        let point = test_light("point", 2_000.0, "Unitless");
+        assert_eq!(emitted_light_flux(&point, outer), 200_000.0);
+        assert_eq!(bevy_light_lumens(&point, outer), 200_000.0);
     }
 
     #[test]
