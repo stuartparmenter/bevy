@@ -15,6 +15,10 @@ bevy = { path = "../../..", default-features = false, features = [
   "default_app",
   "free_camera",
   "meshlet",
+  # The candle flames build their shared 168-triangle lathe at startup rather
+  # than loading it from the packed bundles, so a stale assets tree cannot leave
+  # ThroneRoom without its flames. It costs the runtime build metis and meshopt.
+  "meshlet_processor",
   "multi_threaded",
   "ktx2",
   # Zorah's DecalActors spawn as clustered decals, which compile out without it.
@@ -33,7 +37,7 @@ lz4_flex = { version = "0.13", default-features = false, features = ["frame"], o
 [features]
 default = ["dlss"]
 dlss = ["bevy/dlss"]
-packer = ["bevy/compressed_image_saver", "bevy/meshlet_processor", "dep:lz4_flex"]
+packer = ["bevy/compressed_image_saver", "dep:lz4_flex"]
 
 [target.'cfg(windows)'.dependencies]
 bevy = { path = "../../..", default-features = false, features = ["bevy_winit"] }

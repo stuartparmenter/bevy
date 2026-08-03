@@ -13,7 +13,7 @@ use std::{
 
 use argh::FromArgs;
 use bevy::{
-    asset::LoadState,
+    asset::{LoadState, RenderAssetUsages},
     camera::{CameraMainTextureUsages, Exposure, Hdr},
     camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
     core_pipeline::{
@@ -25,13 +25,14 @@ use bevy::{
         atmosphere::{Falloff, PhaseFunction, ScatteringMedium, ScatteringTerm},
         Atmosphere, AtmosphereEnvironmentMapLight, ClusteredDecal, NotShadowCaster, SunDisk,
     },
-    math::Affine2,
+    math::{ops, primitives::Measured2d, Affine2},
     pbr::experimental::meshlet::{MeshletMesh, MeshletMesh3d, MeshletPlugin},
     pbr::{AtmosphereSettings, DefaultOpaqueRendererMethod, MeshMaterial3d},
     post_process::bloom::{Bloom, BloomScatterModel},
     prelude::*,
     render::{
-        render_resource::{Face, TextureUsages},
+        mesh::Indices,
+        render_resource::{Face, PrimitiveTopology, TextureUsages},
         renderer::RenderDevice,
         working_color_space::WorkingColorSpace,
         RenderPlugin,
@@ -108,12 +109,37 @@ const UE_LIGHT_UNITS_PER_CANDELA: f32 = 10_000.0;
 /// picked a display-space flame swatch; UE renders the linear reading. Keep it.
 const UE_CANDLE_FLAME_PARTICLE_COLOR: Vec3 = Vec3::new(5.0, 2.246_849, 1.134_999_8);
 const UE_CANDLE_FLAME_ALPHA: f32 = 2400.0;
-/// The renderer's authored `DefaultSourceRadius`, 0.5 UE units. This path
-/// deliberately skips the 0.05 m proxy-radius floor `spawn_exported_lights`
-/// applies: at 0.05 m the emitter's area is 100x larger and its luminance falls
-/// from 15,279 cd/m2 to 153 cd/m2, below the 307.2 cd/m2 white point at
-/// ThroneRoom's authored EV100 8 - a grey blob rather than a flame.
-const UE_CANDLE_FLAME_RADIUS: f32 = 0.005;
+/// `NS_CandleFlame_04`'s `User.Flame Size` and `User.Flame Size Max`, the two
+/// Niagara user parameters `InitializeParticle.Sprite Size` reads through the
+/// emitter's parameter map, in UE units. `BP_Niagara_CandleFlames_Spawner`
+/// overrides them with the same pair, so a shipped sprite quad is 6-7 cm wide
+/// by 5-7 cm tall, randomized per particle.
+///
+/// APPROXIMATION. Every flame takes the mean, 6.5 x 6.0 cm. Per-instance scale
+/// would change per-instance surface area, and the emissive inversion turns
+/// that into per-instance luminance, i.e. 6,421 materials.
+///
+/// The renderer's `DefaultSourceRadius`, 0.5 UE units, is the *light's* source
+/// radius, not the sprite's, and sizing the flame from it made it 8.5x too
+/// short.
+const UE_CANDLE_FLAME_SPRITE_MIN: Vec2 = Vec2::new(6.0, 5.0);
+const UE_CANDLE_FLAME_SPRITE_MAX: Vec2 = Vec2::new(7.0, 7.0);
+/// `NiagaraSpriteRendererProperties_0.PivotInUVSpace.Y`: the particle sits 90%
+/// down its quad, so `candle_flame_anchor` is the flame's base and the geometry
+/// grows upward from it.
+const UE_CANDLE_FLAME_PIVOT_V: f32 = 0.9;
+/// Where the drawn flame sits inside a `candle_flame_02` tile, as V fractions
+/// measured across all 256 frames of the 16x16 flipbook. Against the mean
+/// sprite that is a flame 4.25 cm tall starting 2.6 mm below the anchor.
+const UE_CANDLE_FLAME_SILHOUETTE_TOP_V: f32 = 0.235;
+const UE_CANDLE_FLAME_SILHOUETTE_BOTTOM_V: f32 = 0.943;
+/// Half-width of the widest silhouette row, as a fraction of tile width: 6.8 mm
+/// against the mean sprite. It is the midpoint of two thresholds that disagree,
+/// 6.05 mm at brightness > 0.02 and 6.96 mm at > 1/255, because additive fringe
+/// has no hard edge. The 15% spread lands in the area term and moves the
+/// luminance between 3,600 and 4,300 cd/m2, imperceptible at 13x the white
+/// point.
+const UE_CANDLE_FLAME_SILHOUETTE_HALF_WIDTH: f32 = 0.1046;
 const UE_CANDLE_FLAME_SYSTEM: &str = "/Game/VFX/Candle/NS_CandleFlame_04.NS_CandleFlame_04";
 /// The nine Blueprint classes `BP_Niagara_CandleFlames_Spawner` collects with
 /// `GetAllActorsOfClass`.
@@ -233,7 +259,7 @@ struct Args {
     #[argh(switch)]
     unlit_textures: bool,
 
-    /// omit the Niagara candle flame emitters, which are on by default
+    /// omit the Niagara candle flames, geometry and light alike, which are on by default
     #[argh(switch)]
     no_candle_lights: bool,
 
@@ -2030,6 +2056,155 @@ fn make_light_proxy_meshes(meshes: &mut Assets<Mesh>) -> (Handle<Mesh>, Handle<M
     (meshes.add(sphere), meshes.add(disk))
 }
 
+/// Radial segments of the candle flame lathe. Twelve leave a silhouette error
+/// of `1 - cos(15 deg)`, 3.4% of the radius or 0.23 mm, which is sub-pixel at a
+/// metre.
+const CANDLE_FLAME_SEGMENTS: usize = 12;
+/// Profile rings, poles included, so eight bands and 168 triangles.
+const CANDLE_FLAME_RINGS: usize = 9;
+/// `r(t) = scale * t^a * (1 - t)^b`, peaking at `CANDLE_FLAME_PROFILE_PEAK`.
+/// `a = 0.5` makes the base a hemisphere and `b`, which the peak fixes at
+/// `a (1 - peak) / peak`, tapers the tip to a point - the two features the
+/// measured row profile establishes. Fitting the analytic form rather than
+/// tabulating the measured half-widths lands the side silhouette at 3.94 cm2
+/// against the measured 4.17 cm2; a table would imply precision the two
+/// silhouette thresholds do not agree on.
+const CANDLE_FLAME_BASE_EXPONENT: f32 = 0.5;
+const CANDLE_FLAME_PROFILE_PEAK: f32 = 0.32;
+/// Vertex quantization for the flame's meshlet mesh. The packer's 4 snaps to
+/// 1/16 cm, 9% of the flame's 6.8 mm radius, which collapses the tip; 8 snaps
+/// to 1/256 cm, 0.6% of it, and the 4.25 cm extent still needs only 11 bits a
+/// channel. `from_mesh`'s crack warning about matching factors does not apply,
+/// because the flame touches nothing.
+const CANDLE_FLAME_QUANTIZATION: u8 = 8;
+
+/// The measured `candle_flame_02` silhouette as a solid of revolution, in
+/// metres relative to `candle_flame_anchor`.
+struct CandleFlameProfile {
+    /// `y` at `t = 0`. Negative: the sprite pivot sits above the silhouette's
+    /// bottom.
+    base: f32,
+    height: f32,
+    /// Leading coefficient of `r(t) = scale * t^a * (1 - t)^taper`.
+    scale: f32,
+    taper: f32,
+}
+
+impl CandleFlameProfile {
+    fn measured() -> Self {
+        let sprite =
+            (UE_CANDLE_FLAME_SPRITE_MIN + UE_CANDLE_FLAME_SPRITE_MAX) * 0.5 * UE_CENTIMETRES;
+        let peak = CANDLE_FLAME_PROFILE_PEAK;
+        let taper = CANDLE_FLAME_BASE_EXPONENT * (1.0 - peak) / peak;
+        let max_radius = UE_CANDLE_FLAME_SILHOUETTE_HALF_WIDTH * sprite.x;
+        Self {
+            base: (UE_CANDLE_FLAME_PIVOT_V - UE_CANDLE_FLAME_SILHOUETTE_BOTTOM_V) * sprite.y,
+            height: (UE_CANDLE_FLAME_SILHOUETTE_BOTTOM_V - UE_CANDLE_FLAME_SILHOUETTE_TOP_V)
+                * sprite.y,
+            scale: max_radius
+                / (ops::powf(peak, CANDLE_FLAME_BASE_EXPONENT) * ops::powf(1.0 - peak, taper)),
+            taper,
+        }
+    }
+
+    fn radius(&self, t: f32) -> f32 {
+        self.scale * ops::powf(t, CANDLE_FLAME_BASE_EXPONENT) * ops::powf(1.0 - t, self.taper)
+    }
+
+    /// `dr/dt`, which diverges at both poles; `candle_flame_mesh` substitutes
+    /// axial normals there.
+    fn radius_slope(&self, t: f32) -> f32 {
+        let a = CANDLE_FLAME_BASE_EXPONENT;
+        self.scale
+            * (a * ops::powf(t, a - 1.0) * ops::powf(1.0 - t, self.taper)
+                - self.taper * ops::powf(t, a) * ops::powf(1.0 - t, self.taper - 1.0))
+    }
+
+    fn y(&self, t: f32) -> f32 {
+        self.base + self.height * t
+    }
+}
+
+/// One closed, opaque, emissive solid of revolution of the measured flipbook
+/// silhouette, shared by every candle.
+///
+/// UE draws the flame as a camera-facing additive SubUV sprite, which cannot
+/// exist in this traced image: `bevy_solari` builds every BLAS geometry
+/// `OPAQUE`, its `trace_ray` commits the first hit with no any-hit test, and its
+/// `GpuMaterial` carries no alpha at all. Revolving the silhouette is the
+/// closest faithful stand-in, because a floor-level viewer sees the same
+/// teardrop from every azimuth either way - and unlike a billboard it stays
+/// right in reflections and global illumination, where a view-dependent quad
+/// faces the camera rather than the ray. Making it genuinely additive is engine
+/// work: alpha in `GpuMaterial`, a `rayQueryConfirmIntersection` candidate loop,
+/// an instance cull mask so it emits without occluding, and ultimately
+/// pass-through radiance accumulation in ReSTIR.
+///
+/// The attributes are exactly `{POSITION, NORMAL, UV_0}` with no tangents,
+/// which is what `MeshletMesh::from_mesh` demands and what Solari's compact
+/// `raytracing_vertex_stride` arm accepts - so unlike `make_light_proxy_meshes`
+/// this mesh must not be given tangents.
+fn candle_flame_mesh(profile: &CandleFlameProfile) -> Mesh {
+    let ring_stride = CANDLE_FLAME_SEGMENTS + 1;
+    let vertices = ring_stride * CANDLE_FLAME_RINGS;
+    let mut positions = Vec::with_capacity(vertices);
+    let mut normals = Vec::with_capacity(vertices);
+    let mut uvs = Vec::with_capacity(vertices);
+    for ring in 0..CANDLE_FLAME_RINGS {
+        let t = ring as f32 / (CANDLE_FLAME_RINGS - 1) as f32;
+        let radius = profile.radius(t);
+        let slope = profile.radius_slope(t);
+        let y = profile.y(t);
+        for segment in 0..ring_stride {
+            let angle = std::f32::consts::TAU * segment as f32 / CANDLE_FLAME_SEGMENTS as f32;
+            let (sin, cos) = ops::sin_cos(angle);
+            positions.push([radius * cos, y, radius * sin]);
+            // `slope` diverges at the poles, where the surface is flat against
+            // the axis anyway.
+            let normal = if ring == 0 {
+                Vec3::NEG_Y
+            } else if ring == CANDLE_FLAME_RINGS - 1 {
+                Vec3::Y
+            } else {
+                Vec3::new(profile.height * cos, -slope, profile.height * sin).normalize()
+            };
+            normals.push(normal.to_array());
+            // Never sampled - the material is untextured - but `from_mesh`
+            // requires UV_0 to exist.
+            uvs.push([segment as f32 / CANDLE_FLAME_SEGMENTS as f32, 1.0 - t]);
+        }
+    }
+    let mut indices = Vec::new();
+    for ring in 0..CANDLE_FLAME_RINGS - 1 {
+        for segment in 0..CANDLE_FLAME_SEGMENTS {
+            let lower = (ring * ring_stride + segment) as u32;
+            let upper = lower + ring_stride as u32;
+            // Both pole rings collapse onto the axis, so a band touching one
+            // contributes a fan rather than a quad.
+            if ring != 0 {
+                indices.extend([lower, upper, lower + 1]);
+            }
+            if ring != CANDLE_FLAME_RINGS - 2 {
+                indices.extend([upper, upper + 1, lower + 1]);
+            }
+        }
+    }
+    Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::all())
+        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+        .with_inserted_indices(Indices::U32(indices))
+}
+
+/// Summed triangle area of the generated lathe, so the emissive inversion
+/// follows any change to the profile or its tessellation.
+fn candle_flame_surface_area(mesh: &Mesh) -> f32 {
+    mesh.triangles()
+        .expect("the generated candle flame must be an indexed triangle list")
+        .map(|triangle| triangle.area())
+        .sum()
+}
+
 fn spawn_exported_lights(
     commands: &mut Commands,
     converted: &ConvertedWorld,
@@ -2279,41 +2454,65 @@ fn candle_flame_anchor(partitions: &[PartitionRecord]) -> Option<Vec3> {
     })
 }
 
-/// The Niagara flame lights, as Solari emissive proxies.
+/// The Niagara flames, as opaque emissive geometry.
 ///
 /// The candle actors export empty `lights` arrays because UE draws their light
 /// with a Niagara light renderer rather than a light component, so they cannot
 /// go through `spawn_exported_lights`. Every flame is identical, which is what
-/// makes 6,421 of them affordable: they share the point light's proxy sphere,
-/// adding no BLAS, and one material, so Solari's per-change clone of
-/// `Assets<StandardMaterial>` does not grow. They do add one TLAS instance and
-/// one uniformly sampled light source each.
+/// makes 6,421 of them affordable: they share one lathe, one BLAS, one meshlet
+/// mesh and one material, so Solari's per-change clone of
+/// `Assets<StandardMaterial>` does not grow. They add one TLAS instance, one
+/// uniformly sampled light source and one meshlet instance each.
 ///
-/// Like the exported fixtures' proxies they carry no `Mesh3d`, so they light
-/// only the traced image. There is no raster counterpart: `bevy_solari` binds
-/// no punctual lights, and 6,421 clustered `PointLight`s would not survive the
-/// raster warm-up, so `--raster-only` shows the room without its candles.
+/// Unlike the exported fixtures' proxies these rasterize, because Solari adds
+/// directly visible emission only out of the deferred G-buffer, in
+/// `restir.wgsl`'s `pixel_color += surface.material.emissive`. It traces no
+/// camera ray, so a TLAS-only emitter lights the room and appears in reflections
+/// and global illumination but never covers a pixel of the primary image - which
+/// is exactly what these flames did before.
+///
+/// They rasterize as meshlets rather than as `Mesh3d`. The meshlet deferred
+/// G-buffer pass draws one fullscreen triangle per material, depth tested
+/// `Equal` against the meshlet material depth alone and ordered after every
+/// plain-`Mesh3d` deferred write, so a `Mesh3d` flame in front of a candle body
+/// would keep its depth and lose its material. As a meshlet the flame is the
+/// visibility buffer and wins its own pixels.
 fn spawn_candle_flames(
     commands: &mut Commands,
     converted: &ConvertedWorld,
-    proxy_mesh: &Handle<Mesh>,
+    meshes: &mut Assets<Mesh>,
+    meshlet_meshes: &mut Assets<MeshletMesh>,
     materials: &mut Assets<StandardMaterial>,
 ) -> Vec<PendingRaytracingInstance> {
     if !candle_flame_system_is_active(converted) {
         return Vec::new();
     }
+    let profile = CandleFlameProfile::measured();
+    let flame = candle_flame_mesh(&profile);
+    let area = candle_flame_surface_area(&flame);
+    let flame_meshlet = meshlet_meshes.add(
+        MeshletMesh::from_mesh(&flame, CANDLE_FLAME_QUANTIZATION)
+            .expect("the generated candle flame must convert to a meshlet mesh"),
+    );
+    let flame_mesh = meshes.add(flame);
     let color = UE_CANDLE_FLAME_PARTICLE_COLOR * UE_CANDLE_FLAME_ALPHA;
     let flux = ue_simple_light_lumens(color);
     // Derived, never typed, so the authored 5 : 2.246849 : 1.1349998 ratio
     // survives exactly and the flux carries the whole magnitude.
     let tint = color / color.max_element();
-    let radius = UE_CANDLE_FLAME_RADIUS;
-    // A Lambertian sphere emits `luminance * pi * 4pi r^2`, the same inversion
-    // the exported point lights use for their proxies.
-    let pi = std::f32::consts::PI;
-    let emissive =
-        LinearRgba::rgb(tint.x, tint.y, tint.z) * (flux / (4.0 * pi * pi * radius * radius));
+    // A Lambertian emitter radiates `luminance * pi * area`, the same inversion
+    // the exported point lights use for their proxies. The lathe is convex, so
+    // it does not shadow itself. Sizing the geometry from the sprite rather than
+    // from the light's source radius is therefore self-correcting on brightness:
+    // the flux derivation is untouched and the luminance falls from an aliasing
+    // sub-pixel 15,279 cd/m2 to a stable 3,895 cd/m2, 12.7x ThroneRoom's
+    // 307.2 cd/m2 white point and within 2.6x of a real candle.
+    let emissive = LinearRgba::rgb(tint.x, tint.y, tint.z) * (flux / (std::f32::consts::PI * area));
     let material = materials.add(StandardMaterial {
+        // UE's `M_AddBase_01` is unlit, but `GpuMaterial` has no unlit flag, so
+        // `unlit` would split the traced image from the raster one. A black base
+        // colour zeroes the lit response the same way, which is the trick the
+        // exported light proxies already use.
         base_color: Color::BLACK,
         emissive,
         perceptual_roughness: 1.0,
@@ -2342,17 +2541,25 @@ fn spawn_candle_flames(
                 continue;
             };
             let world = ue_world_to_bevy(actor_matrix * ue_matrix(&component.transform));
+            // The mesh is authored in metres at final size and the anchor is the
+            // flame's base, so both the scale and the rotation are identity:
+            // flames rise vertically whatever the candle's yaw, `Position
+            // Offset` is zero, and the emitter has no velocity or force module.
             let entity = commands
                 .spawn((
-                    Name::new("Candle flame Solari emitter"),
+                    Name::new("Candle flame"),
+                    MeshletMesh3d(flame_meshlet.clone()),
                     MeshMaterial3d(material.clone()),
-                    Transform::from_translation(world.transform_point(anchor))
-                        .with_scale(Vec3::splat(radius)),
+                    // `bCastShadows` is false on the sprite renderer. Raster
+                    // reads this alone: Solari shadows come from the TLAS, which
+                    // carries every instance unconditionally.
+                    NotShadowCaster,
+                    Transform::from_translation(world.transform_point(anchor)),
                 ))
                 .id();
             raytracing_instances.push(PendingRaytracingInstance {
                 entity,
-                mesh: proxy_mesh.clone(),
+                mesh: flame_mesh.clone(),
                 geometry_error: 0.0,
             });
         }
@@ -2361,7 +2568,9 @@ fn spawn_candle_flames(
         candle_flames = raytracing_instances.len(),
         candles_without_converted_bounds = without_bounds,
         lumens_each = flux,
-        radius_metres = radius,
+        height_metres = profile.height,
+        surface_area_square_metres = area,
+        luminance_nits = emissive.red,
         "spawned Zorah Niagara candle flames"
     );
     raytracing_instances
@@ -2797,6 +3006,7 @@ fn setup(
     asset_server: Res<AssetServer>,
     converted: Res<ConvertedWorld>,
     mut meshes: ResMut<Assets<Mesh>>,
+    mut meshlet_meshes: ResMut<Assets<MeshletMesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut scattering_media: ResMut<Assets<ScatteringMedium>>,
     mut ambient_light: ResMut<GlobalAmbientLight>,
@@ -2916,7 +3126,8 @@ fn setup(
         raytracing_light_instances.extend(spawn_candle_flames(
             &mut commands,
             &converted,
-            &point_proxy_mesh,
+            &mut meshes,
+            &mut meshlet_meshes,
             &mut materials,
         ));
     }
@@ -3605,6 +3816,7 @@ fn warm_up_raytracing(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bevy::mesh::VertexAttributeValues;
 
     fn test_transform() -> UeTransform {
         UeTransform {
@@ -3827,6 +4039,125 @@ mod tests {
                 .max_element()
                 < 1.0e-4
         );
+    }
+
+    #[test]
+    fn candle_flame_profile_matches_the_authored_sprite_and_flipbook_silhouette() {
+        // Mean of `User.Flame Size` (6,5) and `User.Flame Size Max` (7,7).
+        let sprite =
+            (UE_CANDLE_FLAME_SPRITE_MIN + UE_CANDLE_FLAME_SPRITE_MAX) * 0.5 * UE_CENTIMETRES;
+        assert!((sprite - Vec2::new(0.065, 0.060)).abs().max_element() < 1.0e-6);
+
+        let profile = CandleFlameProfile::measured();
+        // 4.25 cm tall, starting 2.6 mm below the pivot: a textbook candle
+        // flame, and 8.5x the 5 mm source radius that used to size it.
+        assert!((profile.height - 0.042_48).abs() < 1.0e-5);
+        assert!((profile.base - -0.002_58).abs() < 1.0e-5);
+        assert!((profile.y(0.0) - profile.base).abs() < 1.0e-6);
+        assert!((profile.y(1.0) - 0.039_9).abs() < 1.0e-4);
+        // Both poles close, and the widest row is 6.8 mm at 32% of the height.
+        assert_eq!(profile.radius(0.0), 0.0);
+        assert_eq!(profile.radius(1.0), 0.0);
+        let peak = profile.radius(CANDLE_FLAME_PROFILE_PEAK);
+        assert!((peak - 0.006_799).abs() < 1.0e-5);
+        for step in 0..=100 {
+            assert!(profile.radius(step as f32 / 100.0) <= peak + 1.0e-6);
+        }
+        // `b = a (1 - peak) / peak` is what puts the maximum at `peak`, so the
+        // slope crosses zero exactly there.
+        assert!(profile.radius_slope(CANDLE_FLAME_PROFILE_PEAK).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn candle_flame_mesh_is_a_closed_lathe_solari_and_meshlets_both_accept() {
+        let profile = CandleFlameProfile::measured();
+        let mesh = candle_flame_mesh(&profile);
+        // `MeshletMesh::from_mesh`, Solari's compact vertex stride and the
+        // example's own BLAS gate all demand exactly these three attributes.
+        assert!(mesh.contains_attribute(Mesh::ATTRIBUTE_POSITION));
+        assert!(mesh.contains_attribute(Mesh::ATTRIBUTE_NORMAL));
+        assert!(mesh.contains_attribute(Mesh::ATTRIBUTE_UV_0));
+        assert!(!mesh.contains_attribute(Mesh::ATTRIBUTE_TANGENT));
+        assert_eq!(mesh.get_vertex_size(), 32);
+        assert_eq!(mesh.primitive_topology(), PrimitiveTopology::TriangleList);
+        assert_eq!(mesh.count_vertices(), 117);
+        // Two 12-triangle pole fans and six 24-triangle bands, fewer than the
+        // 224-triangle proxy sphere this replaces.
+        let Some(Indices::U32(indices)) = mesh.indices() else {
+            panic!("the candle flame must carry u32 indices");
+        };
+        assert_eq!(indices.len() / 3, 168);
+        assert!(indices.chunks_exact(3).all(|triangle| {
+            triangle[0] != triangle[1] && triangle[1] != triangle[2] && triangle[0] != triangle[2]
+        }));
+
+        let Some(VertexAttributeValues::Float32x3(positions)) =
+            mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+        else {
+            panic!("the candle flame must carry Float32x3 positions");
+        };
+        let bottom = positions.iter().fold(f32::INFINITY, |low, p| low.min(p[1]));
+        let top = positions
+            .iter()
+            .fold(f32::NEG_INFINITY, |high, p| high.max(p[1]));
+        assert!((bottom - profile.base).abs() < 1.0e-6);
+        assert!((top - (profile.base + profile.height)).abs() < 1.0e-6);
+        let peak = profile.radius(CANDLE_FLAME_PROFILE_PEAK);
+        let widest = positions
+            .iter()
+            .fold(0.0f32, |wide, p| wide.max(Vec2::new(p[0], p[2]).length()));
+        assert!(widest <= peak + 1.0e-6);
+
+        // Front faces point outward, which is what `initial_path.wgsl`'s
+        // `front_face` emission gate needs from a single-sided closed solid: a
+        // closed surface encloses a positive signed volume only if it is.
+        let volume: f32 = mesh
+            .triangles()
+            .expect("the candle flame must be an indexed triangle list")
+            .map(|triangle| {
+                let [a, b, c] = triangle.vertices;
+                a.dot(b.cross(c)) / 6.0
+            })
+            .sum();
+        assert!(volume > 0.0);
+        // Roughly half the cylinder the silhouette fits inside.
+        let bounds = std::f32::consts::PI * peak * peak * profile.height;
+        assert!((0.25..0.75).contains(&(volume / bounds)));
+    }
+
+    /// The flames rasterize as meshlets, and the runtime builds their meshlet
+    /// mesh at startup rather than loading it, so a failure here is a crash on
+    /// entering ThroneRoom.
+    #[test]
+    fn candle_flame_converts_to_a_meshlet_mesh() {
+        bevy::tasks::AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
+        let mesh = candle_flame_mesh(&CandleFlameProfile::measured());
+        MeshletMesh::from_mesh(&mesh, CANDLE_FLAME_QUANTIZATION)
+            .expect("the candle flame lathe must convert to a meshlet mesh");
+    }
+
+    #[test]
+    fn candle_flame_emissive_reproduces_the_authored_flux_over_the_lathe() {
+        let mesh = candle_flame_mesh(&CandleFlameProfile::measured());
+        let area = candle_flame_surface_area(&mesh);
+        assert!((area - 1.2323e-3).abs() < 1.0e-6);
+
+        let color = UE_CANDLE_FLAME_PARTICLE_COLOR * UE_CANDLE_FLAME_ALPHA;
+        let flux = ue_simple_light_lumens(color);
+        let tint = color / color.max_element();
+        let luminance = flux / (std::f32::consts::PI * area);
+        // Sizing from the sprite instead of the light's source radius leaves the
+        // flux alone and drops the luminance to 12.7x the 307.2 cd/m2 white
+        // point at ThroneRoom's authored EV100 8.
+        assert!((luminance - 3_895.0).abs() < 5.0);
+        assert!((10.0..20.0).contains(&(luminance / 307.2)));
+        // Integrating the Lambertian emission back over the surface returns the
+        // authored 15.08 lm, which pins the `pi * area` factor rather than the
+        // sphere's `4 pi^2 r^2`.
+        let emissive = tint * luminance;
+        assert!((emissive.x * std::f32::consts::PI * area - flux).abs() < 0.01);
+        // The G-buffer stores emissive in RGB9E5, whose ceiling is 65,408.
+        assert!(emissive.max_element() < 65_408.0);
     }
 
     #[test]

@@ -368,18 +368,44 @@ class package because their World Partition instance contains no component
 exports.
 Throne Room's 6,421 candles are lit by a Niagara Light Renderer rather than a
 light component, so their actors export no light at all. The runtime spawns one
-emissive proxy per candle when the level runs `NS_CandleFlame_04`, placed by the
-same "top of static mesh" rule the Niagara Blueprint uses: the horizontal centre
-of the candle's converted bounds, one UE unit below the top. All 6,421 share the
-point light's proxy sphere and one material, so they add no BLAS and no material
-clone, but they do add one TLAS instance and one uniformly sampled Solari light
-source each: Throne Room's 23,189 partitions plus 27 light proxies grow from
-23,216 instances to 29,637, and its 29 light sources (27 proxies, one
-directional, one environment) become 6,450. That is 10x under the 65,535
-light-source ceiling, but `generate_random_light_sample` picks uniformly, so
-every key light becomes 222x rarer to sample. `--no-candle-lights` turns the
-flames off to isolate that cost. Like the other proxies they carry no `Mesh3d`,
-so they light the traced image only and `--raster-only` shows no candlelight.
+flame per candle when the level runs `NS_CandleFlame_04`, placed by the same
+"top of static mesh" rule the Niagara Blueprint uses: the horizontal centre of
+the candle's converted bounds, one UE unit below the top. The sprite renderer's
+`PivotInUVSpace` puts the particle 90% down its quad, so that anchor is the
+flame's base and the geometry grows upward from it. All 6,421 share one mesh,
+one meshlet mesh and one material, so they add one BLAS and no material clone,
+but they do add one TLAS instance and one uniformly sampled Solari light source
+each: Throne Room's 23,189 partitions plus 27 light proxies grow from 23,216
+instances to 29,637, and its 29 light sources (27 proxies, one directional, one
+environment) become 6,450. That is 10x under the 65,535 light-source ceiling,
+but `generate_random_light_sample` picks uniformly, so every key light becomes
+222x rarer to sample. `--no-candle-lights` turns the flames off - geometry and
+light alike - to isolate that cost.
+
+Unlike the exported fixtures' proxies the flames rasterize, as meshlets, so they
+are visible in the primary image as well as in reflections and global
+illumination. Solari adds directly visible emission only out of the deferred
+G-buffer and traces no camera ray, so a TLAS-only emitter lights the room
+without ever covering a pixel. Meshlets rather than `Mesh3d`, because the
+meshlet deferred G-buffer pass depth-tests against the meshlet material depth
+alone and runs after every plain-`Mesh3d` deferred write: a `Mesh3d` flame in
+front of a candle body would keep its depth and lose its material.
+
+The geometry is a solid of revolution of the measured flipbook silhouette:
+`r(t) = scale * t^0.5 * (1 - t)^1.0625` revolved over 12 segments and 9 rings,
+4.25 cm tall and 1.36 cm across at its widest, 168 triangles, starting 2.6 mm
+below the anchor. The dimensions come from `NS_CandleFlame_04`'s `User.Flame
+Size` (6,5) and `User.Flame Size Max` (7,7) UE units, averaged, times the
+silhouette `candle_flame_02` occupies inside a flipbook tile, measured across
+all 256 frames. That is 1.08M triangles across the level, 25% fewer than the
+proxy sphere it replaces and 0.25% of the scene.
+
+Sizing the flame from the sprite rather than from the light renderer's
+`DefaultSourceRadius` leaves the flux derivation untouched and changes only the
+area term in `luminance = flux / (pi * area)`: 3,895 cd/m2 rather than 15,279,
+which is 12.7x Throne Room's 307.2 cd/m2 white point at EV100 8 and within 2.6x
+of a real candle. It is also 58 px tall at a metre where the 5 mm sphere was
+14 px and sub-pixel past 14 m.
 
 Their colour is exact and their brightness is not. The particle colour
 `(5, 2.246849, 1.1349998)` and the `2400` alpha that scales it are read verbatim
@@ -393,9 +419,11 @@ mirrors, because Zorah ships on an NVIDIA NvRTX branch that is not public and is
 not in the sample download. That puts each flame at 1.2 cd / 15.08 lm, against a
 real wax candle's roughly 1 cd. Two further judgement calls are labelled in
 `main.rs`: the RGB triple is collapsed to a scalar by its peak channel, which is
-1.8x brighter than a luminance-weighted reading; and the flame is treated as
-isotropic. `UE_LIGHT_UNITS_PER_CANDELA` is the single knob. A frame of Throne
-Room rendered in Zorah's own build would settle all three.
+1.8x brighter than a luminance-weighted reading; and the total flux is spread
+uniformly over the lathe, which makes the flame brighter side-on than from above
+in roughly the proportion a real flame is, but not by a measured profile.
+`UE_LIGHT_UNITS_PER_CANDELA` is the single knob. A frame of Throne Room rendered
+in Zorah's own build would settle all three.
 
 Source emissive intensity/color/mask parameters are also mapped, and the
 runtime marks emission explicitly from Zorah's authored switches and custom
@@ -408,10 +436,34 @@ analytical point/spot lights, so their emissive proxies have Lambertian rather
 than exact UE angular profiles. UE IES profiles and procedural light-function
 materials retain uniform-flux proxies but the profiles themselves are not
 evaluated. SkyLight real-time/environment capture is a raster ambient
-approximation and is not yet a traced environment light. The candle flames do
-not animate, which costs nothing here: `NS_CandleFlame_04` has no curve, noise,
-random or time input anywhere in its chain, so UE's flames do not flicker
-either. The Niagara systems that do animate - the nebula orb's translucent
+approximation and is not yet a traced environment light.
+
+The candle flames are opaque where UE's are additive. Nothing else is
+available: `bevy_solari` builds every BLAS geometry `OPAQUE`, its `trace_ray`
+commits the first hit with no any-hit test, and its `GpuMaterial` carries no
+alpha at all, so an additive or alpha-masked flame cannot appear in the traced
+image. The visible consequences are that a flame occludes what is behind it
+instead of adding to it, that it casts a shadow-ray occlusion it should not, and
+that its lowest centimetre may visibly clip through the candle body where UE's
+additive sprite hid the intersection. A faithful port needs engine work in
+dependency order: alpha in `GpuMaterial`, a `rayQueryConfirmIntersection`
+candidate loop in place of the single `rayQueryProceed`, the per-instance cull
+mask the TLAS already reserves 8 bits for, and ultimately pass-through radiance
+accumulation in ReSTIR.
+
+Three smaller flame approximations follow from the same choice. The lathe shows
+the measured silhouette from every azimuth, which is what a camera-facing sprite
+gives a floor-level viewer, but a viewer directly above sees a small disc rather
+than a flame. Emission is uniform over the surface, where the flipbook's bottom
+15% is a dark wick zone; no emissive texture, because the measured contrast is
+only 1.82x peak-to-mean and Solari samples textures at LOD 0. And every flame is
+the mean of UE's per-particle 6-7 x 5-7 UE unit randomisation, because
+per-instance scale would mean per-instance area and therefore 6,421 materials.
+The flames also do not animate. The light never did - `NS_CandleFlame_04` has no
+curve, noise, random or time input anywhere in its chain - so only the sprite's
++/-14% per-frame variation is lost, and its 256-frame flipbook is a seamless 4 s
+loop of a stationary particle, which makes a static mesh a fair port of its time
+average. The Niagara systems that do animate - the nebula orb's translucent
 shells and the GreenHouse butterflies - are exported but not spawned. UE
 light-blocker meshes are retained as
 ray-tracing occluders but intentionally omitted from camera-visible meshlet

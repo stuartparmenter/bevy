@@ -1394,6 +1394,47 @@ static class ZorahConvert
         return records.ToArray();
     }
 
+    // `FNiagaraParameterStore`-shaped tags a `UNiagaraScript` carries besides
+    // its rapid iteration parameters.
+    private static readonly string[] NiagaraExecutionStoreNames =
+    [
+        "ScriptExecutionParamStore",
+        "ScriptExecutionParamStoreCPU",
+        "ExposedParameters",
+        "OverrideParameters",
+    ];
+
+    // `FNiagaraVMExecutableData::Parameters` is the compiled script's external
+    // parameter list: one `FNiagaraVariable` per constant the script reads,
+    // each carrying its baked value in `VarData`. A module input left at its
+    // module default has no rapid iteration entry but does appear here, so this
+    // is the only place the default is recoverable.
+    private static NiagaraParameterRecord[] ReadNiagaraCompiledParameters(object? executableData)
+    {
+        var parameters = ReadStructFields(
+            ReadStructFields(executableData).GetValueOrDefault("Parameters")
+        );
+        var records = new List<NiagaraParameterRecord>();
+        foreach (var entry in ReadArrayValues(parameters.GetValueOrDefault("Parameters")))
+        {
+            var variable = StructValue(entry);
+            var type = JsonScalar(
+                ReadStructFields(GetPublicMember(variable, "TypeDef"))
+                    .GetValueOrDefault("ClassStructOrEnum")
+            )?.ToString();
+            var data = (GetPublicMember(variable, "VarData") as IEnumerable)?
+                .Cast<object>()
+                .OfType<byte>()
+                .ToArray() ?? [];
+            records.Add(new NiagaraParameterRecord(
+                Name: GetPublicMember(variable, "Name")?.ToString() ?? "unnamed",
+                Type: type,
+                Value: ReadNiagaraParameterValue(data, 0, type)
+            ));
+        }
+        return records.ToArray();
+    }
+
     // Component counts for the Niagara types this project uses. An unlisted type
     // (a data interface, an enum, a struct) reads back null rather than a guess,
     // because a wrong width would silently shift every later parameter.
@@ -1686,6 +1727,33 @@ static class ZorahConvert
                 {
                     Console.WriteLine(
                         $"ZORAH_NIAGARA_PARAMETER object={obj.Name} " +
+                        $"name={parameter.Name} type={parameter.Type ?? "None"} " +
+                        $"value={JsonSerializer.Serialize(parameter.Value, JsonOptions)}"
+                    );
+                }
+                // A module input left at its module default has no rapid
+                // iteration entry; the compiler bakes the default into the
+                // script's execution store instead, so read that too.
+                foreach (var storeName in NiagaraExecutionStoreNames)
+                {
+                    foreach (var parameter in ReadNiagaraParameterStore(
+                        GetTaggedValue(obj, storeName)
+                    ))
+                    {
+                        Console.WriteLine(
+                            $"ZORAH_NIAGARA_STORE_PARAMETER object={obj.Name} " +
+                            $"store={storeName} name={parameter.Name} " +
+                            $"type={parameter.Type ?? "None"} " +
+                            $"value={JsonSerializer.Serialize(parameter.Value, JsonOptions)}"
+                        );
+                    }
+                }
+                foreach (var parameter in ReadNiagaraCompiledParameters(
+                    GetTaggedValue(obj, "CachedScriptVM")
+                ))
+                {
+                    Console.WriteLine(
+                        $"ZORAH_NIAGARA_COMPILED_PARAMETER object={obj.Name} " +
                         $"name={parameter.Name} type={parameter.Type ?? "None"} " +
                         $"value={JsonSerializer.Serialize(parameter.Value, JsonOptions)}"
                     );
