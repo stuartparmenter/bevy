@@ -28,7 +28,7 @@ use bevy::{
     math::Affine2,
     pbr::experimental::meshlet::{MeshletMesh, MeshletMesh3d, MeshletPlugin},
     pbr::{AtmosphereSettings, DefaultOpaqueRendererMethod, MeshMaterial3d},
-    post_process::bloom::Bloom,
+    post_process::bloom::{Bloom, BloomScatterModel},
     prelude::*,
     render::{
         render_resource::{Face, TextureUsages},
@@ -374,6 +374,24 @@ struct PostProcessRecord {
     priority: f32,
     #[serde(default = "default_blend_weight")]
     blend_weight: f32,
+    #[serde(default)]
+    bloom_method: Option<String>,
+    #[serde(default)]
+    bloom_intensity: Option<f32>,
+    // UE's ACES film curve knobs, exported so the authored curve shape is
+    // visible in the manifest. Bevy's tone-mapping operators are not
+    // parameterized by slope/toe/shoulder, so nothing reads them yet; see the
+    // tonemapper choice in `setup`.
+    #[serde(default, rename = "film_slope")]
+    _film_slope: Option<f32>,
+    #[serde(default, rename = "film_toe")]
+    _film_toe: Option<f32>,
+    #[serde(default, rename = "film_shoulder")]
+    _film_shoulder: Option<f32>,
+    #[serde(default, rename = "film_black_clip")]
+    _film_black_clip: Option<f32>,
+    #[serde(default, rename = "film_white_clip")]
+    _film_white_clip: Option<f32>,
     #[serde(default, rename = "auto_exposure_method")]
     _auto_exposure_method: Option<String>,
     #[serde(default)]
@@ -2117,10 +2135,11 @@ fn legacy_zorah_post_process(level: &str) -> Option<PostProcessRecord> {
     // Older packed Zorah manifests predate post-process export. These values
     // are the authored unbound volumes in the immutable 1.1.0 source sample;
     // newly converted manifests carry the same data directly on their actors.
-    let (min_ev100, max_ev100, bias) = match level {
-        "GreenHouse_Level" => (Some(4.0), Some(5.0), Some(0.99)),
-        "ThroneRoom_Level" => (Some(8.0), Some(8.0), None),
-        "Restir_Level" => (None, None, Some(-2.5)),
+    // ThroneRoom is also the only level whose volume ticks the bloom overrides.
+    let (min_ev100, max_ev100, bias, bloom_method, bloom_intensity) = match level {
+        "GreenHouse_Level" => (Some(4.0), Some(5.0), Some(0.99), None, None),
+        "ThroneRoom_Level" => (Some(8.0), Some(8.0), None, Some("BM_FFT"), Some(0.003)),
+        "Restir_Level" => (None, None, Some(-2.5), None, None),
         _ => return None,
     };
     Some(PostProcessRecord {
@@ -2128,6 +2147,13 @@ fn legacy_zorah_post_process(level: &str) -> Option<PostProcessRecord> {
         unbound: true,
         priority: 0.0,
         blend_weight: 1.0,
+        bloom_method: bloom_method.map(String::from),
+        bloom_intensity,
+        _film_slope: None,
+        _film_toe: None,
+        _film_shoulder: None,
+        _film_black_clip: None,
+        _film_white_clip: None,
         _auto_exposure_method: Some("AEM_Histogram".into()),
         auto_exposure_min_ev100: min_ev100,
         auto_exposure_max_ev100: max_ev100,
@@ -2166,6 +2192,39 @@ fn resolved_exposure_ev100(
         .filter(|value| value.is_finite())
         .unwrap_or(0.0);
     (metered_ev100 - compensation).clamp(-16.0, 32.0)
+}
+
+fn resolved_bloom(post_process: Option<&PostProcessRecord>) -> Bloom {
+    // Where the volume authors nothing, UE falls back to its engine-wide bloom
+    // defaults, which live in C++ and not in the shipped project -- so the
+    // baseline stays this example's own preset rather than a guessed number.
+    let mut bloom = Bloom::GT7_GLARE;
+    let Some(post_process) = post_process else {
+        return bloom;
+    };
+    // UE's BloomIntensity and `Bloom::intensity` are both a linear "how much of
+    // the blurred image survives" dial anchored at 0 = no bloom, but they scale
+    // different convolutions, so this is a direct transfer of the authored
+    // number, not a calibrated match.
+    if let Some(intensity) = post_process
+        .bloom_intensity
+        .filter(|intensity| intensity.is_finite() && *intensity >= 0.0)
+    {
+        bloom.intensity = intensity;
+    }
+    // BM_FFT is UE's aperture-convolution bloom, which `Gt7Glare` reproduces by
+    // weighting the mip chain with a diffraction pattern; BM_SOG is its
+    // sum-of-Gaussians approximation, closest to the parametric curve.
+    match post_process.bloom_method.as_deref() {
+        Some("BM_FFT") => {
+            bloom.scatter = BloomScatterModel::Gt7Glare {
+                f_number: BloomScatterModel::DEFAULT_F_NUMBER,
+            }
+        }
+        Some("BM_SOG") => bloom.scatter = BloomScatterModel::Aesthetic,
+        _ => {}
+    }
+    bloom
 }
 
 fn setup(
@@ -2299,6 +2358,7 @@ fn setup(
     let camera_target = options.camera_target.unwrap_or(preset_target);
     let exposure_ev100 =
         resolved_exposure_ev100(options.exposure_ev100, converted.post_process.as_ref());
+    let bloom = resolved_bloom(converted.post_process.as_ref());
     let queued_partitions = pending.len();
     let mut seen_bundle_roots = HashSet::new();
     let bundle_roots = pending
@@ -2356,13 +2416,19 @@ fn setup(
         Exposure {
             ev100: exposure_ev100,
         },
-        // GT7 tonemapping + physically based glare drive the HDR output.
+        // Zorah renders through UE's stock ACES filmic curve: Restir ticks all
+        // five Film* overrides (Slope/Toe/Shoulder/BlackClip/WhiteClip) yet
+        // serializes no value for any of them, so each sits at the engine
+        // default, and GreenHouse/ThroneRoom leave the curve untouched.
+        // `Tonemapping::AcesFitted` is the closest operator by curve shape, but
+        // it is SDR-only -- its output is capped at paper white, which would
+        // defeat the HDR display target this example configures. GT7 is kept as
+        // the one peak-luminance-aware filmic operator; the authored Film*
+        // parameters ride along in the manifest so the choice can be revisited
+        // if Bevy grows a parameterizable ACES curve.
         Tonemapping::GranTurismo7,
         GranTurismo7Params::default(),
-        Bloom {
-            intensity: 0.15,
-            ..Bloom::GT7_GLARE
-        },
+        bloom,
         ZorahCamera,
         FreeCamera {
             walk_speed: (extent * 0.02).max(3.0),
@@ -3259,19 +3325,63 @@ mod tests {
     #[test]
     fn ue_post_process_exposure_maps_to_bevy_ev100() {
         let post_process = PostProcessRecord {
-            enabled: true,
-            unbound: true,
-            priority: 0.0,
-            blend_weight: 1.0,
-            _auto_exposure_method: Some("AEM_Histogram".into()),
             auto_exposure_min_ev100: Some(4.0),
             auto_exposure_max_ev100: Some(5.0),
             auto_exposure_bias: Some(0.99),
+            ..legacy_zorah_post_process("GreenHouse_Level").unwrap()
         };
 
         let exposure = resolved_exposure_ev100(None, Some(&post_process));
         assert!((exposure - 3.51).abs() < 0.0001);
         assert_eq!(resolved_exposure_ev100(Some(7.0), Some(&post_process)), 7.0);
+    }
+
+    #[test]
+    fn ue_post_process_bloom_drives_bevy_bloom() {
+        // ThroneRoom is the one level that ticks bOverride_BloomMethod and
+        // bOverride_BloomIntensity: BM_FFT at 0.003.
+        let throne_room = resolved_bloom(legacy_zorah_post_process("ThroneRoom_Level").as_ref());
+        assert_eq!(throne_room.intensity, 0.003);
+        assert!(matches!(
+            throne_room.scatter,
+            BloomScatterModel::Gt7Glare { .. }
+        ));
+
+        // GreenHouse and Restir author no bloom override, so the example's own
+        // preset stands in for UE's engine-wide defaults.
+        let green_house = resolved_bloom(legacy_zorah_post_process("GreenHouse_Level").as_ref());
+        assert_eq!(green_house.intensity, Bloom::GT7_GLARE.intensity);
+        assert!(matches!(
+            green_house.scatter,
+            BloomScatterModel::Gt7Glare { .. }
+        ));
+        assert_eq!(resolved_bloom(None).intensity, Bloom::GT7_GLARE.intensity);
+    }
+
+    #[test]
+    fn ue_sum_of_gaussians_bloom_maps_to_the_parametric_curve() {
+        let post_process = PostProcessRecord {
+            bloom_method: Some("BM_SOG".into()),
+            bloom_intensity: Some(0.675),
+            ..legacy_zorah_post_process("Restir_Level").unwrap()
+        };
+
+        let bloom = resolved_bloom(Some(&post_process));
+        assert_eq!(bloom.intensity, 0.675);
+        assert!(matches!(bloom.scatter, BloomScatterModel::Aesthetic));
+    }
+
+    #[test]
+    fn non_finite_bloom_intensity_falls_back_to_the_preset() {
+        let post_process = PostProcessRecord {
+            bloom_intensity: Some(f32::NAN),
+            ..legacy_zorah_post_process("ThroneRoom_Level").unwrap()
+        };
+
+        assert_eq!(
+            resolved_bloom(Some(&post_process)).intensity,
+            Bloom::GT7_GLARE.intensity
+        );
     }
 
     #[test]

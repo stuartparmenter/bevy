@@ -2003,12 +2003,25 @@ static class ZorahConvert
             ? JsonScalar(settings.GetValueOrDefault(name))?.ToString()
             : null;
 
+        // Every field below is gated on its bOverride_ bit, matching UE's blend
+        // rules: a value the artist typed and then unticked stays serialized in
+        // the struct but never reaches the view. Conversely a ticked override
+        // whose value equals the engine default is not serialized at all, so it
+        // reads back as null -- Restir does exactly that for all five Film*
+        // knobs, pinning the stock ACES curve.
         return new PostProcessRecord(
             Enabled: ReadBool(actor, "bEnabled", true),
             Unbound: ReadBool(actor, "bUnbound", false),
             Priority: ReadDouble(actor, "Priority", 0.0),
             BlendRadius: ReadDouble(actor, "BlendRadius", 100.0),
             BlendWeight: ReadDouble(actor, "BlendWeight", 1.0),
+            BloomMethod: OverriddenName("BloomMethod"),
+            BloomIntensity: OverriddenDouble("BloomIntensity"),
+            FilmSlope: OverriddenDouble("FilmSlope"),
+            FilmToe: OverriddenDouble("FilmToe"),
+            FilmShoulder: OverriddenDouble("FilmShoulder"),
+            FilmBlackClip: OverriddenDouble("FilmBlackClip"),
+            FilmWhiteClip: OverriddenDouble("FilmWhiteClip"),
             AutoExposureMethod: IsOverridden("AutoExposureMethod")
                 ? OverriddenName("AutoExposureMethod") ?? "AEM_Histogram"
                 : null,
@@ -2754,6 +2767,13 @@ sealed record PostProcessRecord(
     double Priority,
     double BlendRadius,
     double BlendWeight,
+    string? BloomMethod,
+    double? BloomIntensity,
+    double? FilmSlope,
+    double? FilmToe,
+    double? FilmShoulder,
+    double? FilmBlackClip,
+    double? FilmWhiteClip,
     string? AutoExposureMethod,
     double? AutoExposureMinEv100,
     double? AutoExposureMaxEv100,

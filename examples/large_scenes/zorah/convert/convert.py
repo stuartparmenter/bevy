@@ -20,6 +20,14 @@ EXPECTED_POST_PROCESS_EXPOSURE = {
     "Restir_Level": (None, None, -2.5),
     "ThroneRoom_Level": (8.0, 8.0, None),
 }
+# (BloomMethod, BloomIntensity) per level. Only ThroneRoom ticks the bloom
+# override bits; the other two volumes serialize the same numbers with the bits
+# clear, so UE never applies them and the export drops them.
+EXPECTED_POST_PROCESS_BLOOM = {
+    "GreenHouse_Level": (None, None),
+    "Restir_Level": (None, None),
+    "ThroneRoom_Level": ("BM_FFT", 0.003),
+}
 EXPECTED_SCENE_INVENTORY = {
     "GreenHouse_Level": {
         "actors": 1795,
@@ -313,7 +321,8 @@ def scene_manifest_is_current(path: Path) -> bool:
         ]
         if document.get("format") != "zorah-scene-manifest-v3" or len(records) != 1:
             return False
-        inventory = EXPECTED_SCENE_INVENTORY.get(document.get("level"))
+        level = document.get("level")
+        inventory = EXPECTED_SCENE_INVENTORY.get(level)
         if inventory is None or document.get("failures"):
             return False
         if (
@@ -329,16 +338,21 @@ def scene_manifest_is_current(path: Path) -> bool:
         record = records[0]
         if record.get("auto_exposure_method") != "AEM_Histogram":
             return False
-        expected = EXPECTED_POST_PROCESS_EXPOSURE.get(document.get("level"))
-        if expected is None:
+        exposure = EXPECTED_POST_PROCESS_EXPOSURE.get(level)
+        bloom = EXPECTED_POST_PROCESS_BLOOM.get(level)
+        if exposure is None or bloom is None:
+            return False
+        bloom_method, bloom_intensity = bloom
+        if record.get("bloom_method") != bloom_method:
             return False
         for field, expected_value in zip(
             (
+                "bloom_intensity",
                 "auto_exposure_min_ev100",
                 "auto_exposure_max_ev100",
                 "auto_exposure_bias",
             ),
-            expected,
+            (bloom_intensity, *exposure),
         ):
             value = record.get(field)
             if expected_value is None:
