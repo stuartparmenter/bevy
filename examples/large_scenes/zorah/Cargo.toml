@@ -1,0 +1,51 @@
+[package]
+name = "zorah"
+version = "0.1.0"
+edition = "2024"
+default-run = "zorah"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+argh = "0.1.12"
+bevy = { path = "../../..", default-features = false, features = [
+  "asset_processor",
+  "bevy_camera_controller",
+  "bevy_solari",
+  "default_app",
+  "free_camera",
+  "meshlet",
+  "multi_threaded",
+  "ktx2",
+  "png",
+  "std",
+  "zstd_rust",
+  "3d_bevy_render",
+] }
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures-io = "0.3"
+lz4_flex = { version = "0.13", default-features = false, features = ["frame"], optional = true }
+
+[features]
+default = ["dlss"]
+dlss = ["bevy/dlss"]
+packer = ["bevy/compressed_image_saver", "bevy/meshlet_processor", "dep:lz4_flex"]
+
+[target.'cfg(windows)'.dependencies]
+bevy = { path = "../../..", default-features = false, features = ["bevy_winit"] }
+
+[[bin]]
+name = "zorah"
+path = "src/main.rs"
+
+[[bin]]
+name = "zorah_pack"
+path = "src/bin/zorah_pack.rs"
+required-features = ["packer"]
+
+[[bin]]
+name = "zorah_capacity"
+path = "src/bin/zorah_capacity.rs"
+required-features = ["packer"]

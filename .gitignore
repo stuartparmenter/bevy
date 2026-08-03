@@ -26,6 +26,13 @@ imported_assets
 examples/large_scenes/bistro/assets/*
 examples/large_scenes/caldera_hotel/assets/*
 examples/large_scenes/zero_day/assets/*
+examples/large_scenes/zorah/assets/*
+examples/large_scenes/zorah/.assets.convert/
+examples/large_scenes/zorah/convert/bin/
+examples/large_scenes/zorah/convert/obj/
+__pycache__/
+.pytest_cache/
+.vs/
 examples/asset/saved_assets
 
 # Bevy Examples
