@@ -288,6 +288,19 @@ This is not a general UE material or Blueprint interpreter. Complex material
 graphs, layer blending, decals, WPO/wind, subsurface profiles,
 water/translucency, and meshlet alpha masking remain approximations or gaps.
 
+The sample's one water surface, the GreenHouse reflecting pond, is
+`MSM_SingleLayerWater`. Its own parameter family is mapped to the four terms
+Bevy has: Water Base Color, Water Roughness, Water Specular, and the first
+authored wave normal with its tiling and pan speed, which the runtime advances
+through `uv_transform` every frame so both meshlet raster and Solari see the
+motion. The volume half of that shading model has nowhere to land - neither
+`StandardMaterial` nor Solari's `GpuMaterial` carries IOR, transmission or
+thickness, and `brdf.wgsl` has no transmission lobe - so the pond renders as a
+dark reflective surface rather than one the bed shows through, and its
+absorption tint and caustics are dropped. UE also layers three wave normals
+over world-space UVs; one normal map and one `uv_transform` leave room for the
+first, applied to UV0.
+
 The scene manifest preserves UE directional, point, spot, and sky-light
 components, including physical units, colors, temperature, source dimensions,
 cone/source angles, range, transforms, and IES/light-function references.
@@ -317,4 +330,7 @@ evaluated. SkyLight real-time/environment capture is a raster ambient
 approximation and is not yet a traced environment light; Niagara flame
 animation/flicker is not reproduced. UE light-blocker meshes are retained as
 ray-tracing occluders but intentionally omitted from camera-visible meshlet
-rasterization.
+rasterization. The 225 components UE excludes from the shadow pass (1
+GreenHouse, 216 Restir, 8 Throne Room) become `NotShadowCaster`, which meshlet
+raster honors; Solari's TLAS carries every instance, so they still occlude
+there.

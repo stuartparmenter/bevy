@@ -23,7 +23,7 @@ use bevy::{
     diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin},
     light::{
         atmosphere::{Falloff, PhaseFunction, ScatteringMedium, ScatteringTerm},
-        Atmosphere, AtmosphereEnvironmentMapLight, SunDisk,
+        Atmosphere, AtmosphereEnvironmentMapLight, NotShadowCaster, SunDisk,
     },
     math::Affine2,
     pbr::experimental::meshlet::{MeshletMesh, MeshletMesh3d, MeshletPlugin},
@@ -119,6 +119,13 @@ const EMISSIVE_INTENSITY_NAMES: &[&str] = &[
     "emissiveintensity",
     "emissionintensity",
 ];
+const ROUGHNESS_NAMES: &[&str] = &["roughness", "waterroughness"];
+const SPECULAR_NAMES: &[&str] = &["waterspecular"];
+// The converter forwards whichever of UE's three wave panners it could resolve,
+// so the runtime accepts all three names in the order UE layers them.
+const WAVE_PAN_SPEED_NAMES: &[&str] = &["waveaspeed", "wavebspeed", "wavecspeed"];
+const WAVE_UV_SCALE_U_NAMES: &[&str] = &["waveauvx", "wavebuvx", "wavecuvx"];
+const WAVE_UV_SCALE_V_NAMES: &[&str] = &["waveauvy", "wavebuvy", "wavecuvy"];
 
 #[derive(FromArgs)]
 /// Render a converted Zorah World Partition level with meshlets plus Solari.
@@ -238,6 +245,7 @@ struct PendingPartition {
     blas_vertices: usize,
     blas_achieved_error: f32,
     raytracing_only: bool,
+    cast_shadow: bool,
     spawned: bool,
 }
 
@@ -473,6 +481,8 @@ struct ComponentRecord {
     visible: bool,
     #[serde(default)]
     hidden_in_game: bool,
+    #[serde(default = "default_true")]
+    cast_shadow: bool,
     instances: Option<Vec<UeTransform>>,
     #[serde(default)]
     override_materials: Vec<String>,
@@ -1094,6 +1104,13 @@ fn select_scalar(material: &EffectiveMaterial, desired_names: &[&str]) -> Option
         .map(|(_, value)| value)
 }
 
+/// `select_scalar` with a manifest's non-finite values treated as absent.
+fn finite_scalar(material: &EffectiveMaterial, desired_names: &[&str], default: f32) -> f32 {
+    select_scalar(material, desired_names)
+        .filter(|value| value.is_finite())
+        .unwrap_or(default)
+}
+
 fn select_color(material: &EffectiveMaterial, desired_names: &[&str]) -> Option<Color> {
     let value = material
         .vectors
@@ -1149,10 +1166,7 @@ fn material_base_color(material: &EffectiveMaterial) -> Color {
     )
     .unwrap_or(Color::WHITE)
     .to_linear();
-    let luminance = select_scalar(material, &["luminance"])
-        .filter(|value| value.is_finite())
-        .unwrap_or(1.0)
-        .max(0.0);
+    let luminance = finite_scalar(material, &["luminance"], 1.0).max(0.0);
     Color::LinearRgba(LinearRgba::new(
         (tint.red * luminance).clamp(0.0, 1.0),
         (tint.green * luminance).clamp(0.0, 1.0),
@@ -1304,6 +1318,35 @@ fn udim_uv_transform(columns: u32, rows: u32) -> Affine2 {
     )
 }
 
+/// UE's panning wave normal, reduced to what a `StandardMaterial` expresses.
+#[derive(Clone, Copy)]
+struct WaterWave {
+    uv_scale: Vec2,
+    /// Tiled UV units per second.
+    speed: f32,
+}
+
+/// Reads the surviving wave panner off an `MSM_SingleLayerWater` material.
+///
+/// Two approximations, both forced by what the manifest carries. UE tiles the
+/// wave normal over world-space UVs whose scale constant lives in the material
+/// graph rather than in any parameter, so the authored tiling is applied to UV0
+/// instead; on the GreenHouse pond that plane is exactly ten metres across.
+/// `Wave * Speed` is likewise a single authored scalar whose per-axis split is
+/// in the graph, so both axes pan at it.
+fn water_wave(material: &EffectiveMaterial) -> Option<WaterWave> {
+    if material.shading_model != SourceShadingModel::SingleLayerWater {
+        return None;
+    }
+    Some(WaterWave {
+        uv_scale: Vec2::new(
+            finite_scalar(material, WAVE_UV_SCALE_U_NAMES, 1.0),
+            finite_scalar(material, WAVE_UV_SCALE_V_NAMES, 1.0),
+        ),
+        speed: finite_scalar(material, WAVE_PAN_SPEED_NAMES, 0.0),
+    })
+}
+
 /// Whether authored UVs stay inside the atlas the exporter wrote: `u` in
 /// `[0, columns]` and `v` in `[-(rows - 1), 1]`. Anything outside still renders,
 /// wrapped by the `Repeat` sampler onto another tile of the same atlas.
@@ -1324,8 +1367,9 @@ fn build_material_handles(
     preserve_alpha: bool,
     unlit_textures: bool,
     failed_texture_bundles: &HashSet<String>,
-) -> HashMap<String, Handle<StandardMaterial>> {
+) -> (HashMap<String, Handle<StandardMaterial>>, PanningWater) {
     let mut result = HashMap::new();
+    let mut panning_water = PanningWater::default();
     let mut cache = HashMap::new();
     let used = used_material_objects(converted);
     let mut masked_materials = 0usize;
@@ -1474,7 +1518,9 @@ fn build_material_handles(
         {
             wrapped_uv_materials.push(object.clone());
         }
-        let uv_transform = udim_uv_transform(columns, rows);
+        let wave = water_wave(&effective);
+        let uv_transform = udim_uv_transform(columns, rows)
+            * wave.map_or(Affine2::IDENTITY, |wave| Affine2::from_scale(wave.uv_scale));
         let metallic = select_scalar(&effective, &["metallic", "metalness"]).unwrap_or(
             if texture_carries_metallic(orm_parameter) {
                 1.0
@@ -1482,8 +1528,12 @@ fn build_material_handles(
                 0.0
             },
         );
-        let perceptual_roughness = select_scalar(&effective, &["roughness"])
+        let perceptual_roughness = select_scalar(&effective, ROUGHNESS_NAMES)
             .unwrap_or(if orm.is_some() { 1.0 } else { 0.5 });
+        // UE's Water Specular drives how strongly the surface reflects. Nothing
+        // else in Zorah authors a specular parameter, so every other material
+        // keeps Bevy's 0.5 default, which is 4% reflectance.
+        let reflectance = finite_scalar(&effective, SPECULAR_NAMES, 0.5);
         let render_properties = source_material_render_properties(&effective);
         match effective.blend_mode {
             SourceBlendMode::Opaque => {}
@@ -1515,6 +1565,7 @@ fn build_material_handles(
                 perceptual_roughness
             },
             uv_transform,
+            reflectance,
             unlit: unlit_textures || render_properties.unlit,
             // Meshlets currently draw only opaque materials. Retaining UE's
             // alpha mode deliberately omits unsupported foliage/translucency
@@ -1528,7 +1579,11 @@ fn build_material_handles(
             cull_mode: render_properties.cull_mode,
             ..default()
         };
-        result.insert(object, materials.add(material));
+        let handle = materials.add(material);
+        if let Some(wave) = wave.filter(|wave| wave.speed != 0.0) {
+            panning_water.0.push((handle.clone(), wave.speed));
+        }
+        result.insert(object, handle);
     }
     if !wrapped_uv_materials.is_empty() {
         warn!(
@@ -1558,7 +1613,33 @@ fn build_material_handles(
             );
         }
     }
-    result
+    (result, panning_water)
+}
+
+/// The water materials whose wave normal pans, with its authored speed.
+#[derive(Resource, Default)]
+struct PanningWater(Vec<(Handle<StandardMaterial>, f32)>);
+
+/// Advances each water surface's wave normal at its authored pan speed.
+///
+/// UE drives the same panner from the graph's single Time node. `uv_transform`
+/// is the only per-frame handle a `StandardMaterial` offers for it, and Solari
+/// rebuilds its material buffer every frame, so both renderers see the motion.
+fn pan_water_surfaces(
+    time: Res<Time>,
+    water: Res<PanningWater>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    let delta = time.delta_secs();
+    for (handle, speed) in &water.0 {
+        let Some(mut material) = materials.get_mut(handle) else {
+            continue;
+        };
+        // UE fracs the panned coordinate. Wrapping keeps the offset precise
+        // across a long session, and the Repeat sampler hides the seam.
+        material.uv_transform.translation =
+            (material.uv_transform.translation + Vec2::splat(speed * delta)).rem_euclid(Vec2::ONE);
+    }
 }
 
 fn main() {
@@ -1647,6 +1728,10 @@ fn main() {
     .add_systems(
         Update,
         warm_up_raytracing.run_if(in_state(ZorahState::WarmingRaytracing)),
+    )
+    .add_systems(
+        Update,
+        pan_water_surfaces.run_if(resource_exists::<PanningWater>),
     )
     .run();
 }
@@ -2353,7 +2438,7 @@ fn setup(
         unlit: options.unlit_textures,
         ..default()
     });
-    let material_handles = build_material_handles(
+    let (material_handles, panning_water) = build_material_handles(
         &converted,
         &asset_server,
         &mut materials,
@@ -2361,6 +2446,7 @@ fn setup(
         options.unlit_textures,
         &failed_texture_bundles.0,
     );
+    commands.insert_resource(panning_water);
     let mut pending = Vec::new();
     let mut skipped_components = 0usize;
     let mut world_min = Vec3::splat(f32::INFINITY);
@@ -2398,6 +2484,7 @@ fn setup(
                             &mut world_min,
                             &mut world_max,
                             is_lightblocker_mesh(mesh_name),
+                            component.cast_shadow,
                         );
                     }
                 }
@@ -2412,6 +2499,7 @@ fn setup(
                     &mut world_min,
                     &mut world_max,
                     is_lightblocker_mesh(mesh_name),
+                    component.cast_shadow,
                 ),
             }
         }
@@ -2561,6 +2649,7 @@ fn queue_partitions(
     world_min: &mut Vec3,
     world_max: &mut Vec3,
     raytracing_only: bool,
+    cast_shadow: bool,
 ) {
     let transform = ue_world_to_bevy(ue_world);
     *world_min = world_min.min(transform.translation);
@@ -2588,6 +2677,7 @@ fn queue_partitions(
             blas_vertices: partition.blas_vertices,
             blas_achieved_error: partition.blas_achieved_error,
             raytracing_only,
+            cast_shadow,
             spawned: false,
         });
     }
@@ -2864,13 +2954,19 @@ fn spawn_partitions_when_ready(
                 ))
                 .id()
         } else {
-            commands
-                .spawn((
-                    MeshletMesh3d(assets.meshlet.clone()),
-                    MeshMaterial3d(partition.material.clone()),
-                    partition.transform,
-                ))
-                .id()
+            let mut entity = commands.spawn((
+                MeshletMesh3d(assets.meshlet.clone()),
+                MeshMaterial3d(partition.material.clone()),
+                partition.transform,
+            ));
+            // UE hides several surfaces from the shadow pass, most visibly the
+            // GreenHouse pond, whose own shadow otherwise darkens the bed it
+            // reflects. Only meshlet raster reads this: Solari shadows come
+            // from the TLAS, which carries every instance unconditionally.
+            if !partition.cast_shadow {
+                entity.insert(NotShadowCaster);
+            }
+            entity.id()
         };
         raytracing_instances.push(PendingRaytracingInstance {
             entity,
@@ -3310,6 +3406,7 @@ mod tests {
                     transform: test_transform(),
                     visible: true,
                     hidden_in_game: false,
+                    cast_shadow: true,
                     instances: None,
                     override_materials: vec![],
                 }],
@@ -3772,6 +3869,74 @@ mod tests {
         };
         assert!(!texture_carries_metallic(Some(&ors)));
         assert!(texture_carries_metallic(Some(&orm)));
+    }
+
+    #[test]
+    fn single_layer_water_reads_its_own_parameter_family() {
+        // MI_Water_EOS_ReflectionPond's authored values, as the bake forwards
+        // them: the generic Roughness/Specular/Tint names never appear on it.
+        let record: MaterialRecord = serde_json::from_str(
+            r#"{
+                "object": "water",
+                "parent": null,
+                "scalars": [
+                    {"name": "Water Roughness", "association": "GlobalParameter", "index": -1, "value": 0.02},
+                    {"name": "Water Specular", "association": "GlobalParameter", "index": -1, "value": 1.0},
+                    {"name": "Wave A Speed", "association": "GlobalParameter", "index": -1, "value": 0.0082},
+                    {"name": "Wave A UV X", "association": "GlobalParameter", "index": -1, "value": 3.700028},
+                    {"name": "Wave A UV Y", "association": "GlobalParameter", "index": -1, "value": 5.5}
+                ],
+                "vectors": [
+                    {"name": "Water Base Color", "association": "GlobalParameter", "index": -1, "value": "000000 (FLinearColor)"}
+                ],
+                "base_overrides": {"ShadingModel": "MSM_SingleLayerWater"}
+            }"#,
+        )
+        .unwrap();
+        let records = HashMap::from([(record.object.clone(), record)]);
+        let effective =
+            resolve_effective_material("water", &records, &mut HashMap::new(), &mut Vec::new());
+
+        assert_eq!(select_scalar(&effective, ROUGHNESS_NAMES), Some(0.02));
+        assert_eq!(select_scalar(&effective, SPECULAR_NAMES), Some(1.0));
+        assert_eq!(material_base_color(&effective), Color::BLACK);
+        let wave = water_wave(&effective).expect("water materials carry a wave panner");
+        assert_eq!(wave.uv_scale, Vec2::new(3.700028, 5.5));
+        assert_eq!(wave.speed, 0.0082);
+    }
+
+    #[test]
+    fn only_water_materials_pan_their_normal_map() {
+        let record: MaterialRecord = serde_json::from_str(
+            r#"{
+                "object": "stone",
+                "parent": null,
+                "scalars": [
+                    {"name": "Wave A Speed", "association": "GlobalParameter", "index": -1, "value": 0.0082}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let records = HashMap::from([(record.object.clone(), record)]);
+        let effective =
+            resolve_effective_material("stone", &records, &mut HashMap::new(), &mut Vec::new());
+
+        assert!(water_wave(&effective).is_none());
+    }
+
+    #[test]
+    fn components_cast_shadows_unless_ue_disabled_them() {
+        let transform = r#""transform": {"translation": {"x": 0, "y": 0, "z": 0},
+            "rotation": {"x": 0, "y": 0, "z": 0, "w": 1}, "scale": {"x": 1, "y": 1, "z": 1}}"#;
+        let default: ComponentRecord =
+            serde_json::from_str(&format!(r#"{{"mesh": null, {transform}}}"#)).unwrap();
+        let pond: ComponentRecord = serde_json::from_str(&format!(
+            r#"{{"mesh": null, {transform}, "cast_shadow": false}}"#
+        ))
+        .unwrap();
+
+        assert!(default.cast_shadow);
+        assert!(!pond.cast_shadow);
     }
 
     #[test]

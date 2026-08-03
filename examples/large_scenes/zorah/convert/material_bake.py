@@ -62,10 +62,25 @@ EMISSIVE_INTENSITY_NAMES = (
 )
 EMISSIVE_COLOR_NAMES = ("Emissive Color", "Emission Color", "Emission Tint")
 HEX_COLOR = re.compile(r"^([0-9a-fA-F]{6}|[0-9a-fA-F]{8})")
+# MSM_SingleLayerWater has its own parameter family and shares no name with the
+# LS materials above, so the generic selection finds nothing on Zorah's one
+# water surface. Bevy has the opaque half of that shading model and none of the
+# volume underneath it, so only these four terms are mapped.
+WATER_SHADING_MODEL = "MSM_SingleLayerWater"
+WATER_BASE_COLOR_NAME = "Water Base Color"
+WATER_SURFACE_SCALARS = (("Water Roughness", 0.0), ("Water Specular", 0.5))
+# UE layers three panning wave normals. A `StandardMaterial` has one normal map
+# and one `uv_transform`, so only the first authored wave survives, carrying its
+# own tiling and pan speed to the runtime.
+WATER_WAVES = (
+    ("Wave A Normal", "Wave A Speed", "Wave A UV X", "Wave A UV Y"),
+    ("Wave B Normal", "Wave B Speed", "Wave B UV X", "Wave B UV Y"),
+    ("Wave C Normal", "Wave C Speed", "Wave C UV X", "Wave C UV Y"),
+)
 GLOBAL = "GlobalParameter"
 LAYER = "LayerParameter"
 BLEND = "BlendParameter"
-MATERIAL_BAKE_PIPELINE_VERSION = 5
+MATERIAL_BAKE_PIPELINE_VERSION = 6
 LAYER_MATERIAL_BAKE_PIPELINE_VERSION = 5
 # The runtime binds textures by parameter name, so every selected texture is
 # emitted under the name main.rs looks for rather than the authoring name.
@@ -783,6 +798,54 @@ def runtime_parameter(name: str, value: Any) -> dict[str, Any]:
     return {"name": name, "association": GLOBAL, "index": -1, "value": value}
 
 
+def is_single_layer_water(material: EffectiveMaterial) -> bool:
+    return material.base_overrides.get("ShadingModel") == WATER_SHADING_MODEL
+
+
+def selected_water_wave(
+    material: EffectiveMaterial, textures: TextureSet
+) -> tuple[str, list[dict[str, Any]]] | None:
+    """The first authored wave whose normal map exported, with its panner."""
+    for texture_name, speed_name, uv_x_name, uv_y_name in WATER_WAVES:
+        reference, _ = texture_reference(material, (texture_name,), GLOBAL, -1)
+        if reference is None or reference not in textures.records:
+            continue
+        return reference, [
+            runtime_parameter(name, material.scalar((name,), GLOBAL, -1, default))
+            for name, default in ((speed_name, 0.0), (uv_x_name, 1.0), (uv_y_name, 1.0))
+        ]
+    return None
+
+
+def water_runtime_parameters(
+    material: EffectiveMaterial,
+    wave: Iterable[dict[str, Any]],
+    approximations: set[str] | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Map MSM_SingleLayerWater onto the terms a `StandardMaterial` has.
+
+    Only the surface survives the trip: base color, roughness, specular and one
+    panning wave normal. The volume half of the shading model - absorption,
+    scattering, murkiness, caustics, and the 1.17 IOR that refracts the bed -
+    has no `StandardMaterial` or Solari term to land in, so the pond renders as
+    a dark reflective surface rather than one the bed shows through.
+    """
+    tint = selected_color(
+        material, (WATER_BASE_COLOR_NAME,), GLOBAL, -1, (0.0, 0.0, 0.0, 1.0)
+    )
+    if approximations is not None:
+        if out_of_range_components(tint):
+            approximations.add("water base color clamped to the 0..1 hex range")
+        approximations.add("single-layer water renders without its absorbing volume")
+    scalars = [
+        runtime_parameter(name, material.scalar((name,), GLOBAL, -1, default))
+        for name, default in WATER_SURFACE_SCALARS
+    ]
+    return [*scalars, *wave], [
+        runtime_parameter(WATER_BASE_COLOR_NAME, f"{hex_color(tint)} (FLinearColor)")
+    ]
+
+
 def emissive_properties(
     material: EffectiveMaterial,
 ) -> tuple[bool, float, np.ndarray, tuple[str, str] | None]:
@@ -891,32 +954,38 @@ def runtime_material_record(
     material: EffectiveMaterial,
     textures: dict[str, tuple[str, str]],
     approximations: set[str] | None = None,
+    water_wave: Iterable[dict[str, Any]] = (),
 ) -> dict[str, Any]:
     scalar_parameters: list[dict[str, Any]] = []
     vector_parameters: list[dict[str, Any]] = []
     texture_parameters = [runtime_parameter(name, reference) for name, reference in textures.values()]
-    metallic = material.scalar(("Metallic", "Metalness"), GLOBAL, -1, math.nan)
-    roughness = material.scalar(("Roughness",), GLOBAL, -1, math.nan)
-    if math.isfinite(metallic):
-        scalar_parameters.append(runtime_parameter("Metallic", metallic))
-    if math.isfinite(roughness):
-        scalar_parameters.append(runtime_parameter("Roughness", roughness))
-    if "base" not in textures:
-        tint = selected_color(
-            material,
-            ("Base Color Tint", "Diffuse Tint", "Tint", "Base Color"),
-            GLOBAL,
-            -1,
-            (1.0, 1.0, 1.0, 1.0),
+    if is_single_layer_water(material):
+        scalar_parameters, vector_parameters = water_runtime_parameters(
+            material, water_wave, approximations
         )
-        if approximations is not None and out_of_range_components(tint):
-            approximations.add("base color tint clamped to the 0..1 hex range")
-        vector_parameters.append(
-            runtime_parameter("Tint", f"{hex_color(tint)} (FLinearColor)")
-        )
-        luminance = material.scalar(("Luminance",), GLOBAL, -1, 1.0)
-        if not math.isclose(luminance, 1.0):
-            scalar_parameters.append(runtime_parameter("Luminance", luminance))
+    else:
+        metallic = material.scalar(("Metallic", "Metalness"), GLOBAL, -1, math.nan)
+        roughness = material.scalar(("Roughness",), GLOBAL, -1, math.nan)
+        if math.isfinite(metallic):
+            scalar_parameters.append(runtime_parameter("Metallic", metallic))
+        if math.isfinite(roughness):
+            scalar_parameters.append(runtime_parameter("Roughness", roughness))
+        if "base" not in textures:
+            tint = selected_color(
+                material,
+                ("Base Color Tint", "Diffuse Tint", "Tint", "Base Color"),
+                GLOBAL,
+                -1,
+                (1.0, 1.0, 1.0, 1.0),
+            )
+            if approximations is not None and out_of_range_components(tint):
+                approximations.add("base color tint clamped to the 0..1 hex range")
+            vector_parameters.append(
+                runtime_parameter("Tint", f"{hex_color(tint)} (FLinearColor)")
+            )
+            luminance = material.scalar(("Luminance",), GLOBAL, -1, 1.0)
+            if not math.isclose(luminance, 1.0):
+                scalar_parameters.append(runtime_parameter("Luminance", luminance))
     return apply_runtime_emissive({
         "package": material.package,
         "object": material.object,
@@ -941,6 +1010,7 @@ def bake_material(
     approximations: set[str] = set()
     selected: dict[str, tuple[str, str]] = {}
     generated: list[dict[str, Any]] = []
+    water_wave: list[dict[str, Any]] = []
     layer_count = len(material.layers)
     digest = hashlib.sha256(material.object.encode("utf-8")).hexdigest()[:16]
 
@@ -988,6 +1058,16 @@ def bake_material(
     else:
         selected_scopes: dict[str, tuple[str, int]] = {}
         source_names: dict[str, str] = {}
+        if is_single_layer_water(material):
+            # Selected ahead of the generic pass because the wave normals are
+            # the only textures on the water graph, and none of their names
+            # appear in the families below.
+            wave = selected_water_wave(material, texture_set)
+            if wave is None:
+                approximations.add("single-layer water has no exported wave normal")
+            else:
+                reference, water_wave = wave
+                selected["normal"] = (RUNTIME_TEXTURE_NAMES["normal"], reference)
         for kind, names in (
             ("base", BASE_NAMES),
             ("normal", NORMAL_NAMES),
@@ -1134,7 +1214,7 @@ def bake_material(
             selected["surface"] = ("ORM", object_name)
 
     return (
-        runtime_material_record(material, selected, approximations),
+        runtime_material_record(material, selected, approximations, water_wave),
         generated,
         approximations,
     )

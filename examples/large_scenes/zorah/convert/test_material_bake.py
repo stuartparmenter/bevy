@@ -483,6 +483,70 @@ class MaterialBakeTests(unittest.TestCase):
                 [("ORM", "/Game/Rot")],
             )
 
+    def test_single_layer_water_exports_its_own_parameter_family(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            Image.new("RGBA", (4, 4), (128, 128, 255, 255)).save(root / "waves.png")
+            texture_set = material_bake.TextureSet(
+                root,
+                {
+                    "exported": [
+                        {
+                            "object": "/Game/Waves",
+                            "output": "waves.png",
+                            "output_size": [4, 4],
+                            "srgb": False,
+                            "normal_map": True,
+                        }
+                    ]
+                },
+            )
+            # MI_Water_EOS_ReflectionPond's authored values. None of the names
+            # the generic path selects on appear anywhere in this family.
+            material = self.effective_with(
+                scalars=[
+                    parameter("Water Roughness", 0.02),
+                    parameter("Water Specular", 1.0),
+                    parameter("Wave A Speed", 0.0082),
+                    parameter("Wave A UV X", 3.700028),
+                    parameter("Wave A UV Y", 5.5),
+                ],
+                vectors=[parameter("Water Base Color", "000000 (FLinearColor)")],
+                textures=[
+                    parameter("Wave A Normal", "/Game/Waves"),
+                    parameter("Wave B Normal", "/Game/Waves"),
+                ],
+            )
+            material.base_overrides = {"ShadingModel": "MSM_SingleLayerWater"}
+
+            runtime, generated, approximations = material_bake.bake_material(
+                material, texture_set, root, 4
+            )
+
+            self.assertEqual(generated, [])
+            self.assertEqual(
+                [(item["name"], item["value"]) for item in runtime["textures"]],
+                [("Normal", "/Game/Waves")],
+            )
+            self.assertEqual(
+                [(item["name"], item["value"]) for item in runtime["scalars"]],
+                [
+                    ("Water Roughness", 0.02),
+                    ("Water Specular", 1.0),
+                    ("Wave A Speed", 0.0082),
+                    ("Wave A UV X", 3.700028),
+                    ("Wave A UV Y", 5.5),
+                ],
+            )
+            self.assertEqual(
+                [(item["name"], item["value"]) for item in runtime["vectors"]],
+                [("Water Base Color", "000000FF (FLinearColor)")],
+            )
+            self.assertIn(
+                "single-layer water renders without its absorbing volume",
+                approximations,
+            )
+
     def test_sixteen_bit_sources_are_rescaled_not_clipped(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "mask.png"
