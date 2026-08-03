@@ -31,13 +31,18 @@ EXPECTED_POST_PROCESS_BLOOM = {
 # One actor per external-actor package: a UChildActorComponent's child is saved
 # beside its parent in the same package, and the export re-parents it onto the
 # parent instead of listing it as an actor of its own.
+#
+# referenced_meshes counts Niagara mesh-renderer meshes as well as component
+# ones: the butterfly mesh in GreenHouse, and the two nebula spheres in
+# ThroneRoom. Restir's one Niagara system renders no mesh.
 EXPECTED_SCENE_INVENTORY = {
     "GreenHouse_Level": {
         "actors": 1788,
         "actor_packages": 1788,
         "unresolved_mesh_components": 27,
-        "referenced_meshes": 299,
+        "referenced_meshes": 300,
         "decal_components": 232,
+        "niagara_components": 2,
     },
     "Restir_Level": {
         "actors": 1924,
@@ -45,13 +50,15 @@ EXPECTED_SCENE_INVENTORY = {
         "unresolved_mesh_components": 0,
         "referenced_meshes": 271,
         "decal_components": 323,
+        "niagara_components": 1,
     },
     "ThroneRoom_Level": {
         "actors": 6773,
         "actor_packages": 6773,
         "unresolved_mesh_components": 0,
-        "referenced_meshes": 113,
+        "referenced_meshes": 115,
         "decal_components": 17,
+        "niagara_components": 14,
     },
 }
 CONVERT_DIRECTORY = Path(__file__).resolve().parent
@@ -342,6 +349,8 @@ def scene_manifest_is_current(path: Path) -> bool:
             != inventory["referenced_meshes"]
             or int(document.get("decal_components", -1))
             != inventory["decal_components"]
+            or int(document.get("niagara_components", -1))
+            != inventory["niagara_components"]
         ):
             return False
         record = records[0]

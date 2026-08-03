@@ -1361,6 +1361,83 @@ static class ZorahConvert
                 .ToArray();
     }
 
+    // A Niagara parameter store is a flat little-endian byte blob plus a sorted
+    // (name, type, offset) index. FNiagaraVariableWithOffset serializes natively
+    // rather than as tagged properties, so its members come off the CUE4Parse
+    // struct itself instead of ReadStructFields.
+    private static NiagaraParameterRecord[] ReadNiagaraParameterStore(object? store)
+    {
+        var fields = ReadStructFields(store);
+        var data = ReadArrayValues(fields.GetValueOrDefault("ParameterData"))
+            .OfType<byte>()
+            .ToArray();
+        var records = new List<NiagaraParameterRecord>();
+        foreach (var entry in ReadArrayValues(
+            fields.GetValueOrDefault("SortedParameterOffsets")
+        ))
+        {
+            var variable = StructValue(entry);
+            var type = JsonScalar(
+                ReadStructFields(GetPublicMember(variable, "TypeDef"))
+                    .GetValueOrDefault("ClassStructOrEnum")
+            )?.ToString();
+            records.Add(new NiagaraParameterRecord(
+                Name: GetPublicMember(variable, "Name")?.ToString() ?? "unnamed",
+                Type: type,
+                Value: ReadNiagaraParameterValue(
+                    data,
+                    ToNullableInt(GetPublicMember(variable, "Offset")) ?? -1,
+                    type
+                )
+            ));
+        }
+        return records.ToArray();
+    }
+
+    // Component counts for the Niagara types this project uses. An unlisted type
+    // (a data interface, an enum, a struct) reads back null rather than a guess,
+    // because a wrong width would silently shift every later parameter.
+    private static readonly Dictionary<string, int> NiagaraParameterFloatCounts =
+        new(StringComparer.Ordinal)
+        {
+            ["/Script/Niagara.NiagaraFloat"] = 1,
+            ["/Script/CoreUObject.Vector2D"] = 2,
+            ["/Script/CoreUObject.Vector2f"] = 2,
+            ["/Script/Niagara.NiagaraPosition"] = 3,
+            ["/Script/CoreUObject.Vector"] = 3,
+            ["/Script/CoreUObject.Vector3f"] = 3,
+            ["/Script/CoreUObject.Vector4"] = 4,
+            ["/Script/CoreUObject.Vector4f"] = 4,
+            ["/Script/CoreUObject.Quat"] = 4,
+            ["/Script/CoreUObject.LinearColor"] = 4,
+        };
+
+    private static object? ReadNiagaraParameterValue(byte[] data, int offset, string? type)
+    {
+        if (offset < 0 || type is null)
+        {
+            return null;
+        }
+        // Niagara stores bools as int32 with -1 for true.
+        if (type is "/Script/Niagara.NiagaraInt32" or "/Script/Niagara.NiagaraBool")
+        {
+            return offset + 4 <= data.Length
+                ? BitConverter.ToInt32(data, offset)
+                : null;
+        }
+        if (!NiagaraParameterFloatCounts.TryGetValue(type, out var count) ||
+            offset + (4 * count) > data.Length)
+        {
+            return null;
+        }
+        var components = new float[count];
+        for (var index = 0; index < count; index++)
+        {
+            components[index] = BitConverter.ToSingle(data, offset + (4 * index));
+        }
+        return count == 1 ? components[0] : components;
+    }
+
     private static TextureBlockRecord[] ReadTextureSourceBlocks(
         Dictionary<string, object?> source,
         int sourceWidth,
@@ -1585,6 +1662,33 @@ static class ZorahConvert
                             entryIndex++;
                         }
                     }
+                }
+            }
+            // Niagara emitters, renderers and parameter stores are plain tagged
+            // UObjects to CUE4Parse, with no typed wrapper to read them through,
+            // so dump every tag and let the caller pick the ones it needs.
+            if (obj.ExportType.StartsWith("Niagara", StringComparison.Ordinal))
+            {
+                foreach (var property in obj.Properties)
+                {
+                    Console.WriteLine(
+                        $"ZORAH_NIAGARA_PROPERTY object={obj.Name} type={obj.ExportType} " +
+                        $"name={property.Name.Text} value=" +
+                        JsonSerializer.Serialize(
+                            JsonScalar(property.Tag?.GenericValue),
+                            JsonOptions
+                        )
+                    );
+                }
+                foreach (var parameter in ReadNiagaraParameterStore(
+                    GetTaggedValue(obj, "RapidIterationParameters")
+                ))
+                {
+                    Console.WriteLine(
+                        $"ZORAH_NIAGARA_PARAMETER object={obj.Name} " +
+                        $"name={parameter.Name} type={parameter.Type ?? "None"} " +
+                        $"value={JsonSerializer.Serialize(parameter.Value, JsonOptions)}"
+                    );
                 }
             }
             if (obj is UStaticMeshComponent component)
@@ -1842,7 +1946,25 @@ static class ZorahConvert
         var componentTypes = new Dictionary<string, int>(StringComparer.Ordinal);
         var referencedMeshes = new HashSet<string>(StringComparer.Ordinal);
         var referencedDecalMaterials = new HashSet<string>(StringComparer.Ordinal);
+        var referencedNiagaraMaterials = new HashSet<string>(StringComparer.Ordinal);
+        var missingNiagaraAssets = new HashSet<string>(StringComparer.Ordinal);
+        // Placed instances of the same system are common - ThroneRoom has 6,421
+        // candles fed by one - and reading a system means loading and walking a
+        // package with hundreds of exports.
+        var niagaraSystems = new Dictionary<string, NiagaraMeshRendererRecord[]>(
+            StringComparer.Ordinal
+        );
         var packagesWithoutActors = 0;
+
+        void RequestNiagaraAsset(string? path, HashSet<string> requested)
+        {
+            if (path is not null)
+            {
+                (provider.Files.ContainsKey(ObjectPathToPackageKey(path))
+                    ? requested
+                    : missingNiagaraAssets).Add(path);
+            }
+        }
 
         for (var packageIndex = 0; packageIndex < packagePaths.Length; packageIndex++)
         {
@@ -1882,6 +2004,17 @@ static class ZorahConvert
                         .OrderBy(component => component.Name)
                         .Select(component => ConvertComponent(provider, component, archetypes))
                         .Concat(ConvertChildActorComponents(provider, objects, archetypes, owned))
+                        .ToArray();
+
+                    var niagara = owned
+                        .OfType<UNiagaraComponent>()
+                        .OrderBy(component => component.Name, StringComparer.Ordinal)
+                        .Select(component => ConvertNiagaraComponent(
+                            provider,
+                            component,
+                            archetypes,
+                            niagaraSystems
+                        ))
                         .ToArray();
 
                     var lights = owned
@@ -1926,6 +2059,25 @@ static class ZorahConvert
                             referencedDecalMaterials.Add(decal.Material);
                         }
                     }
+                    // A mesh renderer's mesh reaches the scene through the
+                    // particle system rather than through a component property,
+                    // so it has to be collected here or geometry conversion
+                    // never sees it. Renderers reach for /Engine primitives
+                    // (BasicShapes/Sphere and friends) that the sample download
+                    // does not ship, so only assets the provider actually holds
+                    // are requested.
+                    foreach (var renderer in niagara
+                        .SelectMany(component => component.MeshRenderers))
+                    {
+                        foreach (var mesh in renderer.Meshes)
+                        {
+                            RequestNiagaraAsset(mesh.Mesh, referencedMeshes);
+                        }
+                        foreach (var material in renderer.OverrideMaterials)
+                        {
+                            RequestNiagaraAsset(material, referencedNiagaraMaterials);
+                        }
+                    }
 
                     actors.Add(new ActorRecord(
                         Package: packagePath,
@@ -1936,6 +2088,7 @@ static class ZorahConvert
                         Transform: ConvertObjectTransform(rootComponent),
                         Hidden: actor.GetOrDefault("bHidden", false),
                         Components: components,
+                        Niagara: niagara,
                         Lights: lights,
                         Decals: decals,
                         Atmosphere: atmosphere,
@@ -1985,6 +2138,11 @@ static class ZorahConvert
             ReferencedDecalMaterials: referencedDecalMaterials
                 .Order(StringComparer.Ordinal)
                 .ToArray(),
+            NiagaraComponents: actors.Sum(actor => actor.Niagara.Length),
+            ReferencedNiagaraMaterials: referencedNiagaraMaterials
+                .Order(StringComparer.Ordinal)
+                .ToArray(),
+            MissingNiagaraAssets: missingNiagaraAssets.Order(StringComparer.Ordinal).ToArray(),
             Actors: actors.OrderBy(actor => actor.Package, StringComparer.Ordinal)
                 .ThenBy(actor => actor.Name, StringComparer.Ordinal)
                 .ToArray(),
@@ -2022,6 +2180,8 @@ static class ZorahConvert
             $"lights={manifest.Actors.Sum(actor => actor.Lights.Length)} " +
             $"meshes={manifest.ReferencedMeshes.Length} failures={manifest.Failures.Length} " +
             $"unresolved_mesh_components={manifest.UnresolvedStaticMeshComponents} " +
+            $"niagara={manifest.NiagaraComponents} " +
+            $"niagara_missing={manifest.MissingNiagaraAssets.Length} " +
             $"output={outputPath}"
         );
         return failures.Count == 0 ? 0 : 1;
@@ -2380,6 +2540,108 @@ static class ZorahConvert
             FadeDuration: ReadDouble(chain, "FadeDuration", 0.0),
             FadeInStartDelay: ReadDouble(chain, "FadeInStartDelay", 0.0),
             FadeInDuration: ReadDouble(chain, "FadeInDuration", 0.0)
+        );
+    }
+
+    private static NiagaraComponentRecord ConvertNiagaraComponent(
+        DefaultFileProvider provider,
+        UNiagaraComponent component,
+        ComponentArchetypes archetypes,
+        Dictionary<string, NiagaraMeshRendererRecord[]> systemCache
+    )
+    {
+        var chain = archetypes.Chain(component);
+        // A blueprint's SimpleConstructionScript node keeps Asset and the
+        // relative transform; the placed instance serializes neither, which is
+        // why this has to read through the archetype chain the same way
+        // ConvertComponent does for StaticMesh.
+        var asset = ReadReference(chain, "Asset");
+        NiagaraMeshRendererRecord[] renderers = [];
+        if (asset is not null)
+        {
+            if (!systemCache.TryGetValue(asset, out var cached))
+            {
+                cached = ReadNiagaraMeshRenderers(provider, asset);
+                systemCache[asset] = cached;
+            }
+            renderers = cached;
+        }
+        return new NiagaraComponentRecord(
+            Name: component.Name,
+            Type: component.ExportType,
+            Asset: asset,
+            Transform: archetypes.TransformRelativeToActor(component),
+            Visible: ReadBool(chain, "bVisible", true),
+            HiddenInGame: ReadBool(chain, "bHiddenInGame", false),
+            AutoActivate: ReadBool(chain, "bAutoActivate", true),
+            VisibleInRayTracing: ReadBool(chain, "bVisibleInRayTracing", true),
+            // Unlike a UStaticMeshComponent, a particle system does not cast by
+            // default: the butterfly component serializes CastShadow=true, which
+            // it would not if true were the class default.
+            CastShadow: ReadBool(chain, "CastShadow", false),
+            OverrideParameters: ReadNiagaraParameterStore(
+                ReadTaggedValue(chain, "OverrideParameters")
+            ),
+            MeshRenderers: renderers
+        );
+    }
+
+    // Mesh renderers live on the emitters inside the system asset, not on the
+    // component, so the meshes and their material overrides are only reachable
+    // by opening that package. A renderer whose bIsEnabled is false is still
+    // reported: the emitter that owns it may be enabled, and dropping it here
+    // would hide the reason a mesh never appears.
+    private static NiagaraMeshRendererRecord[] ReadNiagaraMeshRenderers(
+        DefaultFileProvider provider,
+        string systemPath
+    )
+    {
+        var packagePath = ObjectPathToPackageKey(systemPath);
+        if (!provider.Files.ContainsKey(packagePath))
+        {
+            return [];
+        }
+        var records = new List<NiagaraMeshRendererRecord>();
+        foreach (var renderer in provider.LoadPackage(packagePath).GetExports()
+            .Where(export => export.ExportType == "NiagaraMeshRendererProperties"))
+        {
+            var meshes = ReadArrayValues(GetTaggedValue(renderer, "Meshes"))
+                .Select(ReadStructFields)
+                .Select(mesh => new NiagaraRendererMeshRecord(
+                    Mesh: PackageReferencePath(mesh.GetValueOrDefault("Mesh")),
+                    Scale: ReadVec3Record(mesh.GetValueOrDefault("Scale"), 1.0),
+                    PivotOffset: ReadVec3Record(mesh.GetValueOrDefault("PivotOffset"), 0.0)
+                ))
+                .ToArray();
+            records.Add(new NiagaraMeshRendererRecord(
+                // The renderer's outer is its emitter; the system names emitters
+                // by that outer, so this is the handle to match against.
+                Emitter: renderer.Outer?.Name.Text ?? "None",
+                Enabled: ToBool(GetTaggedValue(renderer, "bIsEnabled"), true),
+                Meshes: meshes,
+                OverrideMaterials: ToBool(
+                    GetTaggedValue(renderer, "bOverrideMaterials"),
+                    false
+                )
+                    ? ReadArrayValues(GetTaggedValue(renderer, "OverrideMaterials"))
+                        .Select(ReadStructFields)
+                        .Select(entry =>
+                            PackageReferencePath(entry.GetValueOrDefault("ExplicitMat")))
+                        .OfType<string>()
+                        .ToArray()
+                    : []
+            ));
+        }
+        return records.OrderBy(record => record.Emitter, StringComparer.Ordinal).ToArray();
+    }
+
+    private static Vec3Record ReadVec3Record(object? value, double defaultComponent)
+    {
+        var fields = ReadStructFields(value);
+        return new Vec3Record(
+            ToNullableDouble(fields.GetValueOrDefault("X")) ?? defaultComponent,
+            ToNullableDouble(fields.GetValueOrDefault("Y")) ?? defaultComponent,
+            ToNullableDouble(fields.GetValueOrDefault("Z")) ?? defaultComponent
         );
     }
 
@@ -3066,6 +3328,11 @@ sealed record SceneManifest(
     string[] ReferencedMeshes,
     int DecalComponents,
     string[] ReferencedDecalMaterials,
+    int NiagaraComponents,
+    string[] ReferencedNiagaraMaterials,
+    // Meshes and materials a Niagara renderer asks for that are not in the
+    // sample download - all of them /Engine primitives.
+    string[] MissingNiagaraAssets,
     ActorRecord[] Actors,
     FailureRecord[] Failures
 );
@@ -3106,6 +3373,7 @@ sealed record ActorRecord(
     TransformRecord Transform,
     bool Hidden,
     StaticMeshComponentRecord[] Components,
+    NiagaraComponentRecord[] Niagara,
     LightComponentRecord[] Lights,
     DecalComponentRecord[] Decals,
     SkyAtmosphereComponentRecord? Atmosphere,
@@ -3235,6 +3503,38 @@ sealed record DecalComponentRecord(
     double FadeInDuration
 );
 
+/// A placed UNiagaraComponent.
+///
+/// Nothing downstream simulates particles. The record exists so the meshes a
+/// system renders reach geometry conversion, and so a consumer can place a
+/// system's static output at the right transform.
+sealed record NiagaraComponentRecord(
+    string Name,
+    string Type,
+    string? Asset,
+    TransformRecord Transform,
+    bool Visible,
+    bool HiddenInGame,
+    bool AutoActivate,
+    bool VisibleInRayTracing,
+    bool CastShadow,
+    NiagaraParameterRecord[] OverrideParameters,
+    NiagaraMeshRendererRecord[] MeshRenderers
+);
+
+sealed record NiagaraMeshRendererRecord(
+    string Emitter,
+    bool Enabled,
+    NiagaraRendererMeshRecord[] Meshes,
+    string[] OverrideMaterials
+);
+
+sealed record NiagaraRendererMeshRecord(
+    string? Mesh,
+    Vec3Record Scale,
+    Vec3Record PivotOffset
+);
+
 sealed record StaticMeshComponentRecord(
     string Name,
     string Type,
@@ -3345,6 +3645,12 @@ sealed record TextureRecord(
     long PayloadSize,
     bool Exported,
     TextureBlockRecord[] Blocks
+);
+
+sealed record NiagaraParameterRecord(
+    string Name,
+    string? Type,
+    object? Value
 );
 
 sealed record TextureBlockRecord(

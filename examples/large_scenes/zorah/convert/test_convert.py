@@ -678,6 +678,7 @@ class IncrementalConversionTests(unittest.TestCase):
             "unresolved_static_mesh_components": inventory["unresolved_mesh_components"],
             "referenced_meshes": ["mesh"] * inventory["referenced_meshes"],
             "decal_components": inventory["decal_components"],
+            "niagara_components": inventory["niagara_components"],
             "actors": [{"post_process": volume}]
             + [{}] * (inventory["actors"] - 1),
             "failures": [],
