@@ -3047,6 +3047,7 @@ fn setup(
         unlit: options.unlit_textures,
         ..default()
     });
+    let occluder_material = materials.add(occluder_material());
     let (material_handles, panning_water) = build_material_handles(
         &converted,
         &asset_server,
@@ -3090,6 +3091,7 @@ fn setup(
                             component_matrix * ue_matrix(instance),
                             &material_handles,
                             &default_material,
+                            &occluder_material,
                             &mut world_min,
                             &mut world_max,
                             is_lightblocker_mesh(mesh_name),
@@ -3105,6 +3107,7 @@ fn setup(
                     component_matrix,
                     &material_handles,
                     &default_material,
+                    &occluder_material,
                     &mut world_min,
                     &mut world_max,
                     is_lightblocker_mesh(mesh_name),
@@ -3265,6 +3268,26 @@ fn is_lightblocker_mesh(mesh: &str) -> bool {
     mesh.to_ascii_lowercase().contains("/lightblockers/")
 }
 
+/// The material every raytracing-only lightblocker partition traces with.
+///
+/// ThroneRoom's blockers wear `Placeholder` and `M_Placeholder_Dark3`, whose
+/// UE definitions carry no shading at all: `Placeholder` is `MSM_Unlit` with an
+/// empty `Expressions` array, and `M_Placeholder_Dark3` is a material instance
+/// with a null `Parent`. Both therefore render black in UE, which is what makes
+/// them pure occluders. The converter fabricates `Tint = FFFFFFFF` for both, so
+/// `material_base_color` resolves them to white and 6,087 m2 of geometry that
+/// never reaches the G-buffer becomes the scene's brightest diffuse reflector
+/// inside the BVH. Zero reflectance drops the 4% specular lobe `unlit` would
+/// also have removed, so the partitions absorb every ray they intercept.
+fn occluder_material() -> StandardMaterial {
+    StandardMaterial {
+        base_color: Color::BLACK,
+        perceptual_roughness: 1.0,
+        reflectance: 0.0,
+        ..default()
+    }
+}
+
 fn queue_partitions(
     pending: &mut Vec<PendingPartition>,
     partitions: &[PartitionRecord],
@@ -3273,6 +3296,7 @@ fn queue_partitions(
     ue_world: Mat4,
     material_handles: &HashMap<String, Handle<StandardMaterial>>,
     default_material: &Handle<StandardMaterial>,
+    occluder_material: &Handle<StandardMaterial>,
     world_min: &mut Vec3,
     world_max: &mut Vec3,
     raytracing_only: bool,
@@ -3287,11 +3311,18 @@ fn queue_partitions(
             .clone()
             .unwrap_or_else(|| format!("{}#Mesh0/Primitive0", partition.geometry));
         let material_object = partition_material(partition, material_slots, overrides);
-        let material = match material_object {
-            Some(object) => material_handles
-                .get(object)
-                .unwrap_or_else(|| panic!("converted material has no runtime handle: {object}")),
-            None => default_material,
+        // `raytracing_only` is `is_lightblocker_mesh`. A blocker is an occluder
+        // in UE rather than a surface, so it contributes no radiance to the
+        // BVH; see `occluder_material`.
+        let material = if raytracing_only {
+            occluder_material
+        } else {
+            match material_object {
+                Some(object) => material_handles.get(object).unwrap_or_else(|| {
+                    panic!("converted material has no runtime handle: {object}")
+                }),
+                None => default_material,
+            }
         };
         pending.push(PendingPartition {
             geometry: partition.geometry.clone(),
@@ -4226,6 +4257,69 @@ mod tests {
         assert!(!is_lightblocker_mesh(
             "/Game/Assets/Environment/ThroneRoom/Meshes/SM_ThroneRoom_Room_A1"
         ));
+    }
+
+    #[test]
+    fn lightblocker_partitions_trace_as_black_occluders() {
+        const BLOCKER_MATERIAL: &str = "/Game/Assets/Blockout/Materials/Placeholder.Placeholder";
+        // The converter fabricates this `Tint` for both blocker materials even
+        // though `Placeholder` has an empty expression graph, so the shared
+        // material path resolves them to white.
+        let record: MaterialRecord = serde_json::from_str(
+            r#"{
+                "object": "/Game/Assets/Blockout/Materials/Placeholder.Placeholder",
+                "parent": null,
+                "vectors": [
+                    {"name": "Tint", "association": "GlobalParameter", "index": -1, "value": "FFFFFFFF (FLinearColor)"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let records = HashMap::from([(record.object.clone(), record)]);
+        let authored = resolve_effective_material(
+            BLOCKER_MATERIAL,
+            &records,
+            &mut HashMap::new(),
+            &mut Vec::new(),
+        );
+        assert_eq!(material_base_color(&authored), Color::WHITE);
+        assert_eq!(occluder_material().base_color, Color::BLACK);
+
+        let mut materials = Assets::<StandardMaterial>::default();
+        let authored_handle = materials.add(StandardMaterial {
+            base_color: material_base_color(&authored),
+            ..default()
+        });
+        let default_material = materials.add(StandardMaterial::default());
+        let occluder = materials.add(occluder_material());
+        let handles = HashMap::from([(BLOCKER_MATERIAL.to_string(), authored_handle.clone())]);
+        let partitions: Vec<PartitionRecord> = serde_json::from_str(
+            r#"[{"geometry": "blocker", "meshlet": "blocker.meshlet", "material_slot": 0}]"#,
+        )
+        .unwrap();
+        let slots = [Some(BLOCKER_MATERIAL.to_string())];
+
+        let queued = |raytracing_only| {
+            let mut pending = Vec::new();
+            let (mut world_min, mut world_max) = (Vec3::ZERO, Vec3::ZERO);
+            queue_partitions(
+                &mut pending,
+                &partitions,
+                &slots,
+                &[],
+                Mat4::IDENTITY,
+                &handles,
+                &default_material,
+                &occluder,
+                &mut world_min,
+                &mut world_max,
+                raytracing_only,
+                true,
+            );
+            pending.remove(0).material
+        };
+        assert_eq!(queued(true), occluder);
+        assert_eq!(queued(false), authored_handle);
     }
 
     #[test]

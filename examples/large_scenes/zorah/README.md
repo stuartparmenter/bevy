@@ -467,7 +467,10 @@ average. The Niagara systems that do animate - the nebula orb's translucent
 shells and the GreenHouse butterflies - are exported but not spawned. UE
 light-blocker meshes are retained as
 ray-tracing occluders but intentionally omitted from camera-visible meshlet
-rasterization. The 225 components UE excludes from the shadow pass (1
+rasterization, and they trace black: their `Placeholder` and
+`M_Placeholder_Dark3` materials have no shading graph in UE, so the `Tint =
+FFFFFFFF` the converter fabricates for them would otherwise make Throne Room's
+6,087 m2 of invisible blockers the room's brightest diffuse reflector. The 225 components UE excludes from the shadow pass (1
 GreenHouse, 216 Restir, 8 Throne Room) become `NotShadowCaster`, which meshlet
 raster honors; Solari's TLAS carries every instance, so they still occlude
 there.
