@@ -1,9 +1,10 @@
 import hashlib
+import io
 import json
 import sys
 import tempfile
 import unittest
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -373,6 +374,72 @@ class IncrementalConversionTests(unittest.TestCase):
             verify_conversion.effective_material(overrides, slots, 0, 0),
             "/Game/Materials/MI_Base.MI_Base",
         )
+
+    def test_diagnostic_materials_name_the_requesting_mesh_slot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            loose = root / "loose"
+            missing = "/Game/Materials/MI_Absent.MI_Absent"
+            write_json(
+                loose / "geometry.json",
+                {
+                    "material_resolutions": [
+                        {
+                            "mesh": "/Game/Meshes/SM_Bush.SM_Bush",
+                            "slot": "1",
+                            "name": "MI_Absent",
+                            "material": missing,
+                        },
+                        {
+                            "mesh": "/Game/Meshes/SM_Cap.SM_Cap",
+                            "slot": "0",
+                            "name": "M_Stone",
+                            "material": convert.WORLD_GRID_MATERIAL,
+                        },
+                        {
+                            "mesh": "/Game/Meshes/SM_Pot.SM_Pot",
+                            "slot": "0",
+                            "name": "MI_Pot",
+                            "material": "/Game/Materials/MI_Pot.MI_Pot",
+                        },
+                    ]
+                },
+            )
+            manifest = root / "materials.source.json"
+            write_json(
+                manifest,
+                {
+                    "materials": [
+                        {"object": missing, "type": "MissingSourceMaterial"},
+                        {
+                            "object": "/Game/Materials/MI_Pot.MI_Pot",
+                            "type": "MaterialInstanceConstant",
+                        },
+                    ]
+                },
+            )
+
+            output = io.StringIO()
+            with redirect_stdout(output):
+                convert.report_diagnostic_materials(loose, manifest)
+
+            reported = [
+                line
+                for line in output.getvalue().splitlines()
+                if line.startswith("ZORAH_CONVERT_DIAGNOSTIC_MATERIAL")
+            ]
+            self.assertEqual(
+                reported,
+                [
+                    "ZORAH_CONVERT_DIAGNOSTIC_MATERIAL "
+                    "mesh=/Game/Meshes/SM_Bush.SM_Bush slot=1 name=MI_Absent "
+                    f"object={missing} reason=project-material-absent-from-download",
+                    "ZORAH_CONVERT_DIAGNOSTIC_MATERIAL "
+                    "mesh=/Game/Meshes/SM_Cap.SM_Cap slot=0 name=M_Stone "
+                    f"object={convert.WORLD_GRID_MATERIAL} "
+                    "reason=unreal-unassigned-slot-fallback",
+                ],
+            )
 
     def test_engine_primitive_requires_authored_override(self):
         with tempfile.TemporaryDirectory() as directory:

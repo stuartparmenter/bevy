@@ -89,9 +89,10 @@ ENGINE_PRIMITIVES = {
     "/Engine/EngineMeshes/Cube.Cube",
     "/Engine/BasicShapes/Plane.Plane",
 }
+WORLD_GRID_MATERIAL = "/Engine/EngineMaterials/WorldGridMaterial.WorldGridMaterial"
 ENGINE_MATERIALS = {
     "/Engine/EngineDebugMaterials/BlackUnlitMaterial.BlackUnlitMaterial",
-    "/Engine/EngineMaterials/WorldGridMaterial.WorldGridMaterial",
+    WORLD_GRID_MATERIAL,
 }
 
 
@@ -863,6 +864,32 @@ def apply_exact_mesh_materials(
     write_json_if_changed(loose / "material-input.json", sorted(material_objects))
 
 
+def report_diagnostic_materials(loose: Path, material_manifest: Path) -> None:
+    """Name every mesh slot that renders as the magenta diagnostic material.
+
+    The material manifest only records the object path a lookup failed on, so
+    join it back to geometry.json's per-slot resolutions to say which mesh and
+    which slot asked for it. Nothing here is fixable from the download: see
+    KnownMissingProjectMaterials in Program.cs for what was ruled out.
+    """
+    reasons = {WORLD_GRID_MATERIAL: "unreal-unassigned-slot-fallback"}
+    reasons.update(
+        (record["object"], "project-material-absent-from-download")
+        for record in load_json(material_manifest).get("materials", [])
+        if record.get("type") == "MissingSourceMaterial"
+    )
+    for record in load_json(loose / "geometry.json").get("material_resolutions", []):
+        reason = reasons.get(record.get("material"))
+        if reason is None:
+            continue
+        print(
+            f"ZORAH_CONVERT_DIAGNOSTIC_MATERIAL mesh={record['mesh']} "
+            f"slot={record['slot']} name={record['name']} "
+            f"object={record['material']} reason={reason}",
+            flush=True,
+        )
+
+
 def validate_engine_primitive_overrides(scene_paths: list[Path]) -> None:
     """Require an authored material for every generated Engine primitive."""
     for scene_path in scene_paths:
@@ -1374,6 +1401,7 @@ def main() -> int:
                 next_materials,
             )
         os.replace(next_materials, materials)
+    report_diagnostic_materials(loose, materials)
 
     textures = loose / "textures.json"
     if args.refresh_source or not texture_inventory_matches(materials, textures):

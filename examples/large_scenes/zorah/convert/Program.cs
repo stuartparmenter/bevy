@@ -28,6 +28,18 @@ static class ZorahConvert
         "Restir_Level",
         "ThroneRoom_Level",
     ];
+    // SM_TravelersPalm_A01_01 and SM_Tree_F02_SmallBush_01 are the only meshes
+    // that reference these, and Content/Assets/Vegetation/{TravelersPalm_A,
+    // Tree_F}/ ship with a Meshes/ subdirectory and nothing else. Ruled out,
+    // against the 2026-08-02 download (changelist 275914), by grepping the name
+    // table of all 12,750 packages under Content/ for "Tree_F" and
+    // "TravelersPalm": the substrings occur only in those two meshes and in the
+    // 22 + 2 __ExternalActors__ that place them. So there is no renamed copy in
+    // MaterialLibrary/, Materials/ or Merged/, and no ObjectRedirector either -
+    // a redirector would still carry the old object name that these meshes ask
+    // for. The names below are byte-for-byte the interface paths in each mesh's
+    // StaticMaterials array (verify with `inspect SM_Tree_F02_SmallBush_01`),
+    // so this is not a spelling or slot-index mismatch.
     private static readonly HashSet<string> KnownMissingProjectMaterials = new(
         [
             "/Game/Assets/Vegetation/TravelersPalm_A/Materials/MI_TravelersPalm_Zorah_A01_Atlas.MI_TravelersPalm_Zorah_A01_Atlas",
@@ -586,6 +598,11 @@ static class ZorahConvert
             var packageKey = ObjectPathToPackageKey(objectPath);
             if (!packageLookup.TryGetValue(packageKey, out var packagePath))
             {
+                Console.Error.WriteLine(
+                    $"ZORAH_MATERIAL_UNRESOLVED object={objectPath} package={packageKey} " +
+                    "reason=no-such-package-under-content " +
+                    $"known_missing={KnownMissingProjectMaterials.Contains(objectPath)}"
+                );
                 if (KnownMissingProjectMaterials.Contains(objectPath))
                 {
                     // The fixed Zorah 1.1.0 download contains these exact mesh

@@ -5,7 +5,7 @@
 mod zorah_bundle;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     env, fs,
     path::{Path, PathBuf},
     time::Instant,
@@ -85,6 +85,9 @@ fn ue_sky_light_illuminance(intensity: f32) -> f32 {
 const UE_BLACK_UNLIT_MATERIAL: &str =
     "/Engine/EngineDebugMaterials/BlackUnlitMaterial.BlackUnlitMaterial";
 const UE_WORLD_GRID_MATERIAL: &str = "/Engine/EngineMaterials/WorldGridMaterial.WorldGridMaterial";
+/// `MaterialRecord::kind` the converter writes for a material the mesh
+/// references but the project download does not contain.
+const MISSING_SOURCE_MATERIAL: &str = "MissingSourceMaterial";
 const BASE_COLOR_TEXTURE_NAMES: &[&str] = &[
     "basecolortexture",
     "diffusetexture",
@@ -560,6 +563,8 @@ struct MaterialManifest {
 #[derive(Clone, Deserialize)]
 struct MaterialRecord {
     object: String,
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
     parent: Option<String>,
     #[serde(default)]
     emissive: Option<bool>,
@@ -1127,8 +1132,12 @@ fn partition_material<'a>(
         })
 }
 
-fn used_material_objects(converted: &ConvertedWorld) -> HashSet<String> {
-    let mut used = HashSet::new();
+/// Every material a visible partition renders with, mapped to the mesh slots
+/// that ask for it as `<mesh object> slot <LOD0 section index>`. The slots name
+/// the requester whether the assignment came from the mesh or from a component
+/// override, which is what a diagnostic material has to report.
+fn used_material_objects(converted: &ConvertedWorld) -> BTreeMap<String, BTreeSet<String>> {
+    let mut used: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for actor in &converted.actors {
         if actor.hidden {
             continue;
@@ -1149,7 +1158,9 @@ fn used_material_objects(converted: &ConvertedWorld) -> HashSet<String> {
                     &mesh.material_slots,
                     &component.override_materials,
                 ) {
-                    used.insert(material.to_string());
+                    used.entry(material.to_string())
+                        .or_default()
+                        .insert(format!("{mesh_name} slot {}", partition.material_slot));
                 }
             }
         }
@@ -1157,10 +1168,25 @@ fn used_material_objects(converted: &ConvertedWorld) -> HashSet<String> {
     used
 }
 
+/// Why a material renders as the magenta diagnostic: the project download has
+/// nothing to reproduce. `convert.py`'s `report_diagnostic_materials` prints the
+/// same reasons at conversion time, with the authored slot names.
+fn diagnostic_material_reason(
+    object: &str,
+    materials: &HashMap<String, MaterialRecord>,
+) -> Option<&'static str> {
+    if object == UE_WORLD_GRID_MATERIAL {
+        return Some("UE renders this slot with its unassigned-slot fallback");
+    }
+    let kind = materials.get(object)?.kind.as_deref()?;
+    (kind == MISSING_SOURCE_MATERIAL)
+        .then_some("the material package is absent from the project download")
+}
+
 fn selected_texture_bundle_roots(converted: &ConvertedWorld) -> Vec<String> {
     let mut roots = HashSet::new();
     let mut effective_cache = HashMap::new();
-    for object in used_material_objects(converted) {
+    for object in used_material_objects(converted).into_keys() {
         let effective = resolve_effective_material(
             &object,
             &converted.materials,
@@ -1292,9 +1318,15 @@ fn build_material_handles(
             }
         }
     }
-    let mut objects: Vec<_> = used.into_iter().collect();
-    objects.sort();
-    for object in objects {
+    for (object, requesters) in used {
+        if let Some(reason) = diagnostic_material_reason(&object, &converted.materials) {
+            let requesters: Vec<_> = requesters.iter().map(String::as_str).collect();
+            warn!(
+                material = %object,
+                requested_by = %requesters.join(", "),
+                "{reason}; rendering the magenta diagnostic material"
+            );
+        }
         if object == UE_BLACK_UNLIT_MATERIAL {
             result.insert(
                 object,
@@ -1307,9 +1339,9 @@ fn build_material_handles(
             continue;
         }
         if object == UE_WORLD_GRID_MATERIAL {
-            // Engine content is not part of the downloadable Zorah project.
-            // Make the exact WorldGridMaterial reference visibly diagnostic
-            // instead of silently falling back to an unrelated scene material.
+            // Never substitute a scene material whose name merely resembles the
+            // authored slot name: the slot's assignment really is the engine
+            // fallback, and engine content is not part of the download.
             result.insert(
                 object,
                 materials.add(StandardMaterial {
@@ -3261,6 +3293,7 @@ mod tests {
                 material_name.clone(),
                 MaterialRecord {
                     object: material_name,
+                    kind: None,
                     parent: None,
                     emissive: None,
                     scalars: vec![],
