@@ -690,6 +690,33 @@ class IncrementalConversionTests(unittest.TestCase):
             write_json(scene, {"actors": [{"lights": [placed]}]})
             convert.validate_blueprint_light_archetypes([scene])
 
+    def test_child_actors_must_be_parented_onto_their_component(self):
+        with tempfile.TemporaryDirectory() as directory:
+            scene = Path(directory) / "Restir_Level.json"
+            child = {
+                "name": (
+                    "SMG_Courtyard_FirePotExterior_A2_0_GEN_VARIABLE_"
+                    "SMG_Courtyard_FirePotExterior_A2_0_C_CAT_UAID_9C6B_1891711581"
+                ),
+                "label": "SMG_Courtyard_FirePotExterior_A2_0",
+                "type": "SMG_Courtyard_FirePotExterior_A2_0_C",
+            }
+            write_json(scene, {"actors": [child]})
+            with self.assertRaisesRegex(RuntimeError, "un-parented child actor"):
+                convert.validate_child_actor_placement([scene])
+
+            # The planter that owns it keeps its own name and the child's meshes.
+            parent = {
+                "name": "SMG_Courtyard_Planter_Fire_D1_1_C_UAID_9C6B_1891708580",
+                "label": "SMG_Courtyard_Planter_Fire_D1_1",
+                "type": "SMG_Courtyard_Planter_Fire_D1_1_C",
+                "components": [
+                    {"name": "SMG_Courtyard_FirePotExterior_A2_0.SM_Courtyard_FirePotExterior_A2_1"}
+                ],
+            }
+            write_json(scene, {"actors": [parent]})
+            convert.validate_child_actor_placement([scene])
+
     def test_interrupted_install_promotes_the_packed_tree(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

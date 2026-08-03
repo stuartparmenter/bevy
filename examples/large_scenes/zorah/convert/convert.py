@@ -28,15 +28,18 @@ EXPECTED_POST_PROCESS_BLOOM = {
     "Restir_Level": (None, None),
     "ThroneRoom_Level": ("BM_FFT", 0.003),
 }
+# One actor per external-actor package: a UChildActorComponent's child is saved
+# beside its parent in the same package, and the export re-parents it onto the
+# parent instead of listing it as an actor of its own.
 EXPECTED_SCENE_INVENTORY = {
     "GreenHouse_Level": {
-        "actors": 1795,
+        "actors": 1788,
         "actor_packages": 1788,
         "unresolved_mesh_components": 27,
         "referenced_meshes": 299,
     },
     "Restir_Level": {
-        "actors": 1926,
+        "actors": 1924,
         "actor_packages": 1924,
         "unresolved_mesh_components": 0,
         "referenced_meshes": 271,
@@ -440,6 +443,32 @@ def validate_blueprint_light_archetypes(scene_paths: list[Path]) -> None:
                         f"{light.get('name')} carries un-merged blueprint archetype "
                         "defaults; re-export the scene manifests"
                     )
+
+
+def is_child_actor_template(actor: dict) -> bool:
+    """True for the actor a UChildActorComponent spawned from its template.
+
+    UE names that export <component>_<child class>_CAT, so the actor's own type
+    appears inside its name; nothing else in the levels is named that way.
+    """
+    return f"_{actor.get('type', '')}_CAT" in (actor.get("name") or "")
+
+
+def validate_child_actor_placement(scene_paths: list[Path]) -> None:
+    """Reject a child actor still standing as an actor of its own.
+
+    The level saves it with an identity root transform, because its placement
+    lives on the parent's UChildActorComponent, so one that survives the export
+    puts its meshes at the map origin instead of on its parent.
+    """
+    for scene_path in scene_paths:
+        for actor in load_json(scene_path).get("actors", []):
+            if is_child_actor_template(actor):
+                raise RuntimeError(
+                    f"{scene_path.name} actor "
+                    f"{actor.get('label') or actor.get('name')} is an un-parented "
+                    "child actor; re-export the scene manifests"
+                )
 
 
 def install_scene_manifests(
@@ -1306,6 +1335,7 @@ def main() -> int:
         if not all(scene_manifest_is_current(path) for path in next_paths):
             raise RuntimeError("scene-only export did not produce current light manifests")
         validate_blueprint_light_archetypes(next_paths)
+        validate_child_actor_placement(next_paths)
         install_scene_manifests(next_paths, work, loose, output)
         next_scene_directory.rmdir()
         verify_runtime(output, cargo, audit_capacity=True)
@@ -1353,6 +1383,7 @@ def main() -> int:
         shutil.copy2(path, loose / "scenes" / f"{level}.json")
     validate_engine_primitive_overrides(scene_paths)
     validate_blueprint_light_archetypes(scene_paths)
+    validate_child_actor_placement(scene_paths)
 
     geometry_document = load_json(loose / "geometry.json")
     mesh_material_input = work / "mesh-material-input.json"

@@ -1382,6 +1382,28 @@ static class ZorahConvert
                     }
                 }
             }
+            if (obj is UChildActorComponent childActorComponent)
+            {
+                Console.WriteLine(
+                    "ZORAH_CHILD_ACTOR_COMPONENT " +
+                    $"child_actor={ChildActor(childActorComponent)?.Name ?? "None"}"
+                );
+                foreach (var record in ConvertChildActorComponents(
+                    provider,
+                    objects,
+                    InspectArchetypes(provider, obj, objects),
+                    [obj]
+                ))
+                {
+                    Console.WriteLine(
+                        $"ZORAH_CHILD_ACTOR_MESH name={record.Name} " +
+                        $"mesh={record.Mesh ?? "None"} " +
+                        $"translation={Format(record.Transform.Translation)} " +
+                        $"rotation={Format(record.Transform.Rotation)} " +
+                        $"scale={Format(record.Transform.Scale)}"
+                    );
+                }
+            }
             if (obj is USceneComponent sceneComponent)
             {
                 var transform = ConvertTransform(sceneComponent.GetRelativeTransform());
@@ -1519,9 +1541,7 @@ static class ZorahConvert
         return new ComponentArchetypes(
             actor,
             actor is null ? null : FindRootComponent(actor, packageObjects),
-            actor is null
-                ? Array.Empty<UObject>()
-                : packageObjects.Where(obj => FindOwningActor(obj)?.Name == actor.Name),
+            actor is null ? [] : OwnedComponents(actor, packageObjects),
             LoadBlueprintComponentTemplates(provider, actor?.Class?.GetPathName())
         );
     }
@@ -1579,8 +1599,15 @@ static class ZorahConvert
             try
             {
                 var objects = provider.LoadPackage(packagePath).GetExports().ToArray();
+                var childActorNames = objects
+                    .OfType<UChildActorComponent>()
+                    .Select(ChildActor)
+                    .OfType<UObject>()
+                    .Select(child => child.Name)
+                    .ToHashSet(StringComparer.Ordinal);
                 var packageActors = objects
                     .Where(IsExternalActorRoot)
+                    .Where(actor => !childActorNames.Contains(actor.Name))
                     .OrderBy(actor => actor.Name)
                     .ToArray();
                 if (packageActors.Length == 0)
@@ -1592,9 +1619,7 @@ static class ZorahConvert
                 {
                     Increment(actorTypes, actor.ExportType);
                     var rootComponent = FindRootComponent(actor, objects);
-                    var owned = objects
-                        .Where(component => FindOwningActor(component)?.Name == actor.Name)
-                        .ToArray();
+                    var owned = OwnedComponents(actor, objects);
                     var archetypes = new ComponentArchetypes(
                         actor,
                         rootComponent,
@@ -1605,6 +1630,7 @@ static class ZorahConvert
                         .OfType<UStaticMeshComponent>()
                         .OrderBy(component => component.Name)
                         .Select(component => ConvertComponent(provider, component, archetypes))
+                        .Concat(ConvertChildActorComponents(provider, objects, archetypes, owned))
                         .ToArray();
 
                     var lights = owned
@@ -1802,6 +1828,9 @@ static class ZorahConvert
         return null;
     }
 
+    private static UObject[] OwnedComponents(UObject actor, UObject[] packageObjects) =>
+        packageObjects.Where(obj => FindOwningActor(obj)?.Name == actor.Name).ToArray();
+
     private static UObject? FindRootComponent(UObject actor, UObject[] packageObjects)
     {
         try
@@ -1818,9 +1847,7 @@ static class ZorahConvert
             // stripped editor template. Fall back to the exported component name.
         }
 
-        var owned = packageObjects
-            .Where(obj => FindOwningActor(obj)?.Name == actor.Name)
-            .ToArray();
+        var owned = OwnedComponents(actor, packageObjects);
         return owned.FirstOrDefault(obj => obj.Name is "DefaultSceneRoot" or "DefaultSceneRoot_0")
             ?? owned.FirstOrDefault(obj => obj.ExportType.EndsWith(
                 "RootComponent",
@@ -1883,6 +1910,54 @@ static class ZorahConvert
                 )
                 : null
         );
+    }
+
+    // The blueprint's component keeps a ChildActorTemplate; a placed instance
+    // serializes the actor it spawned from that template as ChildActor instead.
+    private static UObject? ChildActor(UChildActorComponent component) =>
+        (GetTaggedValue(component, "ChildActor") as FPackageIndex)?.Load();
+
+    // UChildActorComponent spawns its child at the component's world transform
+    // and attaches the spawned root to the component, so the child's own root
+    // transform never applies. The level saves that child as a package-level
+    // export sitting beside its parent, which is why its meshes have to be
+    // re-parented here instead of being emitted as their own actor.
+    private static StaticMeshComponentRecord[] ConvertChildActorComponents(
+        DefaultFileProvider provider,
+        UObject[] packageObjects,
+        ComponentArchetypes archetypes,
+        UObject[] ownedComponents
+    )
+    {
+        var records = new List<StaticMeshComponentRecord>();
+        foreach (var component in ownedComponents
+            .OfType<UChildActorComponent>()
+            .OrderBy(component => component.Name, StringComparer.Ordinal))
+        {
+            var childActor = ChildActor(component);
+            if (childActor is null)
+            {
+                continue;
+            }
+            var childOwned = OwnedComponents(childActor, packageObjects);
+            var childArchetypes = new ComponentArchetypes(
+                childActor,
+                FindRootComponent(childActor, packageObjects),
+                childOwned,
+                LoadBlueprintComponentTemplates(provider, childActor.Class?.GetPathName())
+            );
+            var childTransform = archetypes.TransformRelativeToActor(component);
+            records.AddRange(childOwned
+                .OfType<UStaticMeshComponent>()
+                .OrderBy(mesh => mesh.Name, StringComparer.Ordinal)
+                .Select(mesh => ConvertComponent(provider, mesh, childArchetypes))
+                .Select(record => record with
+                {
+                    Name = $"{component.Name}.{record.Name}",
+                    Transform = ComposeTransforms(childTransform, record.Transform),
+                }));
+        }
+        return records.ToArray();
     }
 
     private static string ClassifyMissingMesh(
