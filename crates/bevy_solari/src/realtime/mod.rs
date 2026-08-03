@@ -222,6 +222,24 @@ mod shader_source_tests {
     }
 
     #[test]
+    fn shadow_rays_do_not_spend_the_origin_bias_at_the_light_end() {
+        // The light point lies exactly on the traced triangle, so truncating the ray by the shading
+        // surface's BLAS error charged that error twice and hid every occluder standing closer to
+        // its light than the bias.
+        let sampling = include_str!("../scene/sampling.wgsl");
+        assert!(!sampling.contains("dist - ray_origin_bias"));
+        assert!(
+            sampling.contains("dist - max(RAY_T_MIN, LIGHT_SAMPLE_END_EPSILON_RELATIVE * dist)")
+        );
+
+        // A light inside the offset shell has nothing between it and the surface, so it is visible.
+        // Reporting it occluded is what stopped emitters lighting the geometry they sit on.
+        assert!(sampling.contains(
+            "if dist <= RAY_T_MIN || t_max < RAY_T_MIN { return VisibilityRay(ray_origin, vec3(0.0), 0.0, false, 1.0); }"
+        ));
+    }
+
+    #[test]
     fn world_cache_linear_probe_wraps() {
         let world_cache_query = include_str!("world_cache_query.wgsl");
         assert!(world_cache_query.contains("key = wrap_key(key + 1u);"));

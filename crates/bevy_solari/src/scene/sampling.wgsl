@@ -274,43 +274,60 @@ fn calculate_resolved_light_contribution(resolved_light_sample: ResolvedLightSam
     return LightContribution(radiance, resolved_light_sample.inverse_pdf, inverse_solid_angle_pdf, wi, resolved_light_sample.world_position.w == 1.0, false);
 }
 
-fn trace_visibility(ray_origin_in: vec3<f32>, origin_world_normal: vec3<f32>, point: vec4<f32>, ray_origin_bias: f32) -> f32 {
-    var ray_direction = point.xyz;
-    var ray_t_max = RAY_T_MAX;
+// The light sample point is resolved from the same vertex buffers and the same instance transform
+// the BLAS was built from, so it lies exactly on the traced triangle. All the far end of a shadow
+// ray has to survive is float rounding - not a geometry error. Spending the origin's error there as
+// well truncated every shadow ray by that error a second time, which erased the shadow of any
+// occluder standing closer to its light than the bias.
+const LIGHT_SAMPLE_END_EPSILON_RELATIVE = 0.001f;
 
-    if point.w == 1.0 {
-        let ray = ray_direction - ray_origin_in;
-        let dist = length(ray);
-        if !(dist > ray_origin_bias) || !isfinite(dist) { return 0.0; }
-        ray_direction = ray / dist;
-        ray_t_max = dist - ray_origin_bias;
-    }
+struct VisibilityRay {
+    origin: vec3<f32>,
+    direction: vec3<f32>,
+    t_max: f32,
+    // False when the two points settle the query on their own and no ray is needed.
+    trace: bool,
+    // Visibility to report when `trace` is false.
+    visibility: f32,
+}
 
-    if !isfinite3(ray_direction) || ray_t_max < RAY_T_MIN { return 0.0; }
-    let side = select(-1.0, 1.0, dot(origin_world_normal, ray_direction) >= 0.0);
+fn setup_visibility_ray(ray_origin_in: vec3<f32>, origin_world_normal: vec3<f32>, point: vec4<f32>, ray_origin_bias: f32) -> VisibilityRay {
+    let toward_light = select(point.xyz, point.xyz - ray_origin_in, point.w == 1.0);
+    if !isfinite3(toward_light) { return VisibilityRay(ray_origin_in, vec3(0.0), 0.0, false, 0.0); }
+
+    // Lift the origin clear of its own instance's simplified BLAS first, then measure the ray from
+    // where it actually starts, so the bias is spent once instead of at both ends.
+    let side = select(-1.0, 1.0, dot(origin_world_normal, toward_light) >= 0.0);
     let ray_origin = ray_origin_in + origin_world_normal * side * max(ray_origin_bias, RAY_T_MIN);
 
-    let ray_hit = trace_ray(ray_origin, ray_direction, RAY_T_MIN, ray_t_max, RAY_FLAG_TERMINATE_ON_FIRST_HIT);
+    if point.w != 1.0 {
+        return VisibilityRay(ray_origin, point.xyz, RAY_T_MAX, true, 0.0);
+    }
+
+    let ray = point.xyz - ray_origin;
+    let dist = length(ray);
+    let t_max = dist - max(RAY_T_MIN, LIGHT_SAMPLE_END_EPSILON_RELATIVE * dist);
+    if !isfinite(dist) { return VisibilityRay(ray_origin, vec3(0.0), 0.0, false, 0.0); }
+    // The light sits inside the shell the origin was lifted into, so nothing can lie between the
+    // two points. Reporting that as occluded is what stopped a candle body being lit by its flame.
+    if dist <= RAY_T_MIN || t_max < RAY_T_MIN { return VisibilityRay(ray_origin, vec3(0.0), 0.0, false, 1.0); }
+
+    return VisibilityRay(ray_origin, ray / dist, t_max, true, 0.0);
+}
+
+fn trace_visibility(ray_origin_in: vec3<f32>, origin_world_normal: vec3<f32>, point: vec4<f32>, ray_origin_bias: f32) -> f32 {
+    let ray = setup_visibility_ray(ray_origin_in, origin_world_normal, point, ray_origin_bias);
+    if !ray.trace { return ray.visibility; }
+
+    let ray_hit = trace_ray(ray.origin, ray.direction, RAY_T_MIN, ray.t_max, RAY_FLAG_TERMINATE_ON_FIRST_HIT);
     return f32(ray_hit.kind == RAY_QUERY_INTERSECTION_NONE);
 }
 
 fn trace_visibility_previous_frame(ray_origin_in: vec3<f32>, origin_world_normal: vec3<f32>, point: vec4<f32>, ray_origin_bias: f32) -> f32 {
-    var ray_direction = point.xyz;
-    var ray_t_max = RAY_T_MAX;
+    let ray = setup_visibility_ray(ray_origin_in, origin_world_normal, point, ray_origin_bias);
+    if !ray.trace { return ray.visibility; }
 
-    if point.w == 1.0 {
-        let ray = ray_direction - ray_origin_in;
-        let dist = length(ray);
-        if !(dist > ray_origin_bias) || !isfinite(dist) { return 0.0; }
-        ray_direction = ray / dist;
-        ray_t_max = dist - ray_origin_bias;
-    }
-
-    if !isfinite3(ray_direction) || ray_t_max < RAY_T_MIN { return 0.0; }
-    let side = select(-1.0, 1.0, dot(origin_world_normal, ray_direction) >= 0.0);
-    let ray_origin = ray_origin_in + origin_world_normal * side * max(ray_origin_bias, RAY_T_MIN);
-
-    let ray_hit = trace_ray_previous_frame(ray_origin, ray_direction, RAY_T_MIN, ray_t_max, RAY_FLAG_TERMINATE_ON_FIRST_HIT);
+    let ray_hit = trace_ray_previous_frame(ray.origin, ray.direction, RAY_T_MIN, ray.t_max, RAY_FLAG_TERMINATE_ON_FIRST_HIT);
     return f32(ray_hit.kind == RAY_QUERY_INTERSECTION_NONE);
 }
 
