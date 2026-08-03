@@ -357,41 +357,47 @@ static class ZorahConvert
         var temporaryPath = outputPath + $".tmp.{Environment.ProcessId}";
         try
         {
-            await using var output = File.Create(temporaryPath);
             var blockSize = 1 << blockSizeExponent;
             ulong written = 0;
-            for (var index = 0; index < blockSizes.Length; index++)
+            // Scoped so the handle is closed before the move; Windows refuses
+            // to rename a file that is still open.
+            await using (var output = File.Create(temporaryPath))
             {
-                var compressed = reader.ReadBytes(checked((int)blockSizes[index]));
-                if (compressed.Length != blockSizes[index])
+                for (var index = 0; index < blockSizes.Length; index++)
                 {
-                    throw new EndOfStreamException($"truncated compressed block {index}");
-                }
-                var remaining = rawSize - written;
-                var rawBlockSize = checked((int)Math.Min((ulong)blockSize, remaining));
-                if (compressed.Length >= rawBlockSize)
-                {
-                    await output.WriteAsync(compressed.AsMemory(0, rawBlockSize));
-                }
-                else
-                {
-                    var raw = new byte[rawBlockSize];
-                    var decoded = OodleDecompressor.Decompress(compressed, raw);
-                    if (decoded != rawBlockSize)
+                    var compressed = reader.ReadBytes(checked((int)blockSizes[index]));
+                    if (compressed.Length != blockSizes[index])
                     {
-                        throw new InvalidDataException(
-                            $"OodleSharp block {index} decoded {decoded} bytes; expected {rawBlockSize}"
-                        );
+                        throw new EndOfStreamException($"truncated compressed block {index}");
                     }
-                    await output.WriteAsync(raw);
+                    var remaining = rawSize - written;
+                    var rawBlockSize = checked((int)Math.Min((ulong)blockSize, remaining));
+                    if (compressed.Length >= rawBlockSize)
+                    {
+                        await output.WriteAsync(compressed.AsMemory(0, rawBlockSize));
+                    }
+                    else
+                    {
+                        var raw = new byte[rawBlockSize];
+                        var decoded = OodleDecompressor.Decompress(compressed, raw);
+                        if (decoded != rawBlockSize)
+                        {
+                            throw new InvalidDataException(
+                                $"OodleSharp block {index} decoded {decoded} bytes; expected {rawBlockSize}"
+                            );
+                        }
+                        await output.WriteAsync(raw);
+                    }
+                    written += (uint)rawBlockSize;
                 }
-                written += (uint)rawBlockSize;
+                if (written != rawSize)
+                {
+                    throw new InvalidDataException(
+                        $"raw-source wrote {written} bytes; expected {rawSize}"
+                    );
+                }
+                await output.FlushAsync();
             }
-            if (written != rawSize)
-            {
-                throw new InvalidDataException($"raw-source wrote {written} bytes; expected {rawSize}");
-            }
-            await output.FlushAsync();
             File.Move(temporaryPath, outputPath);
         }
         catch
