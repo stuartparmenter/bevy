@@ -12,17 +12,21 @@ struct InstanceGeometryIds {
     index_buffer_id: u32,
     index_buffer_offset: u32,
     triangle_count: u32,
+    vertex_stride_words: u32,
+    world_geometry_error: f32,
+    _padding: f32,
 }
 
-struct VertexBuffer { vertices: array<PackedVertex> }
+struct SceneParameters {
+    environment_radiance: vec3<f32>,
+    max_world_geometry_error: f32,
+    inverse_environment_light_pdf: f32,
+    _padding: vec3<f32>,
+}
+
+struct VertexBuffer { words: array<u32> }
 
 struct IndexBuffer { indices: array<u32> }
-
-struct PackedVertex {
-    a: vec4<f32>,
-    b: vec4<f32>,
-    tangent: vec4<f32>,
-}
 
 struct Vertex {
     position: vec3<f32>,
@@ -31,12 +35,32 @@ struct Vertex {
     tangent: vec4<f32>,
 }
 
-fn unpack_vertex(packed: PackedVertex) -> Vertex {
+fn load_vertex(vertex_buffer_id: u32, index: u32, stride: u32) -> Vertex {
+    let base = index * stride;
     var vertex: Vertex;
-    vertex.position = packed.a.xyz;
-    vertex.normal = vec3(packed.a.w, packed.b.xy);
-    vertex.uv = packed.b.zw;
-    vertex.tangent = packed.tangent;
+    vertex.position = vec3<f32>(
+        bitcast<f32>(vertex_buffers[vertex_buffer_id].words[base]),
+        bitcast<f32>(vertex_buffers[vertex_buffer_id].words[base + 1u]),
+        bitcast<f32>(vertex_buffers[vertex_buffer_id].words[base + 2u]),
+    );
+    vertex.normal = vec3<f32>(
+        bitcast<f32>(vertex_buffers[vertex_buffer_id].words[base + 3u]),
+        bitcast<f32>(vertex_buffers[vertex_buffer_id].words[base + 4u]),
+        bitcast<f32>(vertex_buffers[vertex_buffer_id].words[base + 5u]),
+    );
+    vertex.uv = vec2<f32>(
+        bitcast<f32>(vertex_buffers[vertex_buffer_id].words[base + 6u]),
+        bitcast<f32>(vertex_buffers[vertex_buffer_id].words[base + 7u]),
+    );
+    vertex.tangent = vec4<f32>(0.0);
+    if stride >= 12u {
+        vertex.tangent = vec4<f32>(
+            bitcast<f32>(vertex_buffers[vertex_buffer_id].words[base + 8u]),
+            bitcast<f32>(vertex_buffers[vertex_buffer_id].words[base + 9u]),
+            bitcast<f32>(vertex_buffers[vertex_buffer_id].words[base + 10u]),
+            bitcast<f32>(vertex_buffers[vertex_buffer_id].words[base + 11u]),
+        );
+    }
     return vertex;
 }
 
@@ -50,21 +74,37 @@ struct Material {
     perceptual_roughness: f32,
     emissive: vec3<f32>,
     metallic: f32,
-    _padding: vec3<f32>,
+    flags: u32,
+    _padding_a: u32,
+    _padding_b: u32,
     reflectance: f32,
+    uv_transform: mat3x3<f32>,
 }
 
 const TEXTURE_MAP_NONE = 0xFFFFFFFFu;
 
+// Mirrors the behavior of StandardMaterialFlags::FLIP_NORMAL_MAP_Y in the raster path. The bit
+// value is Solari's own; binder.rs sets it from StandardMaterial::flip_normal_map_y.
+const MATERIAL_FLAGS_FLIP_NORMAL_MAP_Y = 1u;
+
 const MIRROR_ROUGHNESS_THRESHOLD = 0.001f;
 
 struct LightSource {
-    kind: u32, // 1 bit for kind, 31 bits for extra data
+    // The low bit is the kind. For emissive meshes, the upper 31 bits are the
+    // first triangle in this logical light's at-most-65535-triangle chunk.
+    kind: u32,
     id: u32,
 }
 
 const LIGHT_SOURCE_KIND_EMISSIVE_MESH = 0u;
 const LIGHT_SOURCE_KIND_DIRECTIONAL = 1u;
+// Resolves like a directional light, but its radiance is also what a missed BRDF ray picks up from
+// sample_environment_radiance, so the two strategies have to be MIS-weighted against each other.
+const LIGHT_SOURCE_KIND_ENVIRONMENT = 3u;
+
+fn light_source_is_emissive_mesh(light_source: LightSource) -> bool {
+    return (light_source.kind & 1u) == 0u;
+}
 
 struct DirectionalLight {
     direction_to_light: vec3<f32>,
@@ -91,11 +131,65 @@ const LIGHT_NOT_PRESENT_THIS_FRAME = 0xFFFFFFFFu;
 @group(0) @binding(13) var<storage> previous_frame_light_id_translations: array<u32>;
 @group(0) @binding(14) var brdf_dfg_lut: texture_2d<f32>;
 @group(0) @binding(15) var brdf_dfg_lut_sampler: sampler;
+@group(0) @binding(16) var<storage, read> scene_parameters: SceneParameters;
 
 const RAY_T_MIN = 0.001f;
 const RAY_T_MAX = 100000.0f;
 
 const RAY_NO_CULL = 0xFFu;
+
+fn primary_ray_origin_bias() -> f32 {
+    return RAY_T_MIN + max(scene_parameters.max_world_geometry_error, 0.0);
+}
+
+fn sample_environment_radiance(direction: vec3<f32>) -> vec3<f32> {
+    // Feather the horizon slightly to avoid a hard discontinuity while still
+    // modeling an upper-hemisphere captured sky.
+    let sky_visibility = smoothstep(-0.01, 0.01, direction.y);
+    return scene_parameters.environment_radiance * sky_visibility;
+}
+
+fn environment_light_pdf(direction: vec3<f32>) -> f32 {
+    if direction.y <= 0.0 || !(scene_parameters.inverse_environment_light_pdf > 0.0) {
+        return 0.0;
+    }
+    return 1.0 / scene_parameters.inverse_environment_light_pdf;
+}
+
+fn ray_origin_bias_for_instance(instance_id: u32) -> f32 {
+    return RAY_T_MIN + max(geometry_ids[instance_id].world_geometry_error, 0.0);
+}
+
+// The visibility buffer rasterizes whichever meshlet LOD keeps its simplification error under about
+// one pixel, so a shading point read back from the G-buffer sits up to a pixel's worth of world
+// space away from the fixed-LOD surface the BLAS holds - a gap that grows linearly with camera
+// distance. Past a few tens of meters it exceeds the BLAS build error that
+// `ray_origin_bias_for_instance` covers, the shading point ends up inside the traced proxy, and
+// every visibility and GI ray from it is instantly self-occluded. Widen the bias by the same bound
+// the LOD selector enforces (bevy_pbr::meshlet_cull_shared::lod_error_is_imperceptible).
+const RAY_ORIGIN_BIAS_RASTER_LOD_SCALE = 3.0f;
+// Capped rather than left to grow: a bias thicker than the thinnest occluder Solari must respect
+// leaks light through it, and this scene's walls and floors are on the order of a meter. Reached at
+// roughly 150 m at 1080p, by which point a pixel already covers 17 cm.
+const RAY_ORIGIN_BIAS_RASTER_LOD_MAX = 0.5f;
+
+// `pixel_world_size` is the world-space size of one pixel at the shading point, passed in because
+// this module is bound with the scene and cannot see any pass's view uniform. The comparison rejects
+// NaN, which reaches here whenever a degenerate G-buffer texel produces a garbage world position.
+fn ray_origin_bias_with_raster_lod(base_bias: f32, pixel_world_size: f32) -> f32 {
+    let lod_error = RAY_ORIGIN_BIAS_RASTER_LOD_SCALE * pixel_world_size;
+    return base_bias + select(0.0, min(lod_error, RAY_ORIGIN_BIAS_RASTER_LOD_MAX), lod_error > 0.0);
+}
+
+fn offset_ray_origin(
+    world_position: vec3<f32>,
+    geometric_world_normal: vec3<f32>,
+    ray_direction: vec3<f32>,
+    bias: f32,
+) -> vec3<f32> {
+    let side = select(-1.0, 1.0, dot(geometric_world_normal, ray_direction) >= 0.0);
+    return world_position + geometric_world_normal * side * max(bias, RAY_T_MIN);
+}
 
 fn trace_ray(ray_origin: vec3<f32>, ray_direction: vec3<f32>, ray_t_min: f32, ray_t_max: f32, ray_flag: u32) -> RayIntersection {
     let ray = RayDesc(ray_flag, RAY_NO_CULL, ray_t_min, ray_t_max, ray_origin, ray_direction);
@@ -134,7 +228,13 @@ struct ResolvedRayHitFull {
     world_tangent: vec4<f32>,
     uv: vec2<f32>,
     triangle_area: f32,
+    triangle_id: u32,
     triangle_count: u32,
+    ray_origin_bias: f32,
+    // False when the ray reached the triangle from behind its outward-facing side. Emission is
+    // one-sided, so BRDF paths must gate emissive collection on this to match NEE, which culls the
+    // back side through cos_theta_light.
+    front_face: bool,
     material: ResolvedMaterial,
 }
 
@@ -168,20 +268,28 @@ fn resolve_material(material: Material, uv: vec2<f32>) -> ResolvedMaterial {
 
 fn resolve_ray_hit_full(ray_hit: RayIntersection) -> ResolvedRayHitFull {
     let barycentrics = vec3(1.0 - ray_hit.barycentrics.x - ray_hit.barycentrics.y, ray_hit.barycentrics);
-    return resolve_triangle_data_full(ray_hit.instance_index, ray_hit.primitive_index, barycentrics);
+    var hit = resolve_triangle_data_full(ray_hit.instance_index, ray_hit.primitive_index, barycentrics);
+    hit.front_face = ray_hit.front_face;
+    if !ray_hit.front_face {
+        hit.world_normal = -hit.world_normal;
+        hit.geometric_world_normal = -hit.geometric_world_normal;
+    }
+    return hit;
 }
 
 fn load_vertices(instance_geometry_ids: InstanceGeometryIds, triangle_id: u32) -> array<Vertex, 3> {
-    let index_buffer = &index_buffers[instance_geometry_ids.index_buffer_id].indices;
-    let vertex_buffer = &vertex_buffers[instance_geometry_ids.vertex_buffer_id].vertices;
-
     let indices_i = (triangle_id * 3u) + vec3(0u, 1u, 2u) + instance_geometry_ids.index_buffer_offset;
-    let indices = vec3((*index_buffer)[indices_i.x], (*index_buffer)[indices_i.y], (*index_buffer)[indices_i.z]) + instance_geometry_ids.vertex_buffer_offset;
+    let index_buffer_id = instance_geometry_ids.index_buffer_id;
+    let indices = vec3(
+        index_buffers[index_buffer_id].indices[indices_i.x],
+        index_buffers[index_buffer_id].indices[indices_i.y],
+        index_buffers[index_buffer_id].indices[indices_i.z],
+    ) + instance_geometry_ids.vertex_buffer_offset;
 
     return array<Vertex, 3>(
-        unpack_vertex((*vertex_buffer)[indices.x]),
-        unpack_vertex((*vertex_buffer)[indices.y]),
-        unpack_vertex((*vertex_buffer)[indices.z])
+        load_vertex(instance_geometry_ids.vertex_buffer_id, indices.x, instance_geometry_ids.vertex_stride_words),
+        load_vertex(instance_geometry_ids.vertex_buffer_id, indices.y, instance_geometry_ids.vertex_stride_words),
+        load_vertex(instance_geometry_ids.vertex_buffer_id, indices.z, instance_geometry_ids.vertex_stride_words)
     );
 }
 
@@ -209,23 +317,82 @@ fn resolve_triangle_data_full(instance_id: u32, triangle_id: u32, barycentrics: 
     let previous_frame_world_vertices = transform_positions(previous_frame_transform, vertices);
     let previous_frame_world_position = mat3x3(previous_frame_world_vertices[0], previous_frame_world_vertices[1], previous_frame_world_vertices[2]) * barycentrics;
 
-    let uv = mat3x2(vertices[0].uv, vertices[1].uv, vertices[2].uv) * barycentrics;
+    let raw_uv = mat3x2(vertices[0].uv, vertices[1].uv, vertices[2].uv) * barycentrics;
+    let uv = (material.uv_transform * vec3(raw_uv, 1.0)).xy;
 
-    let local_tangent = mat3x3(vertices[0].tangent.xyz, vertices[1].tangent.xyz, vertices[2].tangent.xyz) * barycentrics;
-    let world_tangent = vec4(
-        normalize(mat3x3(transform[0].xyz, transform[1].xyz, transform[2].xyz) * local_tangent),
-        vertices[0].tangent.w,
+    var local_tangent = mat3x3(vertices[0].tangent.xyz, vertices[1].tangent.xyz, vertices[2].tangent.xyz) * barycentrics;
+    var tangent_sign = vertices[0].tangent.w;
+    if instance_geometry_ids.vertex_stride_words < 12u {
+        let edge1 = vertices[1].position - vertices[0].position;
+        let edge2 = vertices[2].position - vertices[0].position;
+        let uv_edge1 = vertices[1].uv - vertices[0].uv;
+        let uv_edge2 = vertices[2].uv - vertices[0].uv;
+        let determinant = uv_edge1.x * uv_edge2.y - uv_edge1.y * uv_edge2.x;
+        // The determinant is in squared UV units, so the degeneracy test has to be relative to the
+        // chart's own scale. An absolute epsilon rejects valid dense-mesh triangles whose UV edges
+        // are only a fraction of a texel apart.
+        let uv_edge_scale_squared = max(dot(uv_edge1, uv_edge1), dot(uv_edge2, uv_edge2));
+        if abs(determinant) > 1e-6 * uv_edge_scale_squared {
+            local_tangent = normalize((edge1 * uv_edge2.y - edge2 * uv_edge1.y) / determinant);
+            let local_bitangent = normalize((edge2 * uv_edge1.x - edge1 * uv_edge2.x) / determinant);
+            let local_normal_for_sign = normalize(
+                mat3x3(vertices[0].normal, vertices[1].normal, vertices[2].normal) * barycentrics
+            );
+            tangent_sign = select(-1.0, 1.0, dot(cross(local_normal_for_sign, local_tangent), local_bitangent) >= 0.0);
+        } else {
+            let fallback_axis = select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), abs(vertices[0].normal.x) > 0.9);
+            local_tangent = normalize(cross(fallback_axis, vertices[0].normal));
+            tangent_sign = 1.0;
+        }
+    }
+    let linear_transform = mat3x3(transform[0].xyz, transform[1].xyz, transform[2].xyz);
+    let linear_determinant = determinant(linear_transform);
+    var normal_transform = linear_transform;
+    if abs(linear_determinant) > 1e-12 {
+        // The cofactor matrix is inverse-transpose(M) * determinant(M).
+        // Scale its vector columns individually because WGSL/Naga does not
+        // define matrix-by-scalar division.
+        let inverse_determinant = 1.0 / linear_determinant;
+        normal_transform = mat3x3(
+            cross(linear_transform[1], linear_transform[2]) * inverse_determinant,
+            cross(linear_transform[2], linear_transform[0]) * inverse_determinant,
+            cross(linear_transform[0], linear_transform[1]) * inverse_determinant,
+        );
+    }
+    let local_normal = mat3x3(vertices[0].normal, vertices[1].normal, vertices[2].normal) * barycentrics;
+    var world_normal = normalize(normal_transform * local_normal);
+
+    var transformed_tangent = linear_transform * local_tangent;
+    transformed_tangent -= world_normal * dot(world_normal, transformed_tangent);
+    if dot(transformed_tangent, transformed_tangent) <= 1e-12 {
+        let fallback_axis = select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), abs(world_normal.x) > 0.9);
+        transformed_tangent = cross(fallback_axis, world_normal);
+    }
+    let transform_handedness = select(-1.0, 1.0, linear_determinant >= 0.0);
+    let world_tangent = vec4(normalize(transformed_tangent), tangent_sign * transform_handedness);
+
+    let triangle_cross = cross(
+        world_vertices[1] - world_vertices[0],
+        world_vertices[2] - world_vertices[0],
     );
-
-    let local_normal = mat3x3(vertices[0].normal, vertices[1].normal, vertices[2].normal) * barycentrics; // TODO: Use barycentric lerp, ray_hit.object_to_world, cross product geo normal
-    var world_normal = normalize(mat3x3(transform[0].xyz, transform[1].xyz, transform[2].xyz) * local_normal);
-    let geometric_world_normal = world_normal;
+    let triangle_cross_length_squared = dot(triangle_cross, triangle_cross);
+    var geometric_world_normal = world_normal;
+    if triangle_cross_length_squared > 1e-20 {
+        // cross(M*e1, M*e2) carries a factor of det(M), which points the winding normal inward on
+        // mirrored (negative-determinant) instances while the cofactor-transformed shading normal
+        // still points outward. Undo that sign so both agree, and so the geometric normal keeps the
+        // same sidedness as RayIntersection::front_face, which the driver derives in object space.
+        geometric_world_normal = triangle_cross * (inverseSqrt(triangle_cross_length_squared) * transform_handedness);
+    }
     if material.normal_map_texture_id != TEXTURE_MAP_NONE {
         let TBN = calculate_tbn_mikktspace(world_normal, world_tangent);
         let T = TBN[0];
         let B = TBN[1];
         let N = TBN[2];
         var Nt = sample_texture(material.normal_map_texture_id, uv) * 2.0 - 1.0;
+        if (material.flags & MATERIAL_FLAGS_FLIP_NORMAL_MAP_Y) != 0u {
+            Nt.y = -Nt.y; // Normal maps authored for DirectX, matching apply_normal_mapping
+        }
         Nt.z = sqrt(max(1.0 - dot(Nt.xy, Nt.xy), 0.0)); // Reconstruct Z to support two-channel normal maps
         world_normal = normalize(Nt.x * T + Nt.y * B + Nt.z * N);
     }
@@ -244,7 +411,11 @@ fn resolve_triangle_data_full(instance_id: u32, triangle_id: u32, barycentrics: 
         world_tangent,
         uv,
         triangle_area,
+        triangle_id,
         instance_geometry_ids.triangle_count,
+        ray_origin_bias_for_instance(instance_id),
+        // Triangle data resolved without a ray (light samples) is described from its emitting side.
+        true,
         resolved_material,
     );
 }

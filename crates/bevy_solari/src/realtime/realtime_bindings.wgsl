@@ -79,6 +79,23 @@ struct Reservoir {
     light_sample: LightSample,
 }
 
+// World-space size of one main-pass pixel at `world_position`, seen from `view_position`. This is
+// also the world-space simplification error the meshlet LOD selector allows there, so it is what
+// `ray_origin_bias_with_raster_lod` needs; keep it in step with
+// bevy_pbr::meshlet_cull_shared::lod_error_is_imperceptible, orthographic branch included.
+fn pixel_world_size(world_position: vec3<f32>, view_position: vec3<f32>) -> f32 {
+    let projection = view.clip_from_view;
+    let pixels_per_unit_at_unit_distance = abs(projection[1][1]) * view.main_pass_viewport.w * 0.5;
+    if !(pixels_per_unit_at_unit_distance > 0.0) {
+        return 0.0;
+    }
+    if projection[3][3] == 1.0 {
+        // Orthographic projections have no distance falloff.
+        return 1.0 / pixels_per_unit_at_unit_distance;
+    }
+    return distance(world_position, view_position) / pixels_per_unit_at_unit_distance;
+}
+
 fn empty_reservoir() -> Reservoir {
     return Reservoir(
         vec3(0.0),
@@ -92,7 +109,9 @@ fn empty_reservoir() -> Reservoir {
 
 struct WorldCacheGeometryData {
     world_position: vec3<f32>,
-    padding_a: u32,
+    // Geometry error of the surface that seeded the cell, and nothing else. The raster LOD term is
+    // added when the cell traces, since a cell outlives the camera position it was seeded from.
+    ray_origin_bias: f32,
     world_normal: vec3<f32>,
     padding_b: u32,
 }

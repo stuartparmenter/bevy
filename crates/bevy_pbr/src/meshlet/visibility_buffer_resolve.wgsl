@@ -5,7 +5,9 @@
         Meshlet,
         meshlet_visibility_buffer,
         meshlet_raster_clusters,
-        meshlets,
+        MeshletGpuDescriptor,
+        meshlet_instance_descriptors,
+        load_meshlet,
         meshlet_instance_uniforms,
         get_meshlet_vertex_id,
         get_meshlet_vertex_position,
@@ -14,10 +16,13 @@
     },
     mesh_view_bindings::view,
     mesh_functions::mesh_position_local_to_world,
-    mesh_types::Mesh,
-    view_transformations::{position_world_to_clip, frag_coord_to_ndc},
+    mesh_types::{Mesh, MESH_FLAGS_SIGN_DETERMINANT_MODEL_3X3_BIT},
+    view_transformations::position_world_to_clip,
 }
-#import bevy_render::maths::{affine3_to_square, mat2x4_f32_to_mat3x3_unpack}
+#import bevy_render::{
+    maths::{affine3_to_square, mat2x4_f32_to_mat3x3_unpack},
+    view::frag_coord_to_ndc,
+}
 
 #ifdef PREPASS_FRAGMENT
 #ifdef MOTION_VECTOR_PREPASS
@@ -35,22 +40,43 @@ struct PartialDerivatives {
     barycentrics: vec3<f32>,
     ddx: vec3<f32>,
     ddy: vec3<f32>,
+    // Twice the signed NDC area of the triangle. Positive means the triangle winds
+    // counter-clockwise on screen, i.e. what `@builtin(front_facing)` reports as front.
+    ndc_double_area: f32,
+}
+
+// Clip w is the positive view depth for anything in front of the near plane, and the
+// interpolated 1/w and the NDC determinant are non-zero for any triangle that actually
+// rasterized. All three can still reach zero for a triangle straddling the eye (the
+// resolve reprojects unclipped world positions) or one that rasterized degenerately, and
+// the resulting inf/NaN propagates into the deferred G-buffer as pure black. Floor them
+// well below anything a well-formed triangle produces so healthy fragments are unchanged.
+const CLIP_W_EPSILON: f32 = 1e-6;
+const RECIPROCAL_EPSILON: f32 = 1e-20;
+
+fn safe_inverse(x: f32) -> f32 {
+    // Sign-preserving, and bit-identical to 1.0 / x whenever abs(x) >= RECIPROCAL_EPSILON.
+    return select(-1.0, 1.0, x >= 0.0) / max(abs(x), RECIPROCAL_EPSILON);
 }
 
 // https://github.com/ConfettiFX/The-Forge/blob/9d43e69141a9cd0ce2ce2d2db5122234d3a2d5b5/Common_3/Renderer/VisibilityBuffer2/Shaders/FSL/vb_shading_utilities.h.fsl#L90-L150
-fn compute_partial_derivatives(vertex_world_positions: array<vec4<f32>, 3>, ndc_uv: vec2<f32>, half_screen_size: vec2<f32>) -> PartialDerivatives {
+// two_over_screen_size (The Forge's twoOverWindowSize) converts the per-NDC
+// derivatives to per-pixel: one pixel spans 2/viewport NDC units.
+fn compute_partial_derivatives(vertex_world_positions: array<vec4<f32>, 3>, ndc_uv: vec2<f32>, two_over_screen_size: vec2<f32>) -> PartialDerivatives {
     var result: PartialDerivatives;
 
     let vertex_clip_position_0 = position_world_to_clip(vertex_world_positions[0].xyz);
     let vertex_clip_position_1 = position_world_to_clip(vertex_world_positions[1].xyz);
     let vertex_clip_position_2 = position_world_to_clip(vertex_world_positions[2].xyz);
 
-    let inv_w = 1.0 / vec3(vertex_clip_position_0.w, vertex_clip_position_1.w, vertex_clip_position_2.w);
+    let clip_w = vec3(vertex_clip_position_0.w, vertex_clip_position_1.w, vertex_clip_position_2.w);
+    let inv_w = 1.0 / max(clip_w, vec3(CLIP_W_EPSILON));
     let ndc_0 = vertex_clip_position_0.xy * inv_w[0];
     let ndc_1 = vertex_clip_position_1.xy * inv_w[1];
     let ndc_2 = vertex_clip_position_2.xy * inv_w[2];
 
-    let inv_det = 1.0 / determinant(mat2x2(ndc_2 - ndc_1, ndc_0 - ndc_1));
+    result.ndc_double_area = determinant(mat2x2(ndc_2 - ndc_1, ndc_0 - ndc_1));
+    let inv_det = safe_inverse(result.ndc_double_area);
     result.ddx = vec3(ndc_1.y - ndc_2.y, ndc_2.y - ndc_0.y, ndc_0.y - ndc_1.y) * inv_det * inv_w;
     result.ddy = vec3(ndc_2.x - ndc_1.x, ndc_0.x - ndc_2.x, ndc_1.x - ndc_0.x) * inv_det * inv_w;
 
@@ -59,7 +85,7 @@ fn compute_partial_derivatives(vertex_world_positions: array<vec4<f32>, 3>, ndc_
 
     let delta_v = ndc_uv - ndc_0;
     let interp_inv_w = inv_w.x + delta_v.x * ddx_sum + delta_v.y * ddy_sum;
-    let interp_w = 1.0 / interp_inv_w;
+    let interp_w = safe_inverse(interp_inv_w);
 
     result.barycentrics = vec3(
         interp_w * (inv_w[0] + delta_v.x * result.ddx.x + delta_v.y * result.ddy.x),
@@ -67,16 +93,16 @@ fn compute_partial_derivatives(vertex_world_positions: array<vec4<f32>, 3>, ndc_
         interp_w * (delta_v.x * result.ddx.z + delta_v.y * result.ddy.z),
     );
 
-    result.ddx *= half_screen_size.x;
-    result.ddy *= half_screen_size.y;
-    ddx_sum *= half_screen_size.x;
-    ddy_sum *= half_screen_size.y;
+    result.ddx *= two_over_screen_size.x;
+    result.ddy *= two_over_screen_size.y;
+    ddx_sum *= two_over_screen_size.x;
+    ddy_sum *= two_over_screen_size.y;
 
     result.ddy *= -1.0;
     ddy_sum *= -1.0;
 
-    let interp_ddx_w = 1.0 / (interp_inv_w + ddx_sum);
-    let interp_ddy_w = 1.0 / (interp_inv_w + ddy_sum);
+    let interp_ddx_w = safe_inverse(interp_inv_w + ddx_sum);
+    let interp_ddy_w = safe_inverse(interp_inv_w + ddy_sum);
 
     result.ddx = interp_ddx_w * (result.barycentrics * interp_inv_w + result.ddx) - result.barycentrics;
     result.ddy = interp_ddy_w * (result.barycentrics * interp_inv_w + result.ddy) - result.barycentrics;
@@ -91,6 +117,10 @@ struct VertexOutput {
     ddx_uv: vec2<f32>,
     ddy_uv: vec2<f32>,
     world_tangent: vec4<f32>,
+    // Screen-space winding facing, matching `@builtin(front_facing)`. The instance
+    // determinant is *not* folded in here: consumers pass this through
+    // `pbr_functions::winding_corrected_front_facing` to get logical facing.
+    is_front: bool,
     mesh_flags: u32,
     cluster_id: u32,
     material_bind_group_slot: u32,
@@ -107,14 +137,19 @@ fn resolve_vertex_output(frag_coord: vec4<f32>) -> VertexOutput {
     let cluster_id = packed_ids >> 7u;
     let instanced_offset = meshlet_raster_clusters[cluster_id];
     let meshlet_id = instanced_offset.offset;
-    var meshlet = meshlets[meshlet_id];
+    let descriptor = meshlet_instance_descriptors[instanced_offset.instance_id];
+    var meshlet = load_meshlet(descriptor, meshlet_id);
 
     let triangle_id = extractBits(packed_ids, 0u, 7u);
     let index_ids = meshlet.start_index_id + (triangle_id * 3u) + vec3(0u, 1u, 2u);
-    let vertex_ids = vec3(get_meshlet_vertex_id(index_ids[0]), get_meshlet_vertex_id(index_ids[1]), get_meshlet_vertex_id(index_ids[2]));
-    let vertex_0 = load_vertex(&meshlet, vertex_ids[0]);
-    let vertex_1 = load_vertex(&meshlet, vertex_ids[1]);
-    let vertex_2 = load_vertex(&meshlet, vertex_ids[2]);
+    let vertex_ids = vec3(
+        get_meshlet_vertex_id(descriptor, index_ids[0]),
+        get_meshlet_vertex_id(descriptor, index_ids[1]),
+        get_meshlet_vertex_id(descriptor, index_ids[2]),
+    );
+    let vertex_0 = load_vertex(descriptor, &meshlet, vertex_ids[0]);
+    let vertex_1 = load_vertex(descriptor, &meshlet, vertex_ids[1]);
+    let vertex_2 = load_vertex(descriptor, &meshlet, vertex_ids[2]);
 
     let instance_id = instanced_offset.instance_id;
     var instance_uniform = meshlet_instance_uniforms[instance_id];
@@ -124,11 +159,11 @@ fn resolve_vertex_output(frag_coord: vec4<f32>) -> VertexOutput {
     let world_position_1 = mesh_position_local_to_world(world_from_local, vec4(vertex_1.position, 1.0));
     let world_position_2 = mesh_position_local_to_world(world_from_local, vec4(vertex_2.position, 1.0));
 
-    let frag_coord_ndc = frag_coord_to_ndc(frag_coord).xy;
+    let frag_coord_ndc = frag_coord_to_ndc(frag_coord, view.main_pass_viewport).xy;
     let partial_derivatives = compute_partial_derivatives(
         array(world_position_0, world_position_1, world_position_2),
         frag_coord_ndc,
-        view.viewport.zw / 2.0,
+        2.0 / view.main_pass_viewport.zw,
     );
 
     let world_position = mat3x4(world_position_0, world_position_1, world_position_2) * partial_derivatives.barycentrics;
@@ -140,11 +175,25 @@ fn resolve_vertex_output(frag_coord: vec4<f32>) -> VertexOutput {
     let ddx_world_position = world_positions_camera_relative * partial_derivatives.ddx;
     let ddy_world_position = world_positions_camera_relative * partial_derivatives.ddy;
 
-    let world_normal = mat3x3(
+    let interpolated_normal = mat3x3(
         normal_local_to_world(vertex_0.normal, &instance_uniform),
         normal_local_to_world(vertex_1.normal, &instance_uniform),
         normal_local_to_world(vertex_2.normal, &instance_uniform),
     ) * partial_derivatives.barycentrics;
+
+    // Coarse LODs can collapse a plate into a single triangle carrying near-opposite vertex
+    // normals, whose interpolation is zero-length. That divides by zero in
+    // calculate_tbn_mikktspace and in the tangent-plane projection below, so fall back to the
+    // triangle plane. The cross product is in index order, which the instance determinant flips.
+    let geometric_normal = cross(
+        world_position_1.xyz - world_position_0.xyz,
+        world_position_2.xyz - world_position_0.xyz,
+    ) * select(-1.0, 1.0, (instance_uniform.flags & MESH_FLAGS_SIGN_DETERMINANT_MODEL_3X3_BIT) != 0u);
+    let world_normal = normalize(select(
+        geometric_normal,
+        interpolated_normal,
+        dot(interpolated_normal, interpolated_normal) > 1e-12,
+    ));
 
     let uv = mat3x2(vertex_0.uv, vertex_1.uv, vertex_2.uv) * partial_derivatives.barycentrics;
     let ddx_uv = mat3x2(vertex_0.uv, vertex_1.uv, vertex_2.uv) * partial_derivatives.ddx;
@@ -171,6 +220,7 @@ fn resolve_vertex_output(frag_coord: vec4<f32>) -> VertexOutput {
         ddx_uv,
         ddy_uv,
         world_tangent,
+        partial_derivatives.ndc_double_area > 0.0,
         instance_uniform.flags,
         instance_id ^ meshlet_id,
         instance_uniform.material_and_lightmap_bind_group_slot & 0xffffu,
@@ -188,11 +238,11 @@ struct MeshletVertex {
     uv: vec2<f32>,
 }
 
-fn load_vertex(meshlet: ptr<function, Meshlet>, vertex_id: u32) -> MeshletVertex {
+fn load_vertex(descriptor: MeshletGpuDescriptor, meshlet: ptr<function, Meshlet>, vertex_id: u32) -> MeshletVertex {
     return MeshletVertex(
-        get_meshlet_vertex_position(meshlet, vertex_id),
-        get_meshlet_vertex_normal(meshlet, vertex_id),
-        get_meshlet_vertex_uv(meshlet, vertex_id),
+        get_meshlet_vertex_position(descriptor, meshlet, vertex_id),
+        get_meshlet_vertex_normal(descriptor, meshlet, vertex_id),
+        get_meshlet_vertex_uv(descriptor, meshlet, vertex_id),
     );
 }
 
@@ -226,8 +276,9 @@ fn calculate_world_tangent(
 
     var world_tangent = jacobian_sign * (ddy_uv.y * ddx_world_position_s - ddx_uv.y * ddy_world_position_s);
 
-    // The sign intrinsic returns 0 if the argument is 0
-    if jacobian_sign != 0.0 {
+    // The sign intrinsic returns 0 if the argument is 0, and collinear projected position
+    // gradients (edge-on slivers) zero the tangent itself
+    if jacobian_sign != 0.0 && dot(world_tangent, world_tangent) > 1e-20 {
         world_tangent = normalize(world_tangent);
     }
 

@@ -1,8 +1,9 @@
+enable wgpu_binding_array;
+
 #import bevy_pbr::{
     meshlet_bindings::{
-        meshlet_cluster_meshlet_ids,
-        meshlets,
-        meshlet_cluster_instance_ids,
+        meshlet_instance_descriptors,
+        load_meshlet_geometry,
         meshlet_instance_uniforms,
         meshlet_raster_clusters,
         meshlet_previous_raster_counts,
@@ -15,6 +16,7 @@
         get_meshlet_vertex_position,
     },
     mesh_functions::mesh_position_local_to_world,
+    mesh_types::MESH_FLAGS_SIGN_DETERMINANT_MODEL_3X3_BIT,
     view_transformations::ndc_to_uv,
 }
 #import bevy_render::maths::affine3_to_square
@@ -43,7 +45,8 @@ fn rasterize_cluster(
 
     let cluster_id = workgroup_id_1d + meshlet_previous_raster_counts[0];
     let instanced_offset = meshlet_raster_clusters[cluster_id];
-    var meshlet = meshlets[instanced_offset.offset];
+    let descriptor = meshlet_instance_descriptors[instanced_offset.instance_id];
+    var meshlet = load_meshlet_geometry(descriptor, instanced_offset.offset);
 
     let instance_uniform = meshlet_instance_uniforms[instanced_offset.instance_id];
     let world_from_local = affine3_to_square(instance_uniform.world_from_local);
@@ -52,13 +55,13 @@ fn rasterize_cluster(
     for (var i = 0u; i <= 128u; i += 128u) {
         let vertex_id = local_invocation_index + i;
         if vertex_id < get_meshlet_vertex_count(&meshlet) {
-            let vertex_position = get_meshlet_vertex_position(&meshlet, vertex_id);
+            let vertex_position = get_meshlet_vertex_position(descriptor, &meshlet, vertex_id);
 
             // Project vertex to viewport space
             let world_position = mesh_position_local_to_world(world_from_local, vec4(vertex_position, 1.0));
             let clip_position = view.clip_from_world * vec4(world_position.xyz, 1.0);
             let ndc_position = clip_position.xyz / clip_position.w;
-            let viewport_position_xy = ndc_to_uv(ndc_position.xy) * view.viewport.zw;
+            let viewport_position_xy = ndc_to_uv(ndc_position.xy) * view.main_pass_viewport.zw;
 
             // Write vertex to workgroup shared memory
             viewport_vertices[vertex_id] = vec3(viewport_position_xy, ndc_position.z);
@@ -70,13 +73,22 @@ fn rasterize_cluster(
     let triangle_id = local_invocation_index;
     if triangle_id >= get_meshlet_triangle_count(&meshlet) { return; }
     let index_ids = meshlet.start_index_id + (triangle_id * 3u) + vec3(0u, 1u, 2u);
-    let vertex_ids = vec3(get_meshlet_vertex_id(index_ids[0]), get_meshlet_vertex_id(index_ids[1]), get_meshlet_vertex_id(index_ids[2]));
+    let vertex_ids = vec3(
+        get_meshlet_vertex_id(descriptor, index_ids[0]),
+        get_meshlet_vertex_id(descriptor, index_ids[1]),
+        get_meshlet_vertex_id(descriptor, index_ids[2]),
+    );
+    // A negative-determinant instance transform reverses screen-space winding for every one of its
+    // triangles, so reverse the triangle back. Both the backface test and the edge equations below
+    // require a positive-area triangle; flipping only the sign of the test would reject every
+    // interior pixel instead.
+    let mirrored = (instance_uniform.flags & MESH_FLAGS_SIGN_DETERMINANT_MODEL_3X3_BIT) == 0u;
     let vertex_0 = viewport_vertices[vertex_ids[2]];
-    let vertex_1 = viewport_vertices[vertex_ids[1]];
-    let vertex_2 = viewport_vertices[vertex_ids[0]];
+    let vertex_1 = viewport_vertices[select(vertex_ids[1], vertex_ids[0], mirrored)];
+    let vertex_2 = viewport_vertices[select(vertex_ids[0], vertex_ids[1], mirrored)];
     let packed_ids = (cluster_id << 7u) | triangle_id;
 
-    // Backface culling
+    // Backface culling (also rejects degenerate zero-area triangles)
     let triangle_double_area = edge_function(vertex_0.xy, vertex_1.xy, vertex_2.xy);
     if triangle_double_area <= 0.0 { return; }
 
@@ -94,8 +106,8 @@ fn rasterize_cluster(
     var max_y = ceil(max3(vertex_0.y, vertex_1.y, vertex_2.y));
     min_x = max(min_x, 0.0);
     min_y = max(min_y, 0.0);
-    max_x = min(max_x, view.viewport.z - 1.0);
-    max_y = min(max_y, view.viewport.w - 1.0);
+    max_x = min(max_x, view.main_pass_viewport.z - 1.0);
+    max_y = min(max_y, view.main_pass_viewport.w - 1.0);
 
     // Setup initial triangle equations
     let starting_pixel = vec2(min_x, min_y) + 0.5;

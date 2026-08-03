@@ -1,3 +1,5 @@
+enable wgpu_binding_array;
+
 #define_import_path bevy_pbr::meshlet_bindings
 
 #import bevy_pbr::mesh_types::Mesh
@@ -21,6 +23,8 @@ struct Meshlet {
     min_vertex_position_channel_x: f32,
     min_vertex_position_channel_y: f32,
     min_vertex_position_channel_z: f32,
+    min_vertex_uv: vec2<f32>,
+    vertex_uv_extent: vec2<f32>,
 }
 
 fn get_meshlet_vertex_count(meshlet: ptr<function, Meshlet>) -> u32 {
@@ -35,6 +39,200 @@ struct MeshletCullData {
     aabb: MeshletAabbErrorOffset,
     lod_group_sphere: vec4<f32>,
 }
+
+// Exact mirror of Rust's `MeshletGpuDescriptor` (8 u32 words / 32 bytes).
+struct MeshletGpuDescriptor {
+    page_id: u32,
+    vertex_positions_base: u32,
+    vertex_normals_base: u32,
+    vertex_uvs_base: u32,
+    indices_base: u32,
+    bvh_nodes_base: u32,
+    meshlets_base: u32,
+    meshlet_cull_data_base: u32,
+}
+
+#ifdef MESHLET_PAGE_ACCESS
+struct MeshletPage {
+    words: array<u32>,
+}
+
+#ifdef MESHLET_MESH_MATERIAL_PASS
+@group(2) @binding(4) var<storage, read> meshlet_pages: binding_array<MeshletPage>;
+#else
+@group(1) @binding(0) var<storage, read> meshlet_pages: binding_array<MeshletPage>;
+#endif
+
+fn meshlet_page_word(page_id: u32, word: u32) -> u32 {
+    return meshlet_pages[page_id].words[word];
+}
+
+fn meshlet_page_f32(page_id: u32, word: u32) -> f32 {
+    return bitcast<f32>(meshlet_page_word(page_id, word));
+}
+
+fn load_meshlet(descriptor: MeshletGpuDescriptor, meshlet_id: u32) -> Meshlet {
+    let base = descriptor.meshlets_base + meshlet_id * 12u;
+    return Meshlet(
+        meshlet_page_word(descriptor.page_id, base + 0u),
+        meshlet_page_word(descriptor.page_id, base + 1u),
+        meshlet_page_word(descriptor.page_id, base + 2u),
+        meshlet_page_word(descriptor.page_id, base + 3u),
+        meshlet_page_word(descriptor.page_id, base + 4u),
+        meshlet_page_f32(descriptor.page_id, base + 5u),
+        meshlet_page_f32(descriptor.page_id, base + 6u),
+        meshlet_page_f32(descriptor.page_id, base + 7u),
+        vec2<f32>(
+            meshlet_page_f32(descriptor.page_id, base + 8u),
+            meshlet_page_f32(descriptor.page_id, base + 9u),
+        ),
+        vec2<f32>(
+            meshlet_page_f32(descriptor.page_id, base + 10u),
+            meshlet_page_f32(descriptor.page_id, base + 11u),
+        ),
+    );
+}
+
+// Visibility raster only needs the first eight words of a meshlet. Preserve the common Meshlet
+// type for the geometry helpers while avoiding four unused UV-word loads per rasterized cluster.
+fn load_meshlet_geometry(descriptor: MeshletGpuDescriptor, meshlet_id: u32) -> Meshlet {
+    let base = descriptor.meshlets_base + meshlet_id * 12u;
+    return Meshlet(
+        meshlet_page_word(descriptor.page_id, base + 0u),
+        meshlet_page_word(descriptor.page_id, base + 1u),
+        meshlet_page_word(descriptor.page_id, base + 2u),
+        meshlet_page_word(descriptor.page_id, base + 3u),
+        meshlet_page_word(descriptor.page_id, base + 4u),
+        meshlet_page_f32(descriptor.page_id, base + 5u),
+        meshlet_page_f32(descriptor.page_id, base + 6u),
+        meshlet_page_f32(descriptor.page_id, base + 7u),
+        vec2<f32>(0.0),
+        vec2<f32>(0.0),
+    );
+}
+
+fn load_aabb_error_offset(page_id: u32, base: u32) -> MeshletAabbErrorOffset {
+    return MeshletAabbErrorOffset(
+        vec4<f32>(
+            meshlet_page_f32(page_id, base + 0u),
+            meshlet_page_f32(page_id, base + 1u),
+            meshlet_page_f32(page_id, base + 2u),
+            meshlet_page_f32(page_id, base + 3u),
+        ),
+        vec4<f32>(
+            meshlet_page_f32(page_id, base + 4u),
+            meshlet_page_f32(page_id, base + 5u),
+            meshlet_page_f32(page_id, base + 6u),
+            meshlet_page_f32(page_id, base + 7u),
+        ),
+    );
+}
+
+struct BvhSubnode {
+    aabb: MeshletAabbErrorOffset,
+    lod_bounds: vec4<f32>,
+    child_count: u32,
+}
+
+fn load_bvh_subnode(
+    descriptor: MeshletGpuDescriptor,
+    node_id: u32,
+    subnode: u32,
+) -> BvhSubnode {
+    let base = descriptor.bvh_nodes_base + node_id * 100u;
+    let sphere = base + 64u + subnode * 4u;
+    let packed_child_counts = meshlet_page_word(
+        descriptor.page_id,
+        base + 96u + subnode / 4u,
+    );
+    return BvhSubnode(
+        load_aabb_error_offset(descriptor.page_id, base + subnode * 8u),
+        vec4<f32>(
+            meshlet_page_f32(descriptor.page_id, sphere + 0u),
+            meshlet_page_f32(descriptor.page_id, sphere + 1u),
+            meshlet_page_f32(descriptor.page_id, sphere + 2u),
+            meshlet_page_f32(descriptor.page_id, sphere + 3u),
+        ),
+        extractBits(packed_child_counts, (subnode % 4u) * 8u, 8u),
+    );
+}
+
+fn load_meshlet_cull_data(descriptor: MeshletGpuDescriptor, meshlet_id: u32) -> MeshletCullData {
+    let base = descriptor.meshlet_cull_data_base + meshlet_id * 12u;
+    return MeshletCullData(
+        load_aabb_error_offset(descriptor.page_id, base),
+        vec4<f32>(
+            meshlet_page_f32(descriptor.page_id, base + 8u),
+            meshlet_page_f32(descriptor.page_id, base + 9u),
+            meshlet_page_f32(descriptor.page_id, base + 10u),
+            meshlet_page_f32(descriptor.page_id, base + 11u),
+        ),
+    );
+}
+
+fn get_meshlet_vertex_id(descriptor: MeshletGpuDescriptor, index_id: u32) -> u32 {
+    let packed_index = meshlet_page_word(
+        descriptor.page_id,
+        descriptor.indices_base + index_id / 4u,
+    );
+    return extractBits(packed_index, (index_id % 4u) * 8u, 8u);
+}
+
+fn get_meshlet_vertex_position(
+    descriptor: MeshletGpuDescriptor,
+    meshlet: ptr<function, Meshlet>,
+    vertex_id: u32,
+) -> vec3<f32> {
+    let unpacked = unpack4xU8((*meshlet).packed_b);
+    let bits_per_channel = unpacked.xyz;
+    let bits_per_vertex = bits_per_channel.x + bits_per_channel.y + bits_per_channel.z;
+    var start_bit = (*meshlet).start_vertex_position_bit + vertex_id * bits_per_vertex;
+
+    var vertex_position_packed = vec3(0u);
+    for (var i = 0u; i < 3u; i++) {
+        let lower_word_index = descriptor.vertex_positions_base + start_bit / 32u;
+        let lower_word_bit_offset = start_bit & 31u;
+        var next_32_bits = meshlet_page_word(descriptor.page_id, lower_word_index) >> lower_word_bit_offset;
+        if lower_word_bit_offset + bits_per_channel[i] > 32u {
+            next_32_bits |= meshlet_page_word(descriptor.page_id, lower_word_index + 1u) << (32u - lower_word_bit_offset);
+        }
+        vertex_position_packed[i] = extractBits(next_32_bits, 0u, bits_per_channel[i]);
+        start_bit += bits_per_channel[i];
+    }
+
+    var vertex_position = vec3<f32>(vertex_position_packed) + vec3(
+        (*meshlet).min_vertex_position_channel_x,
+        (*meshlet).min_vertex_position_channel_y,
+        (*meshlet).min_vertex_position_channel_z,
+    );
+    vertex_position /= f32(1u << unpacked.w) * CENTIMETERS_PER_METER;
+    return vertex_position;
+}
+
+fn get_meshlet_vertex_normal(
+    descriptor: MeshletGpuDescriptor,
+    meshlet: ptr<function, Meshlet>,
+    vertex_id: u32,
+) -> vec3<f32> {
+    let packed = meshlet_page_word(
+        descriptor.page_id,
+        descriptor.vertex_normals_base + (*meshlet).start_vertex_attribute_id + vertex_id,
+    );
+    return octahedral_decode_signed(unpack2x16snorm(packed));
+}
+
+fn get_meshlet_vertex_uv(
+    descriptor: MeshletGpuDescriptor,
+    meshlet: ptr<function, Meshlet>,
+    vertex_id: u32,
+) -> vec2<f32> {
+    let packed = meshlet_page_word(
+        descriptor.page_id,
+        descriptor.vertex_uvs_base + (*meshlet).start_vertex_attribute_id + vertex_id,
+    );
+    return (*meshlet).min_vertex_uv + unpack2x16unorm(packed) * (*meshlet).vertex_uv_extent;
+}
+#endif
 
 struct MeshletAabb {
     center: vec3<f32>,
@@ -99,21 +297,20 @@ var<immediate> constants: Constants;
 @group(0) @binding(3) var<storage, read> meshlet_instance_uniforms: array<Mesh>;
 @group(0) @binding(4) var<storage, read> meshlet_view_instance_visibility: array<u32>; // 1 bit per entity instance, packed as a bitmask
 @group(0) @binding(5) var<storage, read> meshlet_instance_aabbs: array<MeshletAabb>;
-@group(0) @binding(6) var<storage, read> meshlet_instance_bvh_root_nodes: array<u32>;
 
 // BVH cull queue data
-@group(0) @binding(7) var<storage, read_write> meshlet_bvh_cull_count_write: atomic<u32>;
-@group(0) @binding(8) var<storage, read_write> meshlet_bvh_cull_dispatch: DispatchIndirectArgs;
-@group(0) @binding(9) var<storage, read_write> meshlet_bvh_cull_queue: array<InstancedOffset>;
+@group(0) @binding(6) var<storage, read_write> meshlet_bvh_cull_count_write: atomic<u32>;
+@group(0) @binding(7) var<storage, read_write> meshlet_bvh_cull_dispatch: DispatchIndirectArgs;
+@group(0) @binding(8) var<storage, read_write> meshlet_bvh_cull_queue: array<InstancedOffset>;
 
 // Second pass queue data
 #ifdef MESHLET_FIRST_CULLING_PASS
-@group(0) @binding(10) var<storage, read_write> meshlet_second_pass_instance_count: atomic<u32>;
-@group(0) @binding(11) var<storage, read_write> meshlet_second_pass_instance_dispatch: DispatchIndirectArgs;
-@group(0) @binding(12) var<storage, read_write> meshlet_second_pass_instance_candidates: array<u32>;
+@group(0) @binding(9) var<storage, read_write> meshlet_second_pass_instance_count: atomic<u32>;
+@group(0) @binding(10) var<storage, read_write> meshlet_second_pass_instance_dispatch: DispatchIndirectArgs;
+@group(0) @binding(11) var<storage, read_write> meshlet_second_pass_instance_candidates: array<u32>;
 #else
-@group(0) @binding(10) var<storage, read> meshlet_second_pass_instance_count: u32;
-@group(0) @binding(11) var<storage, read> meshlet_second_pass_instance_candidates: array<u32>;
+@group(0) @binding(9) var<storage, read> meshlet_second_pass_instance_count: u32;
+@group(0) @binding(10) var<storage, read> meshlet_second_pass_instance_candidates: array<u32>;
 #endif
 #endif
 
@@ -126,8 +323,8 @@ var<immediate> constants: Constants;
 @group(0) @binding(1) var<uniform> view: View;
 @group(0) @binding(2) var<uniform> previous_view: PreviousViewUniforms;
 
-// Global mesh data
-@group(0) @binding(3) var<storage, read> meshlet_bvh_nodes: array<BvhNode>;
+// Per-instance page address translation
+@group(0) @binding(3) var<storage, read> meshlet_instance_descriptors: array<MeshletGpuDescriptor>;
 
 // Per entity instance data
 @group(0) @binding(4) var<storage, read> meshlet_instance_uniforms: array<Mesh>;
@@ -162,8 +359,8 @@ var<immediate> constants: Constants;
 @group(0) @binding(1) var<uniform> view: View;
 @group(0) @binding(2) var<uniform> previous_view: PreviousViewUniforms;
 
-// Global mesh data
-@group(0) @binding(3) var<storage, read> meshlet_cull_data: array<MeshletCullData>;
+// Per-instance page address translation
+@group(0) @binding(3) var<storage, read> meshlet_instance_descriptors: array<MeshletGpuDescriptor>;
 
 // Per entity instance data
 @group(0) @binding(4) var<storage, read> meshlet_instance_uniforms: array<Mesh>;
@@ -189,118 +386,21 @@ var<immediate> constants: Constants;
 
 #ifdef MESHLET_VISIBILITY_BUFFER_RASTER_PASS
 @group(0) @binding(0) var<storage, read> meshlet_raster_clusters: array<InstancedOffset>; // Per cluster
-@group(0) @binding(1) var<storage, read> meshlets: array<Meshlet>; // Per meshlet
-@group(0) @binding(2) var<storage, read> meshlet_indices: array<u32>; // Many per meshlet
-@group(0) @binding(3) var<storage, read> meshlet_vertex_positions: array<u32>; // Many per meshlet
-@group(0) @binding(4) var<storage, read> meshlet_instance_uniforms: array<Mesh>; // Per entity instance
-@group(0) @binding(5) var<storage, read> meshlet_previous_raster_counts: array<u32>;
-@group(0) @binding(6) var<storage, read> meshlet_software_raster_cluster_count: u32;
+@group(0) @binding(1) var<storage, read> meshlet_instance_descriptors: array<MeshletGpuDescriptor>;
+@group(0) @binding(2) var<storage, read> meshlet_instance_uniforms: array<Mesh>; // Per entity instance
+@group(0) @binding(3) var<storage, read> meshlet_previous_raster_counts: array<u32>;
+@group(0) @binding(4) var<storage, read> meshlet_software_raster_cluster_count: u32;
 #ifdef MESHLET_VISIBILITY_BUFFER_RASTER_PASS_OUTPUT
-@group(0) @binding(7) var meshlet_visibility_buffer: texture_storage_2d<r64uint, atomic>;
+@group(0) @binding(5) var meshlet_visibility_buffer: texture_storage_2d<r64uint, atomic>;
 #else
-@group(0) @binding(7) var meshlet_visibility_buffer: texture_storage_2d<r32uint, atomic>;
+@group(0) @binding(5) var meshlet_visibility_buffer: texture_storage_2d<r32uint, atomic>;
 #endif
-@group(0) @binding(8) var<uniform> view: View;
-
-// TODO: Load only twice, instead of 3x in cases where you load 3 indices per thread?
-fn get_meshlet_vertex_id(index_id: u32) -> u32 {
-    let packed_index = meshlet_indices[index_id / 4u];
-    let bit_offset = (index_id % 4u) * 8u;
-    return extractBits(packed_index, bit_offset, 8u);
-}
-
-fn get_meshlet_vertex_position(meshlet: ptr<function, Meshlet>, vertex_id: u32) -> vec3<f32> {
-    // Get bitstream start for the vertex
-    let unpacked = unpack4xU8((*meshlet).packed_b);
-    let bits_per_channel = unpacked.xyz;
-    let bits_per_vertex = bits_per_channel.x + bits_per_channel.y + bits_per_channel.z;
-    var start_bit = (*meshlet).start_vertex_position_bit + (vertex_id * bits_per_vertex);
-
-    // Read each vertex channel from the bitstream
-    var vertex_position_packed = vec3(0u);
-    for (var i = 0u; i < 3u; i++) {
-        let lower_word_index = start_bit / 32u;
-        let lower_word_bit_offset = start_bit & 31u;
-        var next_32_bits = meshlet_vertex_positions[lower_word_index] >> lower_word_bit_offset;
-        if lower_word_bit_offset + bits_per_channel[i] > 32u {
-            next_32_bits |= meshlet_vertex_positions[lower_word_index + 1u] << (32u - lower_word_bit_offset);
-        }
-        vertex_position_packed[i] = extractBits(next_32_bits, 0u, bits_per_channel[i]);
-        start_bit += bits_per_channel[i];
-    }
-
-    // Remap [0, range_max - range_min] vec3<u32> to [range_min, range_max] vec3<f32>
-    var vertex_position = vec3<f32>(vertex_position_packed) + vec3(
-        (*meshlet).min_vertex_position_channel_x,
-        (*meshlet).min_vertex_position_channel_y,
-        (*meshlet).min_vertex_position_channel_z,
-    );
-
-    // Reverse vertex quantization
-    let vertex_position_quantization_factor = unpacked.w;
-    vertex_position /= f32(1u << vertex_position_quantization_factor) * CENTIMETERS_PER_METER;
-
-    return vertex_position;
-}
+@group(0) @binding(6) var<uniform> view: View;
 #endif
 
 #ifdef MESHLET_MESH_MATERIAL_PASS
 @group(2) @binding(0) var meshlet_visibility_buffer: texture_storage_2d<r64uint, read>;
 @group(2) @binding(1) var<storage, read> meshlet_raster_clusters: array<InstancedOffset>; // Per cluster
-@group(2) @binding(2) var<storage, read> meshlets: array<Meshlet>; // Per meshlet
-@group(2) @binding(3) var<storage, read> meshlet_indices: array<u32>; // Many per meshlet
-@group(2) @binding(4) var<storage, read> meshlet_vertex_positions: array<u32>; // Many per meshlet
-@group(2) @binding(5) var<storage, read> meshlet_vertex_normals: array<u32>; // Many per meshlet
-@group(2) @binding(6) var<storage, read> meshlet_vertex_uvs: array<vec2<f32>>; // Many per meshlet
-@group(2) @binding(7) var<storage, read> meshlet_instance_uniforms: array<Mesh>; // Per entity instance
-
-// TODO: Load only twice, instead of 3x in cases where you load 3 indices per thread?
-fn get_meshlet_vertex_id(index_id: u32) -> u32 {
-    let packed_index = meshlet_indices[index_id / 4u];
-    let bit_offset = (index_id % 4u) * 8u;
-    return extractBits(packed_index, bit_offset, 8u);
-}
-
-fn get_meshlet_vertex_position(meshlet: ptr<function, Meshlet>, vertex_id: u32) -> vec3<f32> {
-    // Get bitstream start for the vertex
-    let unpacked = unpack4xU8((*meshlet).packed_b);
-    let bits_per_channel = unpacked.xyz;
-    let bits_per_vertex = bits_per_channel.x + bits_per_channel.y + bits_per_channel.z;
-    var start_bit = (*meshlet).start_vertex_position_bit + (vertex_id * bits_per_vertex);
-
-    // Read each vertex channel from the bitstream
-    var vertex_position_packed = vec3(0u);
-    for (var i = 0u; i < 3u; i++) {
-        let lower_word_index = start_bit / 32u;
-        let lower_word_bit_offset = start_bit & 31u;
-        var next_32_bits = meshlet_vertex_positions[lower_word_index] >> lower_word_bit_offset;
-        if lower_word_bit_offset + bits_per_channel[i] > 32u {
-            next_32_bits |= meshlet_vertex_positions[lower_word_index + 1u] << (32u - lower_word_bit_offset);
-        }
-        vertex_position_packed[i] = extractBits(next_32_bits, 0u, bits_per_channel[i]);
-        start_bit += bits_per_channel[i];
-    }
-
-    // Remap [0, range_max - range_min] vec3<u32> to [range_min, range_max] vec3<f32>
-    var vertex_position = vec3<f32>(vertex_position_packed) + vec3(
-        (*meshlet).min_vertex_position_channel_x,
-        (*meshlet).min_vertex_position_channel_y,
-        (*meshlet).min_vertex_position_channel_z,
-    );
-
-    // Reverse vertex quantization
-    let vertex_position_quantization_factor = unpacked.w;
-    vertex_position /= f32(1u << vertex_position_quantization_factor) * CENTIMETERS_PER_METER;
-
-    return vertex_position;
-}
-
-fn get_meshlet_vertex_normal(meshlet: ptr<function, Meshlet>, vertex_id: u32) -> vec3<f32> {
-    let packed_normal = meshlet_vertex_normals[(*meshlet).start_vertex_attribute_id + vertex_id];
-    return octahedral_decode_signed(unpack2x16snorm(packed_normal));
-}
-
-fn get_meshlet_vertex_uv(meshlet: ptr<function, Meshlet>, vertex_id: u32) -> vec2<f32> {
-    return meshlet_vertex_uvs[(*meshlet).start_vertex_attribute_id + vertex_id];
-}
+@group(2) @binding(2) var<storage, read> meshlet_instance_descriptors: array<MeshletGpuDescriptor>;
+@group(2) @binding(3) var<storage, read> meshlet_instance_uniforms: array<Mesh>; // Per entity instance
 #endif

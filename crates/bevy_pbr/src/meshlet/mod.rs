@@ -7,8 +7,6 @@ mod instance_manager;
 mod material_pipeline_prepare;
 mod material_shade_nodes;
 mod meshlet_mesh_manager;
-mod persistent_buffer;
-mod persistent_buffer_impls;
 mod pipelines;
 mod resource_manager;
 mod visibility_buffer_raster_node;
@@ -20,6 +18,8 @@ pub(crate) use self::{
     },
 };
 
+#[cfg(feature = "meshlet_processor")]
+pub use self::asset::MeshletRaytracingGeometry;
 pub use self::asset::{
     MeshletMesh, MeshletMeshLoader, MeshletMeshSaver, MESHLET_MESH_ASSET_VERSION,
 };
@@ -50,6 +50,8 @@ use bevy_asset::{embedded_asset, AssetApp, AssetId, Handle};
 use bevy_camera::visibility::{self, Visibility, VisibilityClass};
 use bevy_core_pipeline::{
     core_3d::main_opaque_pass_3d,
+    deferred::node::late_deferred_prepass,
+    prepass::node::early_prepass,
     prepass::{DeferredPrepass, MotionVectorPrepass, NormalPrepass},
     schedule::{Core3d, Core3dSystems},
 };
@@ -91,7 +93,9 @@ use tracing::error;
 /// * Requires preprocessing meshes. See [`MeshletMesh`] for details.
 /// * Limitations on the kinds of materials you can use. See [`MeshletMesh`] for details.
 ///
-/// This plugin requires a fairly recent GPU that supports [`WgpuFeatures::TEXTURE_INT64_ATOMIC`].
+/// This plugin requires a fairly recent GPU that supports [`WgpuFeatures::TEXTURE_INT64_ATOMIC`]
+/// and non-uniform storage-buffer binding arrays. Mesh data is stored in fixed 64 MiB pages so
+/// large scenes never require a monolithic storage buffer or a whole-heap reallocation.
 ///
 /// This plugin currently works only on the Vulkan and Metal backends.
 ///
@@ -124,6 +128,9 @@ impl MeshletPlugin {
             | WgpuFeatures::SUBGROUP
             | WgpuFeatures::DEPTH_CLIP_CONTROL
             | WgpuFeatures::IMMEDIATES
+            | WgpuFeatures::BUFFER_BINDING_ARRAY
+            | WgpuFeatures::STORAGE_RESOURCE_BINDING_ARRAY
+            | WgpuFeatures::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING
     }
 }
 
@@ -199,9 +206,11 @@ impl Plugin for MeshletPlugin {
                 Core3d,
                 (
                     meshlet_visibility_buffer_raster
+                        .before(early_prepass)
                         .before(per_view_shadow_pass::<EARLY_SHADOW_PASS>),
                     meshlet_prepass
                         .after(per_view_shadow_pass::<EARLY_SHADOW_PASS>)
+                        .after(late_deferred_prepass)
                         .in_set(Core3dSystems::Prepass),
                     meshlet_deferred_gbuffer_prepass
                         .after(meshlet_prepass)
@@ -273,6 +282,373 @@ fn configure_meshlet_views(
                 MeshletViewMaterialsPrepass::default(),
                 MeshletViewMaterialsDeferredGBufferPrepass::default(),
             ));
+        }
+    }
+}
+
+#[cfg(test)]
+mod shader_validation_tests {
+    use bevy_shader::Shader;
+    use naga_oil::compose::{Composer, NagaModuleDescriptor, ShaderDefValue};
+    use std::collections::HashMap;
+
+    fn add_stub_module(composer: &mut Composer, source: &'static str, name: &'static str) {
+        let shader = Shader::from_wgsl(source, name);
+        composer.add_composable_module((&shader).into()).unwrap();
+    }
+
+    #[test]
+    fn paged_meshlet_addressing_passes_naga_validation() {
+        let mut composer = Composer::default().with_capabilities(naga::valid::Capabilities::all());
+        add_stub_module(
+            &mut composer,
+            concat!(
+                "#define_import_path bevy_pbr::mesh_types\n",
+                "struct Mesh {\n",
+                "    world_from_local: mat3x4<f32>,\n",
+                "    previous_world_from_local: mat3x4<f32>,\n",
+                "    local_from_world_transpose_a: mat2x4<f32>,\n",
+                "    local_from_world_transpose_b: f32,\n",
+                "    flags: u32,\n",
+                "    material_and_lightmap_bind_group_slot: u32,\n",
+                "}\n",
+                "const MESH_FLAGS_SIGN_DETERMINANT_MODEL_3X3_BIT: u32 = 1u << 31u;\n",
+            ),
+            "mesh_types_stub.wgsl",
+        );
+        add_stub_module(
+            &mut composer,
+            r#"
+#define_import_path bevy_render::view
+struct View {
+    clip_from_world: mat4x4<f32>,
+    main_pass_viewport: vec4<f32>,
+    world_position: vec3<f32>,
+}
+
+fn frag_coord_to_ndc(frag_coord: vec4<f32>, viewport: vec4<f32>) -> vec3<f32> {
+    return vec3(frag_coord.xy / viewport.zw * 2.0 - 1.0, frag_coord.z);
+}
+"#,
+            "view_stub.wgsl",
+        );
+        add_stub_module(
+            &mut composer,
+            concat!(
+                "#define_import_path bevy_pbr::prepass_bindings\n",
+                "struct PreviousViewUniforms { value: u32 }\n",
+                // Group 3 is unused by every meshlet pass, so this cannot collide.
+                "@group(3) @binding(0) var<uniform> previous_view_uniforms: PreviousViewUniforms;\n",
+            ),
+            "previous_view_stub.wgsl",
+        );
+        add_stub_module(
+            &mut composer,
+            concat!(
+                "#define_import_path bevy_pbr::pbr_prepass_functions\n",
+                "fn calculate_motion_vector(world_position: vec4<f32>, previous_world_position: vec4<f32>) -> vec2<f32> {\n",
+                "    return world_position.xy - previous_world_position.xy;\n",
+                "}\n",
+            ),
+            "pbr_prepass_functions_stub.wgsl",
+        );
+        add_stub_module(
+            &mut composer,
+            r#"
+#define_import_path bevy_render::utils
+fn octahedral_decode_signed(value: vec2<f32>) -> vec3<f32> {
+    return vec3<f32>(value, 0.0);
+}
+"#,
+            "render_utils_stub.wgsl",
+        );
+        add_stub_module(
+            &mut composer,
+            r#"
+#define_import_path bevy_render::maths
+fn affine3_to_square(_affine: mat3x4<f32>) -> mat4x4<f32> {
+    return mat4x4<f32>(
+        vec4<f32>(1.0, 0.0, 0.0, 0.0),
+        vec4<f32>(0.0, 1.0, 0.0, 0.0),
+        vec4<f32>(0.0, 0.0, 1.0, 0.0),
+        vec4<f32>(0.0, 0.0, 0.0, 1.0),
+    );
+}
+
+fn mat2x4_f32_to_mat3x3_unpack(a: mat2x4<f32>, b: f32) -> mat3x3<f32> {
+    return mat3x3<f32>(a[0].xyz, vec3<f32>(a[0].w, a[1].xy), vec3<f32>(a[1].zw, b));
+}
+"#,
+            "render_maths_stub.wgsl",
+        );
+        add_stub_module(
+            &mut composer,
+            r#"
+#define_import_path bevy_pbr::mesh_functions
+fn mesh_position_local_to_world(world_from_local: mat4x4<f32>, position: vec4<f32>) -> vec4<f32> {
+    return world_from_local * position;
+}
+"#,
+            "mesh_functions_stub.wgsl",
+        );
+        add_stub_module(
+            &mut composer,
+            r#"
+#define_import_path bevy_pbr::view_transformations
+fn ndc_to_uv(ndc: vec2<f32>) -> vec2<f32> {
+    return ndc * vec2<f32>(0.5, -0.5) + 0.5;
+}
+
+fn position_world_to_clip(world_pos: vec3<f32>) -> vec4<f32> {
+    return vec4(world_pos, 1.0);
+}
+"#,
+            "view_transformations_stub.wgsl",
+        );
+        let bindings = Shader::from_wgsl(
+            include_str!("meshlet_bindings.wgsl"),
+            "meshlet_bindings.wgsl",
+        );
+        composer.add_composable_module((&bindings).into()).unwrap();
+        add_stub_module(
+            &mut composer,
+            r#"
+#define_import_path bevy_pbr::meshlet_cull_shared
+#import bevy_pbr::meshlet_bindings::MeshletAabb
+
+fn lod_error_is_imperceptible(_sphere: vec4<f32>, _error: f32, _instance_id: u32) -> bool {
+    return false;
+}
+
+fn aabb_in_frustum(_aabb: MeshletAabb, _instance_id: u32) -> bool {
+    return true;
+}
+
+fn should_occlusion_cull_aabb(_aabb: MeshletAabb, _instance_id: u32) -> bool {
+    return false;
+}
+"#,
+            "meshlet_cull_shared_stub.wgsl",
+        );
+
+        for pass_def in [
+            "MESHLET_BVH_CULLING_PASS",
+            "MESHLET_CLUSTER_CULLING_PASS",
+            "MESHLET_VISIBILITY_BUFFER_RASTER_PASS",
+            "MESHLET_MESH_MATERIAL_PASS",
+        ] {
+            let test_shader = Shader::from_wgsl(
+                r#"
+enable wgpu_binding_array;
+
+#import bevy_pbr::meshlet_bindings::{
+    MeshletGpuDescriptor,
+    get_meshlet_vertex_id,
+    get_meshlet_vertex_position,
+    get_meshlet_vertex_normal,
+    get_meshlet_vertex_uv,
+    load_bvh_subnode,
+    load_meshlet,
+    load_meshlet_geometry,
+    load_meshlet_cull_data,
+}
+
+@compute @workgroup_size(1)
+fn validate_paged_loads() {
+    let descriptor = MeshletGpuDescriptor(0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u);
+    var meshlet = load_meshlet(descriptor, 0u);
+    var geometry_meshlet = load_meshlet_geometry(descriptor, 0u);
+    let vertex_id = get_meshlet_vertex_id(descriptor, meshlet.start_index_id);
+    let position = get_meshlet_vertex_position(descriptor, &geometry_meshlet, vertex_id);
+    let normal = get_meshlet_vertex_normal(descriptor, &meshlet, vertex_id);
+    let uv = get_meshlet_vertex_uv(descriptor, &meshlet, vertex_id);
+    let bvh = load_bvh_subnode(descriptor, u32(position.x), 0u);
+    let cull = load_meshlet_cull_data(descriptor, u32(normal.x + uv.x));
+}
+"#,
+                "paged_meshlet_validation.wgsl",
+            );
+            let shader_defs = HashMap::from([
+                (
+                    "MESHLET_PAGE_ACCESS".to_string(),
+                    ShaderDefValue::Bool(true),
+                ),
+                (pass_def.to_string(), ShaderDefValue::Bool(true)),
+            ]);
+            composer
+                .make_naga_module(NagaModuleDescriptor {
+                    shader_defs,
+                    ..(&test_shader).into()
+                })
+                .unwrap_or_else(|error| panic!("{pass_def} failed Naga validation: {error:?}"));
+        }
+
+        // Compile an actual page-consuming entry point in both of its pipeline variants. The
+        // culling policy is stubbed because it is orthogonal; all real bindings, descriptor
+        // address translation, queue accesses, and BVH page loads remain intact. Naga validates
+        // composition and types here; bind-group creation and Vulkan non-uniform indexing still
+        // require the Windows/device integration run.
+        let cull_bvh = Shader::from_wgsl(include_str!("cull_bvh.wgsl"), "cull_bvh.wgsl");
+        for first_pass in [false, true] {
+            let mut shader_defs = HashMap::from([
+                (
+                    "MESHLET_PAGE_ACCESS".to_string(),
+                    ShaderDefValue::Bool(true),
+                ),
+                (
+                    "MESHLET_BVH_CULLING_PASS".to_string(),
+                    ShaderDefValue::Bool(true),
+                ),
+            ]);
+            if first_pass {
+                shader_defs.insert(
+                    "MESHLET_FIRST_CULLING_PASS".to_string(),
+                    ShaderDefValue::Bool(true),
+                );
+            }
+            composer
+                .make_naga_module(NagaModuleDescriptor {
+                    shader_defs,
+                    ..(&cull_bvh).into()
+                })
+                .unwrap_or_else(|error| {
+                    panic!("cull_bvh first_pass={first_pass} failed Naga validation: {error:?}")
+                });
+        }
+
+        let cull_instances =
+            Shader::from_wgsl(include_str!("cull_instances.wgsl"), "cull_instances.wgsl");
+        for first_pass in [false, true] {
+            let mut shader_defs = HashMap::from([(
+                "MESHLET_INSTANCE_CULLING_PASS".to_string(),
+                ShaderDefValue::Bool(true),
+            )]);
+            if first_pass {
+                shader_defs.insert(
+                    "MESHLET_FIRST_CULLING_PASS".to_string(),
+                    ShaderDefValue::Bool(true),
+                );
+            }
+            composer
+                .make_naga_module(NagaModuleDescriptor {
+                    shader_defs,
+                    ..(&cull_instances).into()
+                })
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "cull_instances first_pass={first_pass} failed Naga validation: {error:?}"
+                    )
+                });
+        }
+
+        for (name, source) in [
+            (
+                "visibility_buffer_software_raster.wgsl",
+                include_str!("visibility_buffer_software_raster.wgsl"),
+            ),
+            (
+                "visibility_buffer_hardware_raster.wgsl",
+                include_str!("visibility_buffer_hardware_raster.wgsl"),
+            ),
+        ] {
+            let raster = Shader::from_wgsl(source, name);
+            for full_output in [false, true] {
+                let mut shader_defs = HashMap::from([
+                    (
+                        "MESHLET_PAGE_ACCESS".to_string(),
+                        ShaderDefValue::Bool(true),
+                    ),
+                    (
+                        "MESHLET_VISIBILITY_BUFFER_RASTER_PASS".to_string(),
+                        ShaderDefValue::Bool(true),
+                    ),
+                ]);
+                if full_output {
+                    shader_defs.insert(
+                        "MESHLET_VISIBILITY_BUFFER_RASTER_PASS_OUTPUT".to_string(),
+                        ShaderDefValue::Bool(true),
+                    );
+                }
+                composer
+                    .make_naga_module(NagaModuleDescriptor {
+                        shader_defs,
+                        ..(&raster).into()
+                    })
+                    .unwrap_or_else(|error| {
+                        panic!("{name} full_output={full_output} failed Naga validation: {error:?}")
+                    });
+            }
+        }
+
+        // The material-pass resolve reconstructs the triangle, its facing bit and its texture
+        // gradients from the visibility buffer. It has no entry point of its own, so drive it
+        // from a throwaway fragment shader that reads every field of the resolved VertexOutput.
+        add_stub_module(
+            &mut composer,
+            concat!(
+                "#define_import_path bevy_pbr::mesh_view_bindings\n",
+                "#import bevy_render::view::View\n",
+                "@group(0) @binding(0) var<uniform> view: View;\n",
+            ),
+            "mesh_view_bindings_stub.wgsl",
+        );
+        let resolve = Shader::from_wgsl(
+            include_str!("visibility_buffer_resolve.wgsl"),
+            "visibility_buffer_resolve.wgsl",
+        );
+        composer.add_composable_module((&resolve).into()).unwrap();
+        for motion_vectors in [false, true] {
+            let motion_vector_read = if motion_vectors {
+                "+ out.motion_vector.x"
+            } else {
+                ""
+            };
+            let resolve_consumer = Shader::from_wgsl(
+                format!(
+                    r#"
+enable wgpu_binding_array;
+
+#import bevy_pbr::meshlet_visibility_buffer_resolve::resolve_vertex_output
+
+@fragment
+fn fragment(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {{
+    let out = resolve_vertex_output(frag_coord);
+    return vec4(
+        out.position.xyz + out.world_position.xyz + out.world_normal + out.world_tangent.xyz,
+        f32(out.is_front)
+            + f32(out.mesh_flags + out.cluster_id + out.material_bind_group_slot)
+            + out.uv.x + out.ddx_uv.y + out.ddy_uv.x {motion_vector_read},
+    );
+}}
+"#
+                ),
+                "visibility_buffer_resolve_validation.wgsl",
+            );
+            let mut shader_defs = HashMap::from([
+                (
+                    "MESHLET_PAGE_ACCESS".to_string(),
+                    ShaderDefValue::Bool(true),
+                ),
+                (
+                    "MESHLET_MESH_MATERIAL_PASS".to_string(),
+                    ShaderDefValue::Bool(true),
+                ),
+            ]);
+            if motion_vectors {
+                shader_defs.insert("PREPASS_FRAGMENT".to_string(), ShaderDefValue::Bool(true));
+                shader_defs.insert(
+                    "MOTION_VECTOR_PREPASS".to_string(),
+                    ShaderDefValue::Bool(true),
+                );
+            }
+            composer
+                .make_naga_module(NagaModuleDescriptor {
+                    shader_defs,
+                    ..(&resolve_consumer).into()
+                })
+                .unwrap_or_else(|error| {
+                    panic!("visibility_buffer_resolve.wgsl motion_vectors={motion_vectors} failed Naga validation: {error:?}")
+                });
         }
     }
 }

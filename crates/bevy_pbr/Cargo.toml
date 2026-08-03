@@ -26,7 +26,7 @@ area_light_luts = ["bevy_image/ktx2", "bevy_image/zstd"]
 shader_format_glsl = ["bevy_shader/shader_format_glsl"]
 trace = ["bevy_render/trace"]
 # Enables the meshlet renderer for dense high-poly scenes (experimental)
-meshlet = ["dep:lz4_flex", "dep:range-alloc"]
+meshlet = ["dep:lz4_flex"]
 # Enables processing meshes into meshlet meshes
 meshlet_processor = [
   "meshlet",
@@ -77,7 +77,6 @@ derive_more = { version = "2", default-features = false, features = ["from"] }
 lz4_flex = { version = "0.13", default-features = false, features = [
   "frame",
 ], optional = true }
-range-alloc = { version = "0.1", optional = true }
 meshopt = { version = "0.6.2", optional = true }
 metis = { version = "0.2.2", optional = true }
 itertools = { version = "0.14", optional = true }
@@ -92,6 +91,10 @@ offset-allocator = "0.2"
 arrayvec = { version = "0.7", default-features = false }
 indexmap = { version = "2" }
 wgpu-types = "30"
+
+[dev-dependencies]
+naga_oil = { version = "0.23", default-features = false, features = ["test_shader"] }
+naga = { version = "30", features = ["wgsl-in"] }
 
 [lints]
 workspace = true

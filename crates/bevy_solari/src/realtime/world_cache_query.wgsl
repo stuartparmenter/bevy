@@ -21,7 +21,14 @@ const WORLD_CACHE_MAX_SEARCH_STEPS: u32 = 3u;
 const WORLD_CACHE_EMPTY_CELL: u32 = 0u;
 
 #ifndef WORLD_CACHE_NON_ATOMIC_LIFE_BUFFER
-fn query_world_cache(world_position_in: vec3<f32>, world_normal: vec3<f32>, view_position: vec3<f32>, ray_t: f32, cell_lifetime: u32, rng: ptr<function, u32>) -> vec3<f32> {
+fn query_world_cache(world_position_in: vec3<f32>, world_normal: vec3<f32>, ray_origin_bias: f32, view_position: vec3<f32>, ray_t: f32, cell_lifetime: u32, rng: ptr<function, u32>) -> vec3<f32> {
+    if any(world_position_in != world_position_in)
+        || any(world_normal != world_normal)
+        || any(abs(world_position_in) > vec3(1e30))
+        || any(abs(world_normal) > vec3(1e30))
+    {
+        return vec3(0.0);
+    }
     var world_position = world_position_in;
     var cell_size = get_cell_size(world_position, view_position, ray_t, rng);
 
@@ -58,11 +65,12 @@ fn query_world_cache(world_position_in: vec3<f32>, world_normal: vec3<f32>, view
         } else if existing_checksum == WORLD_CACHE_EMPTY_CELL && cas.exchanged {
             // Cell is empty - initialize it
             world_cache_geometry_data[key].world_position = world_position;
+            world_cache_geometry_data[key].ray_origin_bias = ray_origin_bias;
             world_cache_geometry_data[key].world_normal = world_normal;
             return vec3(0.0);
         } else {
             // Collision - linear probe to next entry
-            key += 1u;
+            key = wrap_key(key + 1u);
         }
     }
 
@@ -71,11 +79,12 @@ fn query_world_cache(world_position_in: vec3<f32>, world_normal: vec3<f32>, view
 #endif
 
 fn get_cell_size(world_position: vec3<f32>, view_position: vec3<f32>, ray_t: f32, rng: ptr<function, u32>) -> f32 {
-    let camera_distance = distance(view_position, world_position) / constants.world_cache_position_lod_scale;
+    let lod_scale = max(constants.world_cache_position_lod_scale, 1e-6);
+    let camera_distance = max(distance(view_position, world_position), 0.0) / lod_scale;
     let lod_f = log2(1.0 + camera_distance);
     let lod_fract = fract(lod_f);
     let lod = floor(lod_f) + select(0.0, 1.0, rand_f(rng) < lod_fract * lod_fract * lod_fract);
-    return constants.world_cache_position_base_cell_size * exp2(lod);
+    return max(constants.world_cache_position_base_cell_size, 1e-6) * exp2(lod);
 }
 
 fn quantize_position(world_position: vec3<f32>, quantization_factor: f32) -> vec3<f32> {

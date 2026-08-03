@@ -197,3 +197,84 @@ impl Default for SolariLighting {
         }
     }
 }
+
+#[cfg(test)]
+mod shader_source_tests {
+    #[test]
+    fn ris_visibility_is_part_of_candidate_evaluation() {
+        let initial_path = include_str!("initial_path.wgsl");
+        let candidate_visibility = initial_path
+            .find("let visibility = trace_visibility(ray_origin, geometric_normal")
+            .expect("initial-path RIS candidates must test visibility");
+        let candidate_target = initial_path[candidate_visibility..]
+            .find("let target_function = luminance(brdf_radiance);")
+            .expect("initial-path RIS must evaluate a target after visibility");
+        assert!(candidate_target > 0);
+        assert!(
+            !initial_path.contains("unbiased_contribution_weight *= trace_visibility"),
+            "the selected RIS winner must not issue a redundant visibility ray"
+        );
+
+        let world_cache_update = include_str!("world_cache_update.wgsl");
+        assert!(world_cache_update
+            .contains("let visibility = trace_visibility(world_position, world_normal"));
+        assert!(!world_cache_update.contains("unbiased_contribution_weight *= trace_visibility"));
+    }
+
+    #[test]
+    fn world_cache_linear_probe_wraps() {
+        let world_cache_query = include_str!("world_cache_query.wgsl");
+        assert!(world_cache_query.contains("key = wrap_key(key + 1u);"));
+        assert!(!world_cache_query.contains("\n            key += 1u;"));
+    }
+
+    #[test]
+    fn ray_misses_consume_the_shared_environment() {
+        let initial_path = include_str!("initial_path.wgsl");
+        assert!(initial_path.contains("sample_environment_radiance(next_bounce.wi)"));
+        assert!(initial_path.contains("environment_light_pdf(next_bounce.wi)"));
+        assert!(
+            initial_path.contains("environment_light_pdf(di.wi)"),
+            "environment NEE must MIS against the BRDF-miss strategy that owns the same radiance"
+        );
+    }
+
+    #[test]
+    fn world_cache_gi_misses_do_not_re_add_the_environment() {
+        // sample_di samples the environment for every cell with a full-range visibility ray, and
+        // the GI ray is truncated at world_cache_max_gi_ray_distance, so a miss must add nothing.
+        let world_cache_update = include_str!("world_cache_update.wgsl");
+        assert!(!world_cache_update.contains("sample_environment_radiance"));
+    }
+
+    #[test]
+    fn rasterized_surfaces_widen_the_ray_origin_bias_with_distance() {
+        // The G-buffer surface is whichever meshlet LOD stays under ~1px of screen error, so it
+        // drifts from the traced geometry by an amount that grows with camera distance. A constant
+        // geometry-error bias leaves distant shading points inside the traced proxy, where every
+        // visibility and GI ray is self-occluded and the pixel resolves to black.
+        let initial_path = include_str!("initial_path.wgsl");
+        assert!(initial_path.contains(
+            "ray_origin_bias_with_raster_lod(primary_ray_origin_bias(), pixel_world_size(world_position, view.world_position))"
+        ));
+
+        // One import plus the canonical and other domains of a reservoir merge.
+        let restir = include_str!("restir.wgsl");
+        assert_eq!(restir.matches("ray_origin_bias_with_raster_lod").count(), 3);
+
+        // Cache rays must escape their surface by the same distance the DI rays do.
+        let world_cache_update = include_str!("world_cache_update.wgsl");
+        assert!(world_cache_update.contains("fn cell_ray_origin_bias"));
+        assert_eq!(
+            world_cache_update
+                .matches("cell_ray_origin_bias(geometry_data)")
+                .count(),
+            2
+        );
+
+        // The added term must stay bounded, or a distant surface biases its rays straight through
+        // the wall behind it.
+        let scene_bindings = include_str!("../scene/raytracing_scene_bindings.wgsl");
+        assert!(scene_bindings.contains("min(lod_error, RAY_ORIGIN_BIAS_RASTER_LOD_MAX)"));
+    }
+}

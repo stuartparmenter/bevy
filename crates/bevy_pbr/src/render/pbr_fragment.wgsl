@@ -121,7 +121,6 @@ fn pbr_input_from_standard_material(
     bias.mip_bias = view.mip_bias;
 #endif  // MESHLET_MESH_MATERIAL_PASS
 
-// TODO: Transforming UVs mean we need to apply derivative chain rule for meshlet mesh material pass
 #ifdef VERTEX_UVS
 
 #ifdef BINDLESS
@@ -132,11 +131,22 @@ fn pbr_input_from_standard_material(
 
 pbr_input.material.uv_transform = uv_transform;
 
+// Meshlet shading reconstructs texture gradients explicitly, so automatic
+// derivatives cannot account for the material UV transform. Transform the
+// gradients by the linear portion of the affine transform (translation has no
+// derivative) before using them with textureSampleGrad. This is especially
+// important for UDIM atlases, where a 1/N scale would otherwise select mips as
+// if the texture footprint were N times larger.
+#ifdef MESHLET_MESH_MATERIAL_PASS
+    let uv_transform_linear = mat2x2<f32>(uv_transform[0].xy, uv_transform[1].xy);
+    bias.ddx_uv = uv_transform_linear * bias.ddx_uv;
+    bias.ddy_uv = uv_transform_linear * bias.ddy_uv;
+#endif
+
 #ifdef VERTEX_UVS_A
     var uv = (uv_transform * vec3(in.uv, 1.0)).xy;
 #endif
 
-// TODO: Transforming UVs mean we need to apply derivative chain rule for meshlet mesh material pass
 #ifdef VERTEX_UVS_B
     var uv_b = (uv_transform * vec3(in.uv_b, 1.0)).xy;
 #else

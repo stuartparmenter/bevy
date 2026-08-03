@@ -20,6 +20,7 @@ bevy_derive = { path = "../bevy_derive", version = "0.20.0-dev" }
 bevy_diagnostic = { path = "../bevy_diagnostic", version = "0.20.0-dev" }
 bevy_ecs = { path = "../bevy_ecs", version = "0.20.0-dev" }
 bevy_shader = { path = "../bevy_shader", version = "0.20.0-dev" }
+bevy_tasks = { path = "../bevy_tasks", version = "0.20.0-dev" }
 bevy_math = { path = "../bevy_math", version = "0.20.0-dev" }
 bevy_mesh = { path = "../bevy_mesh", version = "0.20.0-dev" }
 bevy_pbr = { path = "../bevy_pbr", version = "0.20.0-dev", features = [
@@ -38,6 +39,10 @@ bevy_transform = { path = "../bevy_transform", version = "0.20.0-dev" }
 bytemuck = { version = "1" }
 derive_more = { version = "2", default-features = false, features = ["from"] }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
+wgpu = { version = "30", default-features = false }
+
+[dev-dependencies]
+naga_oil = { version = "0.23", default-features = false, features = ["test_shader"] }
 
 [features]
 dlss = ["bevy_anti_alias/dlss"]

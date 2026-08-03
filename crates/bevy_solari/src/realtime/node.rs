@@ -6,7 +6,7 @@ use bevy_asset::{load_embedded_asset, AssetServer, Handle};
 use bevy_core_pipeline::prepass::{
     PreviousViewData, PreviousViewUniformOffset, PreviousViewUniforms, ViewPrepassTextures,
 };
-use bevy_ecs::{prelude::*, resource::Resource, system::Commands};
+use bevy_ecs::{entity::EntityHashMap, prelude::*, resource::Resource, system::Commands};
 use bevy_render::{
     diagnostic::RecordDiagnostics as _,
     render_resource::{
@@ -24,6 +24,34 @@ use bevy_render::{
 };
 use bevy_shader::{Shader, ShaderDefVal};
 use bevy_utils::default;
+use tracing::{info, warn};
+
+#[derive(Default)]
+pub(super) struct SolariPassAvailability {
+    ever_ready: bool,
+    unavailable_reason: Option<&'static str>,
+}
+
+impl SolariPassAvailability {
+    fn report_unavailable(&mut self, reason: &'static str) {
+        if self.ever_ready && self.unavailable_reason != Some(reason) {
+            warn!(
+                reason,
+                "Solari lighting pass became unavailable; this frame will not be shaded"
+            );
+        }
+        self.unavailable_reason = Some(reason);
+    }
+
+    fn report_ready(&mut self) {
+        if let Some(reason) = self.unavailable_reason.take()
+            && self.ever_ready
+        {
+            info!(reason, "Solari lighting pass recovered");
+        }
+        self.ever_ready = true;
+    }
+}
 
 /// Resource holding the Solari lighting pipeline configuration.
 #[derive(Resource)]
@@ -75,8 +103,13 @@ pub fn solari_lighting(
     view_uniforms: Res<ViewUniforms>,
     previous_view_uniforms: Res<PreviousViewUniforms>,
     render_device: Res<RenderDevice>,
+    // Keyed by view: this system runs once per Solari camera, and views can be ready on different
+    // frames, so a single shared tracker would report one view's state as another's.
+    mut availability: Local<EntityHashMap<SolariPassAvailability>>,
     mut ctx: RenderContext,
 ) {
+    let availability = availability.entry(view.entity()).or_default();
+
     #[cfg(any(not(feature = "dlss"), feature = "force_disable_dlss"))]
     let (
         solari_lighting_resources,
@@ -97,8 +130,29 @@ pub fn solari_lighting(
     ) = view.into_inner();
 
     let Some(pipelines) = solari_pipelines else {
+        availability.report_unavailable("pipeline resource is absent");
         return;
     };
+
+    if scene_bindings.bind_group.is_none() {
+        availability.report_unavailable("raytracing scene bind group is absent");
+        return;
+    }
+    if view_prepass_textures.deferred_view().is_none()
+        || view_prepass_textures.depth_only_view().is_none()
+        || view_prepass_textures.motion_vectors_view().is_none()
+        || view_prepass_textures.previous_deferred_view().is_none()
+        || view_prepass_textures.previous_depth_only_view().is_none()
+    {
+        availability.report_unavailable("current or previous prepass texture is absent");
+        return;
+    }
+    if view_uniforms.uniforms.binding().is_none()
+        || previous_view_uniforms.uniforms.binding().is_none()
+    {
+        availability.report_unavailable("current or previous view uniform is absent");
+        return;
+    }
 
     #[cfg(any(not(feature = "dlss"), feature = "force_disable_dlss"))]
     let initial_and_temporal_pipeline = pipelines.initial_and_temporal_pipeline;
@@ -150,6 +204,7 @@ pub fn solari_lighting(
         previous_view_uniforms.uniforms.binding(),
     )
     else {
+        availability.report_unavailable("one or more compute pipelines are unavailable");
         return;
     };
 
@@ -157,8 +212,11 @@ pub fn solari_lighting(
     let Some(resolve_dlss_rr_textures_pipeline) =
         pipeline_cache.get_compute_pipeline(pipelines.resolve_dlss_rr_textures_pipeline)
     else {
+        availability.report_unavailable("DLSS ray-reconstruction resolve pipeline is unavailable");
         return;
     };
+
+    availability.report_ready();
 
     let view_target_attachment = view_target.get_unsampled_color_attachment();
 

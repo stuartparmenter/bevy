@@ -1,3 +1,5 @@
+enable wgpu_binding_array;
+
 #import bevy_pbr::meshlet_bindings::{
     InstancedOffset,
     get_aabb,
@@ -5,7 +7,8 @@
     constants,
     view,
     meshlet_instance_uniforms,
-    meshlet_cull_data,
+    meshlet_instance_descriptors,
+    load_meshlet_cull_data,
     meshlet_software_raster_indirect_args,
     meshlet_hardware_raster_indirect_args,
     meshlet_previous_raster_counts,
@@ -36,7 +39,9 @@ fn cull_clusters(@builtin(global_invocation_id) global_invocation_id: vec3<u32>)
 #endif
     let instanced_offset = meshlet_meshlet_cull_queue[meshlet_id];
     let instance_id = instanced_offset.instance_id;
-    let cull_data = &meshlet_cull_data[instanced_offset.offset];
+    let descriptor = meshlet_instance_descriptors[instance_id];
+    var cull_data_value = load_meshlet_cull_data(descriptor, instanced_offset.offset);
+    let cull_data = &cull_data_value;
     var aabb_error_offset = (*cull_data).aabb;
     let aabb = get_aabb(&aabb_error_offset);
     let error = get_aabb_error(&aabb_error_offset);
@@ -74,7 +79,7 @@ fn cull_clusters(@builtin(global_invocation_id) global_invocation_id: vec3<u32>)
     var screen_aabb = ScreenAabb(vec3<f32>(0.0), vec3<f32>(0.0));
     var sw_raster = project_aabb(clip_from_local, near, aabb, &screen_aabb);
     if sw_raster {
-        let aabb_size = (screen_aabb.max.xy - screen_aabb.min.xy) * view.viewport.zw;
+        let aabb_size = (screen_aabb.max.xy - screen_aabb.min.xy) * view.main_pass_viewport.zw;
         sw_raster = all(aabb_size <= vec2<f32>(64.0));
     }
 

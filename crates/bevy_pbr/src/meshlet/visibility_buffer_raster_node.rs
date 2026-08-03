@@ -3,6 +3,7 @@ use super::{
     resource_manager::{MeshletViewBindGroups, MeshletViewResources, ResourceManager},
 };
 use crate::{LightEntity, ShadowView};
+use bevy_camera::{MainPassResolutionOverride, Viewport};
 use bevy_color::LinearRgba;
 use bevy_core_pipeline::prepass::PreviousViewUniformOffset;
 use bevy_ecs::prelude::*;
@@ -27,6 +28,7 @@ pub fn meshlet_visibility_buffer_raster(
         &PreviousViewUniformOffset,
         &MeshletViewBindGroups,
         &MeshletViewResources,
+        Option<&MainPassResolutionOverride>,
     )>,
     view_light_query: Query<(
         &ShadowView,
@@ -46,6 +48,7 @@ pub fn meshlet_visibility_buffer_raster(
         previous_view_offset,
         meshlet_view_bind_groups,
         meshlet_view_resources,
+        resolution_override,
     ) = view.into_inner();
 
     let Some((
@@ -108,6 +111,7 @@ pub fn meshlet_visibility_buffer_raster(
         first_bvh_cull_pipeline,
         first_meshlet_cull_pipeline,
         remap_1d_to_2d_dispatch_pipeline,
+        meshlet_view_resources.max_compute_workgroups_per_dimension,
     );
     raster_pass(
         true,
@@ -121,6 +125,7 @@ pub fn meshlet_visibility_buffer_raster(
         visibility_buffer_hardware_raster_pipeline,
         fill_counts_pipeline,
         Some(camera),
+        resolution_override,
         meshlet_view_resources.rightmost_slot,
     );
     ctx.command_encoder().pop_debug_group();
@@ -148,6 +153,7 @@ pub fn meshlet_visibility_buffer_raster(
         second_bvh_cull_pipeline,
         second_meshlet_cull_pipeline,
         remap_1d_to_2d_dispatch_pipeline,
+        meshlet_view_resources.max_compute_workgroups_per_dimension,
     );
     raster_pass(
         false,
@@ -161,7 +167,22 @@ pub fn meshlet_visibility_buffer_raster(
         visibility_buffer_hardware_raster_pipeline,
         fill_counts_pipeline,
         Some(camera),
+        resolution_override,
         meshlet_view_resources.rightmost_slot,
+    );
+    diagnostics.record_u32(
+        ctx.command_encoder(),
+        &resource_manager
+            .visibility_buffer_raster_cluster_prev_counts
+            .slice(0..4),
+        "meshlet_software_raster_clusters",
+    );
+    diagnostics.record_u32(
+        ctx.command_encoder(),
+        &resource_manager
+            .visibility_buffer_raster_cluster_prev_counts
+            .slice(4..8),
+        "meshlet_hardware_raster_clusters",
     );
     ctx.command_encoder().pop_debug_group();
 
@@ -170,7 +191,8 @@ pub fn meshlet_visibility_buffer_raster(
         view_depth.get_attachment(StoreOp::Store),
         meshlet_view_bind_groups,
         resolve_depth_pipeline,
-        camera,
+        Some(camera),
+        resolution_override,
     );
     resolve_material_depth(
         &mut ctx,
@@ -178,6 +200,7 @@ pub fn meshlet_visibility_buffer_raster(
         meshlet_view_bind_groups,
         resolve_material_depth_pipeline,
         camera,
+        resolution_override,
     );
     meshlet_view_resources
         .depth_pyramid
@@ -233,6 +256,7 @@ pub fn meshlet_visibility_buffer_raster(
             first_bvh_cull_pipeline,
             first_meshlet_cull_pipeline,
             remap_1d_to_2d_dispatch_pipeline,
+            meshlet_view_resources.max_compute_workgroups_per_dimension,
         );
         raster_pass(
             true,
@@ -245,6 +269,7 @@ pub fn meshlet_visibility_buffer_raster(
             visibility_buffer_software_raster_shadow_view_pipeline,
             shadow_visibility_buffer_hardware_raster_pipeline,
             fill_counts_pipeline,
+            None,
             None,
             meshlet_view_resources.rightmost_slot,
         );
@@ -273,6 +298,7 @@ pub fn meshlet_visibility_buffer_raster(
             second_bvh_cull_pipeline,
             second_meshlet_cull_pipeline,
             remap_1d_to_2d_dispatch_pipeline,
+            meshlet_view_resources.max_compute_workgroups_per_dimension,
         );
         raster_pass(
             false,
@@ -286,6 +312,7 @@ pub fn meshlet_visibility_buffer_raster(
             shadow_visibility_buffer_hardware_raster_pipeline,
             fill_counts_pipeline,
             None,
+            None,
             meshlet_view_resources.rightmost_slot,
         );
         ctx.command_encoder().pop_debug_group();
@@ -295,7 +322,8 @@ pub fn meshlet_visibility_buffer_raster(
             shadow_view.depth_attachment.get_attachment(StoreOp::Store),
             meshlet_view_bind_groups,
             resolve_depth_shadow_view_pipeline,
-            camera,
+            None,
+            None,
         );
         meshlet_view_resources
             .depth_pyramid
@@ -345,12 +373,14 @@ fn first_cull(
     first_bvh_cull_pipeline: &ComputePipeline,
     first_meshlet_cull_pipeline: &ComputePipeline,
     remap_1d_to_2d_pipeline: Option<&ComputePipeline>,
+    max_compute_workgroups_per_dimension: u32,
 ) {
     let workgroups = meshlet_view_resources.scene_instance_count.div_ceil(128);
     cull_pass(
         "meshlet_first_instance_cull",
         ctx,
         &meshlet_view_bind_groups.first_instance_cull,
+        None,
         view_offset,
         previous_view_offset,
         first_instance_cull_pipeline,
@@ -370,6 +400,7 @@ fn first_cull(
             } else {
                 &meshlet_view_bind_groups.first_bvh_cull_pong
             },
+            Some(&meshlet_view_bind_groups.meshlet_pages),
             view_offset,
             previous_view_offset,
             first_bvh_cull_pipeline,
@@ -409,6 +440,7 @@ fn first_cull(
         "meshlet_first_meshlet_cull",
         ctx,
         &meshlet_view_bind_groups.first_meshlet_cull,
+        Some(&meshlet_view_bind_groups.meshlet_pages),
         view_offset,
         previous_view_offset,
         first_meshlet_cull_pipeline,
@@ -419,6 +451,7 @@ fn first_cull(
         pass,
         remap_1d_to_2d_pipeline,
         meshlet_view_bind_groups.remap_1d_to_2d_dispatch.as_ref(),
+        max_compute_workgroups_per_dimension,
     );
 }
 
@@ -432,11 +465,13 @@ fn second_cull(
     second_bvh_cull_pipeline: &ComputePipeline,
     second_meshlet_cull_pipeline: &ComputePipeline,
     remap_1d_to_2d_pipeline: Option<&ComputePipeline>,
+    max_compute_workgroups_per_dimension: u32,
 ) {
     cull_pass(
         "meshlet_second_instance_cull",
         ctx,
         &meshlet_view_bind_groups.second_instance_cull,
+        None,
         view_offset,
         previous_view_offset,
         second_instance_cull_pipeline,
@@ -456,6 +491,7 @@ fn second_cull(
             } else {
                 &meshlet_view_bind_groups.second_bvh_cull_pong
             },
+            Some(&meshlet_view_bind_groups.meshlet_pages),
             view_offset,
             previous_view_offset,
             second_bvh_cull_pipeline,
@@ -469,6 +505,24 @@ fn second_cull(
             },
             0,
         );
+        ctx.command_encoder().clear_buffer(
+            if ping {
+                &meshlet_view_resources.second_bvh_cull_count_front
+            } else {
+                &meshlet_view_resources.second_bvh_cull_count_back
+            },
+            0,
+            Some(4),
+        );
+        ctx.command_encoder().clear_buffer(
+            if ping {
+                &meshlet_view_resources.second_bvh_cull_dispatch_front
+            } else {
+                &meshlet_view_resources.second_bvh_cull_dispatch_back
+            },
+            0,
+            Some(4),
+        );
         ping = !ping;
     }
     ctx.command_encoder().pop_debug_group();
@@ -477,6 +531,7 @@ fn second_cull(
         "meshlet_second_meshlet_cull",
         ctx,
         &meshlet_view_bind_groups.second_meshlet_cull,
+        Some(&meshlet_view_bind_groups.meshlet_pages),
         view_offset,
         previous_view_offset,
         second_meshlet_cull_pipeline,
@@ -487,6 +542,7 @@ fn second_cull(
         pass,
         remap_1d_to_2d_pipeline,
         meshlet_view_bind_groups.remap_1d_to_2d_dispatch.as_ref(),
+        max_compute_workgroups_per_dimension,
     );
 }
 
@@ -494,6 +550,7 @@ fn cull_pass<'a>(
     label: &'static str,
     ctx: &'a mut RenderContext,
     bind_group: &'a BindGroup,
+    pages_bind_group: Option<&'a BindGroup>,
     view_offset: &'a ViewUniformOffset,
     previous_view_offset: &'a PreviousViewUniformOffset,
     pipeline: &'a ComputePipeline,
@@ -510,6 +567,9 @@ fn cull_pass<'a>(
         bind_group,
         &[view_offset.offset, previous_view_offset.offset],
     );
+    if let Some(pages_bind_group) = pages_bind_group {
+        pass.set_bind_group(1, pages_bind_group, &[]);
+    }
     pass.set_immediates(0, bytemuck::cast_slice(immediates));
     pass
 }
@@ -518,10 +578,12 @@ fn remap_1d_to_2d(
     mut pass: ComputePass,
     pipeline: Option<&ComputePipeline>,
     bind_group: Option<&BindGroup>,
+    max_compute_workgroups_per_dimension: u32,
 ) {
     if let (Some(pipeline), Some(bind_group)) = (pipeline, bind_group) {
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, bind_group, &[]);
+        pass.set_immediates(0, &max_compute_workgroups_per_dimension.to_le_bytes());
         pass.dispatch_workgroups(1, 1, 1);
     }
 }
@@ -538,6 +600,7 @@ fn raster_pass(
     visibility_buffer_hardware_raster_pipeline: &RenderPipeline,
     fill_counts_pipeline: &ComputePipeline,
     camera: Option<&ExtractedCamera>,
+    resolution_override: Option<&MainPassResolutionOverride>,
     raster_cluster_rightmost_slot: u32,
 ) {
     let mut software_pass = ctx
@@ -556,6 +619,7 @@ fn raster_pass(
         &meshlet_view_bind_groups.visibility_buffer_raster,
         &[view_offset.offset],
     );
+    software_pass.set_bind_group(1, &meshlet_view_bind_groups.meshlet_pages, &[]);
     software_pass.dispatch_workgroups_indirect(visibility_buffer_software_raster_indirect_args, 0);
     drop(software_pass);
 
@@ -579,8 +643,11 @@ fn raster_pass(
         occlusion_query_set: None,
         multiview_mask: None,
     });
-    if let Some(viewport) = camera.and_then(|camera| camera.viewport.as_ref()) {
-        hardware_pass.set_camera_viewport(viewport);
+    if let Some(viewport) = Viewport::from_viewport_and_override(
+        camera.and_then(|camera| camera.viewport.as_ref()),
+        resolution_override,
+    ) {
+        hardware_pass.set_camera_viewport(&viewport);
     }
     hardware_pass.set_render_pipeline(visibility_buffer_hardware_raster_pipeline);
     hardware_pass.set_immediates(0, &raster_cluster_rightmost_slot.to_le_bytes());
@@ -589,6 +656,7 @@ fn raster_pass(
         &meshlet_view_bind_groups.visibility_buffer_raster,
         &[view_offset.offset],
     );
+    hardware_pass.set_bind_group(1, &meshlet_view_bind_groups.meshlet_pages, &[]);
     hardware_pass.draw_indirect(visibility_buffer_hardware_raster_indirect_args, 0);
     drop(hardware_pass);
 
@@ -608,7 +676,8 @@ fn resolve_depth(
     depth_stencil_attachment: RenderPassDepthStencilAttachment,
     meshlet_view_bind_groups: &MeshletViewBindGroups,
     resolve_depth_pipeline: &RenderPipeline,
-    camera: &ExtractedCamera,
+    camera: Option<&ExtractedCamera>,
+    resolution_override: Option<&MainPassResolutionOverride>,
 ) {
     let mut resolve_pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
         label: Some("resolve_depth"),
@@ -618,8 +687,11 @@ fn resolve_depth(
         occlusion_query_set: None,
         multiview_mask: None,
     });
-    if let Some(viewport) = &camera.viewport {
-        resolve_pass.set_camera_viewport(viewport);
+    if let Some(viewport) = Viewport::from_viewport_and_override(
+        camera.and_then(|camera| camera.viewport.as_ref()),
+        resolution_override,
+    ) {
+        resolve_pass.set_camera_viewport(&viewport);
     }
     resolve_pass.set_render_pipeline(resolve_depth_pipeline);
     resolve_pass.set_bind_group(0, &meshlet_view_bind_groups.resolve_depth, &[]);
@@ -632,6 +704,7 @@ fn resolve_material_depth(
     meshlet_view_bind_groups: &MeshletViewBindGroups,
     resolve_material_depth_pipeline: &RenderPipeline,
     camera: &ExtractedCamera,
+    resolution_override: Option<&MainPassResolutionOverride>,
 ) {
     if let (Some(material_depth), Some(resolve_material_depth_bind_group)) = (
         meshlet_view_resources.material_depth.as_ref(),
@@ -652,8 +725,10 @@ fn resolve_material_depth(
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        if let Some(viewport) = &camera.viewport {
-            resolve_pass.set_camera_viewport(viewport);
+        if let Some(viewport) =
+            Viewport::from_viewport_and_override(camera.viewport.as_ref(), resolution_override)
+        {
+            resolve_pass.set_camera_viewport(&viewport);
         }
         resolve_pass.set_render_pipeline(resolve_material_depth_pipeline);
         resolve_pass.set_bind_group(0, resolve_material_depth_bind_group, &[]);

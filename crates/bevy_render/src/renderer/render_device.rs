@@ -5,6 +5,7 @@ use crate::render_resource::{
 };
 use crate::renderer::WgpuWrapper;
 use bevy_ecs::resource::Resource;
+use bevy_platform::sync::{Arc, Mutex, MutexGuard};
 use wgpu::{
     util::DeviceExt, BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor,
     BindGroupLayoutEntry, BufferAsyncError, BufferBindingType, PollError, PollStatus,
@@ -14,6 +15,23 @@ use wgpu::{
 #[derive(Resource, Clone)]
 pub struct RenderDevice {
     device: WgpuWrapper<wgpu::Device>,
+    error_scope_transactions: ErrorScopeTransactionLock,
+}
+
+/// Serializes complete wgpu error-scope transactions.
+///
+/// With its `std` feature disabled, wgpu stores every thread's error scopes in one global stack.
+/// Holding this lock from the first push through the last pop preserves that stack's LIFO order.
+/// We retain the same serialization with `std` enabled so correctness does not depend on how the
+/// dependency's features were unified.
+#[derive(Clone, Default)]
+struct ErrorScopeTransactionLock(Arc<Mutex<()>>);
+
+impl ErrorScopeTransactionLock {
+    fn lock(&self) -> MutexGuard<'_, ()> {
+        // A panic inside a scoped GPU operation must not permanently disable later error handling.
+        self.0.lock().unwrap_or_else(|error| error.into_inner())
+    }
 }
 
 impl From<wgpu::Device> for RenderDevice {
@@ -24,7 +42,20 @@ impl From<wgpu::Device> for RenderDevice {
 
 impl RenderDevice {
     pub fn new(device: WgpuWrapper<wgpu::Device>) -> Self {
-        Self { device }
+        Self {
+            device,
+            error_scope_transactions: ErrorScopeTransactionLock::default(),
+        }
+    }
+
+    /// Starts an error-scope transaction that cannot overlap another transaction on this device.
+    ///
+    /// Keep the returned guard alive from immediately before the first
+    /// [`wgpu::Device::push_error_scope`] call until every corresponding scope has been popped in
+    /// reverse order. This is required when wgpu is built without `std`, where error scopes are a
+    /// process-wide stack instead of thread-local stacks.
+    pub fn lock_error_scope_transaction(&self) -> MutexGuard<'_, ()> {
+        self.error_scope_transactions.lock()
     }
 
     /// List all [`Features`](wgpu::Features) that may be used with this device.
@@ -296,6 +327,10 @@ impl RenderDevice {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        sync::mpsc::{channel, TryRecvError},
+        time::Duration,
+    };
 
     #[test]
     fn align_copy_bytes_per_row() {
@@ -306,5 +341,32 @@ mod tests {
         assert_eq!(RenderDevice::align_copy_bytes_per_row(1), align);
         assert_eq!(RenderDevice::align_copy_bytes_per_row(align + 1), align * 2);
         assert_eq!(RenderDevice::align_copy_bytes_per_row(align), align);
+    }
+
+    #[test]
+    fn error_scope_transactions_are_serialized_across_clones() {
+        let lock = ErrorScopeTransactionLock::default();
+        let first_transaction = lock.lock();
+        let second_lock = lock.clone();
+        let (started_sender, started_receiver) = channel();
+        let (acquired_sender, acquired_receiver) = channel();
+
+        let worker = std::thread::spawn(move || {
+            started_sender.send(()).unwrap();
+            let _second_transaction = second_lock.lock();
+            acquired_sender.send(()).unwrap();
+        });
+
+        started_receiver.recv().unwrap();
+        assert!(matches!(
+            acquired_receiver.try_recv(),
+            Err(TryRecvError::Empty)
+        ));
+
+        drop(first_transaction);
+        acquired_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second error-scope transaction should proceed after the first is popped");
+        worker.join().unwrap();
     }
 }

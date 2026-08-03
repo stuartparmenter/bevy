@@ -14,11 +14,16 @@ var<immediate> max_compute_workgroups_per_dimension: u32;
 @workgroup_size(1, 1, 1)
 fn remap_dispatch() {
     let cluster_count = meshlet_software_raster_indirect_args.x;
+    meshlet_software_raster_cluster_count = cluster_count;
 
     if cluster_count > max_compute_workgroups_per_dimension {
         let n = u32(ceil(sqrt(f32(cluster_count))));
         meshlet_software_raster_indirect_args.x = n;
         meshlet_software_raster_indirect_args.y = n;
-        meshlet_software_raster_cluster_count = cluster_count;
+    } else {
+        // `fill_counts` resets only X between the first and second passes.
+        // Restore a 1D dispatch here instead of reusing the previous pass's Y.
+        meshlet_software_raster_indirect_args.y = 1u;
     }
+    meshlet_software_raster_indirect_args.z = 1u;
 }

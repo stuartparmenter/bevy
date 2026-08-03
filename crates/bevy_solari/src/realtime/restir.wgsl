@@ -7,9 +7,9 @@ enable wgpu_ray_query;
 #import bevy_solari::brdf::{brdf_pdf, evaluate_brdf, F_AB}
 #import bevy_solari::gbuffer_utils::{gpixel_resolve, permute_pixel, pixel_dissimilar}
 #import bevy_solari::initial_path::{generate_initial_reservoir, InitialSamplingResult}
-#import bevy_solari::realtime_bindings::{depth_buffer, empty_reservoir, gbuffer, motion_vectors, previous_depth_buffer, previous_gbuffer, previous_view, reservoirs_a, reservoirs_b, Reservoir, constants, view, view_output}
-#import bevy_solari::sampling::{balance_heuristic, calculate_resolved_light_contribution, isinf, isnan, LightSample, NULL_LIGHT_ID, power_heuristic, resolve_light_sample, ResolvedLightSample, trace_visibility, trace_visibility_previous_frame}
-#import bevy_solari::scene_bindings::{light_sources, LIGHT_NOT_PRESENT_THIS_FRAME, previous_frame_light_id_translations, RAY_T_MAX, RAY_T_MIN, ResolvedMaterial}
+#import bevy_solari::realtime_bindings::{depth_buffer, empty_reservoir, gbuffer, motion_vectors, pixel_world_size, previous_depth_buffer, previous_gbuffer, previous_view, reservoirs_a, reservoirs_b, Reservoir, constants, view, view_output}
+#import bevy_solari::sampling::{balance_heuristic, calculate_resolved_light_contribution, isinf, isnan, light_sample_is_environment, LightSample, NULL_LIGHT_ID, power_heuristic, resolve_light_sample, ResolvedLightSample, trace_visibility, trace_visibility_previous_frame}
+#import bevy_solari::scene_bindings::{environment_light_pdf, light_sources, LIGHT_NOT_PRESENT_THIS_FRAME, previous_frame_light_id_translations, primary_ray_origin_bias, ray_origin_bias_with_raster_lod, RAY_T_MAX, ResolvedMaterial}
 #import bevy_solari::world_cache::{query_world_cache, WORLD_CACHE_CELL_LIFETIME}
 
 const SPATIAL_REUSE_RADIUS_PIXELS = 30.0;
@@ -72,7 +72,7 @@ fn spatial_and_shade(@builtin(global_invocation_id) global_id: vec3<u32>) {
     textureStore(view_output, global_id.xy, vec4(pixel_color, 1.0));
 
 #ifdef VISUALIZE_WORLD_CACHE
-    textureStore(view_output, global_id.xy, vec4(query_world_cache(surface.world_position, surface.world_normal, view.world_position, RAY_T_MAX, WORLD_CACHE_CELL_LIFETIME, &rng) * view.exposure, 1.0));
+    textureStore(view_output, global_id.xy, vec4(query_world_cache(surface.world_position, surface.world_normal, primary_ray_origin_bias(), view.world_position, RAY_T_MAX, WORLD_CACHE_CELL_LIFETIME, &rng) * view.exposure, 1.0));
 #endif
 }
 
@@ -249,16 +249,20 @@ fn merge_reservoirs(
         canonical_sample_at_other_jacobian = 0.0;
     }
 
-    // Visibility for the cross-domain targets
+    // Visibility for the cross-domain targets. Both endpoints are rasterized G-buffer surfaces, so
+    // both need the raster LOD bias; the other domain measures it from its own camera, which for a
+    // temporal merge is the previous frame's.
+    let canonical_bias = ray_origin_bias_with_raster_lod(primary_ray_origin_bias(), pixel_world_size(canonical_world_position, view.world_position));
+    let other_bias = ray_origin_bias_with_raster_lod(primary_ray_origin_bias(), pixel_world_size(other_world_position, other_view_position));
     if other_sample_at_canonical.target_function > 0.0 && other_sample_at_canonical_jacobian > 0.0 {
-        let visibility = trace_visibility(canonical_world_position + canonical_world_normal * RAY_T_MIN, other_sample_at_canonical.sample_world_position);
+        let visibility = trace_visibility(canonical_world_position, canonical_world_normal, other_sample_at_canonical.sample_world_position, canonical_bias);
         other_sample_at_canonical.target_function *= visibility;
     }
     if canonical_sample_at_other.target_function > 0.0 && canonical_sample_at_other_jacobian > 0.0 {
 #ifdef SPATIAL_MERGE
-        let visibility = trace_visibility(other_world_position + other_world_normal * RAY_T_MIN, canonical_sample_at_other.sample_world_position);
+        let visibility = trace_visibility(other_world_position, other_world_normal, canonical_sample_at_other.sample_world_position, other_bias);
 #else
-        let visibility = trace_visibility_previous_frame(other_world_position + other_world_normal * RAY_T_MIN, canonical_sample_at_other.sample_world_position);
+        let visibility = trace_visibility_previous_frame(other_world_position, other_world_normal, canonical_sample_at_other.sample_world_position, other_bias);
 #endif
         canonical_sample_at_other.target_function *= visibility;
     }
@@ -324,11 +328,16 @@ fn reservoir_contribution(reservoir: Reservoir, resolved: ResolvedLightSample, w
     if reservoir.light_sample.light_id != NULL_LIGHT_ID {
         let light_contribution = calculate_resolved_light_contribution(resolved, world_position, world_normal);
 
-        // MIS weight against the bounce-0 BRDF-emissive strategy, recomputed from this surface's
+        // MIS weight against the bounce-0 BRDF strategy (emissive hits and environment misses), recomputed from this surface's
         // brdf and material rather than baked into the unbiased contribution weight at generation. Mirrors the bounce-0
         // nee_mis_weight in generate_nee_candidate and generate_emissive_candidate, which puts the same factor in the target.
         var nee_mis_weight = 1.0;
-        if light_contribution.brdf_rays_can_hit && light_contribution.inverse_solid_angle_pdf > 0.0 {
+        if light_sample_is_environment(reservoir.light_sample) {
+            let p_nee = mix(1.0, material.perceptual_roughness, material.metallic);
+            let p_nee_strategy = f32(constants.primary_di_samples) * environment_light_pdf(light_contribution.wi) * p_nee;
+            let p_brdf_at_nee = brdf_pdf(wo, light_contribution.wi, world_normal, material, F_ab);
+            nee_mis_weight = power_heuristic(p_nee_strategy, p_brdf_at_nee);
+        } else if light_contribution.brdf_rays_can_hit && light_contribution.inverse_solid_angle_pdf > 0.0 {
             let light_count = arrayLength(&light_sources);
             let inverse_solid_angle_pdf = light_contribution.inverse_solid_angle_pdf * f32(light_count);
             let p_nee = mix(1.0, material.perceptual_roughness, material.metallic);
@@ -340,8 +349,11 @@ fn reservoir_contribution(reservoir: Reservoir, resolved: ResolvedLightSample, w
         let brdf_radiance = light_contribution.radiance * evaluate_brdf(wo, light_contribution.wi, world_normal, material, F_ab) * nee_mis_weight;
         return ReservoirContribution(brdf_radiance, luminance(brdf_radiance), resolved.world_position);
     } else if any(reservoir.radiance != vec3(0.0)) {
-        let delta = reservoir.sample_point_world_position - (world_position + world_normal * RAY_T_MIN);
+        let delta = reservoir.sample_point_world_position - world_position;
         let sample_distance = length(delta);
+        if !(sample_distance > 1e-6) || isinf(sample_distance) || isnan(sample_distance) {
+            return ReservoirContribution(vec3(0.0), 0.0, vec4(0.0));
+        }
         let wi = delta / sample_distance;
         var brdf_radiance = reservoir.radiance * evaluate_brdf(wo, wi, world_normal, material, F_ab);
 

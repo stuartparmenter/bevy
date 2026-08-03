@@ -290,18 +290,22 @@ fn compute_meshlets(
     position_only_vertex_remap: &[u32],
     prev_lod_data: Option<(BoundingSphere, f32)>,
 ) -> (Meshlets, Vec<TempMeshletCullData>) {
-    // For each vertex, build a list of all triangles that use it
-    let mut vertices_to_triangles = vec![Vec::new(); position_only_vertex_remap.len()];
-    for (i, index) in indices.iter().enumerate() {
-        let vertex_id = position_only_vertex_remap[*index as usize];
-        let vertex_to_triangles = &mut vertices_to_triangles[vertex_id as usize];
-        vertex_to_triangles.push(i / 3);
-    }
+    // For each vertex, build a list of all triangles that use it. Sorting scales the scratch with
+    // this call's index count instead of the whole mesh's vertex count, and yields the same
+    // (ascending vertex, ascending triangle) visit order as bucketing by vertex id would.
+    let mut vertices_to_triangles: Vec<_> = indices
+        .iter()
+        .enumerate()
+        .map(|(i, index)| (position_only_vertex_remap[*index as usize], i / 3))
+        .collect();
+    vertices_to_triangles.sort_unstable();
 
     // For each triangle pair, count how many vertices they share
     let mut triangle_pair_to_shared_vertex_count = <HashMap<_, _>>::default();
-    for vertex_triangle_ids in vertices_to_triangles {
-        for (triangle_id1, triangle_id2) in vertex_triangle_ids.into_iter().tuple_combinations() {
+    for vertex_triangle_ids in vertices_to_triangles.chunk_by(|(a, _), (b, _)| a == b) {
+        for (&(_, triangle_id1), &(_, triangle_id2)) in
+            vertex_triangle_ids.iter().tuple_combinations()
+        {
             let count = triangle_pair_to_shared_vertex_count
                 .entry((
                     triangle_id1.min(triangle_id2),
@@ -593,7 +597,7 @@ fn build_and_compress_per_meshlet_vertex_data(
     vertex_stride: usize,
     vertex_positions: &mut BitVec<u32, Lsb0>,
     vertex_normals: &mut Vec<u32>,
-    vertex_uvs: &mut Vec<Vec2>,
+    vertex_uvs: &mut Vec<u32>,
     meshlets: &mut Vec<Meshlet>,
     vertex_position_quantization_factor: u8,
 ) {
@@ -605,9 +609,12 @@ fn build_and_compress_per_meshlet_vertex_data(
 
     let mut min_quantized_position_channels = IVec3::MAX;
     let mut max_quantized_position_channels = IVec3::MIN;
+    let mut min_vertex_uv = Vec2::splat(f32::INFINITY);
+    let mut max_vertex_uv = Vec2::splat(f32::NEG_INFINITY);
 
     // Lossy vertex compression
     let mut quantized_positions = [IVec3::ZERO; 256];
+    let mut uncompressed_uvs = [Vec2::ZERO; 256];
     for (i, vertex_id) in meshlet_vertex_ids.iter().enumerate() {
         // Load source vertex attributes
         let vertex_id_byte = *vertex_id as usize * vertex_stride;
@@ -616,8 +623,9 @@ fn build_and_compress_per_meshlet_vertex_data(
         let normal = Vec3::from_slice(bytemuck::cast_slice(&vertex_data[12..24]));
         let uv = Vec2::from_slice(bytemuck::cast_slice(&vertex_data[24..32]));
 
-        // Copy uncompressed UV
-        vertex_uvs.push(uv);
+        uncompressed_uvs[i] = uv;
+        min_vertex_uv = min_vertex_uv.min(uv);
+        max_vertex_uv = max_vertex_uv.max(uv);
 
         // Compress normal
         vertex_normals.push(pack2x16snorm(octahedral_encode(normal)));
@@ -629,6 +637,25 @@ fn build_and_compress_per_meshlet_vertex_data(
         // Compute per X/Y/Z-channel quantized position min/max for this meshlet
         min_quantized_position_channels = min_quantized_position_channels.min(quantized_position);
         max_quantized_position_channels = max_quantized_position_channels.max(quantized_position);
+    }
+
+    // Normalize UVs to each meshlet's local bounds before packing. This gives substantially more
+    // precision than raw f16 UVs for tiled materials with coordinates far outside 0..1.
+    let vertex_uv_extent = max_vertex_uv - min_vertex_uv;
+    for uv in uncompressed_uvs.iter().take(meshlet_vertex_ids.len()) {
+        let normalized_uv = Vec2::new(
+            if vertex_uv_extent.x > 0.0 {
+                (uv.x - min_vertex_uv.x) / vertex_uv_extent.x
+            } else {
+                0.0
+            },
+            if vertex_uv_extent.y > 0.0 {
+                (uv.y - min_vertex_uv.y) / vertex_uv_extent.y
+            } else {
+                0.0
+            },
+        );
+        vertex_uvs.push(pack2x16unorm(normalized_uv));
     }
 
     // Calculate bits needed to encode each quantized vertex position channel based on the range of each channel
@@ -668,6 +695,8 @@ fn build_and_compress_per_meshlet_vertex_data(
         min_vertex_position_channel_x: min_quantized_position_channels.x as f32,
         min_vertex_position_channel_y: min_quantized_position_channels.y as f32,
         min_vertex_position_channel_z: min_quantized_position_channels.z as f32,
+        min_vertex_uv,
+        vertex_uv_extent,
     });
 }
 
@@ -1087,6 +1116,14 @@ fn pack2x16snorm(v: Vec2) -> u32 {
     bytemuck::cast(v)
 }
 
+// https://www.w3.org/TR/WGSL/#pack2x16unorm-builtin
+fn pack2x16unorm(v: Vec2) -> u32 {
+    let v = (v.clamp(Vec2::ZERO, Vec2::ONE) * 65535.0 + 0.5)
+        .floor()
+        .as_u16vec2();
+    bytemuck::cast(v)
+}
+
 /// An error produced by [`MeshletMesh::from_mesh`].
 #[derive(Error, Debug)]
 pub enum MeshToMeshletMeshConversionError {
@@ -1099,4 +1136,58 @@ pub enum MeshToMeshletMeshConversionError {
     },
     #[error("Mesh has no indices")]
     MeshMissingIndices,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_asset::RenderAssetUsages;
+
+    #[test]
+    fn raytracing_geometry_selects_a_complete_meshlet_lod() {
+        AsyncComputeTaskPool::get_or_init(bevy_tasks::TaskPool::default);
+        const SIDE: usize = 24;
+        let mut positions = Vec::with_capacity((SIDE + 1) * (SIDE + 1));
+        let mut normals = Vec::with_capacity(positions.capacity());
+        let mut uvs = Vec::with_capacity(positions.capacity());
+        for y in 0..=SIDE {
+            for x in 0..=SIDE {
+                let fx = x as f32 / SIDE as f32;
+                let fy = y as f32 / SIDE as f32;
+                positions.push([fx, (fx * 9.0).sin() * (fy * 7.0).sin() * 0.02, fy]);
+                normals.push([0.0, 1.0, 0.0]);
+                uvs.push([fx, fy]);
+            }
+        }
+        let mut indices = Vec::with_capacity(SIDE * SIDE * 6);
+        for y in 0..SIDE {
+            for x in 0..SIDE {
+                let a = (y * (SIDE + 1) + x) as u32;
+                let b = a + 1;
+                let c = a + (SIDE + 1) as u32;
+                let d = c + 1;
+                indices.extend_from_slice(&[a, c, b, b, c, d]);
+            }
+        }
+        let source_triangles = indices.len() / 3;
+        let mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::all())
+            .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+            .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+            .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+            .with_inserted_indices(Indices::U32(indices));
+        let meshlet = MeshletMesh::from_mesh(&mesh, 4).unwrap();
+
+        let exact = meshlet.raytracing_geometry(0.0);
+        assert_eq!(exact.indices.len() / 3, source_triangles);
+        assert_eq!(exact.positions.len(), exact.normals.len());
+        assert_eq!(exact.positions.len(), exact.uvs.len());
+        assert!(exact
+            .indices
+            .iter()
+            .all(|index| (*index as usize) < exact.positions.len()));
+
+        let simplified = meshlet.raytracing_geometry(0.02);
+        assert!(!simplified.indices.is_empty());
+        assert!(simplified.indices.len() <= exact.indices.len());
+    }
 }

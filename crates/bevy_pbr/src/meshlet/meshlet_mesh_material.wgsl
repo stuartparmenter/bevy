@@ -1,3 +1,5 @@
+enable wgpu_binding_array;
+
 #import bevy_pbr::{
     meshlet_visibility_buffer_resolve::resolve_vertex_output,
     view_transformations::uv_to_ndc,

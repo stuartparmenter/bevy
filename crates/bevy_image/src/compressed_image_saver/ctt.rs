@@ -8,7 +8,7 @@ use super::{
     ctt_helpers::{
         bevy_to_ctt_alpha_mode, choose_ctt_compressed_format, wgpu_to_ctt_texture_format,
     },
-    CompressedImageSaverError, CompressedImageSaverSettings,
+    CompressedImageSaverError, CompressedImageSaverSettings, ImageCompressorQuality,
 };
 use crate::{Image, ImageFormat, ImageFormatSetting, ImageLoaderSettings};
 
@@ -85,7 +85,14 @@ impl CompressedImageSaverCtt {
         let settings = ConvertSettings {
             format: Some(output_format),
             container: Container::ktx2_zstd(0),
-            quality: Quality::default(),
+            quality: match settings.quality {
+                ImageCompressorQuality::UltraFast => Quality::UltraFast,
+                ImageCompressorQuality::VeryFast => Quality::VeryFast,
+                ImageCompressorQuality::Fast => Quality::Fast,
+                ImageCompressorQuality::Basic => Quality::Basic,
+                ImageCompressorQuality::Slow => Quality::Slow,
+                ImageCompressorQuality::VerySlow => Quality::VerySlow,
+            },
             output_color_space: None,
             output_alpha: Some(bevy_to_ctt_alpha_mode(settings.output_alpha_mode)),
             swizzle: None,

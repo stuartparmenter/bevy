@@ -92,6 +92,7 @@ struct Vertex {
 
 // The instance_index parameter must match vertex_in.instance_index. This is a work around for a wgpu dx12 bug.
 // See https://github.com/gfx-rs/naga/issues/2416
+#ifndef MESHLET_MESH_MATERIAL_PASS
 fn decompress_vertex(vertex_in: Vertex, instance_index: u32) -> UncompressedVertex {
     let mesh_metadata = bevy_pbr::mesh_functions::get_metadata(instance_index);
     var uncompressed_vertex: UncompressedVertex;
@@ -145,6 +146,7 @@ fn decompress_vertex(vertex_in: Vertex, instance_index: u32) -> UncompressedVert
 #endif
     return uncompressed_vertex;
 }
+#endif  // MESHLET_MESH_MATERIAL_PASS
 
 struct VertexOutput {
     // This is `clip position` when the struct is used as a vertex stage output
