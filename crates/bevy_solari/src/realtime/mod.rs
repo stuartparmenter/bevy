@@ -255,12 +255,22 @@ mod shader_source_tests {
         // visibility and GI ray is self-occluded and the pixel resolves to black.
         let initial_path = include_str!("initial_path.wgsl");
         assert!(initial_path.contains(
-            "ray_origin_bias_with_raster_lod(primary_ray_origin_bias(), pixel_world_size(world_position, view.world_position))"
+            "ray_origin_bias_with_raster_lod(rasterized_surface_ray_origin_bias(surface_world_geometry_error), pixel_world_size(world_position, view.world_position))"
         ));
+        // The scene-wide maximum is the unknown fallback now, not the primary vertex's answer.
+        assert!(!initial_path.contains("primary_ray_origin_bias"));
 
         // One import plus the canonical and other domains of a reservoir merge.
         let restir = include_str!("restir.wgsl");
         assert_eq!(restir.matches("ray_origin_bias_with_raster_lod").count(), 3);
+
+        // The two merge domains are different surfaces and can be different instances. Reusing the
+        // canonical bias for both compiles, shows no acne, and only leaks as energy loss and blotchy
+        // convergence, so pin the two expressions apart.
+        assert!(
+            restir.contains("rasterized_surface_ray_origin_bias(canonical_world_geometry_error)")
+        );
+        assert!(restir.contains("rasterized_surface_ray_origin_bias(other_world_geometry_error)"));
 
         // Cache rays must escape their surface by the same distance the DI rays do.
         let world_cache_update = include_str!("world_cache_update.wgsl");

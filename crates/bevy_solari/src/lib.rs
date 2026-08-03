@@ -19,9 +19,10 @@ pub mod prelude {
     pub use super::SolariPlugins;
     pub use crate::realtime::SolariLighting;
     pub use crate::scene::{
-        RaytracingMesh3d, RaytracingMesh3dGeometryError, RaytracingSceneStatus,
-        RaytracingSceneStatusSnapshot, SolariEnvironmentLight,
+        RaytracingMesh3d, RaytracingSceneStatus, RaytracingSceneStatusSnapshot,
+        SolariEnvironmentLight,
     };
+    pub use bevy_pbr::MeshGeometryError;
 }
 
 use crate::realtime::SolariLightingPlugin;
@@ -143,6 +144,7 @@ fn rgb9e5_to_vec3_(packed: u32) -> vec3<f32> { return vec3<f32>(f32(packed)); }
             r#"
 #define_import_path bevy_pbr::pbr_deferred_types
 fn unpack_24bit_normal(packed: u32) -> vec2<f32> { return vec2<f32>(f32(packed)); }
+fn deferred_geometry_error(gbuffer_a: u32) -> f32 { return -1.0; }
 "#,
         ),
         (

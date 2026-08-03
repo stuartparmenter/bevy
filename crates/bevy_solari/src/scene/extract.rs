@@ -1,4 +1,4 @@
-use super::{RaytracingMesh3d, RaytracingMesh3dGeometryError, SolariEnvironmentLight};
+use super::{RaytracingMesh3d, SolariEnvironmentLight};
 use bevy_asset::{AssetId, Assets};
 use bevy_derive::Deref;
 use bevy_ecs::{
@@ -6,7 +6,7 @@ use bevy_ecs::{
     resource::Resource,
     system::{Commands, Query},
 };
-use bevy_pbr::{MeshMaterial3d, PreviousGlobalTransform, StandardMaterial};
+use bevy_pbr::{MeshGeometryError, MeshMaterial3d, PreviousGlobalTransform, StandardMaterial};
 use bevy_platform::collections::HashMap;
 use bevy_render::{
     extract_resource::ExtractResource, sync_world::RenderEntity, Extract, RenderApp,
@@ -18,7 +18,7 @@ pub fn extract_raytracing_scene(
         Query<(
             RenderEntity,
             &RaytracingMesh3d,
-            &RaytracingMesh3dGeometryError,
+            &MeshGeometryError,
             &MeshMaterial3d<StandardMaterial>,
             &GlobalTransform,
             Option<&PreviousGlobalTransform>,

@@ -1,6 +1,6 @@
 #define_import_path bevy_solari::gbuffer_utils
 
-#import bevy_pbr::pbr_deferred_types::unpack_24bit_normal
+#import bevy_pbr::pbr_deferred_types::{deferred_geometry_error, unpack_24bit_normal}
 #import bevy_pbr::rgb9e5::rgb9e5_to_vec3_
 #import bevy_render::utils::octahedral_decode
 #import bevy_render::view::{View, depth_ndc_to_view_z}
@@ -10,6 +10,10 @@ struct ResolvedGPixel {
     world_position: vec3<f32>,
     world_normal: vec3<f32>,
     material: ResolvedMaterial,
+    // How far this texel's instance may deviate from the geometry the BLAS holds, in world units.
+    // Negative when the instance states no error. Rays leaving this surface are offset by it so
+    // they do not start inside the traced proxy.
+    world_geometry_error: f32,
 }
 
 fn gpixel_resolve(gpixel: vec4<u32>, depth: f32, pixel_id: vec2<u32>, view_size: vec2<f32>, world_from_clip: mat4x4<f32>) -> ResolvedGPixel {
@@ -26,7 +30,7 @@ fn gpixel_resolve(gpixel: vec4<u32>, depth: f32, pixel_id: vec2<u32>, view_size:
     let emissive = rgb9e5_to_vec3_(gpixel.g);
     let material = ResolvedMaterial(base_color, emissive, reflectance, perceptual_roughness, roughness, metallic);
 
-    return ResolvedGPixel(world_position, world_normal, material);
+    return ResolvedGPixel(world_position, world_normal, material, deferred_geometry_error(gpixel.a));
 }
 
 fn reconstruct_world_position(pixel_id: vec2<u32>, depth: f32, view_size: vec2<f32>, world_from_clip: mat4x4<f32>) -> vec3<f32> {

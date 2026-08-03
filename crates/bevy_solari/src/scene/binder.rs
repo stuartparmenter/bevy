@@ -1,6 +1,5 @@
 use super::{
-    blas::BlasManager, extract::StandardMaterialAssets, RaytracingMesh3d,
-    RaytracingMesh3dGeometryError, SolariEnvironmentLight,
+    blas::BlasManager, extract::StandardMaterialAssets, RaytracingMesh3d, SolariEnvironmentLight,
 };
 use bevy_asset::{AssetId, Handle};
 use bevy_color::{ColorToComponents, LinearRgba};
@@ -11,7 +10,8 @@ use bevy_ecs::{
 };
 use bevy_math::{ops::cos, Affine3, Affine3Ext, Mat3, Mat4, Vec3, Vec4};
 use bevy_pbr::{
-    DfgLut, ExtractedDirectionalLight, MeshMaterial3d, PreviousGlobalTransform, StandardMaterial,
+    world_geometry_error, DfgLut, ExtractedDirectionalLight, MeshGeometryError, MeshMaterial3d,
+    PreviousGlobalTransform, StandardMaterial,
 };
 use bevy_platform::{collections::HashMap, hash::FixedHasher};
 use bevy_render::{
@@ -57,7 +57,7 @@ pub fn prepare_raytracing_scene_bindings(
     instances_query: Query<(
         Entity,
         &RaytracingMesh3d,
-        &RaytracingMesh3dGeometryError,
+        &MeshGeometryError,
         &MeshMaterial3d<StandardMaterial>,
         &GlobalTransform,
         Option<&PreviousGlobalTransform>,
@@ -186,6 +186,8 @@ pub fn prepare_raytracing_scene_bindings(
 
     let mut instance_id = 0;
     let mut emissive_mesh_light_count = 0usize;
+    // Bounds every instance, so it is what a rasterized surface falls back to when its G-buffer
+    // texel carries no geometry error of its own.
     let mut max_world_geometry_error = 0.0f32;
     for (entity, mesh, geometry_error, material, transform, previous_frame_transform) in
         &instances_query
@@ -213,7 +215,10 @@ pub fn prepare_raytracing_scene_bindings(
             0xFF,
         ));
 
-        let world_geometry_error = world_geometry_error(geometry_error.0, &transform.to_matrix());
+        // Per instance, because a ray leaving this surface can only self-intersect this instance's
+        // own simplified BLAS. The scene-wide maximum below is only the fallback for a rasterized
+        // surface whose G-buffer texel states no error at all.
+        let world_geometry_error = world_geometry_error(geometry_error.0, &transform.affine());
         let transform = Affine3::from(transform.affine()).to_transpose();
         transforms.get_mut().push(transform);
         previous_frame_transforms.get_mut().push(
@@ -543,42 +548,15 @@ struct GpuSceneParameters {
     _padding: Vec3,
 }
 
-fn world_geometry_error(local_error: f32, transform: &Mat4) -> f32 {
-    if !local_error.is_finite() || local_error <= 0.0 {
-        return 0.0;
-    }
-
-    // sqrt(||M||_1 * ||M||_inf) bounds the largest singular value of
-    // the affine transform's linear part, including shear.
-    let columns = [
-        transform.x_axis.truncate().abs(),
-        transform.y_axis.truncate().abs(),
-        transform.z_axis.truncate().abs(),
-    ];
-    let norm_one = columns
-        .iter()
-        .map(|column| column.element_sum())
-        .fold(0.0f32, f32::max);
-    let row_sums = columns[0] + columns[1] + columns[2];
-    let norm_infinity = row_sums.max_element();
-    let scale_bound = (norm_one * norm_infinity).sqrt();
-    let error = local_error * scale_bound;
-    if error.is_finite() {
-        error
-    } else {
-        0.0
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        emissive_triangle_chunks, world_geometry_error, GpuDirectionalLight, GpuLightSource,
-        RaytracingSceneBindings, MATERIAL_FLAGS_FLIP_NORMAL_MAP_Y,
+        emissive_triangle_chunks, GpuDirectionalLight, GpuLightSource, RaytracingSceneBindings,
+        MATERIAL_FLAGS_FLIP_NORMAL_MAP_Y,
     };
     use crate::scene::SolariEnvironmentLight;
     use bevy_color::LinearRgba;
-    use bevy_math::{Mat4, Vec3};
+    use bevy_math::Vec3;
     use bevy_render::render_resource::{BindingType, BufferBindingType};
 
     #[test]
@@ -594,22 +572,6 @@ mod tests {
                 }
             )
         }));
-    }
-
-    #[test]
-    fn geometry_error_scales_conservatively() {
-        assert_eq!(world_geometry_error(0.02, &Mat4::IDENTITY), 0.02);
-        assert_eq!(
-            world_geometry_error(0.02, &Mat4::from_scale(Vec3::new(2.0, 9.25, 0.5))),
-            0.185
-        );
-    }
-
-    #[test]
-    fn invalid_geometry_error_is_disabled() {
-        assert_eq!(world_geometry_error(-1.0, &Mat4::IDENTITY), 0.0);
-        assert_eq!(world_geometry_error(f32::NAN, &Mat4::IDENTITY), 0.0);
-        assert_eq!(world_geometry_error(f32::INFINITY, &Mat4::IDENTITY), 0.0);
     }
 
     #[test]

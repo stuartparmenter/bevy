@@ -138,8 +138,25 @@ const RAY_T_MAX = 100000.0f;
 
 const RAY_NO_CULL = 0xFFu;
 
-fn primary_ray_origin_bias() -> f32 {
-    return RAY_T_MIN + max(scene_parameters.max_world_geometry_error, 0.0);
+// A rasterized G-buffer surface is offset along the NORMAL-MAPPED shading normal, because that is
+// the only normal the G-buffer stores. An offset of `b` only buys `b * cos(theta)` of clearance from
+// the geometric surface, so scale the geometry-error term up to cover a normal map that tilts the
+// shading normal by up to ~48 degrees. Ray-hit surfaces carry a true geometric normal and need no
+// such margin, which also keeps one instance's primary bias at or above its secondary bias.
+const RAY_ORIGIN_BIAS_SHADING_NORMAL_SAFETY = 1.5f;
+
+// The bias is per instance because a ray leaving a surface can only self-intersect the simplified
+// BLAS of the instance it left: charging every ray the scene's largest geometry error starts small
+// props' shadow rays above the prop itself. `world_geometry_error` comes from the G-buffer, and is
+// negative when the texel was written by something that states none - a custom deferred material,
+// the prepass fallback - in which case fall back to the scene-wide maximum, which bounds every
+// instance. The safety factor is deliberately not applied to that fallback, so a scene that plumbs
+// no geometry error keeps exactly the bias it had.
+fn rasterized_surface_ray_origin_bias(world_geometry_error: f32) -> f32 {
+    if world_geometry_error < 0.0 {
+        return RAY_T_MIN + max(scene_parameters.max_world_geometry_error, 0.0);
+    }
+    return RAY_T_MIN + RAY_ORIGIN_BIAS_SHADING_NORMAL_SAFETY * world_geometry_error;
 }
 
 fn sample_environment_radiance(direction: vec3<f32>) -> vec3<f32> {

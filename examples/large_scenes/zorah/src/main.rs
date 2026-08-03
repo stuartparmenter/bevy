@@ -38,8 +38,8 @@ use bevy::{
         RenderPlugin,
     },
     solari::prelude::{
-        RaytracingMesh3d, RaytracingMesh3dGeometryError, RaytracingSceneStatus,
-        RaytracingSceneStatusSnapshot, SolariEnvironmentLight, SolariLighting, SolariPlugins,
+        MeshGeometryError, RaytracingMesh3d, RaytracingSceneStatus, RaytracingSceneStatusSnapshot,
+        SolariEnvironmentLight, SolariLighting, SolariPlugins,
     },
     window::{AutoField, DisplayCalibrationPolicy, DisplayTarget, PrimaryWindow},
 };
@@ -3784,7 +3784,7 @@ fn warm_up_raytracing(
     for instance in &pending.raytracing_instances[pending.raytracing_cursor..end] {
         commands.entity(instance.entity).insert((
             RaytracingMesh3d(instance.mesh.clone()),
-            RaytracingMesh3dGeometryError(instance.geometry_error),
+            MeshGeometryError(instance.geometry_error),
         ));
     }
     pending.raytracing_cursor = end;

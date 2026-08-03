@@ -6,7 +6,7 @@ mod types;
 use bevy_shader::load_shader_library;
 pub use binder::RaytracingSceneBindings;
 pub use blas::{RaytracingSceneStatus, RaytracingSceneStatusSnapshot};
-pub use types::{RaytracingMesh3d, RaytracingMesh3dGeometryError, SolariEnvironmentLight};
+pub use types::{RaytracingMesh3d, SolariEnvironmentLight};
 
 use crate::SolariPlugins;
 use bevy_app::{App, Plugin};

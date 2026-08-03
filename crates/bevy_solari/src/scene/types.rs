@@ -3,7 +3,7 @@ use bevy_color::LinearRgba;
 use bevy_derive::{Deref, DerefMut};
 use bevy_ecs::{component::Component, prelude::ReflectComponent, template::FromTemplate};
 use bevy_mesh::Mesh;
-use bevy_pbr::{MeshMaterial3d, StandardMaterial};
+use bevy_pbr::{MeshGeometryError, MeshMaterial3d, StandardMaterial};
 use bevy_reflect::{prelude::ReflectDefault, Reflect};
 use bevy_render::sync_world::SyncToRenderWorld;
 use bevy_transform::components::Transform;
@@ -25,22 +25,9 @@ use derive_more::derive::From;
     MeshMaterial3d<StandardMaterial>,
     Transform,
     SyncToRenderWorld,
-    RaytracingMesh3dGeometryError
+    MeshGeometryError
 )]
 pub struct RaytracingMesh3d(pub Handle<Mesh>);
-
-/// A conservative upper bound, in mesh-local units, on the positional error of
-/// geometry represented by [`RaytracingMesh3d`].
-///
-/// This is normally zero for meshes imported without lossy position
-/// quantization. Importers that simplify or quantize geometry should set this
-/// to the largest possible positional error. Solari scales it conservatively
-/// into world space and uses it when offsetting secondary and shadow rays.
-#[derive(
-    Component, FromTemplate, Clone, Copy, Debug, Default, Deref, DerefMut, Reflect, PartialEq,
-)]
-#[reflect(Component, Default, Clone, PartialEq)]
-pub struct RaytracingMesh3dGeometryError(pub f32);
 
 /// A uniform upper-hemisphere environment source used by Solari.
 ///

@@ -10,7 +10,7 @@ enable wgpu_ray_query;
 #import bevy_solari::presample_light_tiles::unpack_resolved_light_sample
 #import bevy_solari::realtime_bindings::{empty_reservoir, light_tile_resolved_samples, light_tile_samples, pixel_world_size, Reservoir, constants, view}
 #import bevy_solari::sampling::{calculate_resolved_light_contribution, emissive_hit_triangle_count, isfinite, isfinite3, isinf, light_sample_is_environment, LightSample, NULL_LIGHT_ID, power_heuristic, trace_visibility}
-#import bevy_solari::scene_bindings::{environment_light_pdf, light_sources, sample_environment_radiance, MIRROR_ROUGHNESS_THRESHOLD, RAY_T_MAX, RAY_T_MIN, offset_ray_origin, primary_ray_origin_bias, ray_origin_bias_with_raster_lod, resolve_ray_hit_full, ResolvedMaterial, ResolvedRayHitFull, trace_ray}
+#import bevy_solari::scene_bindings::{environment_light_pdf, light_sources, sample_environment_radiance, MIRROR_ROUGHNESS_THRESHOLD, RAY_T_MAX, RAY_T_MIN, offset_ray_origin, rasterized_surface_ray_origin_bias, ray_origin_bias_with_raster_lod, resolve_ray_hit_full, ResolvedMaterial, ResolvedRayHitFull, trace_ray}
 #import bevy_solari::world_cache::{get_cell_size, query_world_cache, WORLD_CACHE_CELL_LIFETIME}
 #ifdef DLSS_RR_GUIDE_BUFFERS
 #import bevy_pbr::pbr_functions::{calculate_diffuse_color, calculate_F0}
@@ -50,7 +50,7 @@ struct PathState {
     x1_brdf: vec3<f32>,
 }
 
-fn generate_initial_reservoir(world_position: vec3<f32>, world_normal: vec3<f32>, material: ResolvedMaterial, workgroup_id: vec2<u32>, pixel_id: vec2<u32>, rng: ptr<function, u32>) -> InitialSamplingResult {
+fn generate_initial_reservoir(world_position: vec3<f32>, world_normal: vec3<f32>, material: ResolvedMaterial, surface_world_geometry_error: f32, workgroup_id: vec2<u32>, pixel_id: vec2<u32>, rng: ptr<function, u32>) -> InitialSamplingResult {
     var reservoir = empty_reservoir();
     reservoir.confidence_weight = 1.0;
 
@@ -70,9 +70,9 @@ fn generate_initial_reservoir(world_position: vec3<f32>, world_normal: vec3<f32>
     var path: PathState;
     path.ray_origin = world_position;
     // x1 is a rasterized G-buffer surface, so it carries the raster LOD's drift from the traced
-    // geometry. Every deeper vertex is a ray hit lying exactly on the traced surface and keeps the
-    // plain per-instance bias.
-    path.ray_origin_bias = ray_origin_bias_with_raster_lod(primary_ray_origin_bias(), pixel_world_size(world_position, view.world_position));
+    // geometry on top of its instance's own BLAS error. Every deeper vertex is a ray hit lying
+    // exactly on the traced surface and keeps the plain per-instance bias.
+    path.ray_origin_bias = ray_origin_bias_with_raster_lod(rasterized_surface_ray_origin_bias(surface_world_geometry_error), pixel_world_size(world_position, view.world_position));
     path.normal = world_normal;
     path.geometric_normal = world_normal;
     path.wo = wo;
