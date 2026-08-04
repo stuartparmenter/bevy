@@ -2289,7 +2289,7 @@ fn spawn_exported_lights(
                             ..default()
                         },
                         SunDisk {
-                            angular_size: light.light_source_angle.to_radians().max(0.0001),
+                            angular_size: light.light_source_angle.to_radians(),
                             intensity: 1.0,
                         },
                         world_transform,

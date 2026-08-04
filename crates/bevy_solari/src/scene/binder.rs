@@ -8,7 +8,10 @@ use bevy_ecs::{
     resource::Resource,
     system::{Query, Res, ResMut},
 };
-use bevy_math::{ops::cos, Affine3, Affine3Ext, Mat3, Mat4, Vec3, Vec4};
+use bevy_math::{
+    ops::{cos, sin, FloatPow},
+    Affine3, Affine3Ext, Mat3, Mat4, Vec3, Vec4,
+};
 use bevy_pbr::{
     world_geometry_error, DfgLut, ExtractedDirectionalLight, MeshGeometryError, MeshMaterial3d,
     PreviousGlobalTransform, StandardMaterial,
@@ -186,6 +189,15 @@ pub fn prepare_raytracing_scene_bindings(
 
     let mut instance_id = 0;
     let mut emissive_mesh_light_count = 0usize;
+    let mut dropped = 0usize;
+    // Directional and environment sources are pushed after the emissive ones, so the emissive list
+    // stops short of the cap by the slots they need. A truncated sun disk is NEE-only with no
+    // environment radiance to fall back on; a truncated emissive chunk is only unsampled emission.
+    let directional_light_count = directional_lights_query.iter().len();
+    let emissive_light_budget = emissive_light_source_budget(
+        directional_light_count,
+        environment_lights_query.iter().len(),
+    );
     // Bounds every instance, so it is what a rasterized surface falls back to when its G-buffer
     // texel carries no geometry error of its own.
     let mut max_world_geometry_error = 0.0f32;
@@ -256,6 +268,10 @@ pub fn prepare_raytracing_scene_bindings(
         if material.emissive != Vec3::ZERO {
             let triangle_count = (index_slice.range.len() / 3) as u32;
             for (first_triangle, _) in emissive_triangle_chunks(triangle_count) {
+                if emissive_mesh_light_count >= emissive_light_budget {
+                    dropped += 1;
+                    continue;
+                }
                 light_sources
                     .get_mut()
                     .push(GpuLightSource::new_emissive_mesh_light(
@@ -324,29 +340,31 @@ pub fn prepare_raytracing_scene_bindings(
     // the instances still render, the extra emitters just stop being explicitly sampled.
     let mut sampled_environment_light_count = environment_light_count;
     if light_sources.get().len() > MAX_LIGHT_SOURCES {
-        let dropped = light_sources.get().len() - MAX_LIGHT_SOURCES;
-        // Environment entries are pushed last, so they are the first to be dropped. Whatever is
-        // left is what NEE can still reach, and the shaders MIS against exactly that count.
-        sampled_environment_light_count = environment_light_count.saturating_sub(dropped);
+        // Only reachable when the directional and environment lights exceed the cap between them,
+        // since the emissive budget reserves a slot for each. Environment entries are pushed last,
+        // so they go first, and the shaders MIS against the surviving count.
+        let truncated = light_sources.get().len() - MAX_LIGHT_SOURCES;
+        dropped += truncated;
+        sampled_environment_light_count = environment_light_count.saturating_sub(truncated);
         light_sources.get_mut().truncate(MAX_LIGHT_SOURCES);
         raytracing_scene_bindings
             .previous_frame_light_keys
             .truncate(MAX_LIGHT_SOURCES);
         this_frame_light_key_to_id.retain(|_, id| (*id as usize) < MAX_LIGHT_SOURCES);
-        if !raytracing_scene_bindings.reported_light_source_overflow {
-            error!(
-                dropped,
-                maximum = MAX_LIGHT_SOURCES,
-                "too many light sources in the scene; the excess will not be sampled"
-            );
-            raytracing_scene_bindings.reported_light_source_overflow = true;
-        }
+    }
+    if dropped > 0 && !raytracing_scene_bindings.reported_light_source_overflow {
+        error!(
+            dropped,
+            maximum = MAX_LIGHT_SOURCES,
+            "too many light sources in the scene; the excess will not be sampled"
+        );
+        raytracing_scene_bindings.reported_light_source_overflow = true;
     }
 
     let scene_summary = (
         instance_id,
         emissive_mesh_light_count,
-        directional_lights_query.iter().len(),
+        directional_light_count,
         environment_light_count,
         light_sources.get().len(),
     );
@@ -551,8 +569,9 @@ struct GpuSceneParameters {
 #[cfg(test)]
 mod tests {
     use super::{
-        emissive_triangle_chunks, GpuDirectionalLight, GpuLightSource, RaytracingSceneBindings,
-        MATERIAL_FLAGS_FLIP_NORMAL_MAP_Y,
+        emissive_light_source_budget, emissive_triangle_chunks, GpuDirectionalLight, GpuLightSource,
+        RaytracingSceneBindings, MATERIAL_FLAGS_FLIP_NORMAL_MAP_Y, MAX_LIGHT_SOURCES,
+        MIN_SUN_DISK_ANGULAR_SIZE,
     };
     use crate::scene::SolariEnvironmentLight;
     use bevy_color::LinearRgba;
@@ -586,6 +605,39 @@ mod tests {
         assert_eq!(gpu.cos_theta_max, 0.0);
         assert!(gpu.luminance.abs_diff_eq(Vec3::new(1.0, 0.5, 0.25), 1e-6));
         assert_eq!(gpu.inverse_pdf, core::f32::consts::TAU);
+    }
+
+    #[test]
+    fn the_emissive_budget_leaves_room_for_every_directional_and_environment_light() {
+        // The whole list has to fit, so a truncation can never reach the sun, which is NEE-only.
+        assert_eq!(emissive_light_source_budget(3, 1) + 3 + 1, MAX_LIGHT_SOURCES);
+        // Only the tail truncation can help a scene whose own lights exceed the cap between them.
+        assert_eq!(emissive_light_source_budget(MAX_LIGHT_SOURCES, 1), 0);
+    }
+
+    #[test]
+    fn a_sun_disk_narrower_than_f32_can_resolve_keeps_its_solid_angle() {
+        // TAU * (1.0 - cos(angular_size / 2.0)) is exactly 0.0 in f32 at and below
+        // MIN_SUN_DISK_ANGULAR_SIZE, and dividing an illuminance by it emits nothing at all.
+        for angular_size in [
+            0.0,
+            0.0001,
+            MIN_SUN_DISK_ANGULAR_SIZE,
+            0.0010472,
+            0.00615,
+            0.00930842,
+            core::f32::consts::PI,
+        ] {
+            let (_, solid_angle) = GpuDirectionalLight::sun_disk_cone(angular_size);
+            let clamped = angular_size.max(MIN_SUN_DISK_ANGULAR_SIZE) as f64;
+            let expected = core::f64::consts::TAU * (1.0 - (clamped / 2.0).cos());
+
+            assert!(solid_angle > 0.0, "{angular_size} rad has no solid angle");
+            assert!(
+                ((solid_angle as f64 - expected) / expected).abs() < 1e-5,
+                "{angular_size} rad: {solid_angle} sr, want {expected} sr"
+            );
+        }
     }
 
     #[test]
@@ -723,6 +775,16 @@ impl GpuLightSource {
     }
 }
 
+/// How many emissive-mesh sources fit once the directional and environment lights have reserved
+/// theirs. [`MAX_LIGHT_SOURCES`] bounds the whole list and the emissive entries are pushed first, so
+/// they are the ones that yield.
+fn emissive_light_source_budget(
+    directional_light_count: usize,
+    environment_light_count: usize,
+) -> usize {
+    MAX_LIGHT_SOURCES.saturating_sub(directional_light_count + environment_light_count)
+}
+
 fn emissive_triangle_chunks(triangle_count: u32) -> impl Iterator<Item = (u32, u32)> {
     (0..triangle_count)
         .step_by(MAX_EMISSIVE_TRIANGLES_PER_LIGHT as usize)
@@ -742,10 +804,15 @@ struct GpuDirectionalLight {
     inverse_pdf: f32,
 }
 
+/// Floor for a sun disk's angular size, in radians. 0.028 degrees is far narrower than any sun a
+/// scene asks for and samples as the light direction either way, but it keeps the cone's solid angle
+/// off zero so `illuminance / solid_angle` stays finite. `SunDisk::OFF` is 0.
+const MIN_SUN_DISK_ANGULAR_SIZE: f32 = 1.0 / 2048.0;
+
 impl GpuDirectionalLight {
     fn new(directional_light: &ExtractedDirectionalLight) -> Self {
-        let cos_theta_max = cos(directional_light.sun_disk_angular_size / 2.0);
-        let solid_angle = TAU * (1.0 - cos_theta_max);
+        let (cos_theta_max, solid_angle) =
+            Self::sun_disk_cone(directional_light.sun_disk_angular_size);
         let luminance =
             (directional_light.color.to_vec3() * directional_light.illuminance) / solid_angle;
 
@@ -755,6 +822,21 @@ impl GpuDirectionalLight {
             luminance,
             inverse_pdf: solid_angle,
         }
+    }
+
+    /// `cos_theta_max` and the solid angle, in steradians, of the cone a sun disk `angular_size`
+    /// radians across subtends.
+    ///
+    /// `TAU * (1.0 - cos(angular_size / 2.0))` cancels to exactly 0.0 in f32 below 2^-11 radians, so
+    /// the solid angle goes through `1 - cos(x) = 2 sin^2(x / 2)` instead. That leaves
+    /// [`MIN_SUN_DISK_ANGULAR_SIZE`] answering only for a disk that is genuinely zero, negative or
+    /// NaN, rather than for wherever f32 happens to lose the subtraction.
+    fn sun_disk_cone(angular_size: f32) -> (f32, f32) {
+        let angular_size = angular_size.max(MIN_SUN_DISK_ANGULAR_SIZE);
+        (
+            cos(angular_size / 2.0),
+            TAU * 2.0 * sin(angular_size / 4.0).squared(),
+        )
     }
 
     fn new_environment(environment_light: &SolariEnvironmentLight) -> Self {
