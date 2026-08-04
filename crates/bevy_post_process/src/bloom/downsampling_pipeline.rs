@@ -42,9 +42,7 @@ pub struct BloomDownsamplingPipelineKeys {
     prefilter: bool,
     first_downsample: bool,
     uniform_scale: bool,
-    /// The bloom pyramid format the pass renders into: `Rg11b10Ufloat` for
-    /// views on SDR display targets, `Rgba16Float` for views whose resolved
-    /// display target transfer is HDR (see [`bloom_texture_format`]).
+    /// The bloom pyramid format the pass renders into. See [`bloom_texture_format`].
     texture_format: TextureFormat,
 }
 
@@ -60,13 +58,11 @@ pub struct BloomUniforms {
 }
 
 impl BloomUniforms {
-    /// Packs the soft-knee threshold curve parameters consumed by
-    /// `soft_threshold` in `bloom.wgsl`
-    /// (see <https://catlikecoding.com/unity/tutorials/advanced-rendering/bloom/#3.4>).
+    /// Packs the soft-knee threshold curve parameters that `soft_threshold` in
+    /// `bloom.wgsl` consumes. This is the single source of the packing math.
     ///
-    /// `threshold` is in scene-linear framebuffer units; `threshold_softness`
-    /// is clamped to `[0, 1]`. This is the single source of the packing math,
-    /// consumed by `prepare_bloom_uniforms`.
+    /// `threshold` is in scene-linear framebuffer units. `threshold_softness` is
+    /// clamped to `[0, 1]`.
     pub(crate) fn threshold_precomputations(threshold: f32, threshold_softness: f32) -> Vec4 {
         let knee = threshold * threshold_softness.clamp(0.0, 1.0);
         Vec4::new(
@@ -178,8 +174,6 @@ pub fn prepare_downsampling_pipeline(
     views: Query<(Entity, &Bloom, Option<&ViewDisplayTarget>)>,
 ) {
     for (entity, bloom, display_target) in &views {
-        // `Bloom::thresholding_active` (not `BloomPrefilter::is_active`):
-        // the GT7 glare scatter model is threshold-free by construction.
         let prefilter = bloom.thresholding_active();
         if !prefilter && bloom.prefilter.is_active() {
             once!(warn!(

@@ -159,12 +159,9 @@ impl Plugin for Core3dPlugin {
                         .chain()
                         .in_set(Core3dSystems::MainPass),
                     tonemapping.in_set(Core3dSystems::PostProcess),
-                    // Gamut transform + transfer encoding for HDR display
-                    // targets (no-op early-return on plain SDR targets).
-                    // Runs after the UI pass (which composites in
-                    // display-linear, paper-white-relative space and is
-                    // ordered `.before(display_encoding)` in bevy_ui_render)
-                    // and before the upscaling blit.
+                    // Gamut transform and transfer encoding for HDR display
+                    // targets; a no-op on SDR targets. The UI pass orders
+                    // itself before this, see `bevy_ui_render`.
                     display_encoding
                         .after(Core3dSystems::PostProcess)
                         .before(upscaling),

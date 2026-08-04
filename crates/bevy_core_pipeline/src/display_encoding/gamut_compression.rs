@@ -1,45 +1,8 @@
-//! CPU mirror of the display-encoding pass's out-of-gamut chroma compression
-//! (`gamut_compress` in `display_encoding.wgsl`) — keep both in sync.
-//!
-//! # Algorithm
-//!
-//! This is the ACES 1.3 Reference Gamut Compression (Academy S-2020-001,
-//! "RGC"; reference implementation `lib/RGC_common.ctl` in `aces-dev`)
-//! applied to the gamut stage of the display-encoding pass: out-of-gamut
-//! colors — negative RGB components produced by a wider-working-gamut →
-//! narrower-display-gamut transform — are pulled toward the achromatic axis
-//! at constant `max(r, g, b)` with a smooth parametric knee, instead of being
-//! per-channel clipped (which collapses chroma unevenly and shifts hue).
-//!
-//! Per channel, the distance from the achromatic axis is
-//! `dist = (ach - c) / ach` with `ach = max(r, g, b)`: `0` on the axis, `1`
-//! exactly on the gamut boundary (channel value `0`), `> 1` outside the
-//! gamut. Distances below the per-channel *threshold* pass through
-//! **bit-identically**; above it they are compressed with the monotonic curve
-//!
-//! ```text
-//! compress(d) = thr + scale * nd / (1 + nd^power)^(1/power),
-//! nd          = (d - thr) / scale,
-//! scale       = (lim - thr) / (((1 - thr) / (lim - thr))^(-power) - 1)^(1/power)
-//! ```
-//!
-//! which maps the per-channel *limit* exactly onto the boundary
-//! (`compress(lim) = 1`) and approaches `thr + scale` asymptotically. The
-//! compressed color is `ach - compress(dist) * ach`, so any color whose
-//! distances do not exceed the limits lands inside the target gamut.
-//!
-//! # Constants
-//!
-//! Thresholds ([`GAMUT_COMPRESSION_THRESHOLD`]) and power
-//! ([`GAMUT_COMPRESSION_POWER`]) are the published ACES RGC values
-//! (cyan `0.815`, magenta `0.803`, yellow `0.880`, power `1.2`). The ACES
-//! *limits* (`1.147 / 1.264 / 1.312`) were fitted to digital-cinema camera
-//! gamuts and under-cover the Rec.2020 → Rec.709 contraction this pass
-//! performs — the Rec.2020 hull reaches a distance of ≈ `1.594` in the cyan
-//! direction when expressed in Rec.709 coordinates — so
-//! [`GAMUT_COMPRESSION_LIMIT`] is re-derived from the Rec.2020 hull maxima
-//! (≈ `1.594 / 1.087 / 1.117`) plus headroom. A test sweeps the Rec.2020 hull
-//! and asserts every compressed color is in-gamut.
+//! CPU mirror of the display-encoding pass's out-of-gamut chroma compression.
+//! Keep it in sync with `gamut_compress` in `display_encoding.wgsl`. That
+//! shader documents the ACES 1.3 Reference Gamut Compression this implements
+//! (Academy S-2020-001, "RGC"; reference implementation `lib/RGC_common.ctl`
+//! in `aces-dev`), and where the thresholds, limits and power come from.
 //!
 //! The rationale for choosing the ACES RGC over an exact hue-preserving
 //! `ICtCp` compression is on [`DisplayGamutCompression`].
@@ -48,34 +11,26 @@
 
 use bevy_math::{ops, Vec3};
 
-/// Per-channel ACES RGC compression thresholds (cyan, magenta, yellow):
-/// distances from the achromatic axis below these pass through untouched.
-///
-/// Published ACES 1.3 Reference Gamut Compression values.
+/// Per-channel compression thresholds (cyan, magenta, yellow), the published
+/// ACES 1.3 Reference Gamut Compression values.
 pub const GAMUT_COMPRESSION_THRESHOLD: Vec3 = Vec3::new(0.815, 0.803, 0.880);
 
-/// Per-channel distances that map exactly onto the target-gamut boundary.
-///
-/// Re-derived for the Rec.2020 → Rec.709 contraction (see the module docs);
-/// must be at least the maximum achromatic distance the source gamut reaches
-/// in target-gamut coordinates, or the most saturated sources stay out of
-/// gamut after compression.
+/// Per-channel limits, re-derived for the Rec.2020 to Rec.709 contraction.
+/// Each must be at least the maximum achromatic distance the source gamut
+/// reaches in target-gamut coordinates, or the most saturated sources stay out
+/// of gamut after compression.
 pub const GAMUT_COMPRESSION_LIMIT: Vec3 = Vec3::new(1.62, 1.10, 1.13);
 
 /// Exponent of the ACES RGC parametric compression curve (published value).
 pub const GAMUT_COMPRESSION_POWER: f32 = 1.2;
 
-/// Precomputed curve scales, `compression_scale(threshold, limit, power)`
-/// per channel, evaluated in `f64` and baked (the WGSL side cannot evaluate
-/// `pow` in a `const` expression). Locked to the closed form by a test; keep
-/// in sync with `GAMUT_COMPRESSION_SCALE` in `display_encoding.wgsl`.
+/// Precomputed curve scales: `compression_scale(threshold, limit, power)` per
+/// channel, evaluated in `f64` and baked because the WGSL side cannot evaluate
+/// `pow` in a `const` expression. A test locks them to the closed form.
 pub const GAMUT_COMPRESSION_SCALE: Vec3 = Vec3::new(0.21634937, 0.43270176, 0.18745117);
 
 /// The closed-form scale of the ACES RGC compression curve:
 /// `(lim - thr) / (((1 - thr) / (lim - thr))^(-power) - 1)^(1/power)`.
-///
-/// Chosen so that `compress_distance` maps `limit` exactly onto the gamut
-/// boundary (distance `1`).
 pub fn compression_scale(threshold: f32, limit: f32, power: f32) -> f32 {
     (limit - threshold)
         / ops::powf(
@@ -85,23 +40,22 @@ pub fn compression_scale(threshold: f32, limit: f32, power: f32) -> f32 {
 }
 
 /// The ACES RGC parametric compression curve for one channel's achromatic
-/// distance. Identity below `threshold`, monotonically increasing above it,
-/// maps the limit baked into `scale` to `1.0` and approaches
-/// `threshold + scale` asymptotically.
+/// distance. Below `threshold` it returns `threshold`. [`gamut_compress`]
+/// selects the original distance there.
 pub fn compress_distance(dist: f32, threshold: f32, scale: f32) -> f32 {
     let nd = (dist - threshold).max(0.0) / scale;
     let p = ops::powf(nd, GAMUT_COMPRESSION_POWER);
     threshold + scale * nd / ops::powf(1.0 + p, 1.0 / GAMUT_COMPRESSION_POWER)
 }
 
-/// Compresses an out-of-gamut color (negative components) toward the
-/// achromatic axis at constant `max(r, g, b)`; mirror of `gamut_compress` in
-/// `display_encoding.wgsl`.
+/// Compresses an out-of-gamut color (negative components) toward the achromatic
+/// axis at constant `max(r, g, b)`.
 ///
 /// Channels whose achromatic distance is below [`GAMUT_COMPRESSION_THRESHOLD`]
-/// are returned bit-identically; colors within [`GAMUT_COMPRESSION_LIMIT`]
+/// are returned bit-identically, and colors within [`GAMUT_COMPRESSION_LIMIT`]
 /// land inside the target gamut. Colors with no positive channel are returned
-/// unchanged (the shader's final `max(0)` safety clip handles them).
+/// unchanged. The shader's final `max(0)` safety clip handles them, except
+/// under extended sRGB.
 pub fn gamut_compress(rgb: Vec3) -> Vec3 {
     let achromatic = rgb.max_element();
     if achromatic <= 0.0 {
@@ -126,8 +80,6 @@ pub fn gamut_compress(rgb: Vec3) -> Vec3 {
         ),
     );
     let compressed = Vec3::splat(achromatic) - compressed_dist * achromatic;
-    // Bit-identical pass-through for in-gamut channels under the threshold
-    // (mirrors the WGSL `select`).
     Vec3::select(dist.cmplt(GAMUT_COMPRESSION_THRESHOLD), rgb, compressed)
 }
 
@@ -140,9 +92,9 @@ mod tests {
     };
 
     /// `ICtCp` (ITU-R BT.2100) hue angle, in degrees, of a linear Rec.709
-    /// color (out-of-gamut components allowed: the color is converted to
-    /// Rec.2020 — where the test colors are in-gamut — before the LMS / PQ
-    /// steps). `1.0` is treated as 100 nits; hue angles are only compared
+    /// color. Out-of-gamut components are allowed: the color is converted to
+    /// Rec.2020, where the test colors are in gamut, before the LMS and PQ
+    /// steps. `1.0` is treated as 100 nits, so hue angles are only comparable
     /// against each other at the same scale.
     fn ictcp_hue_degrees(rgb709: Vec3) -> f32 {
         let rgb = REC709_TO_REC2020 * rgb709;
@@ -202,11 +154,11 @@ mod tests {
         }
     }
 
-    /// Sweeps the Rec.2020 gamut hull (cube faces) through the
-    /// Rec.2020 → Rec.709 contraction and asserts every compressed color is
-    /// inside the Rec.709 gamut (up to f32 residue caught by the shader's
-    /// final `max(0)`). This is the property the re-derived limits exist for;
-    /// the ACES camera-gamut limits fail it for the cyan direction.
+    /// Sweeps the Rec.2020 gamut hull (cube faces) through the Rec.2020 to
+    /// Rec.709 contraction and asserts every compressed color is inside the
+    /// Rec.709 gamut, up to f32 residue caught by the shader's final `max(0)`.
+    /// This is the property the re-derived limits exist for. The ACES
+    /// camera-gamut limits fail it in the cyan direction.
     #[test]
     fn rec2020_hull_compresses_into_gamut() {
         const N: usize = 100;
@@ -233,12 +185,10 @@ mod tests {
         assert_eq!(checked, 6 * (N + 1) * (N + 1));
     }
 
-    /// The Rec.2020 primaries/secondaries (the most saturated possible
-    /// inputs) land in-gamut with bounded `ICtCp` hue drift. The bounds are the
-    /// measured behavior of the per-channel ACES RGC formulation — *not*
-    /// exact hue preservation (see the module docs): < 2.5° for
-    /// cyan/magenta/yellow, ~5–6° for green/red, and ~16° for the blue
-    /// corner, the documented worst case of the cheap method.
+    /// The Rec.2020 primaries and secondaries, the most saturated possible
+    /// inputs, land in gamut with bounded `ICtCp` hue drift. The bounds below
+    /// are the measured behavior of the per-channel ACES RGC formulation, not
+    /// exact hue preservation. See `DisplayGamutCompression`.
     #[test]
     fn rec2020_primaries_compress_in_gamut_with_bounded_hue_drift() {
         let cases = [
@@ -268,16 +218,14 @@ mod tests {
         }
     }
 
-    /// Moderately out-of-gamut colors (the common case: slightly-wide chroma
-    /// after a Rec.2020 → Rec.709 contraction) keep hue drift in the low
-    /// single digits of degrees. The per-direction bounds are the measured
-    /// behavior of the per-channel formulation (cyan directions stay under
-    /// ~2°; green/yellow directions drift up to ~3–4.5°).
+    /// Moderately out-of-gamut colors, the common case of slightly wide chroma
+    /// after a Rec.2020 to Rec.709 contraction, keep hue drift in the low
+    /// single digits of degrees. The per-direction bounds below are the
+    /// measured behavior of the per-channel formulation.
     #[test]
     fn moderate_out_of_gamut_hue_drift_is_small() {
-        // The Rec.2020 color with the worst cyan-direction distance
-        // (≈ 1.594), and the same color blended 55% toward its clip
-        // (distance ≈ 1.27).
+        // The Rec.2020 color with the worst cyan-direction distance (~1.594),
+        // and the same color blended 55% toward its clip (distance ~1.27).
         let worst_cyan_709 = REC2020_TO_REC709 * Vec3::new(0.0, 0.17666, 0.19333);
         let cases = [
             (worst_cyan_709, 2.0),
@@ -315,9 +263,9 @@ mod tests {
                 (at_knee - (threshold + eps)).abs() < 1e-5,
                 "channel {i}: discontinuous at the knee ({at_knee})"
             );
-            // Monotonicity of the effective per-channel mapping (identity
-            // below the threshold via the pass-through select, the curve
-            // above it) across the knee and the whole compression range.
+            // Monotonicity of the effective per-channel mapping across the knee
+            // and the whole compression range: identity below the threshold via
+            // the pass-through select, the curve above it.
             let effective = |d: f32| {
                 if d < threshold {
                     d
@@ -339,8 +287,6 @@ mod tests {
         }
     }
 
-    /// `compress_distance(limit) == 1`: a color at exactly the limit distance
-    /// lands exactly on the gamut boundary (channel value 0).
     #[test]
     fn the_limit_maps_onto_the_gamut_boundary() {
         for i in 0..3 {

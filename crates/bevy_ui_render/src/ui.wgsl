@@ -185,12 +185,6 @@ fn nearest_border_active(point_vs_mid: vec2<f32>, size: vec2<f32>, width: vec4<f
         (enabled(flags, BORDER_BOTTOM) && min_dist == bottom);
 }
 
-// Writer-side gamut convert and compositing encode. UI runs after tone mapping,
-// so it composites into the post-tonemap buffer: on a GT7 HDR view the
-// Rec.709-authored color converts to the buffer's Rec.2020 primaries, and on a
-// resolved Srgb/Oklab view the straight-alpha output is encoded to match the
-// buffer (the terminal decode reverses it). Default Rec.709 / Linear views
-// compile a pass-through; the alpha channel is left untouched.
 fn encode_output(color: vec4<f32>) -> vec4<f32> {
     return writer_encode(color);
 }

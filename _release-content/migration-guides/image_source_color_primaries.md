@@ -9,12 +9,11 @@ pull_requests: []
 pub source_primaries: SourceColorPrimaries,
 ```
 
-It records which color primaries (gamut) the image data is expressed in — `Bt709`
-(the sRGB primaries, and the default), `Bt2020`, or `DisplayP3`. This is metadata
-only: it does not change how any image is decoded, stored, or rendered.
+It records which color primaries (gamut) the image data is expressed in: `Bt709`
+(the sRGB primaries, and the default), `Bt2020`, or `DisplayP3`. It is metadata
+only: decoding, storage, and rendering are unchanged.
 
-Struct-literal construction must now provide the field; `SourceColorPrimaries::default()`
-(BT.709) preserves the previous behavior:
+Struct-literal construction must now provide the field:
 
 ```rust
 // 0.19
@@ -35,22 +34,21 @@ let image = Image {
 };
 ```
 
-All of `Image`'s constructors (`Image::new`, `Image::new_fill`, `Image::default`,
-`Image::from_buffer`, `Image::from_dynamic`, ...) initialize the field to
-`SourceColorPrimaries::Bt709`, so code using them is unaffected.
+Every `Image` constructor (`Image::new`, `Image::new_fill`, `Image::default`,
+`Image::from_buffer`, `Image::from_dynamic`, ...) initializes the field to
+`SourceColorPrimaries::Bt709`.
 
 `ImageLoaderSettings`, `HdrTextureLoaderSettings`, and `ExrTextureLoaderSettings`
 gained an optional `source_primaries: Option<SourceColorPrimaries>` setting
-(default `None`; existing `.meta` files keep working). Resolution order is
-setting > file metadata > BT.709. With `None`, the loaders honor per-format file
-metadata: the KTX2 data format descriptor's `colorPrimaries`, Radiance HDR
-`PRIMARIES=` header lines, and the OpenEXR `chromaticities` attribute. The KTX2
-loader also logs a one-time warning when the file's declared transfer function
-contradicts the loader's `is_srgb` setting (the setting still wins, byte-for-byte
-identical) or declares an HDR transfer function (PQ/HLG, still loaded as-is). The
-glTF loader stamps `Bt709` explicitly, as mandated by the glTF 2.0 specification.
+(default `None`, so existing `.meta` files keep working). Resolution order is
+setting > file metadata > BT.709. The file metadata read is the KTX2 data format
+descriptor's `colorPrimaries`, Radiance HDR `PRIMARIES=` header lines, and the
+OpenEXR `chromaticities` attribute. The KTX2 loader also logs a one-time warning
+when the file's declared transfer function contradicts the loader's `is_srgb`
+setting (the setting still wins) or declares an HDR transfer function (PQ/HLG,
+still loaded as-is). The glTF loader stamps `Bt709`, as the glTF 2.0
+specification requires.
 
-The stamp is propagated to `GpuImage::source_primaries` in the render world for use
-by the configurable wide working color space that also ships this release
-(`RenderPlugin::working_color_space` — see the "Wide-gamut color" release
-note).
+The opt-in wide working color space (`RenderPlugin::working_color_space`) still
+assumes every sampled texture is Rec.709.
+See the "Wide-gamut color" release note.

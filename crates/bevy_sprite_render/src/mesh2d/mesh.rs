@@ -108,10 +108,10 @@ impl Plugin for Mesh2dRenderPlugin {
                     Render,
                     (
                         prepare_pending_mesh_material2d_queues.in_set(RenderSystems::Specialize),
-                        // Reads the phase-1 resolved compositing spaces, so
-                        // it must run after the resolver; both `ViewKeyCache`
-                        // consumers (`specialize_material2d_meshes`,
-                        // `specialize_wireframes`) run in `Specialize`, after
+                        // Reads the resolved compositing spaces, so it runs
+                        // after the resolver. The `ViewKeyCache` consumers
+                        // `specialize_material2d_meshes` and
+                        // `specialize_wireframes` run in `Specialize`, after
                         // this set.
                         check_views_need_specialization
                             .in_set(RenderSystems::CreateViews)
@@ -161,10 +161,8 @@ pub fn check_views_need_specialization(
             | Mesh2dPipelineKey::from_target_format(view.target_format)
             | Mesh2dPipelineKey::from_compositing_space(resolved_space.and_then(|space| space.0));
 
-        // In-shader tonemapping fast path: an eligible SDR camera
-        // (`TonemapInShader`, 8-bit main texture) with an active operator
-        // folds tonemapping (and optional debanding) into the mesh2d /
-        // material fragment shaders, skipping the separate tonemapping pass.
+        // Fast path: an SDR camera marked `TonemapInShader` folds tonemapping
+        // and optional debanding into the fragment shaders.
         if tonemap_in_shader
             && let Some(tonemapping) = tonemapping
             && *tonemapping != Tonemapping::None
@@ -351,10 +349,8 @@ pub struct Mesh2dPipeline {
     pub shader: Handle<Shader>,
     pub per_object_buffer_batch_size: Option<u32>,
     /// The project-global working color space, captured at `RenderStartup`.
-    /// Under `WorkingColorSpace::Rec2020` the 2D mesh / material fragment
-    /// shaders convert their composed colors into the working space
-    /// (`OUTPUT_GAMUT_REC2020` writer-encode def, inherited by `Material2d`
-    /// pipelines).
+    /// Under `WorkingColorSpace::Rec2020` the 2D mesh and material fragment
+    /// shaders convert their composed colors into it (`OUTPUT_GAMUT_REC2020`).
     pub working_color_space: WorkingColorSpace,
 }
 
@@ -593,10 +589,8 @@ impl Mesh2dPipelineKey {
             .expect("Unknown bits in `COLOR_TARGET_FORMAT_MASK_BITS` of the pipeline key")
     }
 
-    /// Key bits for a view's RESOLVED [`CompositingSpace`] (the phase-1
-    /// `ResolvedCompositingSpace` value, never the camera's raw request):
-    /// `Some(Srgb)` / `Some(Oklab)` select the matching writer-encode bit;
-    /// linear views (`Some(Linear)` or no space) set no bits.
+    /// Key bits for a view's resolved [`CompositingSpace`], taken from
+    /// `ResolvedCompositingSpace` and never from the camera's raw request.
     #[inline]
     pub fn from_compositing_space(space: Option<CompositingSpace>) -> Self {
         match space {
@@ -638,10 +632,6 @@ impl SpecializedMeshPipeline for Mesh2dPipeline {
         let mut shader_defs = Vec::new();
         let mut vertex_attributes = Vec::new();
 
-        // Pushed for every specialization when (and only when) the app opted
-        // into the Rec.2020 working space, so default projects compose
-        // byte-identically: the writer-encode gamut def converts the composed
-        // mesh/material color into the buffer's Rec.2020 primaries.
         if self.working_color_space.is_rec2020() {
             shader_defs.push("OUTPUT_GAMUT_REC2020".into());
         }
@@ -1063,9 +1053,6 @@ impl<P: PhaseItem> RenderCommand<P> for DrawMesh2d {
 mod tests {
     use super::*;
 
-    /// Key-derivation: a solo default camera's view key carries no
-    /// compositing bits — byte-identical to a hand-constructed key without
-    /// the compositing-space term.
     #[test]
     fn solo_sdr_default_view_key_has_no_compositing_bits() {
         let view_key = Mesh2dPipelineKey::from_msaa_samples(4)
@@ -1078,9 +1065,6 @@ mod tests {
         );
     }
 
-    /// Key-derivation: the resolved space selects exactly its writer-encode
-    /// bit (fixed positions 1 << 4 / 1 << 5); `Some(Linear)` keys like no
-    /// space.
     #[test]
     fn resolved_space_selects_exactly_its_bit() {
         assert_eq!(
@@ -1101,8 +1085,6 @@ mod tests {
         );
     }
 
-    /// Key-derivation: an Oklab 2d solo view (fp16 main texture) keys the
-    /// Oklab writer-encode bit alongside its format and msaa bits.
     #[test]
     fn oklab_solo_view_key_sets_the_oklab_bit() {
         let view_key = Mesh2dPipelineKey::from_msaa_samples(4)

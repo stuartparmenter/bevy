@@ -568,28 +568,22 @@ fn neighborhood_blending_vertex_main(@builtin(vertex_index) vertex_index: u32)
  * IMPORTANT NOTICE: luma edge detection requires gamma-corrected colors, and
  * thus 'color_texture' should be a non-sRGB texture.
  *
- * Bevy note: in Bevy this pass actually reads *display-linear* values, not
- * the gamma-corrected ones the reference shader was tuned for. The view
- * target is either an sRGB texture (hardware-decoded to linear on sample) or,
- * for tone-mapped cameras, an Rgba16Float texture holding display-linear
- * values directly — numerically the same signal modulo quantization. This is
- * a long-standing, deliberate deviation: SMAA_THRESHOLD operates on linear
- * luma here (slightly more sensitive in shadows, slightly less in
- * highlights than the reference tuning).
+ * Bevy note: this pass reads display-linear values, not the gamma-corrected
+ * ones the reference shader was tuned for. The view target is either an sRGB
+ * texture (hardware-decoded to linear on sample) or, for tone-mapped cameras,
+ * an Rgba16Float texture holding display-linear values. This is a
+ * long-standing, deliberate deviation: SMAA_THRESHOLD operates on linear luma
+ * here, which is slightly more sensitive in shadows and less in highlights
+ * than the reference tuning.
  *
- * On HDR display targets (HDR_DISPLAY_TARGET) the input is additionally
- * paper-white-relative and exceeds 1.0 up to peak / paper-white, which would
- * shift SMAA_THRESHOLD's effective sensitivity arbitrarily, so the luma used
- * for edge detection is saturated to [0, 1]: edges between above-paper-white
- * values are detected at their 1.0-clamped contrast, and values at or below
- * paper white behave exactly as on SDR targets. Only the edge metric is
- * clamped; blending (pass 3) still reads the unmodified HDR texels. SDR
- * pipelines never set the def and compile byte-identically.
+ * On HDR display targets the input is also paper-white-relative and exceeds
+ * 1.0 (up to peak / paper white), which shifts SMAA_THRESHOLD's effective
+ * sensitivity, so the luma used for edge detection is saturated to [0, 1].
+ * Blending (pass 3) still reads the unmodified HDR texels.
  */
-// The edge-detection luma for one texel. Takes the sampled rgb, not a uv: a
-// sampling helper would move an implicit-derivative textureSample into a user
-// function (a uniformity requirement the post-discard call sites below cannot
-// meet).
+// The edge-detection luma for one texel. Takes the sampled rgb rather than a
+// uv, because an implicit-derivative textureSample inside a user function has
+// a uniformity requirement the post-discard call sites below cannot meet.
 fn edge_luma(rgb: vec3<f32>) -> f32 {
     let weights = vec3(0.2126, 0.7152, 0.0722);
 #ifdef HDR_DISPLAY_TARGET

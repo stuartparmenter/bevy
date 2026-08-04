@@ -81,32 +81,25 @@ impl From<Camera3dDepthLoadOp> for LoadOp<f32> {
 }
 
 /// If this component is added to a camera, the camera will use an intermediate "high dynamic range" render texture.
-/// This allows rendering with a wider range of lighting values. Note that this only affects the
-/// intermediate render texture, not the signal sent to the display: to output HDR to an
-/// HDR-capable display, request an HDR transfer on the window's
-/// [`DisplayTarget`](bevy_window::DisplayTarget) (cameras rendering to such a target get the
-/// high-precision intermediate automatically).
+/// This allows rendering with a wider range of lighting values. It only affects the
+/// intermediate render texture, not the signal sent to the display. For that, request an
+/// HDR transfer on the window's [`DisplayTarget`](bevy_window::DisplayTarget); cameras
+/// rendering to such a target get the high-precision intermediate automatically.
 #[derive(Component, Default, Copy, Clone, Reflect, PartialEq, Eq, Hash, Debug)]
 #[reflect(Component, Default, PartialEq, Hash, Debug)]
 pub struct Hdr;
 
-/// Marker requiring a camera's tone mapping to run in the node-side pass
-/// rather than folded into its material shaders.
+/// Marker that forces a camera's tone mapping to run in the node-side pass
+/// instead of folding it into the material shaders. Camera extraction treats
+/// it like `NeedsSceneLinearTarget` and skips the in-shader fast path.
 ///
-/// `GranTurismo7Params` pulls this in as a required component: the in-shader
-/// fold has no path to bind the per-view GT7 params uniform, so it would
-/// silently fall back to the baked SDR defaults and discard the camera's
-/// custom parameters. Keeping such a camera on the node-side path lets it
-/// honor them.
+/// `GranTurismo7Params` pulls this in as a required component. The in-shader
+/// fold has no way to bind the per-view GT7 params uniform, so it would fall
+/// back to the baked SDR defaults and drop the camera's parameters.
 ///
-/// Because it is a required component, it survives the removal of the params
-/// that pulled it in (plain `remove::<GranTurismo7Params>()` leaves it behind)
-/// and it also applies to a camera that carries params under a non-GT7
-/// operator. Both are conservative: the camera keeps its `Rgba16Float`
-/// intermediate and one fullscreen pass, and the pixels are the same.
-///
-/// Its presence vetoes the SDR in-shader tone-mapping fast path in camera
-/// extraction, exactly like `NeedsSceneLinearTarget`.
+/// Being a required component, it outlives the params that pulled it in and
+/// also applies under a non-GT7 operator. Both cases only cost the camera an
+/// `Rgba16Float` intermediate and one fullscreen pass; the pixels match.
 #[derive(Component, Default, Copy, Clone, Reflect, PartialEq, Eq, Hash, Debug)]
 #[reflect(Component, Default, PartialEq, Hash, Debug)]
 pub struct NeedsNodeTonemapping;

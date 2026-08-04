@@ -126,7 +126,5 @@ fn fragment(in: UiVertexOutput) -> @location(0) vec4<f32> {
 
     let color = in.color * textureSample(sprite_texture, sprite_sampler, atlas_uv);
 
-    // Gamut convert (Rec.709 -> buffer primaries) and writer-encode into the
-    // resolved compositing space; a no-op on default Rec.709 / Linear views.
     return encode_output(color);
 }

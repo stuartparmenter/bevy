@@ -49,15 +49,14 @@ pub fn upscaling(
         ClearColorConfig::None => None,
     };
     // On an HDR-transfer target the out texture stores encoded signal, so the
-    // `LoadOp::Clear` value must be encoded CPU-side to match the rendered
-    // pixels the finalizer's blit composites over (regions no blit covers
-    // would otherwise present raw display-linear values as HDR signal). For
-    // SDR targets (`encoding: None`) the path is unchanged: the hardware sRGB
-    // view encodes the linear clear on store. The sanitized paper white must
-    // match the value the GPU encoder folds (`sanitized_paper_white_nits`), so
-    // the encoded clear and the rendered pixels agree even for degenerate
-    // authored paper whites. `encoding` is `Some` only on an HDR-transfer
-    // group, which always carries a `ViewDisplayTarget`.
+    // `LoadOp::Clear` value has to be encoded on the CPU. Regions no blit
+    // covers would otherwise present raw display-linear values as HDR signal.
+    // SDR targets (`encoding: None`) are unchanged: the hardware sRGB view
+    // encodes the linear clear on store. The paper white has to be the
+    // sanitized value the GPU encoder folds in, so the clear and the rendered
+    // pixels agree even for degenerate authored paper whites. `encoding` is
+    // `Some` only on an HDR-transfer group, which always carries a
+    // `ViewDisplayTarget`.
     let converted_clear_color = clear_color.map(|color| {
         match contract
             .and_then(|contract| contract.encoding)

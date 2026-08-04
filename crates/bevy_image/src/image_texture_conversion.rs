@@ -156,9 +156,8 @@ impl Image {
     /// - `TextureFormat::Rgba16Float` (converted to [`DynamicImage::ImageRgba32F`])
     /// - `TextureFormat::Rgba32Float`
     ///
-    /// The floating-point formats keep their full (HDR) range; they are
-    /// supported so screenshots of HDR surfaces (e.g. the `Rgba16Float`
-    /// scRGB-linear swapchain) can be captured and saved.
+    /// The float formats keep their full HDR range, so screenshots of an HDR
+    /// (`Rgba16Float` scRGB-linear) swapchain can be saved.
     ///
     /// To convert [`Image`] to a different format see: [`Image::convert`].
     pub fn try_into_dynamic(self) -> Result<DynamicImage, IntoDynamicImageError> {
@@ -189,10 +188,7 @@ impl Image {
                 })
                 .map(DynamicImage::ImageRgba8)
             }
-            // This format is used for the swapchain texture of HDR
-            // (scRGB-linear) windows. The conversion is added here to support
-            // screenshots; the f16 data is widened to f32, the closest
-            // `DynamicImage` pixel type.
+            // f16 has no `DynamicImage` pixel type, so widen it to f32.
             TextureFormat::Rgba16Float => {
                 let pixels: Vec<f32> = data
                     .as_chunks()
@@ -278,8 +274,8 @@ mod test {
 
     #[test]
     fn rgba16float_to_dynamic_keeps_hdr_range() {
-        // 2x1 fp16 image with one above-range (HDR) and one negative
-        // component, as an scRGB-linear screenshot may contain.
+        // 2x1 fp16 image with an above-range and a negative component, as an
+        // scRGB-linear screenshot can contain.
         let pixels: [f32; 8] = [2.5, 1.0, -0.25, 1.0, 0.5, 0.0, 1.0, 0.25];
         let data: Vec<u8> = pixels
             .iter()

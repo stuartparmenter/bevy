@@ -17,16 +17,13 @@
 //
 // The final target_exposure is finally used to smoothly adjust the exposure value over time.
 // Optionally, a two-stage physiological adaptation model bounds this short-term exposure by a
-// slowly moving long-term adaptation envelope (see `PhysiologicalAdaptation` on the Rust side).
+// slowly moving long-term envelope (see `PhysiologicalAdaptation` on the Rust side).
 //
-// The same metering pass optionally measures the scene's luminance-weighted average
-// chromaticity for auto white balance (see `AutoWhiteBalance` on the Rust side): the
-// compute_histogram pass accumulates fixed-point Yxy sums with the same metering-mask weights,
-// and the compute_average pass blends in a faint D65 "virtual light" anchor, temporally adapts
-// the white-point chromaticity, and composes a von Kries correction matrix into the view's
-// color-grading balance matrix. Every auto-white-balance statement is gated on the
-// `awb_enabled` uniform flag, so the auto-exposure-only configuration runs no white-balance
-// arithmetic at all.
+// The same pass optionally measures the scene's luminance-weighted average chromaticity for
+// auto white balance (see `AutoWhiteBalance` on the Rust side): compute_histogram accumulates
+// fixed-point Yxy sums with the same metering-mask weights, and compute_average adapts the
+// white point and composes a von Kries correction into the view's color-grading balance
+// matrix.
 
 #import bevy_render::view::View
 #import bevy_render::globals::Globals
@@ -55,9 +52,8 @@ struct AutoExposure {
     awb_anchor: f32,
     // Non-zero when auto white balance is enabled for this view.
     awb_enabled: u32,
-    // Tail padding to 80 bytes. WGSL rounds a uniform struct's size up to a
-    // multiple of 16 anyway; spelling it out keeps this struct field-for-field
-    // identical to its CPU mirror, which has to pad explicitly.
+    // Tail padding to 80 bytes. WGSL rounds a uniform struct up to a multiple
+    // of 16 anyway, but spelling it out matches the CPU mirror, which must pad.
     pad_0: u32,
     pad_1: u32,
     pad_2: u32,
@@ -69,14 +65,11 @@ struct AutoExposureState {
     exposure: f32,
     // The long-term physiological adaptation envelope, in EV.
     long_term: f32,
-    // The adapted white-point chromaticity (CIE 1931 xy) for auto white
-    // balance.
+    // The adapted white-point chromaticity (CIE 1931 xy) for auto white balance.
     chroma_x: f32,
     chroma_y: f32,
-    // Fixed-point accumulators for the auto white balance measurement: the
-    // luminance-weighted sums of x, of y, and the luminance weight itself
-    // (Yxy space). Flushed by compute_histogram, drained and cleared by
-    // compute_average.
+    // Fixed-point Yxy sums for auto white balance: luminance-weighted x, y, and
+    // the luminance weight. Filled by compute_histogram, drained by compute_average.
     chroma_sums: array<atomic<u32>, 3>,
 }
 
@@ -109,7 +102,7 @@ var<workgroup> histogram_shared: array<atomic<u32>, 64>;
 
 var<workgroup> chroma_shared: array<atomic<u32>, 3>;
 
-// === Auto white balance constants and helpers ===============================
+// Auto white balance constants and helpers.
 
 // Fixed-point scale used by the per-pixel accumulation into chroma_shared.
 // Per-pixel contributions are bounded by the maximum metering weight (16), so
@@ -136,20 +129,18 @@ const AWB_REC2020_TO_Y = vec3<f32>(0.26270021201126703, 0.677998071518871, 0.059
 const AWB_REC2020_TO_Z = vec3<f32>(0.0, 0.028072693049087508, 1.0609850577107909);
 
 // Rows of the inverse of the `AWB_REC709_TO_*` matrix (CIE 1931 XYZ ->
-// linear Rec.709 RGB, D65 white point), used to express white points in the
-// working RGB space when deriving the von Kries gains below.
+// linear Rec.709 RGB, D65 white point), used to express white points in RGB
+// when deriving the von Kries gains below.
 const AWB_XYZ_TO_REC709_R = vec3<f32>(3.2409699419045208, -1.537383177570093, -0.49861076029300311);
 const AWB_XYZ_TO_REC709_G = vec3<f32>(-0.96924363628087962, 1.8759675015077208, 0.041555057407175612);
 const AWB_XYZ_TO_REC709_B = vec3<f32>(0.055630079696993608, -0.20397695888897655, 1.0569715142428784);
 
 // The CAM16-derived RGB -> LMS / LMS -> RGB matrices, copied verbatim from
-// `RGB_TO_LMS` / `LMS_TO_RGB` in `bevy_render/src/view/mod.rs` — the same
-// matrices the CPU uses to build the user's static white-balance matrix from
-// `ColorGrading`'s temperature/tint; keep them in sync. Note that this is
-// bevy's own white-normalized variant of the CAM16 LMS basis (its rows sum
-// to 1.0, mapping RGB white to LMS (1, 1, 1)), NOT the raw CAM16 transform
-// of CIE XYZ — the von Kries gains below must therefore be derived in THIS
-// basis, not in raw CAM16 LMS.
+// `RGB_TO_LMS` / `LMS_TO_RGB` in `bevy_render/src/view/mod.rs`. The CPU uses
+// the same pair for the static white balance from `ColorGrading`'s
+// temperature/tint, so keep them in sync. This is bevy's white-normalized
+// variant of the CAM16 LMS basis (rows sum to 1.0, mapping RGB white to LMS
+// (1, 1, 1)), not the raw CAM16 transform of CIE XYZ.
 const AWB_RGB_TO_LMS = mat3x3<f32>(
     vec3(0.311692, 0.0905138, 0.00764433),
     vec3(0.652085, 0.901341, 0.0486554),
@@ -172,16 +163,13 @@ fn awb_xy_to_rec709(xy: vec2<f32>) -> vec3<f32> {
     );
 }
 
-// The correlated color temperature of a CIE 1931 chromaticity, using
-// McCamy's approximation (C. S. McCamy 1992, "Correlated color temperature
-// as an explicit function of chromaticity coordinates", Color Research &
-// Application 17(2)). The denominator is clamped to stay negative: every
-// real illuminant sits above the y = 0.1858 epicenter, so chromaticities
-// below it (deep blue/violet scenes) must keep reading as cool — letting
-// the sign flip would classify them as extremely warm and drive the
-// correction in the wrong direction. The intermediate `n` is clamped so
-// that extreme chromaticities produce a finite CCT inside the
-// Planckian-locus approximation's validity range.
+// The correlated color temperature of a CIE 1931 chromaticity, using McCamy's
+// approximation (C. S. McCamy 1992, "Correlated color temperature as an explicit
+// function of chromaticity coordinates", Color Research & Application 17(2)).
+// The denominator is clamped to stay negative: real illuminants sit above the
+// y = 0.1858 epicenter, and a sign flip would read chromaticities below it (deep
+// blue scenes) as extremely warm. `n` is clamped so extreme chromaticities still
+// produce a CCT bounded to 1632 K - 21334 K.
 fn awb_cct(xy: vec2<f32>) -> f32 {
     let d = min(0.1858 - xy.y, -1e-6);
     let n = clamp((xy.x - 0.3320) / d, -1.2, 1.3);
@@ -218,27 +206,23 @@ fn awb_planckian_xy(cct: f32) -> vec2<f32> {
 // The white-balance correction matrix for a scene whose adapted illuminant
 // chromaticity is `adapted_xy`. The CCT is clamped to the 2500 K - 7000 K
 // output range of typical real-camera AWB specifications, the off-locus tint
-// component is preserved (clamped to +/-0.05 in xy for stability), and the
-// resulting white point is neutralized towards D65 by a von Kries adaptation
-// in bevy's CAM16-derived RGB <-> LMS basis (the same matrix pair the CPU
-// uses for `ColorGrading`'s temperature/tint).
+// is preserved (clamped to +/-0.05 in xy for stability), and the resulting
+// white point is neutralized towards D65 by a von Kries adaptation in bevy's
+// CAM16-derived RGB <-> LMS basis.
 fn awb_balance_matrix(adapted_xy: vec2<f32>) -> mat3x3<f32> {
     let cct = awb_cct(adapted_xy);
     let locus = awb_planckian_xy(clamp(cct, 1667.0, 25000.0));
     let tint = clamp(adapted_xy - locus, vec2(-0.05), vec2(0.05));
     let white_xy = awb_planckian_xy(clamp(cct, 2500.0, 7000.0)) + tint;
 
-    // Von Kries adaptation: independent gain on each cone response, scaling
-    // the estimated illuminant to D65. The gains MUST be derived in the same
-    // LMS basis the `AWB_LMS_TO_RGB * diag(gain) * AWB_RGB_TO_LMS` sandwich
-    // uses, so both white points are mapped through `AWB_RGB_TO_LMS` from
-    // their unit-luminance Rec.709 coordinates. (Deriving the gains in the
-    // raw CAM16 LMS basis instead — whose cone axes genuinely differ from
-    // bevy's white-normalized variant — only partially neutralizes the
-    // illuminant: a converged correction would leave tungsten light at an
-    // R/B channel ratio of ~1.54 instead of ~1.0.) Both vectors use Y = 1,
-    // so the correction preserves the white point's luminance. A D65 input
-    // yields a gain of exactly 1.0 (identical expressions on both sides).
+    // Von Kries adaptation: an independent gain per cone response, scaling the
+    // estimated illuminant to D65. The gains must be derived in the same LMS
+    // basis the `AWB_LMS_TO_RGB * diag(gain) * AWB_RGB_TO_LMS` sandwich uses, so
+    // both white points go through `AWB_RGB_TO_LMS` from their Rec.709
+    // coordinates. In raw CAM16 LMS the illuminant is only partly neutralized: a
+    // converged correction leaves tungsten light at an R/B ratio of ~1.54
+    // instead of ~1.0. Both vectors use Y = 1, so the correction preserves the
+    // white point's luminance, and a D65 input gives a gain of exactly 1.0.
     let gain = (AWB_RGB_TO_LMS * awb_xy_to_rec709(AWB_D65_XY))
         / (AWB_RGB_TO_LMS * awb_xy_to_rec709(white_xy));
     let scaled = mat3x3<f32>(
@@ -249,13 +233,10 @@ fn awb_balance_matrix(adapted_xy: vec2<f32>) -> mat3x3<f32> {
     return AWB_LMS_TO_RGB * scaled;
 }
 
-// =============================================================================
-
 // For a given color, return the histogram bin index
 fn color_to_bin(hdr: vec3<f32>) -> u32 {
-    // Convert color to luminance, using the Y row that matches the working
-    // space the main texture holds (the same choice the white-balance
-    // measurement below makes).
+    // Convert color to luminance, using the Y row for the working space the
+    // main texture holds.
 #ifdef WORKING_COLOR_SPACE_REC2020
     let lum = dot(hdr, AWB_REC2020_TO_Y);
 #else
@@ -296,9 +277,8 @@ fn compute_histogram(
     }
 
     // Clear the workgroup shared chroma accumulators (auto white balance).
-    // `settings.awb_enabled` comes from a uniform buffer, so all the auto
-    // white balance branches below are uniform control flow and the shared
-    // barriers stay valid.
+    // This guard is non-uniform, but no auto white balance branch contains a
+    // barrier: both workgroup barriers below sit at function scope.
     if settings.awb_enabled != 0u && local_invocation_index < 3u {
         atomicStore(&chroma_shared[local_invocation_index], 0u);
     }
@@ -317,17 +297,13 @@ fn compute_histogram(
         // Increment the shared histogram bin by the weight obtained from the metering mask
         atomicAdd(&histogram_shared[index], weight);
 
-        // Accumulate the auto white balance chromaticity measurement, reusing
-        // the texel and metering-mask weight already loaded for the histogram.
-        // No barriers run inside this block, so nesting the non-uniform flag
-        // check here keeps the workgroup barriers below in uniform control
-        // flow.
+        // Accumulate the auto white balance chromaticity, reusing the texel and
+        // metering-mask weight already loaded for the histogram.
         if settings.awb_enabled != 0u {
             let awb_col = max(col, vec3(0.0));
 
-            // The CIE 1931 XYZ of the working-space color (linear Rec.709 by
-            // default, linear Rec.2020 when the project opted into the wide
-            // working space).
+            // The CIE 1931 XYZ of the working-space color: linear Rec.709 by
+            // default, linear Rec.2020 with the wide working space.
 #ifdef WORKING_COLOR_SPACE_REC2020
             let big_x = dot(awb_col, AWB_REC2020_TO_X);
             let big_y = dot(awb_col, AWB_REC2020_TO_Y);
@@ -340,10 +316,9 @@ fn compute_histogram(
 
             let xyz_sum = big_x + big_y + big_z;
             if xyz_sum > 0.0 {
-                // Luminance-weighted Yxy measurement: each pixel contributes
-                // its chromaticity (x, y) weighted by the metering mask and by
-                // its luminance, normalized (and saturated) against the top of
-                // the metering range so the fixed-point sums cannot overflow.
+                // Luminance-weighted Yxy measurement: each pixel contributes its
+                // (x, y) weighted by the metering mask and its luminance, saturated
+                // against the top of the metering range so the sums cannot overflow.
                 let y_cap = exp2(settings.min_log_lum + settings.log_lum_range);
                 let y_norm = clamp(big_y / y_cap, 0.0, 1.0);
                 let lum_weight = y_norm * f32(weight);
@@ -363,9 +338,9 @@ fn compute_histogram(
     // Accumulate the workgroup histogram into the global histogram.
     // Note that the global histogram was not cleared at the beginning,
     // as it will be cleared in compute_average. The guard matches the clear
-    // above: the workgroup has 256 invocations but only 64 bins, and an
-    // unguarded flush would clamp lanes 64..255 onto bin 63 (naga's default
-    // bounds-check policy), inflating the brightest bin ~193x.
+    // above: 256 invocations, only 64 bins. An unguarded flush would clamp
+    // lanes 64..255 onto bin 63 (naga's default bounds-check policy),
+    // inflating that bin ~193x.
     if local_invocation_index < 64u {
         atomicAdd(
             &histogram[local_invocation_index],
@@ -373,10 +348,9 @@ fn compute_histogram(
         );
     }
 
-    // Accumulate the workgroup chroma sums into the per-view state
-    // accumulators, converting from the workgroup fixed-point scale to the
-    // flush scale and normalizing by the total pixel count for headroom (the
-    // normalization cancels out exactly in compute_average).
+    // Accumulate the workgroup chroma sums into the per-view state, converting
+    // from the workgroup fixed-point scale to the flush scale and normalizing by
+    // the total pixel count for headroom (compute_average cancels it out).
     if settings.awb_enabled != 0u && local_invocation_index < 3u {
         let workgroup_sum = f32(atomicLoad(&chroma_shared[local_invocation_index])) / CHROMA_WORKGROUP_SCALE;
         let normalized = workgroup_sum / (f32(dim.x) * f32(dim.y));
@@ -426,8 +400,7 @@ fn compute_average(@builtin(local_invocation_index) local_index: u32) {
     }
 
     // A constant EV offset on the metered luminance, applied before the compensation
-    // curve is sampled. The branch keeps the default configuration on the exact
-    // histogram average.
+    // curve is sampled. The branch keeps the default on the exact histogram average.
     if settings.metering_bias != 0.0 {
         avg_lum += settings.metering_bias;
     }
@@ -456,11 +429,8 @@ fn compute_average(@builtin(local_invocation_index) local_index: u32) {
         exposure = exposure + max(-speed_up, delta * exp_up);
     }
 
-    // Track the long-term physiological adaptation envelope: a slow, asymmetric follower
-    // of the short-term exposure, modeling receptor sensitivity (photopigment bleaching
-    // and recovery). The envelope is updated even when physiological adaptation is
-    // disabled — it never feeds back into the exposure in that case — so that enabling
-    // it at runtime starts from an envelope that already follows the current exposure.
+    // Track the long-term physiological adaptation envelope: a slow, asymmetric
+    // follower of the short-term exposure, modeling receptor sensitivity.
     var long_term = state.long_term;
     let long_term_delta = exposure - long_term;
     if exposure > long_term {
@@ -473,9 +443,8 @@ fn compute_average(@builtin(local_invocation_index) local_index: u32) {
         long_term = long_term + max(-long_term_speed_up, long_term_delta * long_term_exp_up);
     }
 
-    // Two-stage adaptation: the long-term envelope bounds the short-term result, so e.g.
-    // dark scenes stay dark — even if the short-term stage wants to lift them — until the
-    // long-term envelope has had time to adapt.
+    // Two-stage adaptation: the long-term envelope bounds the short-term result, so
+    // dark scenes stay dark until the envelope has had time to adapt.
     if settings.physiological != 0u {
         exposure = clamp(
             exposure,
@@ -491,11 +460,9 @@ fn compute_average(@builtin(local_invocation_index) local_index: u32) {
     // grading pass.
     view.color_grading.exposure += exposure;
 
-    // Auto white balance. Gated on a uniform flag, so the auto-exposure-only
-    // configuration executes exactly the statements above and nothing else.
+    // Auto white balance. Gated on a uniform flag, so views without it do no extra work.
     if settings.awb_enabled != 0u {
-        // Drain and clear the fixed-point chroma accumulators (see
-        // compute_histogram for the encoding).
+        // Drain and clear the fixed-point chroma accumulators (see compute_histogram).
         let sum_yx = f32(atomicLoad(&state.chroma_sums[0])) / CHROMA_FLUSH_SCALE;
         let sum_yy = f32(atomicLoad(&state.chroma_sums[1])) / CHROMA_FLUSH_SCALE;
         let sum_y = f32(atomicLoad(&state.chroma_sums[2])) / CHROMA_FLUSH_SCALE;
@@ -503,11 +470,9 @@ fn compute_average(@builtin(local_invocation_index) local_index: u32) {
         atomicStore(&state.chroma_sums[1], 0u);
         atomicStore(&state.chroma_sums[2], 0u);
 
-        // The mean metered scene luminance in scene-linear units. The sums
-        // were normalized by the total pixel count (for fixed-point headroom)
-        // and by the top of the metering range; histogram_sum is the total
-        // metering weight over the same pixels, so the pixel count cancels
-        // out exactly.
+        // The mean metered scene luminance, in scene-linear units. The sums were
+        // normalized by the pixel count and by the top of the metering range, and
+        // histogram_sum is the total metering weight, so the pixel count cancels.
         let dim = vec2<f32>(textureDimensions(tex_color));
         var lum_scale = 0.0;
         if histogram_sum > 0u {
@@ -516,29 +481,24 @@ fn compute_average(@builtin(local_invocation_index) local_index: u32) {
         }
         let scene_luminance = sum_y * lum_scale;
 
-        // Blend the faint D65 "virtual light" anchor into the measurement as
-        // one more luminance-weighted Yxy reference — GT7's dark-scene
-        // stability mechanism. The anchor's relative weight scales with the
-        // inverse of the mean scene luminance: negligible in bright scenes,
-        // dominant in near-dark ones (where the measurement would be noise).
+        // Blend the faint D65 "virtual light" anchor into the measurement as one
+        // more luminance-weighted Yxy reference. Its relative weight scales with
+        // the inverse of the mean scene luminance, stabilizing near-dark scenes.
         let denom = scene_luminance + settings.awb_anchor;
         if denom > 0.0 {
             let target_x = (sum_yx * lum_scale + settings.awb_anchor * AWB_D65_XY.x) / denom;
             let target_y = (sum_yy * lum_scale + settings.awb_anchor * AWB_D65_XY.y) / denom;
 
-            // Temporal adaptation of the chromaticity only — luminance
-            // adaptation is auto exposure's job. Exponential approach,
-            // clamped so a single frame never overshoots.
+            // Chromaticity only; luminance adaptation is auto exposure's job.
+            // Exponential approach, clamped so a single frame never overshoots.
             let alpha = saturate(settings.awb_speed * globals.delta_time);
             state.chroma_x += (target_x - state.chroma_x) * alpha;
             state.chroma_y += (target_y - state.chroma_y) * alpha;
         }
 
-        // Compose the automatic correction with the artist-authored white
-        // balance. The tonemapping pass applies `balance * color`, so
-        // right-multiplying puts the automatic correction (towards neutral)
-        // innermost: it corrects the image first, and the user's manual
-        // temperature/tint grade applies on top of the corrected image.
+        // Compose with the artist-authored white balance. The tonemapping pass
+        // applies `balance * color`, so right-multiplying puts the automatic
+        // correction innermost: it runs first, the manual grade on top.
         view.color_grading.balance = view.color_grading.balance
             * awb_balance_matrix(vec2(state.chroma_x, state.chroma_y));
     }

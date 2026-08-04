@@ -21,10 +21,9 @@ use std::f32::consts::PI;
 const SHADER_ASSET_PATH: &str = "shaders/tonemapping_test_patterns.wgsl";
 
 fn main() {
-    // Pass `--rec2020` to opt into the wide (Rec.2020) working color space.
-    // This is a project-global, startup-time setting on `RenderPlugin`: the
-    // scene then renders with Rec.2020 primaries (the native input space of
-    // `Tonemapping::GranTurismo7`), while SDR output remains Rec.709-encoded.
+    // Pass `--rec2020` to render in the Rec.2020 working color space, a startup-time
+    // `RenderPlugin` setting. It is the native input space of `Tonemapping::GranTurismo7`.
+    // SDR output stays Rec.709.
     let working_color_space = if std::env::args().any(|arg| arg == "--rec2020") {
         bevy::render::WorkingColorSpace::Rec2020
     } else {
@@ -341,24 +340,17 @@ fn toggle_tonemapping_method(
     .clone();
 }
 
-/// Cycles the primary window's HDR output: SDR sRGB → scRGB-linear →
-/// extended-sRGB (Rec.709) → extended-sRGB (Display-P3, wide-gamut HDR) →
-/// PQ (HDR10) → back to SDR (and switches the operator to `GranTurismo7`,
-/// currently the only HDR-aware one, when leaving SDR).
+/// Cycles the primary window's HDR output: SDR sRGB, scRGB-linear, extended-sRGB at
+/// Rec.709, extended-sRGB at Display-P3, PQ (HDR10), then back to SDR.
+/// Leaving SDR also switches to `GranTurismo7`, the only HDR-aware operator. GT7
+/// reads the peak luminance off the display target on its own, so this example
+/// never inserts `GranTurismo7Params`.
 ///
-/// On HDR display targets GT7 engages its HDR mode (peak-luminance-aware
-/// output above paper white) automatically, reading the display target's
-/// peak luminance with default `GranTurismo7Params`; add the component to
-/// tune the operator's artistic dials.
-///
-/// NOTE: seeing actual HDR output requires an HDR-capable display and a
-/// backend advertising the matching surface color space: scRGB-linear on
-/// macOS/iOS (Metal), Windows (Vulkan/DX12), or Wayland (Vulkan); encoded
-/// extended-range sRGB / Display-P3 on Metal, Vulkan, and browser WebGPU;
-/// PQ (HDR10) on Vulkan/DX12/Metal with the OS HDR setting enabled. The UI
-/// shows the *requested* transfer; if the surface cannot carry it, Bevy logs a
-/// warning and degrades to plain SDR — read `WindowSurfaceTransfers::resolved`
-/// on the window to see the outcome.
+/// Real HDR output needs an HDR-capable display and a backend that supports the
+/// requested transfer. See [`DisplayTransfer`] for which backends support which.
+/// The UI shows the requested transfer. If the surface cannot carry it, Bevy logs a
+/// warning and falls back to a supported transfer.
+/// `WindowSurfaceTransfers::resolved` on the window says what the surface got.
 fn toggle_hdr_output(
     keys: Res<ButtonInput<KeyCode>>,
     mut display_target: Single<&mut DisplayTarget, With<PrimaryWindow>>,
@@ -375,20 +367,17 @@ fn toggle_hdr_output(
                 };
                 **tonemapping = Tonemapping::GranTurismo7;
             }
-            // scRGB-linear -> encoded extended-range sRGB (the web HDR path),
-            // Rec.709 gamut (wgpu's `ExtendedSrgb` color space).
+            // The web HDR path (wgpu's `ExtendedSrgb` color space).
             DisplayTransfer::ScRgbLinear => {
                 display_target.transfer = DisplayTransfer::ExtendedSrgb;
                 display_target.gamut = DisplayGamut::Rec709;
             }
-            // Encoded extended-range sRGB at Rec.709 -> Display-P3 (wide-gamut
-            // HDR, wgpu's `ExtendedDisplayP3` color space).
+            // Same transfer, wider gamut (wgpu's `ExtendedDisplayP3` color space).
             DisplayTransfer::ExtendedSrgb if display_target.gamut != DisplayGamut::DisplayP3 => {
                 display_target.gamut = DisplayGamut::DisplayP3;
             }
             DisplayTransfer::ExtendedSrgb => {
-                // PQ is canonically Rec.2020; set the gamut to match (the
-                // encoder coerces PQ targets to a Rec.2020 encode anyway).
+                // The encoder coerces PQ targets to Rec.2020, so set the gamut to match.
                 display_target.transfer = DisplayTransfer::Pq;
                 display_target.gamut = DisplayGamut::Rec2020;
             }

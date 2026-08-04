@@ -97,8 +97,6 @@ fn fragment(
     in: BoxShadowVertexOutput,
 ) -> @location(0) vec4<f32> {
     let g = in.color.a * roundedBoxShadow(-0.5 * in.size, 0.5 * in.size, in.point, max(in.blur, 0.01), in.radius_x, in.radius_y);
-    // Gamut convert (Rec.709 -> buffer primaries) and writer-encode into the
-    // resolved compositing space; a no-op on default Rec.709 / Linear views.
     return encode_output(vec4(in.color.rgb, g));
 }
 

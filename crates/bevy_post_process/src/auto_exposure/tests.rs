@@ -1,9 +1,7 @@
 //! CPU-side tests for the auto exposure and auto white balance adaptation math.
 //!
-//! The functions below are an exact Rust mirror of the metering bias, the temporal
-//! smoothing / two-stage clamp, and the auto white balance measurement / CCT
-//! conversion / von Kries balance matrix in `auto_exposure.wgsl`, operation for
-//! operation. If the shader math changes, these mirrors must be updated to match.
+//! The functions marked as mirrors below copy `auto_exposure.wgsl` operation for
+//! operation. If the shader math changes, they must be updated to match.
 
 use super::{
     buffers::{build_uniform, initial_state},
@@ -64,8 +62,8 @@ fn adaptation_step(
     exposure
 }
 
-/// The single-stage smoothing exactly as it existed before the two-stage model was added.
-/// Used to prove that the disabled path is numerically identical to the old behavior.
+/// The single-stage smoothing, without the two-stage model. Reference for the tests
+/// that pin the disabled path to numerically identical output.
 fn legacy_single_stage_step(
     exposure: f32,
     target_exposure: f32,
@@ -123,11 +121,10 @@ fn target_sequence(step: usize) -> f32 {
 fn gpu_struct_layouts_match_the_wgsl_structs() {
     use bevy_render::render_resource::ShaderType;
 
-    // naga computes span=80 for the WGSL `AutoExposure` uniform struct (17 sequential
-    // 4-byte scalars plus three words of tail padding) and span=28 for
-    // `AutoExposureState` (four 4-byte scalars plus a stride-4 array of three
-    // atomic words; storage structs are not size-rounded to 16); the encase
-    // layouts must agree.
+    // naga computes span=80 for the WGSL `AutoExposure` uniform (17 4-byte scalars
+    // plus three words of tail padding) and span=28 for `AutoExposureState` (four
+    // scalars plus a stride-4 array of three atomic words; storage structs are not
+    // rounded to 16). The encase layouts must agree.
     assert_eq!(AutoExposureUniform::min_size().get(), 80);
     assert_eq!(AutoExposureState::min_size().get(), 28);
 }
@@ -136,14 +133,14 @@ fn gpu_struct_layouts_match_the_wgsl_structs() {
 fn default_component_is_configuration_identical_to_legacy() {
     let settings = AutoExposure::default();
 
-    // The pre-existing fields keep their documented legacy defaults...
+    // The fields that predate the two-stage model keep their documented defaults.
     assert_eq!(settings.range, -8.0..=8.0);
     assert_eq!(settings.filter, 0.10..=0.90);
     assert_eq!(settings.speed_brighten, 3.0);
     assert_eq!(settings.speed_darken, 1.0);
     assert_eq!(settings.exponential_transition_distance, 1.5);
 
-    // ...and the new fields default to their neutral values.
+    // The two-stage and bias fields default to neutral.
     assert_eq!(settings.metering_bias, 0.0);
     assert!(settings.physiological.is_none());
 }
@@ -152,7 +149,7 @@ fn default_component_is_configuration_identical_to_legacy() {
 fn default_uniform_is_neutral() {
     let uniform = build_uniform(&AutoExposure::default(), None);
 
-    // The values the legacy implementation uploaded, unchanged.
+    // The metering values the single-stage implementation uploaded, unchanged.
     assert_eq!(uniform.min_log_lum, -8.0);
     assert_eq!(uniform.inv_log_lum_range, 1.0 / 16.0);
     assert_eq!(uniform.log_lum_range, 16.0);
@@ -162,13 +159,11 @@ fn default_uniform_is_neutral() {
     assert_eq!(uniform.speed_down, 1.0);
     assert_eq!(uniform.exponential_transition_distance, 1.5);
 
-    // The new fields are at their neutral values, so the shader skips both the
-    // metering bias and the two-stage clamp.
+    // Neutral, so the shader skips both the metering bias and the two-stage clamp.
     assert_eq!(uniform.metering_bias, 0.0);
     assert_eq!(uniform.physiological, 0);
 
-    // The initial GPU state matches the legacy initial state (exposure 0, clamped into
-    // range), with the envelope starting at the same neutral value.
+    // The initial GPU state: exposure 0 clamped into range, envelope at the same value.
     let state = initial_state(&AutoExposure::default());
     assert_eq!(state.exposure, 0.0);
     assert_eq!(state.long_term, 0.0);
@@ -201,8 +196,7 @@ fn long_term_envelope_bounds_short_term_exposure() {
     let settings = enabled_settings(adaptation);
     let mut state = ae_state(0.0, 0.0);
 
-    // The scene suddenly becomes 10 EV darker; the short-term stage wants to raise the
-    // exposure all the way to +10 EV at 1 EV/s.
+    // The scene becomes 10 EV darker, so the short-term stage wants +10 EV at 1 EV/s.
     let target = 10.0;
     for _ in 0..(10.0 / DT) as usize {
         let applied = adaptation_step(&mut state, target, DT, &settings);
@@ -213,9 +207,8 @@ fn long_term_envelope_bounds_short_term_exposure() {
         );
     }
 
-    // After 10 simulated seconds, the unbounded single-stage exposure would be at ~8.5 EV;
-    // the bounded exposure must still sit at the envelope's upper bound instead
-    // (envelope ≈ 10 s × 0.01 EV/s = 0.1 EV, plus the 2 EV bound).
+    // After 10 simulated seconds the unbounded exposure would be ~9.4 EV. The bound
+    // is the envelope (10 s x 0.01 EV/s = 0.1 EV) plus bound_darken (2 EV).
     assert!(
         state.exposure < 3.0,
         "exposure {} was not bounded by the long-term envelope",
@@ -255,8 +248,7 @@ fn bounded_exposure_converges_once_the_envelope_catches_up() {
 
 #[test]
 fn convergence_within_bounds_is_unaffected_by_the_envelope() {
-    // A target within the bounding range of the (converged) envelope adapts exactly as
-    // fast as the legacy single-stage path.
+    // A target inside the envelope's bounds adapts as fast as the single-stage path.
     let settings = enabled_settings(PhysiologicalAdaptation::default());
     let mut state = ae_state(0.0, 0.0);
     let mut legacy_exposure = 0.0;
@@ -391,11 +383,7 @@ fn initial_state_starts_neutral_inside_the_metering_range() {
     assert_eq!(state.long_term, 2.0);
 }
 
-// === Auto white balance mirrors =====================================================
-//
-// Exact Rust mirrors (operation for operation, in f32) of the auto white balance
-// constants and functions in `auto_exposure.wgsl`. Matrices are stored column-major,
-// like WGSL `mat3x3<f32>`.
+// Auto white balance mirrors. Matrices are stored column-major, like WGSL `mat3x3<f32>`.
 
 /// Mirror of `AWB_D65_XY`.
 const AWB_D65_XY: [f32; 2] = [0.31272, 0.32903];
@@ -462,8 +450,7 @@ fn mat3_mul_mat3(a: &[[f32; 3]; 3], b: &[[f32; 3]; 3]) -> [[f32; 3]; 3] {
     ]
 }
 
-/// Mirror of `awb_xy_to_rec709`: the linear Rec.709 RGB coordinates of the
-/// white point with chromaticity `xy` and unit luminance.
+/// Mirror of `awb_xy_to_rec709` (white point `xy` at unit luminance).
 fn awb_xy_to_rec709(xy: [f32; 2]) -> [f32; 3] {
     let xyz = [xy[0] / xy[1], 1.0, (1.0 - xy[0] - xy[1]) / xy[1]];
     [
@@ -524,9 +511,7 @@ fn awb_white_point(adapted_xy: [f32; 2]) -> [f32; 2] {
     [out[0] + tint[0], out[1] + tint[1]]
 }
 
-/// Mirror of `awb_balance_matrix`. The von Kries gains are derived in the
-/// same LMS basis the `LMS_TO_RGB * diag(gain) * RGB_TO_LMS` sandwich uses,
-/// by mapping both unit-luminance white points through `AWB_RGB_TO_LMS`.
+/// Mirror of `awb_balance_matrix`.
 fn awb_balance_matrix(adapted_xy: [f32; 2]) -> [[f32; 3]; 3] {
     let white_xy = awb_white_point(adapted_xy);
     let d65 = mat3_mul_vec3(&AWB_RGB_TO_LMS, awb_xy_to_rec709(AWB_D65_XY));
@@ -579,9 +564,8 @@ fn rec709_to_xy_lum(rgb: [f32; 3]) -> ([f32; 2], f32) {
     ([x[0] / sum, x[1] / sum], x[1])
 }
 
-/// Mirror of the anchor blend + temporal adaptation in `compute_average`. `sums` are the
-/// drained accumulator values `(x·Y, y·Y, Y)` and `lum_scale` converts them to
-/// scene-linear luminance (their product cancels the pixel-count normalization).
+/// Mirror of the anchor blend and temporal adaptation in `compute_average`. `sums` are
+/// the drained accumulators `(x*Y, y*Y, Y)` and `lum_scale` converts them to scene-linear.
 fn awb_adaptation_step(
     state: &mut AutoExposureState,
     sums: [f32; 3],
@@ -604,8 +588,6 @@ fn awb_settings(white_balance: AutoWhiteBalance) -> AutoExposureUniform {
     build_uniform(&AutoExposure::default(), Some(&white_balance))
 }
 
-// === Auto white balance tests =======================================================
-
 #[test]
 fn mccamy_matches_known_illuminants() {
     // D65 has a CCT of ~6504 K (McCamy's published accuracy near the locus is a few K).
@@ -625,11 +607,9 @@ fn mccamy_matches_known_illuminants() {
 
 #[test]
 fn deep_blue_scenes_read_as_cool_not_warm() {
-    // A scene dominated by saturated blue light adapts to a chromaticity below
-    // McCamy's y = 0.1858 epicenter (this fixture is Rec.709 blue blended with
-    // the default D65 anchor). The CCT must stay pinned at the cool end so the
-    // correction reduces blue; a sign flip in the denominator would read it as
-    // ~1632 K (tungsten) and boost blue instead.
+    // A saturated blue scene adapts below McCamy's y = 0.1858 epicenter (this fixture
+    // is Rec.709 blue blended with the default D65 anchor). The CCT must stay at the
+    // cool end; a denominator sign flip would read it as ~1632 K and boost blue.
     let adapted_xy = [0.1853, 0.1184];
     let cct = awb_cct(adapted_xy);
     assert!(
@@ -637,9 +617,8 @@ fn deep_blue_scenes_read_as_cool_not_warm() {
         "deep-blue chromaticity produced CCT {cct} K, expected the cool extreme"
     );
 
-    // The correction must warm the image: red and green roughly preserved,
-    // blue strongly attenuated. A denominator sign flip instead produces a
-    // blue gain of ~2.
+    // The correction must warm the image: red and green roughly preserved, blue
+    // strongly attenuated. A sign flip instead produces a blue gain of ~2.
     let matrix = awb_balance_matrix(adapted_xy);
     let corrected_white = mat3_mul_vec3(&matrix, [1.0, 1.0, 1.0]);
     assert!(
@@ -678,8 +657,7 @@ fn planckian_locus_round_trips_through_mccamy() {
 
 #[test]
 fn cct_output_is_clamped_to_the_camera_range() {
-    // A 2000 K scene (warmer than any real camera would correct for) is clamped to the
-    // 2500 K lower bound.
+    // A 2000 K scene is clamped to the 2500 K lower bound.
     let white = awb_white_point(awb_planckian_xy(2000.0));
     let clamped = awb_cct(white);
     assert!(
@@ -736,8 +714,7 @@ fn virtual_light_anchor_stabilizes_dark_scenes() {
     assert!((state.chroma_x - AWB_D65_XY[0]).abs() < 1e-3);
     assert!((state.chroma_y - AWB_D65_XY[1]).abs() < 1e-3);
 
-    // A bright scene overwhelms the anchor: the adapted chromaticity converges to the
-    // measurement.
+    // A bright scene overwhelms the anchor and converges to the measurement.
     let measured = [0.40f32, 0.38];
     let luminance = 10.0f32; // 1000x the anchor.
     let sums = [measured[0] * luminance, measured[1] * luminance, luminance];
@@ -779,8 +756,7 @@ fn chromaticity_adaptation_is_rate_limited_and_convergent() {
     let measured = [0.42f32, 0.39];
     let sums = [measured[0], measured[1], 1.0];
 
-    // Exponential approach: each second closes ~`speed` of the remaining distance, so a
-    // single small step moves by exactly alpha * remaining.
+    // A single small step moves by exactly alpha * remaining.
     let mut state = ae_state(0.0, 0.0);
     let expected = AWB_D65_XY[0] + (measured[0] - AWB_D65_XY[0]) * (0.5 * DT).clamp(0.0, 1.0);
     awb_adaptation_step(&mut state, sums, 1.0, DT, &settings);
@@ -819,10 +795,9 @@ fn balance_matrix_is_identity_at_d65() {
 
 #[test]
 fn balance_matrix_neutralizes_a_warm_illuminant() {
-    // CIE standard illuminant A (tungsten, CCT 2856 K — inside the
-    // 2500 K - 7000 K output clamp, so the correction is unclamped) lighting
-    // a white scene, expressed in linear Rec.709 at unit luminance. Its raw
-    // R/B channel ratio is ~7.9.
+    // CIE standard illuminant A (tungsten, CCT 2856 K, inside the 2500 K - 7000 K
+    // output clamp so the correction is unclamped) lighting a white scene, in linear
+    // Rec.709 at unit luminance. Its raw R/B channel ratio is ~7.9.
     let illuminant = awb_xy_to_rec709([0.44757, 0.40745]);
     let ([x, y], luminance) = rec709_to_xy_lum(illuminant);
 
@@ -837,8 +812,7 @@ fn balance_matrix_neutralizes_a_warm_illuminant() {
         awb_adaptation_step(&mut state, sums, 1.0, DT, &settings);
     }
 
-    // The correction must push the illuminant towards neutral: boost blue relative to
-    // red, and reduce the channel spread.
+    // The correction must push the illuminant towards neutral and reduce the spread.
     let m = awb_balance_matrix([state.chroma_x, state.chroma_y]);
     let corrected = mat3_mul_vec3(&m, illuminant);
     let spread_before = illuminant[0] / illuminant[2];
@@ -847,11 +821,9 @@ fn balance_matrix_neutralizes_a_warm_illuminant() {
         spread_after < spread_before,
         "correction did not reduce the warm cast: {spread_before} -> {spread_after}"
     );
-    // Because the von Kries gains are derived in the same LMS basis they are
-    // applied in, a converged in-range correction neutralizes the illuminant
-    // essentially exactly: the residual R/B ratio is ~1.0003 (from D65_XY's
-    // 5-digit rounding) plus ~0.1% of anchor pull. Deriving the gains in raw
-    // CAM16 LMS instead would leave a clearly visible R/B residual of ~1.54.
+    // Deriving the gains in the same LMS basis they are applied in leaves a residual
+    // R/B ratio of ~1.0003 (D65_XY's 5-digit rounding) plus ~0.1% of anchor pull.
+    // Deriving them in raw CAM16 LMS would leave ~1.54 instead.
     assert!(
         (spread_after - 1.0).abs() < 0.01,
         "corrected illuminant {corrected:?} is not neutral (R/B {spread_after})"
@@ -862,8 +834,7 @@ fn balance_matrix_neutralizes_a_warm_illuminant() {
         max / min < 1.01,
         "corrected illuminant {corrected:?} has a residual channel spread"
     );
-    // The correction preserves the white point's luminance (both von Kries
-    // gains are derived from unit-luminance white points).
+    // The correction preserves the white point's luminance.
     let (_, corrected_luminance) = rec709_to_xy_lum(corrected);
     assert!(
         (corrected_luminance - luminance).abs() < 0.01,

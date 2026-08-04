@@ -43,17 +43,15 @@ use bevy_core_pipeline::{
 };
 
 /// Plugin for the auto exposure and auto white balance features, which share
-/// one metering compute pass (the Gran Turismo 7 pattern: one scene
-/// measurement feeds both adaptations).
+/// one metering compute pass.
 ///
 /// See [`AutoExposure`] and [`AutoWhiteBalance`] for more details.
 pub struct AutoExposurePlugin;
 
 #[derive(Resource)]
 struct AutoExposureResources {
-    /// The luminance histogram bins, a single global buffer shared by all
-    /// views: each view's `compute_average` dispatch drains and clears it
-    /// before the next view's histogram pass runs.
+    /// The luminance histogram bins, one global buffer shared by all views. Each
+    /// view's `compute_average` drains and clears it before the next view meters.
     histogram: Buffer,
 }
 
@@ -72,10 +70,6 @@ impl Plugin for AutoExposurePlugin {
         app.add_plugins((
             ExtractComponentPlugin::<AutoExposure>::default(),
             UniformComponentPlugin::<AutoExposureUniform>::default(),
-            // Also inserts the `ExternalWhiteBalance` marker on the
-            // render-world view entity, which keeps the tonemapping pass's
-            // `WHITE_BALANCE` shader path active for the GPU-composed
-            // correction matrix.
             ExtractComponentPlugin::<AutoWhiteBalance>::default(),
         ));
 

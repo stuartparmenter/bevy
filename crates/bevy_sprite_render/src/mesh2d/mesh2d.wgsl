@@ -56,8 +56,6 @@ fn fragment(
 #ifdef TONEMAP_IN_SHADER
     color = tonemapping::tone_mapping(color, view.color_grading);
 #endif
-    // Writer-side gamut convert into a Rec.2020 working buffer and
-    // compositing-space encode; a pass-through on default views.
     return writer_encode(color);
 #else
     return vec4<f32>(1.0, 0.0, 1.0, 1.0);

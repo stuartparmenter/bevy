@@ -31,7 +31,7 @@ struct CachedBindGroup {
     view_uniforms: BufferId,
     source: TextureViewId,
     lut: TextureViewId,
-    /// `Some` iff the pipeline binds the per-view GT7 params uniform.
+    /// `Some` when the pipeline binds the per-view GT7 params uniform.
     gt7_params_uniforms: Option<BufferId>,
     bind_group: BindGroup,
 }
@@ -62,13 +62,10 @@ pub fn tonemapping(
         tonemap_in_shader,
     ) = view.into_inner();
 
-    // `TonemapInShader` cameras fold tone mapping into their material shaders
-    // (the `TONEMAP_IN_SHADER` path selected in camera extraction) and keep an
-    // 8-bit main texture instead of the fp16 intermediate. Running this node
-    // for such a camera would tone-map a second time, so skip it. The 8-bit
-    // format check is a backstop that keeps the node structurally unable to
-    // operate on an 8-bit buffer. (Every camera that runs the node-side
-    // operator is on an `Rgba16Float` intermediate.)
+    // `TonemapInShader` cameras fold tone mapping into their material shaders and keep an
+    // 8-bit main texture instead of the fp16 intermediate. Running this node for one would
+    // tone-map a second time. The 8-bit format check is a backstop: every camera that runs
+    // the node-side operator is on an `Rgba16Float` intermediate.
     if tonemap_in_shader
         || matches!(
             target.main_texture_format(),
@@ -86,11 +83,9 @@ pub fn tonemapping(
     let view_uniforms_buffer = &view_uniforms.uniforms;
     let view_uniforms_id = view_uniforms_buffer.buffer().unwrap().id();
 
-    // Collect the optional GT7 params binding the pipeline was specialized
-    // with. If its buffer or index is missing (which should not happen — the
-    // pipeline was specialized off the presence of the very component the
-    // index addresses), skip the pass rather than binding with a mismatched
-    // layout.
+    // Collect the optional GT7 params binding the pipeline was specialized with. The
+    // buffer and index should always be present, since the pipeline was specialized off
+    // `Gt7ParamsUniform`. Skip the pass rather than bind a mismatched layout.
     let needs_gt7_params = view_tonemapping_pipeline.binds_gt7_params;
 
     let gt7_params_binding = if needs_gt7_params {
@@ -173,8 +168,7 @@ pub fn tonemapping(
         }
     };
 
-    // Dynamic offsets in increasing binding order: view (0), GT7 params (5, if
-    // bound).
+    // Dynamic offsets in increasing binding order: view (0), then GT7 params (5) if bound.
     let mut dynamic_offsets = [0u32; 2];
     let mut dynamic_offset_count = 0;
     dynamic_offsets[dynamic_offset_count] = view_uniform_offset.offset;

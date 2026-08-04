@@ -290,15 +290,15 @@ impl Msaa {
 ///
 /// Feedback and trail effects that load the previous frame's buffer (a camera
 /// with `ClearColorConfig::None` at the bottom of its stack) are only stable
-/// with [`Tonemapping::None`] on an SDR target. Any other operator (or an HDR
-/// target) reprocesses last frame's already tone-mapped and display-encoded
-/// output each frame, so the accumulated image drifts over time. See the
-/// camera-stack resolver (`bevy_core_pipeline::camera_stack`), which reports
-/// this configuration as a diagnostic.
+/// with [`Tonemapping::None`] on an SDR target. Any other operator, or an HDR
+/// target, reprocesses last frame's already tone-mapped and display-encoded
+/// output every frame, so the image drifts over time. The camera-stack
+/// resolver (`bevy_core_pipeline::camera_stack`) reports this configuration as
+/// a diagnostic.
 ///
-/// The tonemapping pass itself lives in `bevy_core_pipeline`; this component
-/// sits here so camera extraction — which picks the main-texture format from
-/// whether an operator is active — can read it directly.
+/// The tonemapping pass itself lives in `bevy_core_pipeline`. This component
+/// sits here so camera extraction can read it when it picks the main-texture
+/// format.
 #[derive(
     Component, Debug, Hash, Clone, Copy, Reflect, Default, ExtractComponent, PartialEq, Eq,
 )]
@@ -308,17 +308,16 @@ impl Msaa {
 pub enum Tonemapping {
     /// Bypass tonemapping.
     None,
-    /// Runs the tonemapping pass with no tone curve: scene values pass
-    /// through unchanged, so output is unbounded display-linear.
+    /// Runs the tonemapping pass with no tone curve. Scene values pass through
+    /// unchanged, so the output is unbounded display-linear.
     ///
-    /// Unlike [`Tonemapping::None`] — a true opt-out that skips the pass
-    /// entirely — `Linear` still applies [`ColorGrading`] and exposure,
-    /// [`DebandDither`], and (under `WorkingColorSpace::Rec2020`) the
-    /// working-space → display conversion. It is the zero-curve choice for
-    /// cameras that need correct output under the wide working space
-    /// without an artistic operator — typically 2D / UI cameras, whose
+    /// [`Tonemapping::None`] skips the pass entirely. `Linear` still applies
+    /// [`ColorGrading`] and exposure, [`DebandDither`], and, under
+    /// `WorkingColorSpace::Rec2020`, the working-space to display conversion.
+    /// Use it on cameras that need correct output under the wide working space
+    /// but no artistic operator, typically 2D and UI cameras: their
     /// `Tonemapping::None` default skips the conversion and renders
-    /// desaturated there.
+    /// desaturated.
     Linear,
     /// Suffers from lots hue shifting, brights don't desaturate naturally.
     /// Bright primaries and secondaries don't desaturate at all.
@@ -372,11 +371,10 @@ pub enum Tonemapping {
     /// (MIT License, Copyright (c) 2025 Polyphony Digital Inc.).
     /// Blends a per-channel filmic curve ("camera-like" highlight skew) with a hue-preserving
     /// `ICtCp` branch (60% hue-preserving / 40% per-channel by default), with a luminance-driven
-    /// chroma fade near peak white. Natively peak-luminance aware, designed to drive both SDR and
-    /// HDR displays: on a view whose resolved `DisplayTarget` requests an HDR transfer the
-    /// operator runs in HDR mode (tone curve rebuilt around the display's peak luminance) and
-    /// emits its native linear Rec.2020 display-referred output straight into the
-    /// display-encoding pass.
+    /// chroma fade near peak white. It drives both SDR and HDR displays: on a view whose
+    /// resolved `DisplayTarget` requests an HDR transfer the operator runs in HDR mode,
+    /// rebuilding its tone curve around the display's peak luminance and emitting its native
+    /// linear Rec.2020 display-referred output into the display-encoding pass.
     /// Algorithmic: does NOT require the `tonemapping_luts` cargo feature.
     /// Tunable per camera via `bevy_core_pipeline::tonemapping::GranTurismo7Params`.
     GranTurismo7,
@@ -385,9 +383,9 @@ pub enum Tonemapping {
 impl Tonemapping {
     /// Every operator, in declaration order, for exhaustive table tests.
     ///
-    /// The `match` ties this array to the enum: adding a variant fails to
-    /// compile here until the new arm — and a matching array entry, with the
-    /// length bumped — is added.
+    /// The `match` ties this array to the enum. Adding a variant fails to
+    /// compile here until the new arm, a matching array entry, and the bumped
+    /// length are all added.
     pub const ALL: [Self; 11] = {
         match Self::None {
             Self::None
@@ -421,17 +419,17 @@ impl Tonemapping {
         *self != Tonemapping::None
     }
 
-    /// Whether this operator's output is inherently capped at `[0, 1]`
-    /// paper-white-relative range (an "SDR-only" operator): every operator
-    /// except [`Tonemapping::GranTurismo7`] (natively peak-luminance aware),
-    /// [`Tonemapping::Linear`] (no curve, unbounded output), and
-    /// [`Tonemapping::None`] (a true pass-through, not an operator).
+    /// Whether this operator's output is capped at the `[0, 1]`
+    /// paper-white-relative range. True for every operator except
+    /// [`Tonemapping::GranTurismo7`] (peak-luminance aware),
+    /// [`Tonemapping::Linear`] (no curve), and [`Tonemapping::None`] (not an
+    /// operator at all).
     ///
     /// On a view whose resolved display target requests an HDR transfer, an
-    /// SDR-only operator would silently cap the image at paper white, leaving
-    /// the display's HDR headroom permanently unused. The substitution table
-    /// (`bevy_core_pipeline::tonemapping::resolve_tonemapping`) degrades
-    /// such views to an HDR-capable substitute (with a `warn_once!`) instead.
+    /// SDR-only operator would cap the image at paper white and leave the
+    /// display's HDR headroom unused. `resolve_tonemapping` in
+    /// `bevy_core_pipeline` substitutes an HDR-capable operator instead, with
+    /// a `warn_once!`.
     pub fn is_sdr_only(&self) -> bool {
         !matches!(
             self,
@@ -458,18 +456,16 @@ pub enum DebandDither {
 ///
 /// Every effect that reads the scene-referred buffer before tone mapping pulls
 /// this in as a required component: bloom, auto exposure, auto white balance,
-/// depth of field, motion blur, temporal anti-aliasing and DLSS. Its presence
+/// depth of field, motion blur, temporal anti-aliasing, and DLSS. Its presence
 /// vetoes the SDR in-shader tone-mapping fast path in camera extraction, which
-/// would otherwise keep the camera on an 8-bit intermediate and fold tone
-/// mapping into the material shaders. (FXAA and SMAA run on the tone-mapped
-/// image, so they do not require it.)
+/// would otherwise keep the camera on an 8-bit intermediate. (FXAA and SMAA run
+/// on the tone-mapped image, so they do not require it.)
 ///
-/// Those effects share this one marker, so removing any of them with
-/// `remove_with_requires` takes it along: on a camera carrying a second
-/// scene-linear effect the fold comes back on and the survivor samples a
-/// tone-mapped 8-bit buffer. Prefer plain `remove::<T>()`, which leaves the
-/// marker behind: the camera keeps its fp16 intermediate — extra memory,
-/// identical pixels.
+/// Because those effects share one marker, removing any of them with
+/// `remove_with_requires` takes it along, and a second scene-linear effect on
+/// the same camera is left sampling a tone-mapped 8-bit buffer. Prefer plain
+/// `remove::<T>()`, which leaves the marker behind. The camera then keeps its
+/// fp16 intermediate, which costs memory but gives the same pixels.
 #[derive(Component, Default, Copy, Clone, Reflect, PartialEq, Eq, Hash, Debug)]
 #[reflect(Component, Default, PartialEq, Hash, Debug)]
 pub struct NeedsSceneLinearTarget;
@@ -1499,9 +1495,9 @@ pub fn cleanup_view_targets_for_resize(
 }
 
 /// The identity key of a camera's main-texture ping-pong. Cameras with equal
-/// keys share one ping-pong allocation in [`prepare_view_targets`]; the
-/// phase-1 composition resolver ([`resolve_composition_spaces`]) groups by
-/// the same key so space resolution and texture sharing can never disagree.
+/// keys share one ping-pong allocation in [`prepare_view_targets`]. The
+/// phase-1 composition resolver ([`resolve_composition_spaces`]) groups by the
+/// same key, so space resolution and texture sharing cannot disagree.
 pub(crate) type MainTextureKey = (
     Option<NormalizedRenderTarget>,
     TextureUsages,
@@ -1574,27 +1570,23 @@ pub fn prepare_view_targets(
         // Convert clear color to the format expected by the main texture.
         //
         // The main texture holds scene-referred working-space values, so the
-        // clear color converts Rec.709 → working space first (a bit-for-bit
-        // identity for the default `WorkingColorSpace::Rec709`). Under
-        // `WorkingColorSpace::Rec2020` the 2D shaders convert composed colors
-        // to Rec.2020 BEFORE the Oklab compositing encode, so cleared pixels
-        // must follow the same `oklab(working-space values)` buffer
-        // convention or the tonemapping decode's working→Rec.709 step would
-        // mis-convert them. Oklab's LMS matrices remain Rec.709-fit, so
-        // perceptual blending of Rec.2020 values is approximate (documented
-        // caveat: `CompositingSpace::Oklab` degrades under
-        // `WorkingColorSpace::Rec2020`).
+        // clear color converts from Rec.709 to the working space first. That
+        // conversion is a bit-for-bit identity under the default
+        // `WorkingColorSpace::Rec709`.
         //
-        // The phase-1 resolved space — not the camera's raw request — decides
-        // the buffer convention: stack members share one main texture, so the
-        // cleared pixels must use the one space the whole stack resolves to.
+        // Under Rec.2020 the 2D shaders convert composed colors to Rec.2020
+        // before the Oklab compositing encode, so cleared pixels must follow
+        // the same `oklab(working-space values)` convention. Otherwise the
+        // tonemapping decode's working-to-Rec.709 step would mis-convert them.
+        // Oklab's LMS matrices are still Rec.709-fit, so perceptual blending of
+        // Rec.2020 values is approximate.
+        //
+        // Stack members share one main texture, so the phase-1 resolved space
+        // rather than the camera's raw request decides the buffer convention.
         let resolved_space = resolved_space.and_then(|space| space.0);
         let converted_clear_color: Option<WgpuColor> =
             clear_color.map(|color| match resolved_space {
                 // If main texture stores Oklab or Srgb, convert Color to it for correct clear.
-                // Keep the direct conversion for Rec.709 (bit-for-bit with
-                // the pre-working-space behavior); only Rec.2020 routes
-                // through linear for the primaries conversion.
                 Some(CompositingSpace::Oklab) => match *working_color_space {
                     WorkingColorSpace::Rec709 => Oklaba::from(color).into(),
                     WorkingColorSpace::Rec2020 => Oklaba::from(linear_rgba_rec709_to_working(
@@ -1603,9 +1595,6 @@ pub fn prepare_view_targets(
                     ))
                     .into(),
                 },
-                // Keep the direct conversion for Rec.709 (bit-for-bit with
-                // the pre-working-space behavior); only Rec.2020 routes
-                // through linear for the primaries conversion.
                 Some(CompositingSpace::Srgb) => match *working_color_space {
                     WorkingColorSpace::Rec709 => Srgba::from(color).into(),
                     WorkingColorSpace::Rec2020 => Srgba::from(linear_rgba_rec709_to_working(

@@ -80,9 +80,8 @@ use bevy_gizmos::{
 
 /// Pushes the writer-side color-space shader defs for the 3D gizmo pipelines.
 ///
-/// Gizmos render pre-tonemap in the scene working space, so a Rec.2020
-/// working space gets the `OUTPUT_GAMUT_REC2020` writer-encode gamut def. A
-/// default Rec.709 project pushes nothing, keeping the SDR path byte-identical.
+/// Gizmos render pre-tonemap in the scene working space, so a Rec.2020 working
+/// space gets the `OUTPUT_GAMUT_REC2020` writer-encode gamut def.
 #[cfg(feature = "bevy_pbr")]
 pub(crate) fn push_gizmo_3d_color_space_defs(
     shader_defs: &mut Vec<bevy_shader::ShaderDefVal>,
@@ -95,11 +94,9 @@ pub(crate) fn push_gizmo_3d_color_space_defs(
 
 /// Pushes the writer-side color-space shader defs for the 2D gizmo pipelines.
 ///
-/// Same `OUTPUT_GAMUT_REC2020` gamut def as the 3D form; 2D gizmos
-/// additionally blend into the camera's compositing-space buffer alongside
-/// sprites, so the resolved `compositing_space` writer-encodes their output
-/// (`COMPOSITING_SPACE_SRGB`/`COMPOSITING_SPACE_OKLAB`). A default Rec.709 /
-/// Linear view pushes nothing, keeping the SDR path byte-identical.
+/// Same gamut def as the 3D form. 2D gizmos also blend into the camera's
+/// compositing-space buffer alongside sprites, so the resolved space adds
+/// `COMPOSITING_SPACE_SRGB` or `COMPOSITING_SPACE_OKLAB`.
 #[cfg(feature = "bevy_sprite_render")]
 pub(crate) fn push_gizmo_2d_color_space_defs(
     shader_defs: &mut Vec<bevy_shader::ShaderDefVal>,

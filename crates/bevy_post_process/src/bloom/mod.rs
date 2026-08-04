@@ -41,30 +41,26 @@ use upsampling_pipeline::{
 
 /// The bloom pyramid format used for views on SDR display targets.
 ///
-/// `Rg11b10Ufloat` halves the bandwidth/memory of `Rgba16Float` and its range
-/// (~`[6.1e-5, 65504]`, no sign bit, no alpha) is sufficient for the
-/// scene-linear input, but its mantissa is coarse above ~1.0.
+/// `Rg11b10Ufloat` halves the memory and bandwidth of `Rgba16Float`, and its
+/// range (~`[6.1e-5, 65024]`, no sign bit, no alpha) covers scene-linear input.
 const BLOOM_TEXTURE_FORMAT: TextureFormat = TextureFormat::Rg11b10Ufloat;
 
 /// The bloom pyramid format used for views whose resolved display target has
 /// an HDR transfer.
 ///
-/// On HDR output, above-paper-white scene content survives all the way to the
-/// display, and `Rg11b10Ufloat`'s coarse mantissa above 1.0 produces visible
-/// quantization banding in the Karis-averaged downsample sums. `Rgba16Float`
-/// has uniform precision across the HDR range at twice the memory cost
-/// (~89 MB/frame vs ~44 MB/frame at 4K with the default 8-level chain) —
-/// spent only on views that can actually show the difference. SDR views keep
-/// [`BLOOM_TEXTURE_FORMAT`] bit-for-bit.
+/// On HDR output, above-paper-white content reaches the display, and
+/// `Rg11b10Ufloat`'s coarse mantissa above 1.0 causes visible banding in the
+/// Karis-averaged downsample sums. `Rgba16Float` has uniform precision across
+/// the HDR range at twice the memory cost: ~5 MB/frame vs ~2.5 MB/frame at 4K
+/// with the default 8-level chain.
 const BLOOM_TEXTURE_FORMAT_HDR: TextureFormat = TextureFormat::Rgba16Float;
 
-/// Returns the bloom pyramid texture format for a view, keyed on whether the
-/// view's resolved display target transfer is HDR.
+/// Returns the bloom pyramid texture format for a view, keyed on whether its
+/// resolved display target transfer is HDR.
 ///
-/// Used by texture creation ([`prepare_bloom_textures`]) and both pipeline
-/// specializations so they can never disagree about the format. A missing
-/// [`ViewDisplayTarget`] (a view never extracted as a camera) means plain
-/// SDR.
+/// Used by [`prepare_bloom_textures`] and both pipeline specializations so they
+/// cannot disagree about the format. A missing [`ViewDisplayTarget`] (a view
+/// never extracted as a camera) means SDR.
 pub(crate) fn bloom_texture_format(display_target: Option<&ViewDisplayTarget>) -> TextureFormat {
     if display_target.is_some_and(ViewDisplayTarget::is_hdr_transfer) {
         BLOOM_TEXTURE_FORMAT_HDR
@@ -351,15 +347,12 @@ impl BloomTexture {
     }
 }
 
-/// Builds each bloom view's [`BloomUniforms`] from the extracted view
-/// geometry and the paper white of the view's resolved display target
-/// ([`BloomPrefilter::threshold_nits`] is divided by it to produce the
-/// framebuffer-value threshold the shader uses).
+/// Builds each bloom view's [`BloomUniforms`] from the extracted view geometry
+/// and the paper white of the view's resolved display target.
 ///
-/// Runs after the [`ViewDisplayTarget`] resolution from
-/// `RenderSystems::PrepareViews` is applied and before
-/// `RenderSystems::PrepareResources`, where `UniformComponentPlugin` writes
-/// the [`BloomUniforms`] components to the GPU.
+/// Runs after `RenderSystems::PrepareViews` has resolved [`ViewDisplayTarget`]
+/// and before `RenderSystems::PrepareResources`, where `UniformComponentPlugin`
+/// uploads the components.
 fn prepare_bloom_uniforms(
     mut commands: Commands,
     views: Query<(
@@ -374,9 +367,8 @@ fn prepare_bloom_uniforms(
         .iter()
         .filter_map(|(entity, bloom, camera, view, display_target)| {
             let target_size = camera.physical_target_size?;
-            // `UVec4(origin.x, origin.y, size.x, size.y)`, in physical pixels;
-            // the size is non-zero (`Bloom` is only extracted for views with a
-            // drawable viewport).
+            // `UVec4(origin.x, origin.y, size.x, size.y)` in physical pixels. The
+            // size is non-zero: `Bloom` is only extracted for drawable viewports.
             let viewport = view.viewport;
             let uniform = BloomUniforms {
                 threshold_precomputations: BloomUniforms::threshold_precomputations(
@@ -569,11 +561,9 @@ fn prepare_bloom_bind_groups(
 /// This function can be visually previewed for all values of *mip* (normalized) with tweakable
 /// [`Bloom`] parameters on [Desmos graphing calculator](https://www.desmos.com/calculator/ncc8xbhzzl).
 ///
-/// For [`BloomScatterModel::Gt7Glare`] the parametric curve is replaced by
-/// blend constants realizing the physically derived diffraction weights; see
-/// [`glare::blend_factor`]. The glare weights are tied to the absolute texel
-/// scale of the pyramid levels (a point-spread function has a physical size),
-/// not normalized to the chain depth, so that branch does not use `max_mip`.
+/// [`BloomScatterModel::Gt7Glare`] instead uses the diffraction weights of
+/// [`glare::blend_factor`]. Those are tied to the absolute texel scale of the
+/// pyramid levels, not to the chain depth, so that branch ignores `max_mip`.
 fn compute_blend_factor(bloom: &Bloom, mip: f32, max_mip: f32) -> f32 {
     match bloom.scatter {
         BloomScatterModel::Aesthetic => {
@@ -605,9 +595,8 @@ mod tests {
     use bevy_math::{Mat4, Vec2};
     use bevy_render::view::RetainedViewEntity;
 
-    /// `prepare_bloom_uniforms` must pack the viewport in target-relative
-    /// units, the aspect from the viewport size, and the threshold against
-    /// the paper white of the view's resolved display target.
+    /// `prepare_bloom_uniforms` packs the viewport in target-relative units, the
+    /// aspect from the viewport size, and the threshold against paper white.
     #[test]
     fn prepare_bloom_uniforms_packs_reference_uniform() {
         let mut world = World::new();
@@ -665,8 +654,7 @@ mod tests {
         let uniforms = world.get::<BloomUniforms>(entity).unwrap();
         assert_eq!(
             uniforms.threshold_precomputations,
-            // 406 nits against a 203-nit paper white: a threshold of 2.0 in
-            // framebuffer units.
+            // 406 nits against a 203-nit paper white is 2.0 in framebuffer units.
             BloomUniforms::threshold_precomputations(2.0, 0.25)
         );
         assert_eq!(
@@ -680,9 +668,8 @@ mod tests {
         assert_eq!(uniforms.scale, Vec2::new(2.0, 1.0));
     }
 
-    /// A verbatim copy of the historical `compute_blend_factor` body, used
-    /// to lock the default ([`BloomScatterModel::Aesthetic`]) path
-    /// bit-for-bit.
+    /// A verbatim copy of the pre-glare `compute_blend_factor` body, used to
+    /// lock the [`BloomScatterModel::Aesthetic`] path bit-for-bit.
     fn legacy_compute_blend_factor(bloom: &Bloom, mip: f32, max_mip: f32) -> f32 {
         let mut lf_boost =
             (1.0 - ops::powf(
@@ -700,9 +687,8 @@ mod tests {
         (bloom.intensity + lf_boost) * high_pass_lq
     }
 
-    /// All `BloomScatterModel::Aesthetic` settings combinations must produce
-    /// the same blend factors as the dedicated aesthetic implementation,
-    /// independent of the glare code path.
+    /// `BloomScatterModel::Aesthetic` must produce the same blend factors as the
+    /// standalone parametric curve, whatever the other settings are.
     #[test]
     fn aesthetic_blend_factors_match_dedicated_implementation() {
         let presets = [
@@ -734,9 +720,8 @@ mod tests {
         }
     }
 
-    /// The glare scatter model ignores the prefilter (no threshold; the PSF
-    /// integrates total energy) and forces energy-conserving compositing,
-    /// while `Aesthetic` keeps the configured behavior.
+    /// The glare scatter model ignores the prefilter and forces
+    /// energy-conserving compositing. `Aesthetic` keeps the configured behavior.
     #[test]
     fn glare_overrides_threshold_and_composite_mode() {
         let mut bloom = Bloom {
@@ -757,9 +742,8 @@ mod tests {
         );
     }
 
-    /// The glare branch's final-pass blend constant is the intensity (total
-    /// scattered energy), and the curve-shape parameters of the parametric
-    /// model have no effect on it.
+    /// The glare branch's final-pass blend constant is the intensity, and the
+    /// parametric curve's shape parameters have no effect on it.
     #[test]
     fn glare_blend_factor_uses_psf_not_parametric_curve() {
         let glare = Bloom {

@@ -182,20 +182,19 @@ pub struct SmaaNeighborhoodBlendingPipelineKey {
     preset: SmaaPreset,
 }
 
-/// A unique identifier for an SMAA edge-detection pipeline (phase 1).
+/// A unique identifier for phase 1 of SMAA: edge detection.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SmaaEdgeDetectionPipelineKey {
     /// The quality preset.
     preset: SmaaPreset,
-    /// Whether the view's display-encoding pass runs; see
-    /// [`ViewStackContract::is_hdr_encode`].
+    /// Whether the view's display-encoding pass runs.
+    /// See [`ViewStackContract::is_hdr_encode`].
     ///
-    /// The post-tonemap input on such views is paper-white-relative
-    /// display-linear and exceeds 1.0, which would shift `SMAA_THRESHOLD`'s
-    /// effective sensitivity, so the edge-detection shader compiles with the
-    /// `HDR_DISPLAY_TARGET` def and saturates the edge-detection luma to
-    /// [0, 1]. SDR views keep the def-less pipeline byte-for-byte. Only
-    /// phase 1 reads luma; phases 2 and 3 are unaffected.
+    /// Post-tonemap input on these views is paper-white-relative
+    /// display-linear and exceeds 1.0, which shifts `SMAA_THRESHOLD`'s
+    /// effective sensitivity. The shader then compiles with the
+    /// `HDR_DISPLAY_TARGET` def and saturates the edge-detection luma
+    /// to [0, 1]. Only phase 1 reads luma, so phases 2 and 3 need no such key.
     hdr: bool,
 }
 

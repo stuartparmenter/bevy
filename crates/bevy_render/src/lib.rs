@@ -137,14 +137,8 @@ pub struct RenderPlugin {
     pub render_creation: RenderCreation,
     /// The color primaries of the renderer's scene-referred working space.
     ///
-    /// Defaults to [`WorkingColorSpace::Rec709`], where the working-space
-    /// conversions are identities. This is a project-global axis read
-    /// exactly once, when the plugin builds: changing the extracted
-    /// [`WorkingColorSpace`] resource at runtime has no effect, because
-    /// the shader def is registered globally when the renderer initializes.
-    ///
-    /// See [`working_color_space`] for the full semantics of
-    /// [`WorkingColorSpace::Rec2020`].
+    /// Defaults to [`WorkingColorSpace::Rec709`]. See [`working_color_space`]
+    /// for what [`WorkingColorSpace::Rec2020`] changes.
     pub working_color_space: WorkingColorSpace,
     /// If `true`, disables asynchronous pipeline compilation.
     /// This has no effect on macOS, Wasm, iOS, or without the `multi_threaded` feature.
@@ -379,10 +373,7 @@ impl Plugin for RenderPlugin {
         load_shader_library!(app, "writer_encode.wgsl");
         load_shader_library!(app, "bindless.wgsl");
 
-        // The working color space is a project-global, immutable axis: insert
-        // it into the main world (for user introspection and extract-side
-        // reads) and, below, into the render world (where pipelines
-        // specialize against it in `RenderStartup`).
+        // Insert into the main world for user introspection.
         app.insert_resource(self.working_color_space);
         app.register_type::<WorkingColorSpace>();
 
@@ -420,8 +411,8 @@ impl Plugin for RenderPlugin {
         app.init_resource::<RenderAssetBytesPerFrame>()
             .init_resource::<RenderErrorHandler>();
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
-            // Immutable copy for `RenderStartup` pipeline initialization and
-            // render-world prepare/extract systems.
+            // Copy for `RenderStartup` pipeline initialization and the
+            // render-world prepare and extract systems.
             render_app.insert_resource(self.working_color_space);
             render_app.init_resource::<RenderScheduleOrder>();
             render_app.init_resource::<RenderAssetBytesPerFrameLimiter>();

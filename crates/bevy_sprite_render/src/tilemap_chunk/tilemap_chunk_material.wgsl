@@ -73,7 +73,6 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         discard;
     }
 
-    // Writer-side gamut convert into a Rec.2020 working buffer and
-    // compositing-space encode; a pass-through on default views.
+    // Writer-side encode; see bevy_render::writer_encode.
     return writer_encode(composed_color);
 }

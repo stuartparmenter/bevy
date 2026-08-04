@@ -2,19 +2,17 @@
 //!
 //! Verifies, on a real wgpu device:
 //!
-//! - the populated `ManualDisplayTargets` map reaches the render world, each
-//!   view resolves its registered target, and screenshot decode keys off the
-//!   same map;
+//! - the populated `ManualDisplayTargets` map reaches the render world, each view
+//!   resolves its registered target, and screenshot decode keys off the same map;
 //! - the display-target uniform is HDR-gated: registered PQ views carry
-//!   `DisplayTargetUniform` with a per-view dynamic offset, while a plain SDR
-//!   view renders correctly without it;
-//! - each GT7 view's `Gt7ParamsUniform` matches the CPU-computed uniform,
-//!   an in-place `GranTurismo7Params` mutation refreshes it, and every GT7
-//!   view tone-maps node-side (the `NeedsNodeTonemapping` veto);
-//! - the PQ encode/decode round trip matches a CPU reference of the full
-//!   chain: Rec.709 -> Rec.2020, the x2.5 GT7 paper-white seam, the GT7
-//!   operator, paper-white PQ encode, fp16 store, PQ EOTF decode, Rec.709;
-//! - auto exposure + auto white balance render and move exposure over time.
+//!   `DisplayTargetUniform` with a per-view dynamic offset, while a plain SDR view
+//!   renders correctly without it;
+//! - each GT7 view's `Gt7ParamsUniform` matches the CPU-computed uniform, an
+//!   in-place `GranTurismo7Params` mutation refreshes it, and every GT7 view
+//!   tone-maps node-side (the `NeedsNodeTonemapping` veto);
+//! - the PQ encode/decode round trip matches the CPU reference chain in
+//!   `expected_decoded`;
+//! - auto exposure and auto white balance render and move exposure over time.
 //!
 //! Run on a software Vulkan driver (lavapipe), no display server needed:
 //!
@@ -23,16 +21,14 @@
 //!   cargo test --test gpu_hdr_fixture -- --nocapture
 //! ```
 //!
-//! Without a usable wgpu adapter (or when renderer init fails) the test
-//! prints a `SKIP` line and passes instead of failing.
+//! Without a usable wgpu adapter, or when renderer init fails, the test prints a `SKIP`
+//! line and passes.
 //!
-//! Scene: five cameras, each with a distinct uniform clear color, each
-//! rendering to its own offscreen `Image` target. Four targets are registered
-//! in `ManualDisplayTargets` with `DisplayTransfer::Pq` + Rec.2020; one is a
-//! plain SDR `Rgba8UnormSrgb` target with no registration. Screenshots are
-//! captured mid-run and decoded by the screenshot decode path
-//! (`decode_pq_screenshot`), then compared against the CPU prediction of the
-//! full chain.
+//! Scene: five cameras, each with a uniform clear color, each rendering to
+//! its own offscreen `Image` target. Four targets are registered in
+//! `ManualDisplayTargets` with `DisplayTransfer::Pq` + Rec.2020. One is a plain SDR
+//! `Rgba8UnormSrgb` target with no registration. Screenshots are captured mid-run,
+//! decoded by `decode_pq_screenshot`, then compared against the CPU prediction.
 
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -79,7 +75,7 @@ const MUTATE_AT: u32 = 70;
 const CAPTURE_2: u32 = 110;
 const MAX_FRAMES: u32 = 2000;
 
-// --- Display targets registered in ManualDisplayTargets -------------------
+// --- Display targets registered in ManualDisplayTargets ---
 
 /// PQ / Rec.2020, 1000-nit peak, 203-nit paper white (targets A, B, E).
 const T_PQ_203: DisplayTarget = DisplayTarget::SDR_SRGB
@@ -89,19 +85,18 @@ const T_PQ_203: DisplayTarget = DisplayTarget::SDR_SRGB
     .with_paper_white(203.0)
     .with_min_luminance(0.005);
 
-/// PQ / Rec.2020, 4000-nit peak, 100-nit paper white (target C) — a second,
-/// distinct calibration so the display-target uniform buffer holds more than
-/// one slice and a wrong dynamic offset would be visible.
+/// PQ / Rec.2020 for target C. A second, distinct calibration, so the display-target
+/// uniform buffer holds more than one slice and a wrong dynamic offset shows up.
 const T_PQ_100: DisplayTarget = DisplayTarget::SDR_SRGB
     .with_transfer(DisplayTransfer::Pq)
     .with_gamut(DisplayGamut::Rec2020)
     .with_peak(4000.0)
     .with_paper_white(100.0);
 
-// --- GT7 params ------------------------------------------------------------
+// --- GT7 params ---
 
-/// Camera B's initial params: non-default, visually drastic (full UCS blend
-/// with the chroma fade band pulled to near zero => achromatic output).
+/// Camera B's initial params: a full UCS blend with the chroma fade band pulled to
+/// near zero, so the output is achromatic.
 fn params_b_initial() -> GranTurismo7Params {
     GranTurismo7Params {
         blend_ratio: 1.0,
@@ -124,15 +119,15 @@ fn params_b_mutated() -> GranTurismo7Params {
     }
 }
 
-// --- Clear colors (scene-linear Rec.709 working space) ---------------------
+// --- Clear colors (scene-linear Rec.709 working space) ---
 
 const C_AB: Vec3 = Vec3::new(1.0, 2.0, 4.0); // spans > 1.0, hits the GT7 shoulder
 const C_C: Vec3 = Vec3::new(4.0, 1.0, 0.05); // > 1.0 red, toe-region blue
 const C_D: Vec3 = Vec3::new(0.25, 0.5, 0.75); // plain SDR
 const C_E: Vec3 = Vec3::new(0.02, 0.02, 0.02); // dark: auto exposure must brighten
 
-// --- Cross-world plumbing (statics; render world and observers write, the
-// --- test body reads after the app exits) ----------------------------------
+// --- Cross-world plumbing ---
+// Statics. The render world and observers write, the test body reads after the app exits.
 
 #[derive(Clone, Debug)]
 struct CapturedImage {
@@ -178,7 +173,7 @@ struct TargetHandles {
     e: Handle<Image>,
 }
 
-// --- App setup --------------------------------------------------------------
+// --- App setup ---
 
 fn hdr_image(images: &mut Assets<Image>) -> Handle<Image> {
     let img = Image::new_target_texture(SIZE, SIZE, TextureFormat::Rgba16Float, None);
@@ -207,9 +202,8 @@ fn capture(commands: &mut Commands, handle: &Handle<Image>, label: &'static str)
             },
         ));
     });
-    // Exercise the save-to-disk path for one representative target. `.exr`
-    // needs the opt-in `exr` cargo feature; `.hdr` ships in the default
-    // feature set. A missing codec logs an error and moves on.
+    // Exercise the save-to-disk path for one target. `.exr` needs the opt-in `exr`
+    // cargo feature, `.hdr` ships by default. A missing codec only logs an error.
     if label == "gt7_default" {
         entity
             .observe(save_to_disk(out_dir().join("gt7_default.exr")))
@@ -258,11 +252,8 @@ fn driver(
     }
 }
 
-/// Render-world observer: records, every frame, what the render world
-/// actually resolved — the extracted `ManualDisplayTargets` map, each view's
-/// `ViewDisplayTarget`, the display-target and GT7 uniform components, their
-/// `DynamicUniformIndex`es, and whether the node-side tonemapping pipeline is
-/// prepared. The last frame's observation is what the test asserts on.
+/// Records, every frame, what the render world resolved. The last frame's
+/// observation is what the test asserts on.
 fn observe_render_world(
     manual: Res<ManualDisplayTargets>,
     views: Query<(
@@ -316,9 +307,9 @@ fn observe_render_world(
     *RENDER_OBS.lock().unwrap() = Some(obs);
 }
 
-// --- CPU reference for the GT7 operator (port of the test-only
-// --- `cpu_reference` module in bevy_core_pipeline's gt7.rs, driven by the
-// --- same `Gt7ParamsUniform` the shader binds) ------------------------------
+// --- CPU reference for the GT7 operator ---
+// A port of the test-only `cpu_reference` module in bevy_core_pipeline's gt7.rs, driven
+// by the same `Gt7ParamsUniform` the shader binds.
 
 const REFERENCE_LUMINANCE: f32 = 100.0;
 const GT7_PQ_M1: f32 = 0.159_301_76;
@@ -422,13 +413,12 @@ fn gt7_apply(params: &Gt7ParamsUniform, rgb: [f32; 3]) -> [f32; 3] {
     out
 }
 
-/// CPU prediction of one decoded screenshot pixel for a GT7 camera on a
-/// PQ/Rec.2020 manual target: scene-linear Rec.709 clear color through the
-/// tonemapping pass (Rec.709 -> Rec.2020 expansion, x2.5 GT7 paper-white
-/// seam, the operator itself in HDR mode, native Rec.2020 output), the
-/// display-encoding pass (identity gamut stage for PQ/Rec.2020, `max(0)`
-/// clip, PQ inverse EOTF at the target's paper white), and the screenshot
-/// decode (PQ EOTF at 1.0 = 80 nits, Rec.2020 -> Rec.709).
+/// CPU prediction of one decoded screenshot pixel for a GT7 camera on a PQ/Rec.2020
+/// manual target. The tonemapping pass expands Rec.709 to Rec.2020, applies the
+/// x2.5 GT7 paper-white seam, then runs the operator in HDR mode. The display
+/// encoding pass is an identity gamut stage for PQ/Rec.2020, a `max(0)` clip, and
+/// the PQ inverse EOTF at the target's paper white. Screenshot decode runs the PQ
+/// EOTF at 1.0 = 80 nits and converts Rec.2020 back to Rec.709.
 fn expected_decoded(clear: Vec3, uniform: &Gt7ParamsUniform, paper_white_nits: f32) -> Vec3 {
     let rec2020 = REC709_TO_REC2020 * clear;
     let fb = rec2020 * 2.5;
@@ -447,7 +437,7 @@ fn expected_decoded(clear: Vec3, uniform: &Gt7ParamsUniform, paper_white_nits: f
     REC2020_TO_REC709 * linear
 }
 
-// --- Capture inspection -----------------------------------------------------
+// --- Capture inspection ---
 
 fn pixel_f32(cap: &CapturedImage, x: u32, y: u32) -> [f32; 4] {
     assert_eq!(cap.format, TextureFormat::Rgba32Float);
@@ -469,7 +459,7 @@ fn close(actual: Vec3, expected: Vec3, rel: f32, abs: f32) -> bool {
     (0..3).all(|i| (actual[i] - expected[i]).abs() <= f32::max(rel * expected[i].abs(), abs))
 }
 
-// --- The test ---------------------------------------------------------------
+// --- The test ---
 
 struct Checker {
     failed: Vec<String>,
@@ -487,8 +477,8 @@ impl Checker {
 }
 
 /// Builds the app. `RenderCreation::Automatic` blocks on renderer init inside
-/// `RenderPlugin::build`, so by the time this returns the wgpu device exists;
-/// with no usable adapter it panics inside `add_plugins` instead.
+/// `RenderPlugin::build`, so the wgpu device exists by the time this returns. With
+/// no usable adapter it panics inside `add_plugins` instead.
 fn build_app() -> App {
     let mut app = App::new();
     app.add_plugins(
@@ -538,14 +528,13 @@ const RUN_TIMEOUT: Duration = Duration::from_secs(480);
 
 #[test]
 fn gpu_hdr_fixture() {
-    // Build and run on a helper thread so a wedged driver cannot hang the
-    // test: the test thread only ever waits with a timeout. Winit is
-    // disabled, so nothing requires the main thread.
+    // Build and run on a helper thread so a wedged driver cannot hang the test. The
+    // test thread only ever waits with a timeout. Winit is disabled, so nothing
+    // needs the main thread.
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        // Silence the default panic hook while building: a missing adapter
-        // panics inside `add_plugins`, and that is the expected skip path,
-        // not a test failure worth a backtrace.
+        // Silence the default panic hook while building. A missing adapter panics
+        // inside `add_plugins`, which is the expected skip path, not a failure.
         let default_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let built = catch_unwind(AssertUnwindSafe(build_app));
@@ -632,7 +621,7 @@ fn gpu_hdr_fixture() {
 
     let mut c = Checker { failed: Vec::new() };
 
-    // ---- Check 1: manual display targets reach the render world ------------
+    // --- Check 1: manual display targets reach the render world ---
     c.check(
         "1a extracted ManualDisplayTargets map reaches the render world",
         obs.manual_len == 4
@@ -665,9 +654,8 @@ fn gpu_hdr_fixture() {
         view("gt7_pw100").display_target == Some(T_PQ_100),
         format!("ViewDisplayTarget = {:?}", view("gt7_pw100").display_target),
     );
-    // The decode side of the same map: PQ targets come back decoded to
-    // Rgba32Float (manual_target_decode consulted the registered entry);
-    // the unregistered SDR target passes through as Rgba8UnormSrgb.
+    // A PQ target decoding to Rgba32Float is the evidence the map entry was found. The
+    // unregistered SDR target passes through as Rgba8UnormSrgb.
     c.check(
         "1c manual_target_decode keys off the registered map entries",
         [
@@ -686,7 +674,7 @@ fn gpu_hdr_fixture() {
         ),
     );
 
-    // ---- Check 2: HDR-gated display-target uniform -------------------------
+    // --- Check 2: HDR-gated display-target uniform ---
     for (label, want_pw) in [
         ("gt7_default", 203.0),
         ("gt7_custom", 203.0),
@@ -731,7 +719,7 @@ fn gpu_hdr_fixture() {
         );
     }
 
-    // ---- Check 3: GT7 uniform and node-side tonemapping veto ---------------
+    // --- Check 3: GT7 uniform and node-side tonemapping veto ---
     let defaults = GranTurismo7Params::default();
     for (label, target, params) in [
         ("gt7_default", T_PQ_203, defaults),
@@ -775,7 +763,7 @@ fn gpu_hdr_fixture() {
         );
     }
 
-    // ---- Check 4: PQ encode/decode round trip vs the CPU reference chain ---
+    // --- Check 4: PQ encode/decode round trip vs the CPU reference chain ---
     let round_trip = |name: &str,
                       label: &str,
                       clear: Vec3,
@@ -829,7 +817,7 @@ fn gpu_hdr_fixture() {
         &mut c,
     );
 
-    // ---- Check 5: auto-exposure smoke --------------------------------------
+    // --- Check 5: auto-exposure smoke ---
     {
         let (e1, _) = decoded_px("auto_exposure_t1");
         let (e2, _) = decoded_px("auto_exposure_t2");
@@ -852,10 +840,7 @@ fn gpu_hdr_fixture() {
     println!("ALL CHECKS PASSED");
 }
 
-/// Startup: creates the five image targets, registers the four HDR ones in
-/// `ManualDisplayTargets` (the ordinary insert path; target D stays
-/// unregistered and must fall back to `DisplayTarget::SDR_SRGB`), and spawns
-/// one camera per target.
+/// Spawns the scene. The unregistered target must fall back to `DisplayTarget::SDR_SRGB`.
 fn setup(
     mut commands: Commands,
     mut images: ResMut<Assets<Image>>,

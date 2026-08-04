@@ -23,16 +23,14 @@ pub struct RenderAppChannels {
     app_to_render_sender: Sender<SubApp>,
     render_to_app_receiver: Receiver<SubApp>,
     render_app_in_render_thread: bool,
-    /// Pumped by [`Drop`] while it awaits the final render frame, so a last
-    /// main-thread-pinned system can't deadlock teardown.
     main_thread_executor: MainThreadExecutor,
 }
 
 impl RenderAppChannels {
     /// Create a `RenderAppChannels` from a [`async_channel::Receiver`] and [`async_channel::Sender`].
     ///
-    /// `main_thread_executor` is pumped by [`Drop`] during teardown so a final
-    /// main-thread-pinned render system can still complete.
+    /// [`Drop`] pumps `main_thread_executor` so a final main-thread-pinned
+    /// render system can finish and teardown does not deadlock.
     pub fn new(
         app_to_render_sender: Sender<SubApp>,
         render_to_app_receiver: Receiver<SubApp>,
@@ -65,13 +63,13 @@ impl Drop for RenderAppChannels {
     fn drop(&mut self) {
         if self.render_app_in_render_thread {
             // The render world's non-send data was initialized on the main thread, so we
-            // wait for it to come back and drop it here, on the correct thread.
+            // wait for the world to come back and drop it here.
             //
-            // We can't just `recv_blocking()`: the final frame may still be running a
-            // main-thread-pinned (`NonSend`) system queued on the `MainThreadExecutor`
-            // (e.g. macOS surface creation / display sensing). The render thread can't
-            // finish — and so can't send the world back — until the main thread ticks that
-            // executor, so pump it while we wait, as `renderer_extract` does each frame.
+            // `recv_blocking()` can deadlock: the final frame may still have a
+            // main-thread-pinned (`NonSend`) system queued on the `MainThreadExecutor`,
+            // such as macOS surface creation or display sensing. The render thread can't
+            // send the world back until the main thread ticks that executor, so pump it
+            // here as `renderer_extract` does each frame.
             let receiver = self.render_to_app_receiver.clone();
             let _recovered_render_app = ComputeTaskPool::get().scope_with_executor(
                 true,

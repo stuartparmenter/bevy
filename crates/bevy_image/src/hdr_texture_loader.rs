@@ -19,12 +19,10 @@ pub struct HdrTextureLoaderSettings {
     /// Where the asset will be used - see the docs on [`RenderAssetUsages`] for details.
     pub asset_usage: RenderAssetUsages,
     /// The color primaries the image data is expressed in, stamped on
-    /// [`Image::source_primaries`]. This is metadata only and does not affect how
-    /// the image is decoded.
+    /// [`Image::source_primaries`].
     ///
-    /// `None` (the default) trusts the file's `PRIMARIES=` header line when present,
-    /// falling back to [`SourceColorPrimaries::Bt709`]. `Some` overrides whatever
-    /// the file says.
+    /// `None` (the default) uses the file's `PRIMARIES=` header line, falling back to
+    /// [`SourceColorPrimaries::Bt709`]. `Some` overrides the file.
     #[serde(default)]
     pub source_primaries: Option<SourceColorPrimaries>,
 }
@@ -86,8 +84,6 @@ impl AssetLoader for HdrTextureLoader {
             format,
             settings.asset_usage,
         );
-        // An explicit loader setting takes priority over the file's own `PRIMARIES=`
-        // metadata, which in turn defaults to BT.709.
         image.source_primaries = settings
             .source_primaries
             .or_else(|| parse_radiance_primaries(&info.custom_attributes))
@@ -101,13 +97,11 @@ impl AssetLoader for HdrTextureLoader {
 }
 
 /// Parses a Radiance `PRIMARIES=` header line (eight CIE 1931 xy coordinates: red,
-/// green, blue, white) from the decoder's custom attributes and matches it against
-/// the supported [`SourceColorPrimaries`] (see
-/// [`SourceColorPrimaries::from_chromaticities`] for the matching tolerance).
+/// green, blue, white) from the decoder's custom attributes and matches it against the
+/// supported [`SourceColorPrimaries`].
 ///
-/// Returns `None` when the line is absent or malformed, and warns (once) when the
-/// line parses but describes a primary set Bevy does not support; callers fall back
-/// to [`SourceColorPrimaries::Bt709`] in both cases.
+/// Returns `None` when the line is absent, malformed, or names primaries Bevy does not
+/// support. Unsupported primaries also warn once.
 fn parse_radiance_primaries(
     custom_attributes: &[(String, String)],
 ) -> Option<SourceColorPrimaries> {

@@ -99,10 +99,9 @@ fn fragment(
     var out: FragmentOutput;
     // Apply lighting.
     out.color = apply_pbr_lighting(pbr_input);
-    // Apply in-shader post processing (fog, alpha-premultiply); tone mapping
-    // and debanding run later, in the post-process tonemapping pass, for
-    // every camera. Note this does not include fullscreen postprocessing
-    // effects like bloom.
+    // Apply in-shader post processing (fog, alpha-premultiply). Tone mapping
+    // and debanding run in the post-process pass. This does not include
+    // fullscreen postprocessing effects like bloom.
     out.color = main_pass_post_lighting_processing(pbr_input, out.color);
     return out;
 }

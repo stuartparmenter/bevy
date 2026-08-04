@@ -25,18 +25,15 @@ struct CachedBindGroup {
     bind_group: BindGroup,
 }
 
-/// Render node (a `Core2d` / `Core3d` schedule system) performing the
-/// gamut-transform + transfer-encoding pass.
+/// Render node (a `Core2d` / `Core3d` schedule system) running the
+/// display-encoding pass.
 ///
-/// Scheduled after the UI pass (UI composites in paper-white-relative
-/// display-linear space, which this pass consumes) and before the upscaling
-/// blit (which passes the encoded signal through unchanged; see
+/// Runs after the UI pass, which composites in the paper-white-relative
+/// display-linear space this pass consumes, and before the upscaling blit,
+/// which passes the encoded signal through unchanged (see
 /// `prepare_view_upscaling_pipelines`).
 ///
-/// Views without a [`ViewDisplayEncodingPipeline`] — every view on a plain
-/// SDR sRGB display target, i.e. all of them by default — do not match the
-/// `ViewQuery`, so the system is skipped entirely: no pass, no ping-pong
-/// flip, zero overhead.
+/// Views without a [`ViewDisplayEncodingPipeline`] get no ping-pong flip.
 pub fn display_encoding(
     view: ViewQuery<(
         &ViewTarget,

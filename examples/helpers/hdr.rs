@@ -1,17 +1,13 @@
-//! Opt-in HDR setup for examples: request the best HDR output the surface
-//! supports, falling back to SDR when none is available.
+//! Opt-in HDR setup for examples. [`HdrPlugin`] points the primary window's
+//! [`DisplayTarget`] at the best transfer the surface reports in
+//! [`WindowSurfaceTransfers`], and falls back to SDR when there is none. A
+//! hardcoded transfer would downgrade to SDR instead.
 //!
-//! Unlike most examples, which demonstrate an application, this is a small
-//! reusable plugin library. [`HdrPlugin`] keeps the primary window's
-//! [`DisplayTarget`] on the best entry of a preference list the surface can
-//! actually present (read from [`WindowSurfaceTransfers`]), rather than
-//! hardcoding one transfer that might silently downgrade to SDR.
-//!
-//! It writes only [`DisplayTarget::transfer`] and [`DisplayTarget::gamut`]; tone
+//! It writes only [`DisplayTarget::transfer`] and [`DisplayTarget::gamut`]. Tone
 //! mapping, the per-camera [`Hdr`](bevy::camera::Hdr) component, and
 //! [`DisplayCalibrationPolicy`](bevy::window::DisplayCalibrationPolicy) stay the
-//! app's job. Pair an HDR transfer with a tone-mapping operator (e.g.
-//! [`Tonemapping::GranTurismo7`](bevy::core_pipeline::tonemapping::Tonemapping)),
+//! app's job. Pair an HDR transfer with a tone-mapping operator such as
+//! [`Tonemapping::GranTurismo7`](bevy::core_pipeline::tonemapping::Tonemapping),
 //! or the renderer warns that HDR output is written without tone mapping.
 //!
 //! ```ignore
@@ -27,23 +23,18 @@ use bevy::{
 /// Requests the best supported HDR output for the primary window, falling back
 /// to SDR.
 ///
-/// `preference` lists `(transfer, gamut)` candidates best-first; the first whose
-/// transfer the surface advertises wins. Each transfer is paired with its
-/// canonical gamut (PQ with [`DisplayGamut::Rec2020`], the sRGB-family transfers
-/// with [`DisplayGamut::Rec709`]) so the encoder never has to coerce it.
-/// Selection re-runs when the surface's capabilities change (first
-/// configuration, a monitor move, an OS HDR toggle); set
+/// The default list pairs each transfer with its canonical gamut (PQ with
+/// [`DisplayGamut::Rec2020`], the sRGB-family transfers with [`DisplayGamut::Rec709`])
+/// so the encoder does not have to coerce it. Selection re-runs whenever the surface's
+/// capabilities change, such as a monitor move or an OS HDR toggle. Set
 /// [`HdrPreference::manual_override`] to hand control to the user.
 pub struct HdrPlugin {
     /// `(transfer, gamut)` candidates, best first. The first whose transfer the
-    /// surface supports wins; if none do, the window stays SDR sRGB.
+    /// surface supports wins. If none do, the window stays SDR sRGB.
     pub preference: Vec<(DisplayTransfer, DisplayGamut)>,
 }
 
 impl Default for HdrPlugin {
-    /// PQ/HDR10 first (absolute, wide-gamut Rec.2020), then scRGB-linear, then
-    /// encoded extended-range sRGB (the web HDR path); SDR sRGB if none are
-    /// advertised.
     fn default() -> Self {
         Self {
             preference: vec![
@@ -65,36 +56,32 @@ impl Plugin for HdrPlugin {
     }
 }
 
-/// Runtime state for [`HdrPlugin`]: the preference order plus a switch that
-/// hands transfer control back to the user.
+/// Runtime state for [`HdrPlugin`].
 #[derive(Resource)]
 pub struct HdrPreference {
     /// `(transfer, gamut)` candidates, best first (see [`HdrPlugin::preference`]).
     pub order: Vec<(DisplayTransfer, DisplayGamut)>,
-    /// When `true`, the plugin stops auto-selecting. Set it once the user picks
-    /// a transfer by hand so a later capability change does not overwrite their
-    /// choice; clear it to resume auto-selection on the next frame.
+    /// When `true`, the plugin stops auto-selecting. Set it after the user picks a
+    /// transfer by hand, so a later capability change does not overwrite it. Clear
+    /// it to resume on the next frame.
     pub manual_override: bool,
 }
 
 /// Selects the best supported `(transfer, gamut)` and writes it to the primary
 /// window's [`DisplayTarget`].
 ///
-/// Runs every frame so clearing [`HdrPreference::manual_override`] resumes
-/// auto-selection at once, but acts only on a capability or preference change.
-/// [`Single`] skips it until [`WindowSurfaceTransfers`] exists (first surface
-/// configuration; never on headless), leaving the authored SDR default.
+/// Runs every frame so clearing [`HdrPreference::manual_override`] takes effect at
+/// once, but acts only on a capability or preference change. [`WindowSurfaceTransfers`]
+/// appears at first surface configuration, and [`Single`] skips this system until then,
+/// leaving the app's authored target alone.
 fn apply_hdr_preference(
     preference: Res<HdrPreference>,
     window: Single<(&mut DisplayTarget, Ref<WindowSurfaceTransfers>), With<PrimaryWindow>>,
 ) {
-    // The user took manual control; leave their transfer alone.
     if preference.manual_override {
         return;
     }
     let (mut target, surface) = window.into_inner();
-    // Act only on a real surface transition, or when the app cleared the
-    // override.
     if !surface.is_changed() && !preference.is_changed() {
         return;
     }
@@ -112,12 +99,9 @@ fn apply_hdr_preference(
         target.gamut = gamut;
     }
 
-    // Report the selection, not every wake-up: writing the transfer
-    // renegotiates the surface, whose new `resolved` lands back on this same
-    // component next frame and wakes this system again with an unchanged
-    // answer. First sight of the surface still reports, so an SDR-only machine
-    // — where the selection matches the authored default and never changes —
-    // says so once.
+    // Writing the transfer renegotiates the surface, which wakes this system again
+    // next frame with the same answer. Log only on a change, plus the first sight of
+    // the surface so an SDR-only machine still says so once.
     if !selection_changed && !surface.is_added() {
         return;
     }

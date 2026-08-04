@@ -33,9 +33,7 @@ fn vertex(
 fn fragment(in: UiVertexOutput) -> @location(0) vec4<f32> {
     let color = vec4<f32>(1.0);
 
-    // Gamut convert (Rec.709 -> buffer primaries) and writer-encode into the
-    // resolved compositing space; a no-op on default Rec.709 / Linear views.
-    // Custom UI materials that supply their own fragment shader opt in by
-    // importing and calling `encode_output` themselves.
+    // Custom UI materials that supply their own fragment shader have to import
+    // and call `encode_output` themselves.
     return encode_output(color);
 }

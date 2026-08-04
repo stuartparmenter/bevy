@@ -224,7 +224,7 @@ fn update_bloom_settings(
                 };
             }
             if let BloomScatterModel::Gt7Glare { ref mut f_number } = bloom.scatter {
-                // Walk the aperture geometrically (one F-stop per second).
+                // Change the aperture by one f-stop per second.
                 if keycode.pressed(KeyCode::KeyL) {
                     *f_number /= ops::exp2(dt * 0.5);
                 }

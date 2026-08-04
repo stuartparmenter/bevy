@@ -1233,9 +1233,7 @@ async fn load_image<'a, 'b>(
                 ImageSampler::Descriptor(sampler_descriptor),
                 settings.load_materials,
             )?;
-            // glTF 2.0 core mandates sRGB (BT.709) color primaries for all textures,
-            // so stamp them explicitly. Support for a wide-gamut KHR extension would
-            // arrive together with that extension.
+            // glTF 2.0 core mandates sRGB (BT.709) primaries for all textures.
             image.source_primaries = SourceColorPrimaries::Bt709;
             Ok(ImageOrPath::Image {
                 image,
@@ -1258,8 +1256,7 @@ async fn load_image<'a, 'b>(
                     ImageSampler::Descriptor(sampler_descriptor),
                     settings.load_materials,
                 )?;
-                // glTF 2.0 core mandates sRGB (BT.709) color primaries for all
-                // textures, so stamp them explicitly.
+                // glTF 2.0 core mandates sRGB (BT.709) primaries for all textures.
                 image.source_primaries = SourceColorPrimaries::Bt709;
                 Ok(ImageOrPath::Image {
                     image,
@@ -2045,9 +2042,7 @@ impl ImageOrPath {
                 .load_builder()
                 .with_settings(move |settings: &mut ImageLoaderSettings| {
                     settings.is_srgb = is_srgb;
-                    // glTF 2.0 core mandates sRGB (BT.709) color primaries for all
-                    // textures, so stamp them explicitly. Support for a wide-gamut
-                    // KHR extension would arrive together with that extension.
+                    // glTF 2.0 core mandates sRGB (BT.709) primaries for all textures.
                     settings.source_primaries = Some(SourceColorPrimaries::Bt709);
                     settings.sampler = ImageSampler::Descriptor(sampler_descriptor.clone());
                     settings.asset_usage = render_asset_usages;

@@ -290,8 +290,7 @@ impl Plugin for UiRenderPlugin {
             .add_systems(
                 Core2d,
                 // UI composites in display-linear, paper-white-relative space:
-                // after tone mapping (PostProcess), before the display-encoding
-                // pass encodes the buffer for the display.
+                // after tone mapping, before the display-encoding pass.
                 ui_pass
                     .after(Core2dSystems::PostProcess)
                     .before(display_encoding)

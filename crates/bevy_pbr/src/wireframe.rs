@@ -958,9 +958,8 @@ impl RenderAsset for RenderWireframeMaterial {
         working_color_space: &mut SystemParamItem<Self::Param>,
         _previous_asset: Option<&Self>,
     ) -> Result<Self, PrepareAssetError<Self::SourceAsset>> {
-        // The wireframe color is written to the framebuffer with no texture
-        // composition, so it converts into the working space here at the
-        // CPU seam, like the other no-composition color inputs.
+        // The wireframe color reaches the framebuffer with no texture
+        // composition, so it converts to the working space here on the CPU.
         Ok(RenderWireframeMaterial {
             color: vec4_rec709_to_working(
                 Vec4::from_array(source_asset.color.to_linear().to_f32_array()),

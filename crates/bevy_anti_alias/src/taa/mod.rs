@@ -457,14 +457,12 @@ fn prepare_taa_pipelines(
     for (entity, camera, view, taa_settings, tonemapping, display_target) in &cameras {
         let mut pipeline_key = TaaPipelineKey {
             target_format: view.target_format,
-            // The reversible tonemapper (`TONEMAP` def) must be applied whenever the
-            // main texture holds unbounded scene-referred values at TAA time, so that
-            // history blending and neighborhood clamping operate on a compressed
-            // range. That is the case for `Hdr` cameras, for any camera whose
-            // tonemapping operator runs in the post-process tonemapping node, which
-            // executes after TAA (i.e. every camera with `Tonemapping != None`),
-            // and for cameras on HDR-transfer display targets, whose main texture
-            // is forced to an unclamped fp16 format even with `Tonemapping::None`.
+            // The reversible tonemapper (`TONEMAP` def) is needed whenever the main
+            // texture holds unbounded scene-referred values at TAA time, so history
+            // blending and neighborhood clamping work on a compressed range. That
+            // covers `Hdr` cameras, cameras whose tonemapping runs in the
+            // post-process node after TAA, and HDR-transfer display targets, whose
+            // main texture is fp16 even with `Tonemapping::None`.
             tonemap: camera.hdr
                 || tonemapping.is_some_and(Tonemapping::is_enabled)
                 || display_target.is_hdr_transfer(),

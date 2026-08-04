@@ -7,22 +7,16 @@ use serde::{Deserialize, Serialize};
 
 /// The color primaries that an [`Image`](crate::Image)'s RGB data is expressed in.
 ///
-/// This is *metadata only*: it records the gamut the pixel values were authored in,
-/// so that a wide working color space can convert them correctly at sample or upload
-/// time. It does not affect how the image is decoded, stored, or rendered today.
+/// This is metadata only: it records the gamut the pixel values were authored in,
+/// so a wide working color space can convert them at sample or upload time.
 ///
-/// Most game assets are authored against the sRGB / Rec. 709 primaries, which is why
-/// [`SourceColorPrimaries::Bt709`] is the default everywhere: images without explicit
-/// file metadata or loader settings are assumed to be BT.709, preserving Bevy's
-/// existing behavior exactly.
-///
-/// Loaders resolve the stamped value in this priority order:
-/// 1. An explicit `source_primaries` loader setting (for example on
-///    [`ImageLoaderSettings`](crate::ImageLoaderSettings)).
-/// 2. Color-primary metadata carried by the file itself (the KTX2 data format
-///    descriptor, Radiance HDR `PRIMARIES=` header lines, `OpenEXR`
-///    `chromaticities`).
-/// 3. The [`SourceColorPrimaries::Bt709`] default.
+/// Loaders resolve the stamped value in this order:
+/// 1. An explicit `source_primaries` loader setting, for example on
+///    [`ImageLoaderSettings`](crate::ImageLoaderSettings).
+/// 2. Color-primary metadata in the file itself: the KTX2 data format descriptor, a
+///    Radiance HDR `PRIMARIES=` header line, or `OpenEXR` `chromaticities`.
+/// 3. The [`SourceColorPrimaries::Bt709`] default, because most assets are authored
+///    against the sRGB / Rec. 709 primaries.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "bevy_reflect",
@@ -32,8 +26,6 @@ use serde::{Deserialize, Serialize};
 #[cfg_attr(not(feature = "bevy_reflect"), derive(TypePath))]
 pub enum SourceColorPrimaries {
     /// The ITU-R BT.709 primaries (shared by sRGB), D65 white point.
-    ///
-    /// This is the default assumption for all image data without explicit metadata.
     #[default]
     Bt709,
     /// The ITU-R BT.2020 (Rec. 2020) wide-gamut primaries, D65 white point.
@@ -44,17 +36,14 @@ pub enum SourceColorPrimaries {
 }
 
 impl SourceColorPrimaries {
-    /// The per-coordinate tolerance used by [`SourceColorPrimaries::from_chromaticities`]
-    /// when matching file-provided chromaticities against the known primary sets.
+    /// The per-coordinate tolerance used by [`SourceColorPrimaries::from_chromaticities`].
     ///
-    /// Standard primaries are typically written with three to four decimal places, so
-    /// `2e-3` comfortably absorbs rounding while remaining far smaller than the
-    /// distance between any two supported primary sets (the closest pair, BT.709 and
-    /// Display P3, differ by `0.04` in the red x coordinate).
+    /// Files typically write primaries with three or four decimal places, so `2e-3`
+    /// absorbs the rounding. BT.709 and Display P3, the closest pair of supported sets,
+    /// differ by `0.04` in the red x coordinate.
     pub const CHROMATICITY_MATCH_TOLERANCE: f32 = 2e-3;
 
-    /// Returns the [`RgbPrimaries`] chromaticity description of this primary set,
-    /// suitable for deriving conversion matrices with
+    /// Returns the [`RgbPrimaries`] chromaticities of this primary set, for use with
     /// [`rgb_to_rgb_matrix`](bevy_color::rgb_to_rgb_matrix).
     pub const fn to_rgb_primaries(self) -> RgbPrimaries {
         match self {
@@ -64,14 +53,11 @@ impl SourceColorPrimaries {
         }
     }
 
-    /// Matches a set of CIE 1931 xy chromaticities (as carried by Radiance HDR
-    /// `PRIMARIES=` lines or `OpenEXR` `chromaticities` attributes) against the known
-    /// primary sets.
+    /// Matches a set of CIE 1931 xy chromaticities against the supported primary sets.
     ///
-    /// Returns the matching variant when every coordinate of `red`, `green`, `blue`,
-    /// and `white` is within [`CHROMATICITY_MATCH_TOLERANCE`] of one of the supported
-    /// primary sets, and `None` otherwise. Callers should fall back to
-    /// [`SourceColorPrimaries::Bt709`] (with a warning) on `None`.
+    /// Returns the matching variant when every coordinate of `red`, `green`, `blue`, and
+    /// `white` is within [`CHROMATICITY_MATCH_TOLERANCE`] of one of them, `None` otherwise.
+    /// Callers fall back to [`SourceColorPrimaries::Bt709`] on `None`.
     ///
     /// [`CHROMATICITY_MATCH_TOLERANCE`]: SourceColorPrimaries::CHROMATICITY_MATCH_TOLERANCE
     pub fn from_chromaticities(

@@ -27,8 +27,8 @@ pub struct ViewAutoExposurePipeline {
     pub metering_mask: Handle<Image>,
 }
 
-/// CPU mirror of the `AutoExposure` settings uniform in `auto_exposure.wgsl`.
-/// The field order and types must match the WGSL struct exactly.
+/// CPU mirror of the `AutoExposure` uniform in `auto_exposure.wgsl`.
+/// Field order and types must match the WGSL struct.
 #[derive(Component, ShaderType, Clone, Copy)]
 pub struct AutoExposureUniform {
     pub(super) min_log_lum: f32,
@@ -49,37 +49,31 @@ pub struct AutoExposureUniform {
     pub(super) awb_speed: f32,
     /// Auto white balance virtual-light anchor luminance, scene-linear units.
     pub(super) awb_anchor: f32,
-    /// Non-zero when the camera has an `AutoWhiteBalance` component. All auto
-    /// white balance shader statements are gated on this flag, so the
-    /// auto-exposure-only configuration runs no white-balance arithmetic at
-    /// all.
+    /// Non-zero when the camera has an `AutoWhiteBalance` component.
+    /// The shader gates all white balance work on this flag.
     pub(super) awb_enabled: u32,
-    /// Tail padding to 80 bytes. The seventeen fields above occupy 68, and a
-    /// WGSL uniform struct's size is rounded up to a multiple of 16; encase
-    /// does not apply that rounding, so the mirror has to carry it explicitly
-    /// or the uploaded buffer is smaller than the binding the shader declares.
+    /// Tail padding to 80 bytes. The 17 fields above take 68, and WGSL rounds
+    /// a uniform struct's size up to a multiple of 16. encase does not, so the
+    /// mirror has to pad explicitly.
     pub(super) pad_0: u32,
     pub(super) pad_1: u32,
     pub(super) pad_2: u32,
 }
 
-/// CPU mirror of the per-view `AutoExposureState` storage buffer in `auto_exposure.wgsl`.
-/// The field order and types must match the WGSL struct exactly.
+/// CPU mirror of the per-view `AutoExposureState` buffer in `auto_exposure.wgsl`.
+/// Field order and types must match the WGSL struct.
 #[derive(ShaderType, Clone, Copy, Debug, PartialEq)]
 pub struct AutoExposureState {
     /// The smoothed short-term exposure correction, in EV.
     pub(super) exposure: f32,
     /// The long-term physiological adaptation envelope, in EV.
     pub(super) long_term: f32,
-    /// The adapted white-point chromaticity (CIE 1931 *x*), used by auto
-    /// white balance. Initialized to (and meaningless at) the D65 *x* value.
+    /// The adapted white-point chromaticity (CIE 1931 x), used by auto white balance.
     pub(super) chroma_x: f32,
-    /// The adapted white-point chromaticity (CIE 1931 *y*); see
-    /// [`Self::chroma_x`].
+    /// The adapted white-point chromaticity (CIE 1931 y); see [`Self::chroma_x`].
     pub(super) chroma_y: f32,
-    /// Fixed-point accumulators for the auto-white-balance chromaticity
-    /// measurement (`x·Y`, `y·Y`, and `Y` sums), `array<atomic<u32>, 3>` on
-    /// the GPU. The shader drains them back to zero every frame.
+    /// Fixed-point sums for the white balance chromaticity measurement (`x*Y`,
+    /// `y*Y`, `Y`), `array<atomic<u32>, 3>` on the GPU. Drained to zero each frame.
     pub(super) chroma_sums: [u32; 3],
 }
 

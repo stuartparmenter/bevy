@@ -3,32 +3,22 @@ title: "Camera compositing resolves once per frame: `ViewTarget::compositing_spa
 pull_requests: []
 ---
 
-Bevy now resolves a camera's `CompositingSpace` request once per frame — after a
-render target's cameras are grouped — into shared state that every render stage
-reads instead of re-deriving:
+Bevy resolves a camera's `CompositingSpace` request once per frame. Two new
+render-world components hold the result:
 
-- `ResolvedCompositingSpace` (render-world per-view component, seeded at camera
-  extraction and resolved in `RenderSystems::CreateViews` after `sort_cameras`):
-  the view's `Option<CompositingSpace>` after grouping cameras that share a
-  main-texture ping-pong.
-- `ViewStackContract` (render-world component, built in
-  `RenderSystems::PrepareViews` after `prepare_view_targets` and
-  `prepare_view_display_targets`): each view's tone-map and display-encode roles,
-  blit disposition, resolved compositing space, the encoder's source gamut, and
-  resolved encode parameters.
+- `ResolvedCompositingSpace`: the view's `Option<CompositingSpace>`. Written by
+  `resolve_composition_spaces` in `RenderSystems::CreateViews`.
+- `ViewStackContract`: the view's compositing space, encoder source gamut,
+  tone-map and display-encode roles, and blit disposition. Written by
+  `resolve_camera_stack_contracts` in `RenderSystems::PrepareViews`.
 
 A solo camera resolves to its own request, so its pipeline keys and pixels are
-unchanged. The changes below affect custom render code that read the old per-view
-state, and camera stacks using a non-default compositing space or HDR output.
+unchanged.
 
 ## Removed API
 
-`ViewTarget::compositing_space` is removed. Read the resolved space from the
-`ResolvedCompositingSpace` component on the render-world view entity in
-`bevy_render`, or from `ViewStackContract::compositing_space` in
-`bevy_core_pipeline`. The raw per-camera request remains as
-`ExtractedCamera::compositing_space`, but it feeds only the extract-time
-main-texture format choice — don't consult it for pass or pipeline-key decisions.
+`ViewTarget::compositing_space` is removed. Read `ResolvedCompositingSpace` or
+`ViewStackContract::compositing_space` instead:
 
 ```rust
 // 0.19
@@ -41,12 +31,18 @@ let space = resolved_space.0;
 let space = contract.compositing_space;
 ```
 
+`ViewStackContract` is overwritten in place and never removed, so keep a
+`ViewTarget` term in your query to skip views whose target was dropped.
+
+`ExtractedCamera::compositing_space` still holds the raw per-camera request.
+Don't use it for pass or pipeline-key decisions.
+
 `encoder_input_gamut` is removed from `bevy_core_pipeline::display_encoding`. The
 encoder's source gamut now comes from `ViewStackContract::source_gamut`.
-`bevy_core_pipeline::tonemapping::resolve_tonemapping` is the single source of
-truth for an operator's output gamut (`ResolvedTonemapping::output_gamut`); it
-replaces the separate `effective_tonemapping` and `tonemap_output_gamut`
-functions, resolving the substituted operator and its output gamut together.
+
+`bevy_core_pipeline::tonemapping::resolve_tonemapping` replaces
+`effective_tonemapping` and `tonemap_output_gamut`. It returns the substituted
+operator and its output gamut together (`ResolvedTonemapping::output_gamut`).
 
 `SortedCamera::hdr` is removed: cameras sort by `(order, target)`, and their
 per-target stacking index keys on the target alone. Read `ExtractedCamera::hdr`
@@ -54,85 +50,52 @@ on the view entity if you need a camera's raw HDR request.
 
 ## Renamed writer-encode shader defs
 
-The writer-side encode defs that 2D pipelines (sprites, 2D meshes and
-materials, gizmos, UI) push into their shaders are renamed, and one shared
-WGSL helper now implements the encode:
+The writer-side encode defs that 2D pipelines (sprites, 2D meshes and materials,
+gizmos, UI) push into their shaders are renamed:
 
-- `SRGB_OUTPUT` → `COMPOSITING_SPACE_SRGB` and `OKLAB_OUTPUT` →
-  `COMPOSITING_SPACE_OKLAB`, unifying the writer-side names with the ones the
-  tonemapping and FXAA passes already used for the same resolved
-  `CompositingSpace`.
-- The gamut-convert def in writer shaders is now `OUTPUT_GAMUT_REC2020` ("the
-  buffer I write into has Rec.2020 primaries"). `WORKING_COLOR_SPACE_REC2020`
-  keeps its project-global meaning and is registered as a global shader def on
-  the `PipelineCache`, visible to every shader without per-pipeline pushes; UI
-  previously pushed that name with a different, per-view meaning, which the
-  split removes.
+| 0.19 | 0.20 |
+| ---- | ---- |
+| `SRGB_OUTPUT` | `COMPOSITING_SPACE_SRGB` |
+| `OKLAB_OUTPUT` | `COMPOSITING_SPACE_OKLAB` |
+
+The gamut-convert def in writer shaders is now `OUTPUT_GAMUT_REC2020`: the
+buffer being written has Rec.2020 primaries. UI used to push
+`WORKING_COLOR_SPACE_REC2020` for that. That name now keeps only its
+project-global meaning.
 
 A custom `Material2d` or UI shader that read the old defs should switch to the
-new names — or import `bevy_render::writer_encode::writer_encode` and call it
-on the composed color, which handles all three defs.
+new names, or call `bevy_render::writer_encode::writer_encode` on its composed
+color, which handles all three defs.
 
 ## Behavior changes
 
-These affect non-default compositing-space and HDR configurations, never default
-SDR cameras.
+These apply to camera stacks, non-default compositing spaces, and HDR output,
+never to default SDR cameras. The release note "The composition contract: one
+resolution for camera compositing" covers the bugs they fix.
 
-- **Camera stacks resolve one compositing space per shared buffer.** Cameras that
-  share a main texture and form a stack (each later camera composites full-screen
-  over the previous output) resolve to a single compositing space. Conflicting
-  requests, or any non-2D-camera member, resolve to linear with a warning naming
-  the misconfiguration. Give every member of a stack the same `CompositingSpace`,
-  or none.
-
-- **Sorted-camera indices count per render target.** A 3D camera and an `Hdr` 2D
-  overlay on the same target now order deterministically, so the overlay
-  composites over the base instead of overwriting it.
-
-- **Stack members below a finalizer skip their upscaling blit.** When a stack
-  defers its tone-map or display-encode pass to a finalizing camera, every member
-  ordered below that finalizer — deferred and pass-disabled members alike — skips
-  its upscaling blit, and the finalizer presents once, with replace, owning the
-  output texture. On HDR display targets the out-texture clear color is CPU-encoded
-  through the resolved transfer, gamut, and paper white, so regions no camera
-  covers present a correct clear instead of a raw linear value (which reads as
-  full-peak nits). A finalizer with `CameraOutputMode::Skip` cancels the skipping
-  for its group.
-
-- **Stacked GT7 under an overlay encodes correctly on HDR output.** The encoder
-  keys its source gamut off the camera that tone-mapped the buffer, not a
-  `Tonemapping::None` overlay composited on top. A `Tonemapping::GranTurismo7` 3D
-  camera under a 2D overlay on a PQ display target no longer gets a spurious
-  Rec.709 → Rec.2020 double expansion that oversaturated the image. See the
-  composition-contract release note for the before/after capture.
-
-- **UI on a `CompositingSpace::Srgb` or `CompositingSpace::Oklab` camera encodes
-  into that space.** UI runs after tone mapping, which leaves the buffer encoded in
-  the camera's compositing space; each UI fragment shader now writer-encodes its
-  final color into the resolved compositing space, the same way the sprite shader
-  does. UI over 3D cameras is unaffected (non-2D cameras resolve to linear).
-
-- **UI and gizmos convert Rec.709-authored colors to the buffer's working gamut on
-  a Rec.2020 (GT7) HDR view.** UI fragment shaders, and the 2D and 3D gizmo
-  line/joint shaders, now apply `rec709_to_rec2020` (the shared
-  `OUTPUT_GAMUT_REC2020` writer-encode) before the compositing-space encode.
-  UI keys this per view off the buffer's `source_gamut`; gizmos render pre-tone-map
-  and key off the global `WorkingColorSpace` like sprites and meshes. SDR and
-  Rec.709 views are byte-identical (no shader def, no conversion).
-
-- **2D gizmos writer-encode into the camera's compositing space.** Like UI and
-  sprites, 2D gizmos blend into a `CompositingSpace::Srgb`/`Oklab` buffer, so they
-  now encode their output to match it. 3D gizmos render pre-tone-map and are
-  unaffected. SDR/linear views are byte-identical.
-
-- **Tilemap chunks writer-encode into the camera's compositing space.** The
-  tilemap chunk material previously wrote linear values into a
-  `CompositingSpace::Srgb`/`Oklab` `Camera2d` buffer, so its tiles decoded
-  wrong next to sprites; it now encodes its output like every other 2D writer.
-  Default/linear views are byte-identical.
-
-- **FXAA on a `CompositingSpace::Oklab` view uses the Oklab L channel for edge
-  luma.** FXAA's Rec.601-weighted luma dot can go negative (and NaN under the
-  square root) on an Oklab buffer's signed chroma channels, so on an Oklab-resolved
-  view FXAA reads the Oklab L channel directly. Other compositing spaces are
-  unchanged.
+- Cameras that share a main texture and form a stack (each later camera
+  composites full-screen over the previous output) resolve to one compositing
+  space. Conflicting requests, or any non-2D-camera member, resolve to linear
+  with a warning naming the misconfiguration. Give every stack member the same
+  `CompositingSpace`, or none.
+- A 3D camera and an `Hdr` 2D overlay on the same target now order
+  deterministically, and the overlay composites over the base instead of
+  overwriting it.
+- Every stack member ordered below a finalizing camera skips its upscaling blit,
+  and the finalizer presents once. A finalizer with `CameraOutputMode::Skip`
+  cancels the skipping for its group.
+- On HDR display targets, regions no camera covers no longer show a raw linear
+  value that reads as full-peak nits.
+- The display encoder takes its source gamut from the camera that tone-mapped
+  the buffer, not from a `Tonemapping::None` overlay composited on top.
+- UI, 2D gizmos, and the tilemap chunk material writer-encode each fragment's
+  final color into the view's resolved compositing space, instead of writing
+  linear values into a `CompositingSpace::Srgb`/`Oklab` buffer. UI over 3D
+  cameras is unaffected (non-2D cameras resolve to linear), as are 3D gizmos,
+  which render pre-tone-map.
+- On a Rec.2020 (GT7) HDR view, UI fragment shaders and the 2D and 3D gizmo
+  line/joint shaders convert their Rec.709-authored colors with
+  `rec709_to_rec2020` (the shared `OUTPUT_GAMUT_REC2020` writer-encode) before
+  the compositing-space encode.
+- FXAA on a `CompositingSpace::Oklab` view reads the Oklab L channel for edge
+  luma. Other compositing spaces are unchanged.

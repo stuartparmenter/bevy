@@ -56,7 +56,6 @@ fn fragment(
 
     pbr_input.V = fns::calculate_view(mesh.world_position, pbr_input.is_orthographic);
 
-    // Output scene-linear color; the camera's tonemapping operator is
-    // applied by the post-process tonemapping pass.
+    // Scene-linear output; the post-process tonemapping pass applies the operator.
     return fns::apply_pbr_lighting(pbr_input);
 }

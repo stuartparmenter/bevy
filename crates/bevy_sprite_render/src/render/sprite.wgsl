@@ -60,8 +60,5 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     color = tonemapping::tone_mapping(color, view.color_grading);
 #endif
 
-    // Writer-side gamut convert (the composed Rec.709 tint × texture color
-    // into a Rec.2020 working buffer) and compositing-space encode; a
-    // pass-through on default views.
     return writer_encode(color);
 }

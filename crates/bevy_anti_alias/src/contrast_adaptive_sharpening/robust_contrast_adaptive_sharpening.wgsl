@@ -34,33 +34,27 @@ const peakC = vec2<f32>(10.0, -40.0);
 
 #ifdef HDR_DISPLAY_TARGET
 // On HDR display targets the tone-mapped input is paper-white-relative
-// display-linear and can exceed 1.0 (up to peak / paper-white, e.g. 10.0 for
+// display-linear and can exceed 1.0 (up to peak / paper white, e.g. 10.0 for
 // a 1000-nit display at 100-nit paper white). RCAS's limiter constants
-// (`peakC`, `FSR_RCAS_LIMIT`) are clip solves that bake in "1.0 is the
-// maximum representable value": the `hitMax` denominator `-40 + 4 * mn4`
-// crosses zero at `mn4 == 10` and flips sign above it, inverting the limiter
-// and producing fireflies / inverted sharpening.
+// (`peakC`, `FSR_RCAS_LIMIT`) are clip solves that assume 1.0 is the maximum
+// representable value. The `hitMax` denominator `-40 + 4 * mn4` crosses zero
+// at `mn4 == 10` and flips sign above it. The inverted limiter produces
+// fireflies and inverted sharpening.
 //
-// Following AMD's HDR guidance for RCAS (feed the filter a bounded signal),
-// the neighborhood is range-compressed into [0, 1) with the reversible
-// Reinhard `x / (1 + x)`, the RCAS math runs on the compressed values (where
-// its [0, 1] clip solves are valid by construction), and the sharpened
-// result is decompressed with the inverse `x / (1 - x)`.
-//
-// SDR pipelines never set `HDR_DISPLAY_TARGET` and compile to exactly the
-// same code as before.
+// Following AMD's HDR guidance for RCAS, the neighborhood is range-compressed
+// into [0, 1) with the reversible Reinhard `x / (1 + x)`, the RCAS math runs
+// on the compressed values, and the sharpened result is decompressed with the
+// inverse `x / (1 - x)`.
 fn rcas_range_compress(c: vec3<f32>) -> vec3<f32> {
-    // Negative inputs are not expected post-tonemap; clamp them so the
+    // Negative inputs are not expected post-tonemap. Clamp them so the
     // compression stays monotonic and invertible.
     let v = max(c, vec3<f32>(0.0));
     return v / (1.0 + v);
 }
 
 fn rcas_range_decompress(c: vec3<f32>) -> vec3<f32> {
-    // RCAS limits its output to the local neighborhood range, but clamp
-    // defensively: the denominator floor of `1 / 65504` (the f16 maximum the
-    // Rgba16Float target can store) keeps the inverse finite for inputs at
-    // or slightly above 1.0 instead of producing infinities.
+    // The denominator floor of `1 / 65504` (the f16 maximum an Rgba16Float
+    // target can store) keeps the inverse finite for inputs at or above 1.0.
     let v = clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
     return v / max(1.0 - v, vec3<f32>(1.0 / 65504.0));
 }
@@ -90,9 +84,7 @@ fn rcas_range_decompress(c: vec3<f32>) -> vec3<f32> {
 //       0.25
 // This is used as a noise detection filter, to reduce the effect of RCAS on grain, and focus on real edges.
 // The CAS node runs after tonemapping. On SDR display targets the input is in
-// the range of 0 to 1; on HDR display targets (HDR_DISPLAY_TARGET) it is
-// paper-white-relative display-linear and the taps are range-compressed into
-// [0, 1) before the RCAS math (see `rcas_range_compress` above).
+// the range of 0 to 1.
 @fragment
 fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     // Algorithm uses minimal 3x3 pixel neighborhood.
@@ -111,8 +103,6 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     let e = vec4<f32>(rcas_range_compress(e_raw.rgb), e_raw.a);
     let f = rcas_range_compress(f_raw);
     let h = rcas_range_compress(h_raw);
-    // The uncompressed neighborhood maximum, bounding the decompressed output
-    // below.
     let local_max = max(max(b_raw, d_raw), max(max(f_raw, h_raw), e_raw.rgb));
 #else
     let b = textureSample(screenTexture, samp, in.uv, vec2<i32>(0, -1)).rgb;
@@ -147,12 +137,10 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
 #endif
 #ifdef HDR_DISPLAY_TARGET
     let sharpened = rcas_range_decompress((lobe * b + lobe * d + lobe * f + lobe * h + e.rgb) / (4.0 * lobe + 1.0));
-    // RCAS's stabilized limiter is approximate and can overshoot the local
-    // range; in SDR the [0, 1] render target absorbed that by clamping at
-    // white. Reproduce that semantic in the unbounded HDR buffer: overshoot
-    // may reach paper white (1.0), and content above paper white may not
-    // overshoot beyond the brightest neighborhood value, so decompression
-    // can never manufacture out-of-scene highlights (fireflies).
+    // RCAS's stabilized limiter can overshoot the local range. In SDR the
+    // [0, 1] render target absorbs that by clamping at white. The unbounded
+    // HDR buffer does not, so clamp here: overshoot may reach paper white
+    // (1.0) but never exceeds the brightest neighborhood value.
     return vec4<f32>(min(sharpened, max(local_max, vec3<f32>(1.0))), e.w);
 #else
     return vec4<f32>((lobe * b + lobe * d + lobe * f + lobe * h + e.rgb) / (4.0 * lobe + 1.0), e.w);

@@ -221,13 +221,9 @@ impl Color {
     ///
     /// # Arguments
     ///
-    /// * `red` - Red channel. Typically `[0.0, 1.0]` for SDR display-referred
-    ///   colors; HDR/scene-referred values may exceed `1.0` and are preserved.
-    /// * `green` - Green channel. Typically `[0.0, 1.0]` for SDR
-    ///   display-referred colors; HDR/scene-referred values may exceed `1.0`
-    ///   and are preserved.
-    /// * `blue` - Blue channel. Typically `[0.0, 1.0]` for SDR display-referred
-    ///   colors; HDR/scene-referred values may exceed `1.0` and are preserved.
+    /// * `red` - Red channel. [0.0, 1.0]
+    /// * `green` - Green channel. [0.0, 1.0]
+    /// * `blue` - Blue channel. [0.0, 1.0]
     /// * `alpha` - Alpha channel. [0.0, 1.0]
     pub const fn linear_rgba(red: f32, green: f32, blue: f32, alpha: f32) -> Self {
         Self::LinearRgba(LinearRgba {
@@ -242,13 +238,9 @@ impl Color {
     ///
     /// # Arguments
     ///
-    /// * `red` - Red channel. Typically `[0.0, 1.0]` for SDR display-referred
-    ///   colors; HDR/scene-referred values may exceed `1.0` and are preserved.
-    /// * `green` - Green channel. Typically `[0.0, 1.0]` for SDR
-    ///   display-referred colors; HDR/scene-referred values may exceed `1.0`
-    ///   and are preserved.
-    /// * `blue` - Blue channel. Typically `[0.0, 1.0]` for SDR display-referred
-    ///   colors; HDR/scene-referred values may exceed `1.0` and are preserved.
+    /// * `red` - Red channel. [0.0, 1.0]
+    /// * `green` - Green channel. [0.0, 1.0]
+    /// * `blue` - Blue channel. [0.0, 1.0]
     pub const fn linear_rgb(red: f32, green: f32, blue: f32) -> Self {
         Self::LinearRgba(LinearRgba {
             red,
@@ -618,9 +610,8 @@ impl Color {
 
     /// Creates a new [`Color`] object storing a [`LinearRec2020`] color.
     ///
-    /// The components are linear (no transfer function) intensities relative to the
-    /// wide-gamut [Rec. 2020](RgbPrimaries::BT2020) primaries. Values above 1.0
-    /// represent HDR intensities.
+    /// The components are linear intensities relative to the wide-gamut
+    /// [Rec. 2020](RgbPrimaries::BT2020) primaries. Values above 1.0 are HDR.
     ///
     /// # Arguments
     ///
@@ -639,9 +630,7 @@ impl Color {
 
     /// Creates a new [`Color`] object storing a [`LinearRec2020`] color with an alpha of 1.0.
     ///
-    /// The components are linear (no transfer function) intensities relative to the
-    /// wide-gamut [Rec. 2020](RgbPrimaries::BT2020) primaries. Values above 1.0
-    /// represent HDR intensities.
+    /// See [`Color::rec2020a`] for details.
     ///
     /// # Arguments
     ///
@@ -657,17 +646,15 @@ impl Color {
         })
     }
 
-    /// Creates a new [`Color`] object from a
-    /// [Display P3](RgbPrimaries::DISPLAY_P3) color (P3 primaries with the sRGB
-    /// transfer function, as used by CSS `color(display-p3 ...)` and wide-gamut
-    /// color pickers).
+    /// Creates a new [`Color`] object from a [Display P3](RgbPrimaries::DISPLAY_P3)
+    /// color: P3 primaries with the sRGB transfer function, as used by CSS
+    /// `color(display-p3 ...)` and wide-gamut color pickers.
     ///
-    /// The components are gamma-encoded, exactly as displayed by such pickers. The
-    /// color is decoded and converted into the wider [`LinearRec2020`] color space.
-    /// Display P3 fits almost entirely inside Rec. 2020, so in-range inputs produce
-    /// non-negative components (except for colors at the very edge of P3's red
-    /// corner, which lies marginally outside Rec. 2020 and may produce a tiny
-    /// negative blue component).
+    /// The gamma-encoded components are decoded and converted into the wider
+    /// [`LinearRec2020`] color space. Display P3 fits almost entirely inside
+    /// Rec. 2020, so nearly all in-range inputs produce non-negative components.
+    /// Colors at the very edge of P3's red corner lie marginally outside Rec. 2020
+    /// and may produce a tiny negative blue component.
     ///
     /// # Arguments
     ///
@@ -691,9 +678,8 @@ impl Color {
         })
     }
 
-    /// Creates a new [`Color`] object from a
-    /// [Display P3](RgbPrimaries::DISPLAY_P3) color (P3 primaries with the sRGB
-    /// transfer function) with an alpha of 1.0.
+    /// Creates a new [`Color`] object from a [Display P3](RgbPrimaries::DISPLAY_P3)
+    /// color with an alpha of 1.0.
     ///
     /// See [`Color::display_p3a`] for details.
     ///
@@ -708,18 +694,17 @@ impl Color {
 
     /// Creates a new [`Color`] object storing a [`Xyza`] color from
     /// [CIE xyY](https://en.wikipedia.org/wiki/CIE_1931_color_space#CIE_xy_chromaticity_diagram_and_the_CIE_xyY_color_space)
-    /// coordinates: a [`Chromaticity`]-style `(x, y)` position
-    /// plus a luminance `Y`, with an alpha of 1.0.
+    /// coordinates: a [`Chromaticity`] `(x, y)` position plus a luminance `Y`, with an
+    /// alpha of 1.0.
     ///
-    /// This is a gamut-independent way to author colors: any visible chromaticity
-    /// can be expressed without negative RGB components, including wide-gamut colors
-    /// outside the sRGB and Rec. 2020 gamuts.
+    /// Any visible chromaticity can be expressed this way, including colors outside
+    /// the sRGB and Rec. 2020 gamuts.
     ///
     /// # Arguments
     ///
-    /// * `x` - CIE 1931 x chromaticity coordinate. Typically [0.0, 0.8]; `y` must be non-zero
-    /// * `y` - CIE 1931 y chromaticity coordinate. Typically (0.0, 0.9]
-    /// * `luminance` - Luminance (Y). 1.0 is the reference white luminance; values above 1.0 represent HDR intensities
+    /// * `x` - CIE 1931 x chromaticity coordinate. Typically [0.0, 0.8]
+    /// * `y` - CIE 1931 y chromaticity coordinate. Typically (0.0, 0.9]; must be non-zero
+    /// * `luminance` - Luminance (Y). 1.0 is the reference white luminance; above 1.0 is HDR
     pub const fn xy_y(x: f32, y: f32, luminance: f32) -> Self {
         let xyz = Chromaticity::new(x, y).to_xyz(luminance);
         Self::xyz(xyz.x, xyz.y, xyz.z)
@@ -1389,8 +1374,8 @@ mod tests {
         assert_approx_eq!(linear.green, 1.0, 1e-4);
         assert_approx_eq!(linear.blue, 1.0, 1e-4);
 
-        // P3 red is outside the sRGB gamut: in Rec. 2020 it is (essentially)
-        // non-negative, while linear sRGB needs a negative green component.
+        // P3 red is outside the sRGB gamut: linear sRGB needs a negative green
+        // component, while in Rec. 2020 the blue component is near zero.
         let red = Color::display_p3(1.0, 0.0, 0.0);
         let rec2020: LinearRec2020 = red.into();
         assert_approx_eq!(rec2020.red, 0.7538, 1e-3);

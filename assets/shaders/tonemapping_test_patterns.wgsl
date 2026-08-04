@@ -48,7 +48,6 @@ fn fragment(
     } else {
         out = continuous_hue(vec2(uv.y * 2.0, uv.x));
     }
-    // The test patterns are emitted scene-linear; the post-process
-    // tonemapping pass applies the camera's operator.
+    // Scene-linear output; the post-process tonemapping pass applies the operator.
     return vec4(out, 1.0);
 }

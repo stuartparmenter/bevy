@@ -52,14 +52,12 @@ impl Sensitivity {
 /// A component for enabling Fast Approximate Anti-Aliasing (FXAA)
 /// for a [`bevy_camera::Camera`].
 ///
-/// On a view whose resolved compositing space is
-/// [`CompositingSpace::Oklab`] the
-/// edge-detection luma reads the Oklab lightness channel directly, since the
-/// Rec.601 luma proxy is undefined on the signed Oklab chroma channels. On a
-/// [`Srgb`](bevy_camera::CompositingSpace::Srgb) view the luma proxy is left
-/// unchanged: FXAA's reference design expects a nonlinear signal, and the
-/// `sqrt` proxy on an already-sRGB-encoded buffer only double-compresses the
-/// thresholds rather than breaking them.
+/// On a view whose resolved compositing space is [`CompositingSpace::Oklab`],
+/// edge detection reads the Oklab lightness channel instead of the Rec.601
+/// luma proxy, which is undefined on the signed Oklab chroma channels. An
+/// [`Srgb`](bevy_camera::CompositingSpace::Srgb) view keeps the proxy. FXAA
+/// expects a nonlinear signal, so on an already-sRGB-encoded buffer the `sqrt`
+/// double-compresses the thresholds rather than breaking them.
 #[derive(Reflect, Component, Clone, ExtractComponent)]
 #[reflect(Component, Default, Clone)]
 #[extract_component_filter(With<Camera>)]
@@ -171,35 +169,24 @@ pub struct FxaaPipelineKey {
     edge_threshold: Sensitivity,
     edge_threshold_min: Sensitivity,
     target_format: TextureFormat,
-    /// Whether the view's display-encoding pass runs; see
-    /// [`ViewStackContract::is_hdr_encode`].
+    /// Whether the view's display-encoding pass runs.
+    /// See [`ViewStackContract::is_hdr_encode`].
     ///
-    /// The post-tonemap input on such views is paper-white-relative
-    /// display-linear and exceeds 1.0, which would defeat FXAA's absolute
-    /// `EDGE_THRESHOLD_MIN` presets and its `sqrt` perceptual luma proxy, so
-    /// the shader compiles with the `HDR_DISPLAY_TARGET` def and saturates
-    /// the edge-detection luma to [0, 1]. SDR views keep the def-less
-    /// pipeline byte-for-byte.
+    /// Post-tonemap input on these views is paper-white-relative
+    /// display-linear and exceeds 1.0, which defeats FXAA's absolute
+    /// `EDGE_THRESHOLD_MIN` presets and its `sqrt` luma proxy. The shader
+    /// then compiles with the `HDR_DISPLAY_TARGET` def and saturates the
+    /// edge-detection luma to [0, 1].
     hdr: bool,
-    /// Whether the view's resolved compositing space is
-    /// [`CompositingSpace::Oklab`] ([`ViewStackContract::compositing_space`],
-    /// never the camera's raw request).
-    ///
-    /// An Oklab buffer holds Oklab triplets whose a/b chroma channels are
-    /// signed, so the Rec.601 luma dot can go negative and the `sqrt`
-    /// perceptual proxy then yields a NaN edge metric. Under this flag the
-    /// shader compiles with the `COMPOSITING_SPACE_OKLAB` def and reads the
-    /// Oklab L channel directly as the edge-detection luma. Non-Oklab views
-    /// keep the def-less pipeline byte-for-byte.
+    /// Whether [`ViewStackContract::compositing_space`] resolved to
+    /// [`CompositingSpace::Oklab`], not what the camera requested. The shader
+    /// then compiles with the `COMPOSITING_SPACE_OKLAB` def and reads the
+    /// Oklab L channel as the edge-detection luma.
     oklab_compositing: bool,
 }
 
-/// The shader-def vector for an [`FxaaPipelineKey`]. Pure so the def-vector
-/// contract can be unit-tested without a render device.
-///
-/// Every conditional def is pushed only when its key field is set, so the
-/// default `hdr: false, oklab_compositing: false` key yields the same vector
-/// as a key without either field.
+/// Returns the shader defs for an [`FxaaPipelineKey`]. Split out so the def
+/// vector can be unit-tested without a render device.
 fn fxaa_shader_defs(key: &FxaaPipelineKey) -> Vec<ShaderDefVal> {
     let mut shader_defs = vec![
         format!("EDGE_THRESH_{}", key.edge_threshold.get_str()).into(),
@@ -260,8 +247,6 @@ pub fn prepare_fxaa_pipelines(
                 edge_threshold_min: fxaa.edge_threshold_min,
                 target_format: view.target_format,
                 hdr: contract.is_hdr_encode(),
-                // The resolved space, not the camera's raw request: a
-                // signed-a/b Oklab buffer needs the Oklab-L luma path.
                 oklab_compositing: contract.compositing_space == Some(CompositingSpace::Oklab),
             },
         );
@@ -286,9 +271,8 @@ mod tests {
         }
     }
 
-    /// The default `oklab_compositing: false` key produces the same def vector
-    /// as before the field existed, for both `hdr` values: no `COMPOSITING_SPACE_OKLAB`
-    /// def is pushed, so non-Oklab pipelines stay byte-identical.
+    /// A key with `oklab_compositing: false` pushes no
+    /// `COMPOSITING_SPACE_OKLAB` def, for both `hdr` values.
     #[test]
     fn non_oklab_def_vector_is_byte_identical() {
         let sdr = fxaa_shader_defs(&base_key(false, false));
@@ -313,8 +297,8 @@ mod tests {
         assert!(!hdr.contains(&ShaderDefVal::from("COMPOSITING_SPACE_OKLAB")));
     }
 
-    /// `oklab_compositing: true` appends exactly the `COMPOSITING_SPACE_OKLAB` def,
-    /// independently of the `hdr` flag.
+    /// `oklab_compositing: true` appends the `COMPOSITING_SPACE_OKLAB` def,
+    /// for both `hdr` values.
     #[test]
     fn oklab_def_present_only_when_set() {
         let sdr = fxaa_shader_defs(&base_key(false, true));

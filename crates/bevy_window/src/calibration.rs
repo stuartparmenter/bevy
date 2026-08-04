@@ -1,19 +1,16 @@
 //! Display-calibration provenance carriers that sit alongside the
 //! user-authoritative [`DisplayTarget`](crate::DisplayTarget).
 //!
-//! [`DisplayTarget`](crate::DisplayTarget) is the *intent*: the calibration the
-//! renderer encodes for. These types carry the other three provenances the
-//! renderer merges with that intent — what the display can do
-//! ([`MonitorDisplayCapability`]), what it is doing right now
-//! ([`WindowDisplayState`]), and which fields the engine is allowed to fill in
-//! ([`DisplayCalibrationPolicy`]) — and the merged result
-//! ([`EffectiveDisplayTarget`]) the render pipeline actually consumes.
+//! [`DisplayTarget`](crate::DisplayTarget) is the intent: the calibration the
+//! renderer encodes for. These types carry the other three provenances merged
+//! with that intent: what the display can do ([`MonitorDisplayCapability`]),
+//! what it is doing right now ([`WindowDisplayState`]), and which fields the
+//! engine may fill in ([`DisplayCalibrationPolicy`]). The merged result is
+//! [`EffectiveDisplayTarget`], which the render pipeline consumes.
 //!
-//! All of these are plain data: they carry no renderer types, and the defaults
-//! reproduce Bevy's SDR behavior exactly. A project that touches none of them
-//! renders byte-identically to one that does not know they exist:
-//! [`DisplayCalibrationPolicy`] defaults to all-manual, under which the
-//! renderer never overwrites a single [`DisplayTarget`] field.
+//! All are plain data with no renderer types, and the defaults reproduce Bevy's
+//! SDR behavior exactly: [`DisplayCalibrationPolicy`] defaults to all-manual,
+//! under which the renderer never overwrites a single [`DisplayTarget`] field.
 
 use bevy_ecs::prelude::Component;
 
@@ -31,11 +28,10 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
 /// Static-per-display capability of the [`Monitor`](crate::Monitor) a window is
 /// presented on: how bright it can get and how wide a gamut it covers.
 ///
-/// Its **absence** means "can't tell" — the renderer never treats a missing
-/// component as "SDR". When present, every field is still `Option`: a platform
-/// reports whatever subset it can, and the all-`None` default likewise reads as
-/// "nothing sensed". All luminance fields are absolute nits (candela per square
-/// meter), achromatic CIE *Y*.
+/// Absence means "can't tell", never "SDR". When present, every field is still
+/// `Option`: a platform reports whatever subset it can, and the all-`None`
+/// default likewise reads as "nothing sensed". All luminance fields are
+/// absolute nits (candela per square meter), achromatic CIE *Y*.
 ///
 /// # Placement
 ///
@@ -62,10 +58,10 @@ pub struct MonitorDisplayCapability {
     /// automatic brightness limiting pulls a large bright region down.
     ///
     /// Author [`DisplayTarget::peak_luminance_nits`] from this rather than from
-    /// [`max_nits`] when the content fills the frame with highlights — a sky, a
-    /// snowfield — so tone mapping targets a level the panel can hold. Only
-    /// DXGI reports it, so it is `None` under Metal and Vulkan even on a display
-    /// that has a full-frame ceiling; fall back to [`max_nits`] there.
+    /// [`max_nits`] when content fills the frame with highlights (a sky, a
+    /// snowfield), so tone mapping targets a level the panel can hold. Only
+    /// DXGI reports it, so it is `None` under Metal and Vulkan even on a
+    /// display that has a full-frame ceiling; fall back to [`max_nits`] there.
     ///
     /// [`max_nits`]: Self::max_nits
     pub max_full_frame_nits: Option<f32>,
@@ -77,12 +73,12 @@ pub struct MonitorDisplayCapability {
     pub gamut_hint: Option<crate::DisplayGamut>,
 }
 
-/// The live, drifting display state of a window's surface: how much HDR headroom
-/// the display can drive right now, and the nit level it maps SDR white to.
+/// The live, drifting display state of a window's surface: the HDR headroom the
+/// display can drive right now, and the nit level it maps SDR white to.
 ///
 /// Unlike [`MonitorDisplayCapability`] (static per display) this changes while
-/// the window is open — the user drags the window to another monitor, moves the
-/// SDR-brightness slider, or (on the Apple EDR path) the system headroom shifts
+/// the window is open: the user drags the window to another monitor or moves
+/// the SDR-brightness slider, or, on the Apple EDR path, system headroom shifts
 /// with ambient light, brightness, and thermal conditions. The renderer commits
 /// a fresh reading only once it moves past a relative epsilon and mirrors the
 /// committed value back insert-on-change, so
@@ -90,9 +86,9 @@ pub struct MonitorDisplayCapability {
 /// transition rather than raw read jitter.
 ///
 /// Treat it as read-only diagnostics: writing it has no effect on the surface.
-/// It is absent until the window's first successful read — on a platform that
-/// reports nothing (Vulkan outside Win32, GLES/WebGL, Android) it never appears
-/// at all.
+/// It is absent until the window's first successful read, and never appears at
+/// all on a platform that reports nothing (Vulkan outside Win32, GLES/WebGL,
+/// Android).
 #[derive(Component, Debug, Clone, Copy, Default, PartialEq)]
 #[cfg_attr(
     feature = "bevy_reflect",
@@ -106,14 +102,14 @@ pub struct MonitorDisplayCapability {
 )]
 pub struct WindowDisplayState {
     /// The linear multiplier of SDR (paper) white the display can drive before
-    /// clipping, **right now** — wgpu's `DisplayHdrInfo::tone_map_headroom()`.
+    /// clipping, right now: wgpu's `DisplayHdrInfo::tone_map_headroom()`.
     ///
-    /// This is the one cross-platform live HDR value, folded from whatever the
-    /// backend reports: Apple's live EDR headroom, or `max_nits / sdr_white_nits`
-    /// on Windows, or `1.0` for a definitively-SDR display. `None` means "can't
-    /// tell here", never "SDR". It is exactly what peak-aware tone mapping
-    /// targets — GT7's HDR ceiling is `peak / paper_white`, which auto-resolves to
-    /// this multiplier.
+    /// The one cross-platform live HDR value, folded from whatever the backend
+    /// reports: Apple's live EDR headroom, `max_nits / sdr_white_nits` on
+    /// Windows, or `1.0` for a definitively-SDR display. `None` means "can't
+    /// tell here", never "SDR". It is what peak-aware tone mapping targets:
+    /// GT7's HDR ceiling is `peak / paper_white`, which auto-resolves to this
+    /// multiplier.
     pub tone_map_headroom: Option<f32>,
     /// The luminance, in nits, of SDR reference white on this surface right now.
     ///
@@ -124,23 +120,21 @@ pub struct WindowDisplayState {
     pub sdr_white_nits: Option<f32>,
 }
 
-/// Per-field policy companion to [`DisplayTarget`]: which calibration fields the
-/// engine may auto-resolve from sensed display information.
+/// Per-field policy companion to [`DisplayTarget`]: which calibration fields
+/// the engine may auto-resolve from sensed display information.
 ///
-/// [`DisplayTarget`] stays user-authoritative — the engine never writes it.
-/// This component instead tells the *resolver* which fields of the derived
+/// [`DisplayTarget`] stays user-authoritative; the engine never writes it. This
+/// component tells the resolver which fields of the derived
 /// [`EffectiveDisplayTarget`] may diverge from the authored target when the OS
-/// or display reports something. A `true` field is filled from sensed display
-/// information when a value is available, falling back to the authored value
-/// when nothing is sensed; a `false` field keeps the authored value verbatim.
-/// The default is all-`false`: the effective target equals the authored target
-/// field-for-field, so a project that adds this component (or never does)
-/// renders identically.
+/// or display reports something. A `true` field takes the sensed value when one
+/// is available and the authored value when nothing is sensed; a `false` field
+/// keeps the authored value verbatim. The default is all-`false`, so the
+/// effective target equals the authored target field-for-field.
 ///
-/// [`DisplayTarget::transfer`] is **deliberately absent**: the transfer
-/// function is never auto-resolved, because changing it would force a swapchain
-/// renegotiation. Sensing fills luminance and gamut only; an OS-reported gamut
-/// mismatch may warn but never rewrites the transfer.
+/// [`DisplayTarget::transfer`] is deliberately absent: auto-resolving the
+/// transfer function would force a swapchain renegotiation. Sensing fills
+/// luminance and gamut only; an OS-reported gamut mismatch may warn but never
+/// rewrites the transfer.
 #[derive(Component, Debug, Clone, Copy, Default, PartialEq)]
 #[cfg_attr(
     feature = "bevy_reflect",
@@ -166,10 +160,8 @@ pub struct DisplayCalibrationPolicy {
 impl DisplayCalibrationPolicy {
     /// Whether any field opts into auto-resolution.
     ///
-    /// When this is `false` the resolver is a pure identity pass, so the renderer
-    /// has no reason to keep re-reading the live display state for this window —
-    /// the gate the render-side poll uses to skip continuous sensing on
-    /// all-manual projects.
+    /// When `false` the resolver is a pure identity pass, so the render-side
+    /// poll uses this to skip continuous display sensing for the window.
     pub const fn has_auto(&self) -> bool {
         self.auto_paper_white
             || self.auto_peak_luminance
@@ -178,10 +170,10 @@ impl DisplayCalibrationPolicy {
     }
 }
 
-/// For each [`DisplayTarget`] field, which provenance won the precedence ladder
+/// Which provenance won the precedence ladder for one [`DisplayTarget`] field
 /// in [`EffectiveDisplayTarget`].
 ///
-/// Calibration UIs read this to show *why* a value is what it is — a user
+/// Calibration UIs read this to show why a value is what it is: a user
 /// override, an OS-sensed value, or the SDR default.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 #[cfg_attr(
@@ -195,8 +187,7 @@ impl DisplayCalibrationPolicy {
     reflect(Serialize, Deserialize)
 )]
 pub enum FieldProvenance {
-    /// The authored [`DisplayTarget`] value (the field is not auto-resolved).
-    /// This is the default and the byte-identity case.
+    /// The authored [`DisplayTarget`] value: the field is not auto-resolved.
     #[default]
     User,
     /// A value sensed from the operating system / display took precedence.
@@ -240,17 +231,16 @@ pub struct DisplayProvenance {
 ///
 /// A required component of [`Window`](crate::Window): every window carries one
 /// from spawn (the SDR default), and the resolver rewrites it in place only
-/// when the resolved value changes. Resolution happens in the main world
-/// (before extraction) so that the identity case — an all-manual policy, or a
-/// user-set target with no sensing — has zero frame lag: a user-set-HDR
-/// project shows HDR on its first frame with no SDR pop. The render pipeline
-/// reads [`target`](Self::target) in place of the raw [`DisplayTarget`]; if
-/// the component is removed the pipeline falls back to
-/// [`DisplayTarget::SDR_SRGB`], exactly as it falls back for a missing
-/// [`DisplayTarget`].
+/// when the resolved value changes. Resolution happens in the main world,
+/// before extraction, so the identity case (an all-manual policy, or a user-set
+/// target with no sensing) has zero frame lag and a user-set-HDR project shows
+/// HDR on its first frame with no SDR pop. The render pipeline reads
+/// [`target`](Self::target) in place of the raw [`DisplayTarget`]; if the
+/// component is removed it falls back to [`DisplayTarget::SDR_SRGB`], as it
+/// does for a missing [`DisplayTarget`].
 ///
-/// Defaults to the SDR sRGB target with all-[`User`](FieldProvenance::User)
-/// provenance, identical to the [`DisplayTarget`] default.
+/// The default is the SDR sRGB target with all-[`User`](FieldProvenance::User)
+/// provenance.
 #[derive(Component, Debug, Default, Clone, Copy, PartialEq)]
 #[cfg_attr(
     feature = "bevy_reflect",

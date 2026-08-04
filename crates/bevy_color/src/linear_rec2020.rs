@@ -11,22 +11,19 @@ use bevy_reflect::prelude::*;
 /// (Rec. 2020) wide-gamut primaries, a D65 white point, and an alpha channel.
 ///
 /// Rec. 2020 covers roughly 76% of the CIE 1931 chromaticity diagram (compared to
-/// roughly 36% for the Rec. 709 / sRGB primaries used by [`LinearRgba`]), making it
-/// the standard container gamut for HDR and wide-color-gamut content. All Rec. 709
-/// colors and almost all Display P3 colors fit inside it with non-negative
-/// components (the extreme edge of P3's red corner lies marginally outside
-/// Rec. 2020 and yields a tiny negative blue component).
+/// roughly 36% for the Rec. 709 primaries used by [`LinearRgba`]), which makes it
+/// the standard container gamut for HDR and wide-gamut content. All Rec. 709 colors
+/// and almost all Display P3 colors fit inside it with non-negative components.
 ///
-/// Component values are linear (no transfer function is applied). `(1.0, 1.0, 1.0)`
-/// is the D65 reference white at SDR paper-white intensity, matching
-/// [`LinearRgba::WHITE`]; values above `1.0` represent HDR intensities and are fully
-/// supported.
+/// Component values are linear. `(1.0, 1.0, 1.0)` is the D65 reference white at SDR
+/// paper-white intensity, the same white as [`LinearRgba::WHITE`]. Values above
+/// `1.0` are HDR intensities.
 ///
-/// Conversions to and from other color spaces are defined through [`Xyza`] using
-/// full-precision matrices derived from the BT.2020 primary chromaticities
-/// (R `(0.708, 0.292)`, G `(0.170, 0.797)`, B `(0.131, 0.046)`) with the crate's
-/// D65 reference white ([`Xyza::D65_WHITE`]), so that white round-trips exactly
-/// between [`LinearRec2020`], [`Xyza`], and [`LinearRgba`].
+/// Conversions to and from other color spaces go through [`Xyza`], using matrices
+/// derived from the BT.2020 primary chromaticities (R `(0.708, 0.292)`,
+/// G `(0.170, 0.797)`, B `(0.131, 0.046)`) and the crate's D65 reference white
+/// ([`Xyza::D65_WHITE`]), so white round-trips exactly between [`LinearRec2020`],
+/// [`Xyza`], and [`LinearRgba`].
 #[doc = include_str!("../docs/conversion.md")]
 /// <div>
 #[doc = include_str!("../docs/diagrams/model_graph.svg")]
@@ -43,14 +40,11 @@ use bevy_reflect::prelude::*;
     reflect(Serialize, Deserialize)
 )]
 pub struct LinearRec2020 {
-    /// The red channel. [0.0, 1.0] for SDR colors; values outside this range
-    /// represent HDR intensities or out-of-gamut colors.
+    /// The red channel. [0.0, 1.0] for SDR colors; other values are HDR or out of gamut.
     pub red: f32,
-    /// The green channel. [0.0, 1.0] for SDR colors; values outside this range
-    /// represent HDR intensities or out-of-gamut colors.
+    /// The green channel. [0.0, 1.0] for SDR colors; other values are HDR or out of gamut.
     pub green: f32,
-    /// The blue channel. [0.0, 1.0] for SDR colors; values outside this range
-    /// represent HDR intensities or out-of-gamut colors.
+    /// The blue channel. [0.0, 1.0] for SDR colors; other values are HDR or out of gamut.
     pub blue: f32,
     /// The alpha channel. [0.0, 1.0]
     pub alpha: f32,
@@ -61,10 +55,10 @@ impl StandardColor for LinearRec2020 {}
 impl_componentwise_vector_space!(LinearRec2020, [red, green, blue, alpha]);
 
 impl LinearRec2020 {
-    /// Linear Rec. 2020 → CIE 1931 XYZ matrix, derived from the ITU-R BT.2020-2
-    /// primary chromaticities with the [`Xyza::D65_WHITE`] reference white using the
+    /// Linear Rec. 2020 to CIE 1931 XYZ matrix, derived from the ITU-R BT.2020-2
+    /// chromaticities with the same
     /// [Lindbloom method](http://www.brucelindbloom.com/index.html?Eqn_RGB_XYZ_Matrix.html)
-    /// (the same derivation and reference white as the crate's sRGB ↔ XYZ matrices).
+    /// and reference white as the crate's sRGB to XYZ matrices.
     ///
     /// Row-major rows: X, Y, Z. The first entry of the Z row is exactly zero because
     /// the BT.2020 red primary lies on the `x + y = 1` line of the chromaticity
@@ -75,7 +69,7 @@ impl LinearRec2020 {
         [0.0, 0.028_072_33, 1.060_757_6],
     ];
 
-    /// CIE 1931 XYZ → linear Rec. 2020 matrix; the inverse of
+    /// CIE 1931 XYZ to linear Rec. 2020 matrix; the inverse of
     /// [`Self::RGB_TO_XYZ`]. Row-major rows: red, green, blue.
     const XYZ_TO_RGB: [[f32; 3]; 3] = [
         [1.716_510_7, -0.355_641_66, -0.253_345_55],
@@ -92,9 +86,6 @@ impl LinearRec2020 {
     };
 
     /// A fully white color with full alpha.
-    ///
-    /// This is the same D65 white as [`LinearRgba::WHITE`], at SDR paper-white
-    /// intensity.
     pub const WHITE: Self = Self {
         red: 1.0,
         green: 1.0,
@@ -152,25 +143,17 @@ impl LinearRec2020 {
         Self { blue, ..self }
     }
 
-    /// Make the color lighter or darker by some amount.
-    ///
-    /// See [`LinearRgba::darker`] / [`LinearRgba::lighter`] for the semantics; this
-    /// is the same operation using the Rec. 2020 luminance weights. Colors within
-    /// the standard SDR range (luminance and every color channel at most `1.0`)
-    /// keep the documented clamp-to-black / clamp-to-white behavior; HDR colors
-    /// (luminance *or* any individual channel above `1.0`) are adjusted without an
-    /// upper clamp, scaling the color and preserving its chromaticity.
+    /// Make the color lighter or darker by some amount. SDR colors keep the
+    /// clamp-to-black / clamp-to-white behavior of [`Luminance::darker`] and
+    /// [`Luminance::lighter`]. HDR colors are adjusted without an upper clamp,
+    /// scaling the color and preserving their chromaticity.
     fn adjust_lightness(&mut self, amount: f32) {
         let luminance = self.luminance();
-        // A color is SDR only if neither its luminance nor any channel exceeds
-        // standard white; a saturated color can have channels above 1.0 while its
-        // luminance stays below 1.0.
+        // A saturated color can have channels above 1.0 while its luminance stays below 1.0.
         let is_sdr = luminance <= 1.0 && self.red <= 1.0 && self.green <= 1.0 && self.blue <= 1.0;
         let target_luminance = if is_sdr {
-            // SDR contract: luminance stays within [0, 1].
             (luminance + amount).clamp(0.0, 1.0)
         } else {
-            // HDR: extend without an upper clamp.
             (luminance + amount).max(0.0)
         };
         if target_luminance < luminance {
@@ -181,7 +164,6 @@ impl LinearRec2020 {
                 let adjustment = (target_luminance - luminance) / (1. - luminance);
                 self.mix_assign(Self::new(1.0, 1.0, 1.0, self.alpha), adjustment);
             } else {
-                // HDR: scale the color, preserving its chromaticity.
                 let scale = target_luminance / luminance;
                 self.red *= scale;
                 self.green *= scale;
@@ -200,21 +182,18 @@ impl Default for LinearRec2020 {
 }
 
 impl Luminance for LinearRec2020 {
-    /// Relative luminance using the Rec. 2020 weights (the Y row of the
-    /// Rec. 2020 → XYZ matrix; approximately `0.2627 R + 0.6780 G + 0.0593 B`,
-    /// per ITU-R BT.2020).
+    /// Relative luminance using the Rec. 2020 weights: the Y row of the RGB to XYZ
+    /// matrix, approximately `0.2627 R + 0.6780 G + 0.0593 B` per ITU-R BT.2020.
     #[inline]
     fn luminance(&self) -> f32 {
         let [lr, lg, lb] = Self::RGB_TO_XYZ[1];
         self.red * lr + self.green * lg + self.blue * lb
     }
 
-    /// Scales the color so that it has the target luminance, preserving its
-    /// chromaticity.
+    /// Scales the color to the target luminance, preserving its chromaticity.
     ///
-    /// When both the input color and the target luminance are within the standard
-    /// SDR range (components and target in `[0.0, 1.0]`), the result is clamped to
-    /// that range. HDR inputs or targets are passed through without clamping.
+    /// If the components are all within `[0.0, 1.0]` and the target is at most `1.0`,
+    /// the result is clamped to that range.
     #[inline]
     fn with_luminance(&self, luminance: f32) -> Self {
         let current_luminance = self.luminance();
@@ -225,9 +204,7 @@ impl Luminance for LinearRec2020 {
             self.blue * adjustment,
         );
         let sdr = |c: f32| (0.0..=1.0).contains(&c);
-        // The target check only excludes HDR targets (> 1.0): a negative
-        // target is nonphysical, not HDR, and keeps the clamp-to-black
-        // behavior (NaN targets fail the comparison and pass through).
+        // A negative target clamps an SDR color to black. NaN passes through unclamped.
         if sdr(self.red) && sdr(self.green) && sdr(self.blue) && luminance <= 1.0 {
             Self {
                 red: red.clamp(0., 1.),
@@ -610,8 +587,8 @@ mod tests {
 
     #[test]
     fn rec709_red_matches_bt2087() {
-        // Converting pure Rec.709 red into Rec.2020 must match the first column of
-        // the published ITU-R BT.2087 matrix.
+        // Pure Rec.709 red in Rec.2020 must match the first column of the published
+        // ITU-R BT.2087 matrix.
         let red: LinearRec2020 = LinearRgba::RED.into();
         assert_approx_eq!(red.red, 0.6274, 1e-3);
         assert_approx_eq!(red.green, 0.0691, 1e-3);
@@ -629,7 +606,7 @@ mod tests {
 
     #[test]
     fn hdr_lighter_darker() {
-        // SDR colors keep the documented clamp-to-white behavior.
+        // SDR colors keep the clamp-to-white behavior.
         let sdr = LinearRec2020::rgb(0.9, 0.9, 0.9);
         let lighter = sdr.lighter(0.5);
         assert_approx_eq!(lighter.luminance(), 1.0, 1e-5);
@@ -641,9 +618,8 @@ mod tests {
         let darker = hdr.darker(0.5);
         assert_approx_eq!(darker.luminance(), 1.5, 1e-4);
 
-        // A saturated HDR color (channel above 1.0, luminance below 1.0) is treated
-        // as HDR, consistently with `with_luminance`: `lighter` scales it while
-        // preserving its chromaticity instead of crushing it to SDR white.
+        // A saturated HDR color (channel above 1.0, luminance below 1.0) counts as HDR:
+        // `lighter` scales it instead of crushing it to SDR white.
         let saturated_hdr = LinearRec2020::rgb(3.0, 0.0, 0.0);
         let luminance = saturated_hdr.luminance();
         assert!(luminance < 1.0);

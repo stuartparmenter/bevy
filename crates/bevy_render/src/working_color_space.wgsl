@@ -1,27 +1,24 @@
 // Working-color-space conversion helpers.
 //
-// Bevy's scene-referred working color space is linear Rec.709 by default and
-// linear Rec.2020 when `WorkingColorSpace::Rec2020` is configured on
-// `RenderPlugin` (see `bevy_render::working_color_space` on the Rust side).
-// When the working space is Rec.2020, every shader receives the
-// `WORKING_COLOR_SPACE_REC2020` def globally (via the pipeline cache); call
-// sites are expected to gate their use of these helpers behind that def so
-// that default (Rec.709) projects compose byte-identically to shaders that
-// predate this module.
+// The scene-referred working color space is linear Rec.709 by default, and
+// linear Rec.2020 when `WorkingColorSpace::Rec2020` is set on `RenderPlugin`.
+// See `bevy_render::working_color_space` on the Rust side. Under Rec.2020 the
+// pipeline cache gives every shader the `WORKING_COLOR_SPACE_REC2020` def.
+// Call sites should gate these helpers behind that def, so default Rec.709
+// projects compose byte-identically to shaders that predate this module.
 //
-// The matrices below are not gated by that def: the display-encoding pass
-// imports all four for its gamut stage, which is keyed by the display target
-// rather than by the working space.
+// The matrices themselves are not gated. The display-encoding pass imports all
+// four for its gamut stage, which is keyed by the display target rather than
+// the working space.
 
 #define_import_path bevy_render::working_color_space
 
-// Full-precision linear Rec.709 -> Rec.2020 matrix (D65, per ITU-R BT.2087;
-// f64-derived via the Lindbloom primaries->XYZ method). The f64 literals round
-// to f32 values bit-identical to
-// `bevy_render::working_color_space::REC709_TO_REC2020` on the Rust side (and
-// to `GT7_REC_709_TO_REC_2020` in gt7.wgsl); keep them in sync. A chromaticity
-// re-derivation (`bevy_color::rgb_to_rgb_matrix`) lands a few ULP away and is
-// not a substitute.
+// Linear Rec.709 -> Rec.2020 matrix (D65, per ITU-R BT.2087), derived in f64
+// by the Lindbloom primaries-to-XYZ method. The f64 literals round to f32
+// values bit-identical to `bevy_render::working_color_space::REC709_TO_REC2020`
+// on the Rust side and to `GT7_REC_709_TO_REC_2020` in gt7.wgsl. Keep them in
+// sync. Re-deriving from chromaticities (`bevy_color::rgb_to_rgb_matrix`) lands
+// a few ULP away and is not a substitute.
 const REC709_TO_REC2020 = mat3x3<f32>(
     0.627403895934699, 0.06909728935823199, 0.016391438875150228,   // column 0
     0.32928303837788375, 0.919540395075459, 0.08801330787722578,    // column 1
@@ -36,8 +33,8 @@ const REC2020_TO_REC709 = mat3x3<f32>(
     -0.07284986331988484, -0.008349422604369487, 1.1187296613629125, // column 2
 );
 
-// Full-precision linear Rec.709 -> Display-P3 matrix (both D65; DCI-P3
-// primaries), f64-derived by the same method. Bit-identical to
+// Linear Rec.709 -> Display-P3 matrix (both D65, DCI-P3 primaries), derived by
+// the same method. Bit-identical to
 // `bevy_render::working_color_space::REC709_TO_DISPLAYP3` on the Rust side.
 // The shared blue primary makes the third column's off-diagonals exactly zero.
 const REC709_TO_DISPLAYP3 = mat3x3<f32>(
@@ -46,10 +43,10 @@ const REC709_TO_DISPLAYP3 = mat3x3<f32>(
     0.0, 0.0, 0.910519928614916,                                 // column 2
 );
 
-// Full-precision linear Rec.2020 -> Display-P3 matrix (both D65). Unlike the
-// Rec.709 case this is a gamut *contraction* (Display-P3 is a subset of
-// Rec.2020), so it can produce negative components. Bit-identical to
-// `bevy_render::working_color_space::REC2020_TO_DISPLAYP3` on the Rust side.
+// Linear Rec.2020 -> Display-P3 matrix (both D65). Display-P3 sits inside
+// Rec.2020, so this contracts the gamut and can produce negative components.
+// Bit-identical to `bevy_render::working_color_space::REC2020_TO_DISPLAYP3` on
+// the Rust side.
 const REC2020_TO_DISPLAYP3 = mat3x3<f32>(
     1.34357825258433, -0.0652974527891195, 0.00282178726170105,  // column 0
     -0.282179670526136, 1.07578791584857, -0.0195984945244942,   // column 1
@@ -57,16 +54,14 @@ const REC2020_TO_DISPLAYP3 = mat3x3<f32>(
 );
 
 // Converts a linear Rec.709 color into the linear Rec.2020 working space.
-// Out-of-gamut inputs (negative components) convert linearly like any other
-// value; no clamping is applied.
+// Negative components convert like any other value. Nothing is clamped.
 fn rec709_to_rec2020(color: vec3<f32>) -> vec3<f32> {
     return REC709_TO_REC2020 * color;
 }
 
 // Converts a linear Rec.2020 working-space color to linear Rec.709.
-// Colors outside the Rec.709 gamut produce negative components; callers that
-// feed Rec.709-fit consumers (tone mapping operators, LUTs) are responsible
-// for clamping.
+// Colors outside the Rec.709 gamut come out with negative components. Callers
+// feeding Rec.709-fit consumers (tone mapping operators, LUTs) must clamp.
 fn rec2020_to_rec709(color: vec3<f32>) -> vec3<f32> {
     return REC2020_TO_REC709 * color;
 }

@@ -16,24 +16,12 @@ use bevy_utils::default;
 /// Writer-side encode state of the view a UI node renders into, shared by
 /// every UI pipeline key.
 ///
-/// UI runs after tone mapping and composites into the post-tonemap buffer, so
-/// its fragment output must match that buffer's conventions on two axes:
-///
-/// - `buffer_gamut_rec2020`: UI colors are authored in Rec.709; on a GT7 HDR
-///   view the buffer holds Rec.2020 primaries, so the fragment converts its
-///   color first (the `OUTPUT_GAMUT_REC2020` writer-encode def).
-/// - `compositing_space`: a resolved [`Srgb`](CompositingSpace::Srgb) or
-///   [`Oklab`](CompositingSpace::Oklab) buffer holds encoded values, so the
-///   straight-alpha output is encoded to match (the `COMPOSITING_SPACE_SRGB`
-///   / `COMPOSITING_SPACE_OKLAB` defs shared with sprites) and the terminal
-///   decode reads it correctly.
-///
-/// The default key pushes no defs, keeping the SDR shader-def vector
-/// byte-identical.
+/// UI colors are authored in Rec.709 and composite into the post-tonemap
+/// buffer, so the fragment converts and encodes them to match it. The default
+/// key pushes no defs, keeping the SDR shader-def vector byte-identical.
 #[derive(Clone, Copy, Default, Hash, PartialEq, Eq)]
 pub struct UiWriterEncodeKey {
-    /// Resolved [`CompositingSpace`] of the view
-    /// ([`ViewStackContract::compositing_space`]).
+    /// Resolved [`CompositingSpace`] of the view ([`ViewStackContract::compositing_space`]).
     pub compositing_space: Option<CompositingSpace>,
     /// Whether the post-tonemap buffer uses Rec.2020 primaries
     /// ([`ViewStackContract::source_gamut_is_rec2020`]).
@@ -174,9 +162,6 @@ mod tests {
         defs
     }
 
-    /// A default view (no compositing-space request or a `Linear` one, Rec.709
-    /// buffer) must leave the shader-def vector untouched so the default UI
-    /// pipeline compiles byte-identically.
     #[test]
     fn no_writer_encode_for_default_or_linear() {
         let baseline = vec![ShaderDefVal::from("ANTI_ALIAS")];
@@ -194,9 +179,6 @@ mod tests {
         assert_eq!(linear_defs, baseline);
     }
 
-    /// A resolved `Srgb` view appends exactly `COMPOSITING_SPACE_SRGB` (the
-    /// writer-encode def family shared with sprites), a resolved `Oklab` view
-    /// exactly `COMPOSITING_SPACE_OKLAB` — each one def, never the other.
     #[test]
     fn compositing_space_appends_exactly_its_def() {
         assert_eq!(
@@ -215,8 +197,6 @@ mod tests {
         );
     }
 
-    /// A Rec.2020 buffer appends exactly `OUTPUT_GAMUT_REC2020` (the
-    /// writer-encode gamut def shared with sprites), nothing else.
     #[test]
     fn rec2020_buffer_appends_exactly_the_gamut_def() {
         assert_eq!(
@@ -228,9 +208,8 @@ mod tests {
         );
     }
 
-    /// Both axes together push in buffer order — gamut convert before the
-    /// compositing-space encode — pinning one def order for every UI pipeline
-    /// (def order is part of the shader-cache key).
+    /// Def order is part of the shader-cache key, so it has to be the same
+    /// for every pipeline.
     #[test]
     fn combined_key_pushes_gamut_then_space() {
         assert_eq!(

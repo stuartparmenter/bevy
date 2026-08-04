@@ -3,17 +3,17 @@
 // materials, gizmos, UI).
 //
 // Two def-gated steps, in buffer order:
-//   1. `OUTPUT_GAMUT_REC2020` — the destination buffer uses Rec.2020
-//      primaries, so the composed Rec.709 color converts once, after
-//      composition. Pre-tonemap writers key this off the project-global
-//      `WorkingColorSpace`; post-tonemap writers (UI) key it per view off the
+//   1. `OUTPUT_GAMUT_REC2020`: the destination buffer uses Rec.2020 primaries,
+//      so the composed Rec.709 color converts once, after composition.
+//      Pre-tonemap writers key this off the project-global
+//      `WorkingColorSpace`. Post-tonemap writers (UI) key it per view off the
 //      buffer's resolved source gamut.
-//   2. `COMPOSITING_SPACE_SRGB` / `COMPOSITING_SPACE_OKLAB` — the view
+//   2. `COMPOSITING_SPACE_SRGB` or `COMPOSITING_SPACE_OKLAB`: the view
 //      composites in an encoded space, so the output is encoded to match and
-//      blending happens in that space (the terminal decode reverses it).
+//      blending happens in that space. The terminal decode reverses it.
 //
-// Default Rec.709 / linear views push no defs and compile a pass-through. The
-// alpha channel is left untouched.
+// Default Rec.709 linear views push no defs and compile a pass-through. Alpha
+// is untouched.
 
 #define_import_path bevy_render::writer_encode
 

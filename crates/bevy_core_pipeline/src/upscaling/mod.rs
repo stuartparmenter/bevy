@@ -46,21 +46,15 @@ fn clear_view_upscaling_pipelines(
     }
 }
 
-/// The compositing space the upscaling blit decodes from, derived from the
+/// The compositing space the upscaling blit decodes from, taken from the
 /// view's [`ViewStackContract`].
 ///
-/// When the display-encoding pass runs for the view's stack (the contract
-/// carries resolved encode parameters), the main texture holds an
-/// already-encoded signal (scRGB-linear, PQ, or encoded extended-range sRGB):
-/// the blit must pass it through unchanged, and any compositing-space decode
-/// was already performed by the encoder. The blit and the encoder read the same
-/// contract field, so the two can never disagree. Encode parameters only
-/// resolve when surface selection actually negotiated a non-sRGB-view surface
-/// (e.g. `Rgba16Float` for scRGB-linear / extended-sRGB), where no hardware
-/// sRGB encode happens on store: the encoded signal reaches the display
-/// unchanged. Downgraded requests resolve to plain
-/// SDR (no encode parameters) and keep the normal
-/// decode-and-hardware-encode path.
+/// Returns `None` when the stack resolved encode parameters. The display
+/// encoder already did the compositing-space decode and the main texture
+/// holds encoded signal (scRGB-linear, PQ, or encoded extended-range sRGB),
+/// so the blit passes it through. A deferred encode normally skips its blit
+/// ([`BlitDisposition::SkipDeferred`]). A request downgraded to plain SDR
+/// carries no encode parameters and keeps the decode-and-hardware-encode path.
 fn blit_source_space(contract: Option<&ViewStackContract>) -> Option<CompositingSpace> {
     let contract = contract?;
     if contract.encoding.is_some() {
@@ -73,14 +67,11 @@ fn blit_source_space(contract: Option<&ViewStackContract>) -> Option<Compositing
 /// The blend state of a camera whose upscaling blit auto-detects its blend
 /// (`CameraOutputMode::Write { blend_state: None }`).
 ///
-/// The first camera to render to an output (`sorted_index == 0`) replaces;
-/// later cameras alpha-blend so they composite over earlier cameras instead of
-/// overwriting them. `force_replace` upgrades the auto-detected blend of a
-/// stack finalizer to replace: it is the lowest surviving blit of a stack
-/// whose earlier blits were skipped, so it carries the whole composition and
-/// must not blend over the cleared out texture. An explicit user `blend_state`
-/// is handled by the caller and is never routed through here, so
-/// `force_replace` never overrides it.
+/// The first camera to render to an output (`sorted_index == 0`) replaces.
+/// Later cameras alpha-blend so they composite over earlier cameras instead
+/// of overwriting them. A [`BlitDisposition::Run`] with `force_replace`
+/// replaces too, because that blit carries the whole composition and must not
+/// blend over the cleared out texture.
 fn auto_blit_blend_state(force_replace: bool, sorted_index: usize) -> Option<BlendState> {
     if force_replace || sorted_index == 0 {
         None
@@ -103,12 +94,10 @@ fn prepare_view_upscaling_pipelines(
     )>,
 ) {
     for (entity, view_target, camera, maybe_pipeline, contract) in view_targets.iter() {
-        // A view ordered below its stack's finalizer must not blit: its main
-        // texture holds the not-yet-finalized buffer (un-tonemapped, and
-        // un-encoded on HDR), and as the lowest surviving blit it would steal
-        // the finalizer's replace. Removing the pipeline keeps the node from
-        // running (its `ViewQuery` hard-requires the component), so the out
-        // texture stays untouched until the finalizer's first blit.
+        // A view below its stack's finalizer skips its blit, see
+        // `BlitDisposition::SkipDeferred`. Removing the pipeline keeps the
+        // node from running, since its `ViewQuery` requires the component, so
+        // the out texture stays untouched until the finalizer blits.
         let force_replace = match contract.map(|contract| contract.blit) {
             Some(BlitDisposition::SkipDeferred) => {
                 commands.entity(entity).remove::<ViewUpscalingPipeline>();
@@ -166,7 +155,7 @@ mod tests {
     use crate::camera_stack::{ResolvedEncoding, StackRole};
     use bevy_window::{DisplayGamut, DisplayTransfer};
 
-    /// A solo SDR view's contract: no encode parameters, no resolved space.
+    /// A solo SDR view's contract, with no encode parameters.
     fn sdr_contract(compositing_space: Option<CompositingSpace>) -> ViewStackContract {
         ViewStackContract {
             tonemap: StackRole::Solo,
@@ -180,9 +169,6 @@ mod tests {
         }
     }
 
-    /// Key-derivation: a solo default camera blits with no source-space
-    /// decode — byte-identical to a hand-constructed key with
-    /// `source_space: None`.
     #[test]
     fn solo_sdr_default_keys_no_source_space() {
         let contract = sdr_contract(None);
@@ -201,8 +187,6 @@ mod tests {
         assert!(key == expected);
     }
 
-    /// Key-derivation: an SDR view with a resolved space keys the blit's
-    /// decode for exactly that space.
     #[test]
     fn resolved_space_keys_the_blit_decode_on_sdr() {
         assert_eq!(
@@ -215,8 +199,6 @@ mod tests {
         );
     }
 
-    /// When the stack resolves encode parameters, the encoder performs the
-    /// decode and the blit passes the encoded signal through unchanged.
     #[test]
     fn encoded_views_blit_without_decode() {
         let mut contract = sdr_contract(Some(CompositingSpace::Srgb));
@@ -227,14 +209,11 @@ mod tests {
         assert_eq!(blit_source_space(Some(&contract)), None);
     }
 
-    /// Views without a contract blit with no decode.
     #[test]
     fn missing_contract_blits_without_decode() {
         assert_eq!(blit_source_space(None), None);
     }
 
-    /// The first camera to render to an output replaces (no auto blend) and
-    /// later cameras alpha-blend so they composite over earlier output.
     #[test]
     fn auto_blend_is_replace_for_first_camera_and_alpha_for_later() {
         assert_eq!(auto_blit_blend_state(false, 0), None);
@@ -248,14 +227,10 @@ mod tests {
         );
     }
 
-    /// `force_replace` upgrades a stack finalizer's auto-detected blend to
-    /// replace even when the finalizer's own sorted index is above zero: it is
-    /// the lowest surviving blit and carries the whole composition.
     #[test]
     fn force_replace_upgrades_later_finalizer_to_replace() {
         assert_eq!(auto_blit_blend_state(true, 1), None);
         assert_eq!(auto_blit_blend_state(true, 2), None);
-        // A first-camera finalizer already replaces; force_replace is a no-op.
         assert_eq!(auto_blit_blend_state(true, 0), None);
     }
 }

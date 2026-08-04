@@ -16,59 +16,46 @@ use tracing::warn;
 ///
 /// Auto white balance estimates the scene's dominant illuminant chromaticity
 /// and slowly adapts a correction towards a neutral (D65) white point,
-/// mimicking the chromatic adaptation of human vision (and of camera AWB).
+/// mimicking the chromatic adaptation of human vision.
 ///
 /// The measurement rides along in [`AutoExposure`]'s metering pass, so this
 /// component requires [`AutoExposure`] and pulls it in when added on its own.
 ///
-/// # How it works
+/// * Metering uses the same per-pixel metering-mask weights as the luminance
+///   histogram to build a luminance-weighted average of the scene's CIE 1931
+///   xy chromaticity, blended in [Yxy] space as Gran Turismo 7 does.
+/// * A faint virtual light, an ideal D65 source of luminance
+///   [`virtual_light_anchor`](Self::virtual_light_anchor), is blended into the
+///   measurement so near-dark scenes stay anchored at neutral instead of
+///   chasing measurement noise.
+/// * Adaptation smooths only the xy chromaticity over time, at
+///   [`speed`](Self::speed). Luminance adaptation is [`AutoExposure`]'s job.
+/// * The adapted chromaticity is converted to a correlated color temperature
+///   (the `McCamy` 1992 approximation) plus a tint offset from the Planckian
+///   locus. The temperature is clamped to the 2500 K - 7000 K range typical of
+///   real camera AWB specifications. The result is applied as a von Kries
+///   adaptation in the same LMS basis Bevy's static white balance uses, by
+///   multiplying the correction matrix into the view's
+///   [`ColorGrading`](bevy_render::view::ColorGrading) balance matrix on the GPU.
 ///
-/// * **Metering** shares the [`AutoExposure`] compute pass: the same
-///   per-pixel metering-mask weights drive both the luminance histogram and a
-///   luminance-weighted average of the scene's CIE 1931 *xy* chromaticity (a
-///   [Yxy] measurement, the blend space Gran Turismo 7 settled on). One
-///   metering dispatch serves both adaptations.
-/// * **Stability**: a faint *virtual light* — an ideal D65 light source of
-///   luminance [`virtual_light_anchor`](Self::virtual_light_anchor) — is
-///   blended into the measurement as one more luminance-weighted reference.
-///   In bright scenes it is negligible; in dark scenes it dominates, anchoring
-///   the white point at neutral instead of chasing measurement noise. This is
-///   Gran Turismo 7's dark-scene stability mechanism.
-/// * **Adaptation** smooths only the *xy* chromaticity over time at
-///   [`speed`](Self::speed) (luminance adaptation is [`AutoExposure`]'s job).
-/// * **Output**: the adapted chromaticity is converted to a correlated color
-///   temperature (the `McCamy` 1992 approximation) plus a tint offset from the
-///   Planckian locus, the temperature is clamped to the **2500 K – 7000 K**
-///   range typical of real camera AWB specifications, and the result is
-///   applied as a von Kries adaptation in the same LMS basis Bevy's existing
-///   white-balance machinery uses: the correction matrix is multiplied into
-///   the view's [`ColorGrading`](bevy_render::view::ColorGrading) balance
-///   matrix on the GPU.
-///
-/// # Composition with manual color grading
-///
-/// The automatic correction composes with, and does not overwrite, the
-/// artist-authored [`ColorGrading`](bevy_render::view::ColorGrading)
-/// `temperature`/`tint` values: the automatic correction (towards neutral) is
-/// applied to the image first, and the manual white-balance adjustment is
-/// applied on top of the corrected image. A deliberate "warm tungsten" grade
-/// therefore stays warm regardless of the scene's measured illuminant.
+/// The automatic correction composes with the artist-authored
+/// [`ColorGrading`](bevy_render::view::ColorGrading) `temperature`/`tint`
+/// instead of overwriting them.
 ///
 /// # Usage Notes
 ///
 /// Like [`AutoExposure`], the correction is consumed by the tonemapping pass,
 /// so cameras with `Tonemapping::None` are unaffected, and the metering runs
 /// in a compute shader (**not compatible with WebGL2**).
-/// Hue-preserving tone-mapping operators (`TonyMcMapface`, `AgX`,
-/// `KhronosPbrNeutral`, `GranTurismo7`) preserve the corrected white point
-/// best; purely per-channel operators (`Reinhard`, `ReinhardLuminance`,
-/// `SomewhatBoringDisplayTransform`) may shift the corrected color slightly
-/// away from neutral again.
 ///
-/// Add this component to a 3d camera together with the
-/// [`AutoExposurePlugin`](super::AutoExposurePlugin) (which owns the shared
-/// metering infrastructure). The metering pass runs only in the 3d core
-/// pipeline, so the correction has no effect on 2d cameras.
+/// Hue-preserving operators (`TonyMcMapface`, `AgX`, `KhronosPbrNeutral`,
+/// `GranTurismo7`, `ReinhardLuminance`) preserve the corrected white point best.
+/// Per-channel operators (`Reinhard`, `SomewhatBoringDisplayTransform`) can
+/// shift it slightly away from neutral again.
+///
+/// Add this component to a 3d camera together with
+/// [`AutoExposurePlugin`](super::AutoExposurePlugin). The metering pass runs
+/// only in the 3d core pipeline, so this has no effect on 2d cameras.
 ///
 /// [Yxy]: https://en.wikipedia.org/wiki/CIE_1931_color_space#CIE_xy_chromaticity_diagram_and_the_CIE_xyY_color_space
 #[derive(Component, Clone, Copy, Debug, PartialEq, Reflect)]
@@ -77,27 +64,23 @@ use tracing::warn;
 pub struct AutoWhiteBalance {
     /// The adaptation speed of the white-point chromaticity, per second.
     ///
-    /// This is the rate constant of an exponential approach: each second, the
-    /// adapted chromaticity moves this fraction of the remaining distance
-    /// towards the measured scene chromaticity (values are clamped so a
-    /// single frame never overshoots). Around `0.5`, adaptation settles in a
-    /// few seconds, comparable to a real camera's AWB; chromatic adaptation
-    /// is deliberately slower than exposure adaptation.
+    /// The rate constant of an exponential approach: each second the adapted
+    /// chromaticity moves this fraction of the remaining distance towards the
+    /// measured scene chromaticity. A single frame never overshoots.
     ///
-    /// Must be finite and non-negative. The default value is 0.5.
+    /// Must be finite and non-negative. The default value is 0.5, which settles
+    /// in a few seconds, like a real camera's AWB. Chromatic adaptation is
+    /// deliberately slower than exposure adaptation.
     pub speed: f32,
 
-    /// The luminance of the faint *virtual light* — an ideal D65 illuminant
-    /// blended into the scene measurement as a luminance-weighted reference —
-    /// in scene-linear luminance units (the same units as the rendered pixel
-    /// values that auto exposure meters).
+    /// The luminance of the virtual light, an ideal D65 illuminant blended into
+    /// the scene measurement as a luminance-weighted reference, in the
+    /// scene-linear units auto exposure meters.
     ///
-    /// The blend weight of the anchor relative to the measurement is
-    /// `virtual_light_anchor / (virtual_light_anchor + scene_luminance)`, so
-    /// its influence scales with the *inverse* of the mean scene luminance:
-    /// negligible in normal lighting, dominant in near-dark scenes where a
-    /// measured chromaticity would be noise. Set it to `0.0` to disable the
-    /// anchor and always trust the measurement.
+    /// The anchor's weight relative to the measurement is
+    /// `virtual_light_anchor / (virtual_light_anchor + scene_luminance)`, so it
+    /// is negligible in normal lighting and dominant in near-dark scenes. Set it
+    /// to `0.0` to disable the anchor and always trust the measurement.
     ///
     /// Must be finite and non-negative. The default value is 0.01.
     pub virtual_light_anchor: f32,
@@ -113,11 +96,7 @@ impl Default for AutoWhiteBalance {
 }
 
 impl AutoWhiteBalance {
-    /// Returns a copy of these settings with invalid fields reset to their
-    /// default values.
-    ///
-    /// Both fields must be finite and non-negative. Warns (once) if any field
-    /// had to be reset.
+    /// Invalid fields are reset to their defaults, warning once.
     pub(super) fn sanitized(&self) -> Self {
         let defaults = Self::default();
         let mut invalid = false;
@@ -157,10 +136,9 @@ impl ExtractComponent<RenderApp> for AutoWhiteBalance {
     type QueryData = &'static Self;
     type QueryFilter = With<Camera>;
     // The `ExternalWhiteBalance` marker keeps the tonemapping pass's
-    // `WHITE_BALANCE` shader path compiled in for this view even when the
-    // static `ColorGrading` temperature/tint deltas are zero, since the
-    // metering compute pass composes the automatic correction matrix into
-    // `view.color_grading.balance` on the GPU.
+    // `WHITE_BALANCE` shader path compiled in for this view even when the static
+    // `ColorGrading` temperature/tint deltas are zero, because the metering pass
+    // composes the correction matrix into `view.color_grading.balance` on the GPU.
     type Out = (Self, ExternalWhiteBalance);
 
     fn extract_component(item: QueryItem<'_, '_, Self::QueryData>) -> Option<Self::Out> {

@@ -262,8 +262,6 @@ impl PipelineCache {
             device.limits().max_storage_buffers_per_shader_stage,
         ));
 
-        // Project-global working-space axis. Not registered for the default
-        // Rec.709 working space, so default projects compose byte-identically.
         if working_color_space.is_rec2020() {
             global_shader_defs.push(WORKING_COLOR_SPACE_REC2020_SHADER_DEF.into());
         }

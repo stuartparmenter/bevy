@@ -1,25 +1,21 @@
 //! A reusable HDR display-calibration screen, packaged as a plugin an app drops
 //! into one of its own [`States`].
 //!
-//! Unlike most examples, which demonstrate an application, this is a small
-//! reusable library: [`HdrCalibrationPlugin<S>`] spawns a guided three-step
-//! calibration wizard on [`OnEnter(state)`](OnEnter), despawns it on
-//! [`OnExit`](DespawnOnExit), and writes the player's choices into the primary
-//! window's [`DisplayTarget`] / [`DisplayCalibrationPolicy`]. On confirm it
-//! persists the result next to the executable and emits [`CalibrationComplete`]
-//! so the app can react (save, advance a menu, ...).
+//! [`HdrCalibrationPlugin<S>`] spawns a guided three-step calibration wizard on
+//! [`OnEnter(state)`](OnEnter), despawns it on [`OnExit`](DespawnOnExit), and writes
+//! the player's choices into the primary window's [`DisplayTarget`] and
+//! [`DisplayCalibrationPolicy`]. On confirm it persists the result next to the
+//! executable and emits [`CalibrationComplete`] so the app can react.
 //!
 //! The wizard owns a dedicated [`Tonemapping::None`] fp16 camera on its own
 //! [`RenderLayers`], so the measurement patches reach the display encoder
-//! unmodified and never fight a gameplay camera. Its UI is pinned to that camera
-//! with [`UiTargetCamera`]. The patches are the only luminance-bearing elements;
-//! the Bevy wordmark is decoration that tracks paper white.
+//! unmodified and never fight a gameplay camera. The patches are the only
+//! luminance-bearing elements. Its UI is pinned to that camera with
+//! [`UiTargetCamera`].
 //!
-//! Transfer and gamut are deliberately *not* this plugin's concern: pair it with
-//! something that selects an HDR transfer (such as the `hdr_helper` example's
-//! `HdrPlugin`), which keeps owning [`DisplayTarget::transfer`] and `.gamut`.
-//! This screen only calibrates the three luminance numbers and the per-field
-//! auto/manual [`DisplayCalibrationPolicy`].
+//! It calibrates only the three luminance numbers and the per-field auto/manual
+//! [`DisplayCalibrationPolicy`]. Transfer and gamut stay with whatever selects an
+//! HDR transfer, such as the `HdrPlugin` in `examples/helpers/hdr.rs`.
 //!
 //! ```ignore
 //! #[derive(States, Default, Clone, PartialEq, Eq, Hash, Debug)]
@@ -46,10 +42,6 @@ use bevy::{
 use serde::{Deserialize, Serialize};
 
 /// Adds a guided HDR calibration screen that runs while the app is in `state`.
-///
-/// Generic over the app's own [`States`] type, so the screen lives inside
-/// whatever state the app already uses (a menu state, a dedicated
-/// `Calibrating` state, ...).
 pub struct HdrCalibrationPlugin<S: States> {
     /// The state during which the calibration screen is shown.
     pub state: S,
@@ -84,9 +76,8 @@ impl<S: States> Plugin for HdrCalibrationPlugin<S> {
     }
 }
 
-/// Emitted (as a global observer [`Event`]) when the player confirms
-/// calibration. Carries the authored target and policy the app should keep; the
-/// plugin has already persisted them.
+/// Emitted when the player confirms calibration. The plugin has already persisted
+/// the values.
 #[derive(Event, Clone)]
 pub struct CalibrationComplete {
     /// The user-authored calibration numbers (never sensed values).
@@ -134,17 +125,16 @@ impl CalibrationStep {
     }
 }
 
-/// How the player wants their calibration resolved: tune it by hand, or trust
-/// the operating system's sensed values. Chosen up front (`M`) so the auto/manual
-/// distinction is explicit rather than a per-field surprise.
+/// How the player wants their calibration resolved. Chosen up front with `M`, so
+/// the auto/manual distinction is explicit rather than a per-field surprise.
 #[derive(Resource, Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum CalibrationStrategy {
-    /// The player tunes peak / paper white / black level; the engine keeps every
+    /// The player tunes peak, paper white, and black level. The engine keeps every
     /// authored value verbatim (HGIG).
     #[default]
     ManualHgig,
-    /// Peak / black level / gamut are filled from sensed display information; the
-    /// player only sets paper white (a viewing preference the display can't sense).
+    /// Peak, black level, and gamut come from sensed display information. The player
+    /// only sets paper white, a viewing preference the display cannot sense.
     TrustOs,
 }
 
@@ -174,12 +164,10 @@ struct MonitorChangeNotice {
     seconds_remaining: f32,
 }
 
-/// How bright a calibration patch should be; [`update_patch_levels`] converts it
-/// to a paper-white-relative linear gray whenever [`EffectiveDisplayTarget`]
-/// changes.
+/// How bright a calibration patch should be.
 #[derive(Component, Clone, Copy)]
 enum Patch {
-    /// An absolute luminance in nits (drawn at `nits / paper_white_nits`).
+    /// An absolute luminance in nits.
     Nits(f32),
     /// A fraction of the resolved `peak_luminance_nits`.
     PeakFraction(f32),
@@ -191,15 +179,15 @@ enum Patch {
 #[derive(Component, Clone, Copy)]
 struct PatternRoot(CalibrationStep);
 
-/// Tags the banner (top): step title, instruction, HGIG / SDR / strategy notes.
+/// Tags the banner at the top of the screen.
 #[derive(Component, Default, Clone, FromTemplate)]
 struct BannerText;
 
-/// Tags the value bar (bottom): the single value the step edits and its keys.
+/// Tags the value bar at the bottom of the screen.
 #[derive(Component, Default, Clone, FromTemplate)]
 struct ValueBarText;
 
-/// Tags the black-level legend row, shown only on step 3.
+/// Tags the black-level legend row.
 #[derive(Component, Default, Clone, FromTemplate)]
 struct BlackLevelRow;
 
@@ -207,11 +195,10 @@ struct BlackLevelRow;
 #[derive(Component, Clone, Copy, FromTemplate)]
 struct BlackLevelLabel(usize);
 
-/// Calibration applied at startup when no saved settings exist (and what Cancel
-/// restores): 200-nit paper white on a 1000-nit display. The 1000-nit candidate
-/// exceeds most consumer panels, so the peak step is two-directional.
-/// Transfer/gamut stay at the SDR default for whatever HDR plugin owns them to
-/// overwrite.
+/// Calibration applied at startup when no saved settings exist, and what Cancel
+/// restores. The 1000-nit candidate exceeds most consumer panels, so the peak step
+/// is two-directional. Transfer and gamut stay at the SDR default for whatever HDR
+/// plugin owns them.
 const DEFAULT_TARGET: DisplayTarget = DisplayTarget::SDR_SRGB
     .with_paper_white(200.0)
     .with_peak(1000.0);
@@ -242,8 +229,6 @@ fn seed_window(
     mut choice: ResMut<BlackLevelChoice>,
 ) {
     let (window, existing) = *primary_window;
-    // Keep whatever transfer/gamut the window already has; only the three
-    // calibration numbers and the strategy are ours to restore.
     let mut target = existing.copied().unwrap_or(DEFAULT_TARGET);
     if let Some(saved_strategy) = restore_calibration(&mut target) {
         *strategy = saved_strategy;
@@ -258,16 +243,15 @@ fn seed_window(
 }
 
 /// Spawns the calibration camera, the three pattern groups, the Bevy wordmark,
-/// and the player UI on entering the calibration state. Everything carries
-/// [`DespawnOnExit`] so leaving the state tears it down.
+/// and the player UI on entering the calibration state.
 fn spawn_calibration<S: States>(
     mut commands: Commands,
     state: Res<State<S>>,
     mut step: ResMut<CalibrationStep>,
 ) {
     let state = state.get().clone();
-    // Start a fresh wizard each entry; the write also re-marks the step changed,
-    // so `update_pattern_visibility` repaints the just-spawned pattern roots.
+    // Start a fresh wizard each entry. The write also marks the step changed, so
+    // `update_pattern_visibility` repaints the just-spawned pattern roots.
     *step = CalibrationStep::PeakLuminance;
     let camera = commands
         .spawn_scene(calibration_camera())
@@ -289,7 +273,7 @@ fn spawn_calibration<S: States>(
         .insert((DespawnOnExit(state), UiTargetCamera(camera)));
 }
 
-// --- BSN scene functions ---------------------------------------------------
+// --- BSN scene functions ---
 
 /// The [`Tonemapping::None`] fp16 orthographic camera the patches render through.
 fn calibration_camera() -> impl Scene {
@@ -298,7 +282,6 @@ fn calibration_camera() -> impl Scene {
         // fp16 intermediate, so patch values above paper white survive to the
         // display-encoding pass.
         Hdr
-        // Patches must reach the encoder unmodified; an operator would bend them.
         template(|_| Ok(Tonemapping::None))
         template_value(Projection::from(OrthographicProjection {
             scaling_mode: ScalingMode::FixedVertical { viewport_height: VIEW_HEIGHT },
@@ -309,11 +292,10 @@ fn calibration_camera() -> impl Scene {
     }
 }
 
-/// One calibration patch: a flat unlit rectangle with its OWN mesh and material
-/// handle. The fresh per-entity material is load-bearing: [`update_patch_levels`]
-/// mutates `base_color` per patch via `materials.get_mut`, so a shared handle
-/// would corrupt every patch. Never hoist the `materials.add(...)` outside and
-/// clone the handle.
+/// One calibration patch: a flat unlit rectangle with its own mesh and material
+/// handle. [`update_patch_levels`] mutates `base_color` per patch, so a shared
+/// material handle would corrupt every patch. Do not hoist the `materials.add(...)`
+/// out and clone the handle.
 fn patch(size: Vec2, position: Vec3, level: Patch) -> impl Scene {
     bsn! {
         template(move |ctx| Ok(Mesh3d(
@@ -332,9 +314,7 @@ fn patch(size: Vec2, position: Vec3, level: Patch) -> impl Scene {
     }
 }
 
-/// The Bevy wordmark: a textured unlit quad that tracks paper white
-/// (`PaperWhiteRelative(1.0)` keeps its tint at white; the encoder scales it).
-/// Reference imagery only, never a measurement element.
+/// The Bevy wordmark: a textured unlit quad that tracks paper white.
 fn wordmark(size: Vec2, position: Vec3) -> impl Scene {
     bsn! {
         template(move |ctx| Ok(Mesh3d(
@@ -372,8 +352,7 @@ fn patterns() -> impl Scene {
 }
 
 /// Step 1: a clipped near-peak surround, a true-black separating frame, and a
-/// center square at the candidate peak. The square merges into the surround
-/// across the black gap at the display's real peak.
+/// center square at the candidate peak.
 fn peak_pattern() -> impl Scene {
     bsn! {
         template_value(Transform::from_xyz(STAGE_SHIFT, 0.0, 0.0))
@@ -427,7 +406,7 @@ fn black_pattern() -> impl Scene {
 }
 
 /// The player UI: banner, value bar, key legend, and the black-level legend row.
-/// All plain SDR text; nothing here is a measurement element.
+/// All plain SDR text.
 fn player_ui() -> impl Scene {
     bsn! {
         Node {
@@ -480,7 +459,7 @@ fn player_ui() -> impl Scene {
 }
 
 /// The black-level legend (step 3 only): a label plus one entry per near-black
-/// step, dim to bright. The selected entry brightens in [`update_black_labels`].
+/// step, dim to bright.
 fn black_level_row() -> impl Scene {
     bsn! {
         BlackLevelRow
@@ -514,7 +493,7 @@ fn black_level_row() -> impl Scene {
     }
 }
 
-// --- Per-frame systems -----------------------------------------------------
+// --- Per-frame systems ---
 
 /// Walks the wizard: `N` / `Space` / right-shoulder next, `P` / left-shoulder
 /// prev, `1`/`2`/`3` jump. Clamped at the ends.
@@ -548,9 +527,7 @@ fn change_step(
 }
 
 /// Flips the calibration strategy with `M` (or gamepad north) and re-applies the
-/// implied policy. Making auto/manual an explicit mode is what keeps the peak
-/// edit from silently going inert: under [`CalibrationStrategy::TrustOs`] the
-/// edit is disabled with an on-screen hint instead.
+/// implied policy.
 fn toggle_strategy(
     keys: Res<ButtonInput<KeyCode>>,
     gamepads: Query<&Gamepad>,
@@ -569,10 +546,10 @@ fn toggle_strategy(
     }
 }
 
-/// Adjusts the current step's value with Left/Right (or the gamepad d-pad).
-/// Peak and black level are inert under [`CalibrationStrategy::TrustOs`] (the
-/// engine resolves them), so only paper white responds there. Peak is clamped at
-/// or above paper white.
+/// Adjusts the current step's value with Left/Right (the gamepad d-pad moves only
+/// the black level). Under [`CalibrationStrategy::TrustOs`] the engine resolves peak
+/// and black level, so only paper white responds. Peak is clamped at or above paper
+/// white.
 fn adjust_value(
     keys: Res<ButtonInput<KeyCode>>,
     gamepads: Query<&Gamepad>,
@@ -629,8 +606,8 @@ fn adjust_value(
 }
 
 /// Confirms (`Enter` / gamepad south) -> persist, emit [`CalibrationComplete`].
-/// Cancels (`Esc` / gamepad east) -> restore the saved-or-default calibration.
-/// Both leave the calibration state to the app's `CalibrationComplete` handler.
+/// Cancels (`Esc` / gamepad east) -> restore the saved-or-default calibration and
+/// stay on the wizard. The app's `CalibrationComplete` handler leaves the state.
 fn confirm_or_cancel(
     keys: Res<ButtonInput<KeyCode>>,
     gamepads: Query<&Gamepad>,
@@ -691,17 +668,15 @@ fn update_pattern_visibility(
     };
 }
 
-/// Recolors patches from the resolved [`EffectiveDisplayTarget`] when it changes
-/// or a patch is freshly spawned. Reading the resolved target (not the authored
-/// [`DisplayTarget`]) is what lets a sensed peak or paper white show through under
+/// Recolors patches from the resolved [`EffectiveDisplayTarget`] when it changes or
+/// a patch is freshly spawned. Reading the resolved target, not the authored
+/// [`DisplayTarget`], lets a sensed peak or paper white show through under
 /// [`CalibrationStrategy::TrustOs`].
 fn update_patch_levels(
     effective: Single<Ref<EffectiveDisplayTarget>, With<PrimaryWindow>>,
     patches: Query<(Ref<Patch>, &MeshMaterial3d<StandardMaterial>)>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    // Repaint on a resolved-target change (sensing/edits) or a just-spawned patch
-    // (startup, or re-entering the calibration state).
     let target_changed = effective.is_changed();
     let target = effective.target;
     let paper_white = target.sanitized_paper_white_nits();
@@ -720,9 +695,8 @@ fn update_patch_levels(
     }
 }
 
-/// Writes the banner: step title and instruction, plus the prominent HGIG note on
-/// step 1, the SDR-inert note on step 2, the strategy line, and a monitor-change
-/// recalibration notice.
+/// Writes the banner: step title and instruction, the HGIG note on step 1, the
+/// SDR-inert note on step 2, the strategy line, and a monitor-change notice.
 fn update_banner(
     mut text: Single<&mut Text, With<BannerText>>,
     step: Res<CalibrationStep>,
@@ -832,10 +806,10 @@ fn update_black_labels(
     }
 }
 
-/// Raises a recalibration notice when the window moves to a different monitor,
-/// by watching the [`OnMonitor`] relationship `bevy_winit` maintains. Sole
-/// owner of the notice countdown. The first insertion per window only reports
-/// the monitor becoming known at startup, so it is logged, not raised.
+/// Raises a recalibration notice when the window moves to a different monitor, by
+/// watching the [`OnMonitor`] relationship `bevy_winit` maintains. The first
+/// insertion per window is the monitor becoming known at startup, so it is logged
+/// rather than raised.
 fn watch_monitor_changes(
     changed: Query<(Entity, Ref<OnMonitor>), Changed<OnMonitor>>,
     mut removed: RemovedComponents<OnMonitor>,
@@ -857,8 +831,8 @@ fn watch_monitor_changes(
             notice.seconds_remaining = 8.0;
         }
     }
-    // Removal means the current monitor is no longer known; skip windows whose
-    // relationship went away because the window itself despawned.
+    // Removal means the monitor is no longer known. Skip windows whose relationship
+    // went away because the window itself despawned.
     for window in removed.read() {
         if windows.contains(window) {
             info!("Window {window} moved to monitor <unknown>; recalibration recommended.");
@@ -868,10 +842,10 @@ fn watch_monitor_changes(
     notice.seconds_remaining = (notice.seconds_remaining - time.delta_secs()).max(0.0);
 }
 
-// --- Persistence -----------------------------------------------------------
+// --- Persistence ---
 
-/// The persisted calibration: the strategy plus the three authored numbers.
-/// Only *authored* values are written - never a sensed/effective value.
+/// The persisted calibration. Only authored values are written, never a sensed or
+/// effective value.
 #[derive(Serialize, Deserialize, Clone, Copy)]
 struct Settings {
     strategy: CalibrationStrategy,
@@ -882,7 +856,7 @@ struct Settings {
 
 /// Applies the saved-or-default calibration numbers to `target`, returning the
 /// saved strategy when settings existed. Only the three luminance numbers are
-/// touched; transfer/gamut stay as they are.
+/// touched. Transfer and gamut stay as they are.
 fn restore_calibration(target: &mut DisplayTarget) -> Option<CalibrationStrategy> {
     let saved = load_settings();
     let numbers = saved.unwrap_or(Settings {
@@ -897,8 +871,8 @@ fn restore_calibration(target: &mut DisplayTarget) -> Option<CalibrationStrategy
     saved.map(|s| s.strategy)
 }
 
-/// Where calibration settings are stored: next to the executable (an
-/// example-appropriate location; a real app would use the OS preferences dir).
+/// Where calibration settings are stored: next to the executable. A real app would
+/// use the OS preferences directory.
 fn settings_path() -> PathBuf {
     let dir = std::env::current_exe()
         .ok()

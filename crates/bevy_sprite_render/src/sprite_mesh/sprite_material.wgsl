@@ -73,7 +73,6 @@ fn fragment(
     output_color = tonemapping::tone_mapping(output_color, view.color_grading);
 #endif
 
-    // Writer-side gamut convert into a Rec.2020 working buffer and
-    // compositing-space encode; a pass-through on default views.
+    // Writer-side encode; see bevy_render::writer_encode.
     return writer_encode(output_color);
 }

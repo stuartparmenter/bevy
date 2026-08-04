@@ -107,9 +107,9 @@ pub fn ktx2_buffer_to_image(
         levels = ktx2.levels().map(|level| level.data.to_vec()).collect();
     }
 
-    // Tracks whether data assumed to be sRGB-encoded was decoded to linear on the CPU
-    // during transcoding; in that case a linear output format does not contradict an
-    // sRGB transfer function declared by the file, but it does override a linear one.
+    // Set when data assumed to be sRGB-encoded was decoded to linear on the CPU during
+    // transcoding. A linear format then agrees with a declared sRGB transfer function,
+    // but it does override a declared linear one.
     let mut srgb_data_linearized_on_cpu = false;
 
     // Identify the format
@@ -262,10 +262,9 @@ pub fn ktx2_buffer_to_image(
         )));
     }
 
-    // Honor the color metadata in the file's data format descriptor. This is
-    // metadata-only: the file's color primaries are stamped on the image (an explicit
-    // loader setting still takes priority over the stamp, applied by the caller), and
-    // transfer-function mismatches warn without changing the resolved texture format.
+    // Read the color metadata from the file's data format descriptor. The primaries are
+    // stamped on the image, and mismatched transfer functions warn. The caller applies
+    // an explicit loader setting over the stamp afterwards.
     let file_source_primaries = ktx2.color_primaries().and_then(|color_primaries| {
         let source_primaries = ktx2_color_primaries_to_source_primaries(color_primaries);
         if source_primaries.is_none() {
@@ -1661,9 +1660,8 @@ mod tests {
     }
 
     /// Builds a minimal valid KTX2 file: a 1x1 texture in the given 8-bit-per-channel
-    /// `vkFormat` (with `pixel` carrying one texel) with a single level and a basic
-    /// data format descriptor block carrying the given raw `colorPrimaries` and
-    /// `transferFunction` bytes (`0` = unspecified).
+    /// `vkFormat`, one level holding the texel `pixel`, and a basic data format descriptor
+    /// with the given raw `colorPrimaries` and `transferFunction` bytes (`0` = unspecified).
     fn minimal_ktx2(
         vk_format: u32,
         color_primaries: u8,
@@ -1684,9 +1682,8 @@ mod tests {
         buffer.extend_from_slice(&1u32.to_le_bytes()); // faceCount
         buffer.extend_from_slice(&1u32.to_le_bytes()); // levelCount
         buffer.extend_from_slice(&0u32.to_le_bytes()); // supercompressionScheme
-                                                       // Section index: a 28-byte DFD at offset 104 (4-byte total size + a 24-byte
-                                                       // basic block with no sample information), no key/value data, no
-                                                       // supercompression global data.
+                                                       // Section index: a 28-byte DFD at offset 104 (4-byte size plus a 24-byte
+                                                       // basic block with no samples), no key/value data, no supercompression global data.
         buffer.extend_from_slice(&104u32.to_le_bytes()); // dfdByteOffset
         buffer.extend_from_slice(&28u32.to_le_bytes()); // dfdByteLength
         buffer.extend_from_slice(&0u32.to_le_bytes()); // kvdByteOffset
@@ -1715,9 +1712,8 @@ mod tests {
         buffer
     }
 
-    /// Builds a minimal valid KTX2 file: a 1x1 white RGBA8 texture (`VkFormat` 37 =
-    /// `R8G8B8A8_UNORM`) with the given raw `colorPrimaries` and `transferFunction`
-    /// bytes.
+    /// Builds a 1x1 white RGBA8 KTX2 file (`VkFormat` 37 = `R8G8B8A8_UNORM`) with the
+    /// given raw `colorPrimaries` and `transferFunction` bytes.
     fn minimal_rgba8_ktx2(color_primaries: u8, transfer_function: u8) -> Vec<u8> {
         minimal_ktx2(
             37,
@@ -1735,7 +1731,7 @@ mod tests {
             (1, SourceColorPrimaries::Bt709),
             (4, SourceColorPrimaries::Bt2020),
             (10, SourceColorPrimaries::DisplayP3),
-            // BT.601 (EBU): carried by the file but unsupported; falls back to BT.709.
+            // BT.601 (EBU): carried by the file but unsupported, so falls back to BT.709.
             (2, SourceColorPrimaries::Bt709),
         ] {
             let buffer = minimal_rgba8_ktx2(color_primaries, /* Linear */ 1);
@@ -1755,8 +1751,6 @@ mod tests {
 
     #[test]
     fn caller_is_srgb_still_wins_over_dfd_transfer_function() {
-        // The file declares a linear transfer function, but the caller requests sRGB:
-        // the caller wins (with a warning), byte-identical to the previous behavior.
         let buffer = minimal_rgba8_ktx2(/* BT709 */ 1, /* Linear */ 1);
         let image = ktx2_buffer_to_image(&buffer, CompressedImageFormats::empty(), true).unwrap();
         assert_eq!(
@@ -1768,9 +1762,8 @@ mod tests {
 
     #[test]
     fn linear_declared_r8_with_caller_is_srgb_is_decoded_on_the_cpu() {
-        // The file declares a linear transfer function, but the caller requests sRGB.
-        // R8 has no sRGB texture format, so the loader sRGB-decodes the data on the
-        // CPU during transcoding (with a warning) and resolves to the non-sRGB format.
+        // R8 has no sRGB texture format, so with `is_srgb` the loader sRGB-decodes the
+        // data on the CPU during transcoding and resolves to the non-sRGB format.
         let buffer = minimal_ktx2(
             /* R8_UNORM */ 9,
             /* BT709 */ 1,
@@ -1782,8 +1775,7 @@ mod tests {
             image.texture_descriptor.format,
             wgpu_types::TextureFormat::R8Unorm,
         );
-        // sRGB-encoded byte 128 decodes to linear 55: the file's declared linear
-        // transfer really is overridden by the caller's `is_srgb`.
+        // sRGB-encoded byte 128 decodes to linear 55.
         assert_eq!(image.data.as_deref(), Some(&[55u8][..]));
     }
 }

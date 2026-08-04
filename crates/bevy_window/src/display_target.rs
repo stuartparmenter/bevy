@@ -1,16 +1,15 @@
 //! Types describing the display a window (or other render target) is presented on.
 //!
 //! The central type is [`DisplayTarget`], a required component of
-//! [`Window`](crate::Window) that captures the calibration of the display the
-//! window's swapchain feeds: how bright "white" is, how bright the display can
-//! get, which color gamut it covers, and which transfer function the signal
-//! should be encoded with.
+//! [`Window`](crate::Window) holding the calibration of the display the
+//! window's swapchain feeds: paper-white and peak luminance, color gamut, and
+//! transfer function.
 //!
-//! `DisplayTarget` is plain data: it carries no renderer types and changing it
-//! never directly mutates GPU state. The renderer reads it during extraction to
+//! `DisplayTarget` is plain data with no renderer types, and writing it never
+//! directly mutates GPU state. The renderer reads it during extraction to
 //! parameterize tone mapping, gamut mapping, transfer-function encoding, and
-//! surface (format, color space) selection. The default value,
-//! [`DisplayTarget::SDR_SRGB`], reproduces Bevy's current SDR behavior exactly.
+//! surface (format, color space) selection. The default,
+//! [`DisplayTarget::SDR_SRGB`], reproduces Bevy's SDR behavior exactly.
 
 use bevy_ecs::prelude::Component;
 
@@ -27,22 +26,21 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
 /// render target) is presented on, so the renderer can produce a correctly
 /// tone-mapped, gamut-mapped, and transfer-encoded signal for it.
 ///
-/// This component is **user-authoritative**: Bevy never overwrites values you
-/// set, even when the window moves to a different monitor. When that happens
-/// the window's [`OnMonitor`](crate::OnMonitor) relationship is retargeted, so
-/// you (or a future auto-resolution system) can watch it with
-/// `Changed<OnMonitor>` and decide whether to update this component.
+/// This component is user-authoritative: Bevy never overwrites values you set,
+/// even when the window moves to a different monitor. Such a move retargets the
+/// window's [`OnMonitor`](crate::OnMonitor) relationship, so you (or a future
+/// auto-resolution system) can watch `Changed<OnMonitor>` and decide whether to
+/// update this component.
 ///
 /// # Placement
 ///
-/// `DisplayTarget` is a required component of [`Window`](crate::Window):
-/// every window entity automatically receives one, defaulting to
-/// [`DisplayTarget::SDR_SRGB`], the standard SDR sRGB output. Multiple cameras
-/// rendering to the same window share the window's single `DisplayTarget`.
+/// A required component of [`Window`](crate::Window): every window entity gets
+/// one, defaulting to [`DisplayTarget::SDR_SRGB`]. Multiple cameras rendering
+/// to the same window share that one `DisplayTarget`.
 ///
 /// Render targets that are not windows (`RenderTarget::Image`,
 /// `RenderTarget::TextureView`) have no window entity to host this component;
-/// they are looked up in the `ManualDisplayTargets` resource in `bevy_render`
+/// they are looked up in `bevy_render`'s `ManualDisplayTargets` resource
 /// instead, and fall back to [`DisplayTarget::SDR_SRGB`] when absent.
 ///
 /// # Units
@@ -61,61 +59,56 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
 )]
 pub struct DisplayTarget {
     /// The luminance, in nits, that "paper white" (also called reference or
-    /// diffuse white) is displayed at: the brightness of a full-white UI
-    /// element or a 100%-diffuse-reflective surface, as opposed to emissive
-    /// highlights, which may go brighter (up to [`peak_luminance_nits`]).
+    /// diffuse white) is displayed at: a full-white UI element or a
+    /// 100%-diffuse-reflective surface, as opposed to emissive highlights,
+    /// which may go brighter (up to [`peak_luminance_nits`]).
     ///
-    /// The tone-mapping operator's output is renormalized at the encoder seam
-    /// so that a value of `1.0` corresponds to this luminance. On SDR
-    /// displays this is the luminance of signal-level white, nominally
-    /// `100.0` nits. Typical HDR values range from 100–300 nits depending on
-    /// viewing environment; ITU-R BT.2408 recommends 203 nits for HDR
-    /// broadcast.
+    /// Tone-mapping output is renormalized at the encoder seam so that `1.0`
+    /// corresponds to this luminance. On SDR displays it is signal-level
+    /// white, nominally `100.0` nits. Typical HDR values are 100-300 nits
+    /// depending on viewing environment; ITU-R BT.2408 recommends 203 nits for
+    /// HDR broadcast.
     ///
-    /// The scRGB-linear transfer function defines its own reference
-    /// white of 80 nits at signal value `1.0`; the encoder accounts for this
-    /// by scaling by `paper_white_nits / 80` when encoding for
-    /// [`DisplayTransfer::ScRgbLinear`]. No such factor is baked into this
-    /// field.
+    /// [`DisplayTransfer::ScRgbLinear`] defines its own 80-nit reference white
+    /// at signal value `1.0`. The encoder handles that by scaling by
+    /// `paper_white_nits / 80`; no such factor is baked into this field.
     ///
     /// [`peak_luminance_nits`]: Self::peak_luminance_nits
     pub paper_white_nits: f32,
     /// The maximum luminance, in nits, that the display can show.
     ///
-    /// Peak-aware tone-mapping operators compress scene highlights into the
-    /// range `[0, peak_luminance_nits]` rather than clipping them. On SDR
-    /// displays peak and paper white coincide (nominally `100.0` nits); on
-    /// HDR displays the peak is higher (commonly 400–4000 nits), leaving
-    /// headroom above paper white for emissive highlights.
+    /// Peak-aware tone-mapping operators compress scene highlights into
+    /// `[0, peak_luminance_nits]` rather than clipping them. On SDR displays
+    /// peak and paper white coincide (nominally `100.0` nits); on HDR displays
+    /// the peak is higher (commonly 400-4000 nits), leaving headroom above
+    /// paper white for emissive highlights.
     ///
-    /// For displays that cannot sustain their peak over the full panel, this
-    /// should be the value obtained from OS metadata or HGIG-style
-    /// calibration (`MaxTML`), not the marketing peak.
+    /// For displays that cannot sustain their peak over the full panel, use the
+    /// value from OS metadata or HGIG-style calibration (`MaxTML`), not the
+    /// marketing peak.
     pub peak_luminance_nits: f32,
     /// The minimum luminance, in nits, that the display can show (its black
     /// level).
     ///
-    /// `0.0` is a reasonable default; self-emissive displays (OLED) reach
-    /// true zero while backlit panels typically bottom out between 0.01 and
-    /// 0.1 nits.
+    /// `0.0` is a reasonable default: OLED panels reach true zero, backlit
+    /// panels typically bottom out between 0.01 and 0.1 nits.
     ///
-    /// No engine stage consumes this value yet: it is carried for calibration
+    /// No engine stage consumes this value yet. It is carried for calibration
     /// UIs and for HDR10 mastering metadata (SMPTE ST 2086) once wgpu exposes
     /// an API for it.
     pub min_luminance_nits: f32,
     /// The color gamut (set of primaries) of the display target.
     ///
-    /// This controls the gamut transform stage: rendered colors in the
-    /// working color space are converted to these primaries (with perceptual
-    /// gamut compression for out-of-gamut colors) before transfer encoding.
+    /// Controls the gamut transform stage: rendered colors in the working
+    /// color space are converted to these primaries (with perceptual gamut
+    /// compression for out-of-gamut colors) before transfer encoding.
     pub gamut: DisplayGamut,
-    /// The transfer function the signal should be encoded with.
+    /// The transfer function to encode the signal with.
     ///
-    /// This is the *requested* transfer. The renderer may be unable to fulfil
-    /// it on the current backend/OS (for example PQ requires the OS to have
-    /// HDR output enabled and the surface to advertise the HDR10 color
-    /// space); in that case it degrades and warns rather than failing. See
-    /// [`DisplayTransfer`] for per-variant details.
+    /// A *request*: the current backend and OS may not be able to fulfil it
+    /// (PQ, for one, needs OS HDR output enabled and a surface advertising the
+    /// HDR10 color space), in which case the renderer degrades and warns rather
+    /// than failing. See [`DisplayTransfer`] for per-variant details.
     pub transfer: DisplayTransfer,
 }
 
@@ -124,8 +117,8 @@ impl DisplayTarget {
     /// luminance of 100 nits, black level of 0, [`DisplayGamut::Rec709`]
     /// primaries, [`DisplayTransfer::Srgb`] encoding.
     ///
-    /// This is the [`Default`] value: the standard SDR sRGB output path, with
-    /// no display-encoding pass and hardware sRGB encode on writeback.
+    /// The [`Default`] value. Renders with no display-encoding pass and
+    /// hardware sRGB encode on writeback.
     pub const SDR_SRGB: Self = Self {
         paper_white_nits: 100.0,
         peak_luminance_nits: 100.0,
@@ -134,10 +127,8 @@ impl DisplayTarget {
         transfer: DisplayTransfer::Srgb,
     };
 
-    /// Returns `self` with [`paper_white_nits`](Self::paper_white_nits) set
-    /// to `nits`.
-    ///
-    /// Builder-style helper for deriving calibrated targets from a base value:
+    /// Returns `self` with [`paper_white_nits`](Self::paper_white_nits) set to
+    /// `nits`.
     ///
     /// ```
     /// # use bevy_window::{DisplayTarget, DisplayTransfer};
@@ -154,9 +145,6 @@ impl DisplayTarget {
 
     /// Returns `self` with [`peak_luminance_nits`](Self::peak_luminance_nits)
     /// set to `nits`.
-    ///
-    /// See [`with_paper_white`](Self::with_paper_white) for the builder
-    /// pattern these helpers support.
     pub const fn with_peak(mut self, nits: f32) -> Self {
         self.peak_luminance_nits = nits;
         self
@@ -164,27 +152,18 @@ impl DisplayTarget {
 
     /// Returns `self` with [`min_luminance_nits`](Self::min_luminance_nits)
     /// set to `nits`.
-    ///
-    /// See [`with_paper_white`](Self::with_paper_white) for the builder
-    /// pattern these helpers support.
     pub const fn with_min_luminance(mut self, nits: f32) -> Self {
         self.min_luminance_nits = nits;
         self
     }
 
     /// Returns `self` with [`gamut`](Self::gamut) set to `gamut`.
-    ///
-    /// See [`with_paper_white`](Self::with_paper_white) for the builder
-    /// pattern these helpers support.
     pub const fn with_gamut(mut self, gamut: DisplayGamut) -> Self {
         self.gamut = gamut;
         self
     }
 
     /// Returns `self` with [`transfer`](Self::transfer) set to `transfer`.
-    ///
-    /// See [`with_paper_white`](Self::with_paper_white) for the builder
-    /// pattern these helpers support.
     pub const fn with_transfer(mut self, transfer: DisplayTransfer) -> Self {
         self.transfer = transfer;
         self
@@ -201,19 +180,18 @@ impl DisplayTarget {
     /// in luminance math:
     ///
     /// - non-finite or non-positive values fall back to
-    ///   [`DisplayTarget::SDR_SRGB`]'s 100 nits (a paper white of zero or
-    ///   `NaN` would black out or `NaN` the whole frame), and
-    /// - values above [`MAX_PAPER_WHITE_NITS`](Self::MAX_PAPER_WHITE_NITS)
-    ///   are clamped to it.
+    ///   [`DisplayTarget::SDR_SRGB`]'s 100 nits (a zero or `NaN` paper white
+    ///   would black out or `NaN` the whole frame);
+    /// - values above [`MAX_PAPER_WHITE_NITS`](Self::MAX_PAPER_WHITE_NITS) are
+    ///   clamped to it.
     ///
-    /// Valid values (the common case) are returned bit-for-bit unchanged.
+    /// Valid values are returned bit-for-bit unchanged.
     ///
-    /// This is the **single source of truth** for paper-white sanitization:
-    /// every renderer stage that folds `paper_white_nits` into its math (the
-    /// tone-mapping operators' seam renormalization *and* the display
-    /// encoder's transfer encoding) must use this method, so the two scale
-    /// factors cancel exactly regardless of what the user authored. Warning
-    /// about the fallback is left to the callers (this method is pure).
+    /// Every renderer stage that folds `paper_white_nits` into its math must go
+    /// through this method (the tone-mapping operators' seam renormalization
+    /// and the display encoder's transfer encoding), so the two scale factors
+    /// cancel exactly whatever the user authored. This method is pure; warning
+    /// about the fallback is left to callers.
     pub fn sanitized_paper_white_nits(&self) -> f32 {
         if !self.paper_white_nits.is_finite() || self.paper_white_nits <= 0.0 {
             Self::SDR_SRGB.paper_white_nits
@@ -224,7 +202,6 @@ impl DisplayTarget {
 }
 
 impl Default for DisplayTarget {
-    /// Returns [`DisplayTarget::SDR_SRGB`].
     fn default() -> Self {
         Self::SDR_SRGB
     }
@@ -246,14 +223,14 @@ impl Default for DisplayTarget {
 )]
 pub enum DisplayGamut {
     /// ITU-R BT.709 primaries, shared by sRGB. The standard-dynamic-range
-    /// gamut every display can show, and the default.
+    /// gamut every display can show.
     #[default]
     Rec709,
-    /// Display P3 primaries (DCI-P3 primaries with a D65 white point), as
-    /// used by most Apple displays and many wide-gamut monitors. Wider than
-    /// Rec.709, narrower than Rec.2020.
+    /// Display P3 primaries (DCI-P3 with a D65 white point), used by most Apple
+    /// displays and many wide-gamut monitors. Wider than Rec.709, narrower than
+    /// Rec.2020.
     ///
-    /// Realized as wide-gamut HDR output by pairing with
+    /// Reaches wide-gamut HDR output only paired with
     /// [`DisplayTransfer::ExtendedSrgb`] (wgpu's `ExtendedDisplayP3` surface
     /// color space); the [`Srgb`](DisplayTransfer::Srgb),
     /// [`ScRgbLinear`](DisplayTransfer::ScRgbLinear), and
@@ -266,21 +243,24 @@ pub enum DisplayGamut {
     Rec2020,
 }
 
-/// The transfer function used to encode the final signal for a display
-/// target.
+/// The transfer function used to encode the final signal for a display target.
 ///
 /// This is the last stage of the display pipeline: it converts display-linear
-/// color (already tone-mapped and gamut-mapped) into the non-linear (or
-/// scaled linear) signal values the display expects.
+/// color (already tone-mapped and gamut-mapped) into the non-linear (or scaled
+/// linear) signal values the display expects.
 ///
-/// Backend support varies and depends on wgpu's surface color-space API:
-/// [`Srgb`] is available everywhere; [`ScRgbLinear`] (linear scRGB) on
-/// macOS/iOS (Metal), Windows (Vulkan/DX12), and Wayland (Vulkan) — it is
-/// **native-only**, as browser WebGPU cannot express a linear-transfer canvas;
-/// [`ExtendedSrgb`] (encoded extended-range sRGB) on Metal, Vulkan
-/// (Rec.709 gamut only), and browser WebGPU on HDR-capable displays — this is
-/// the web HDR path; [`Pq`] (HDR10) on Vulkan, DX12, and Metal when the OS has
-/// HDR output enabled. Unfulfillable requests degrade with a warning.
+/// Backend support follows wgpu's surface color-space API:
+///
+/// - [`Srgb`]: everywhere.
+/// - [`ScRgbLinear`] (linear scRGB): macOS/iOS (Metal), Windows (Vulkan/DX12),
+///   Wayland (Vulkan). Native-only, since browser WebGPU cannot express a
+///   linear-transfer canvas.
+/// - [`ExtendedSrgb`] (encoded extended-range sRGB): Metal, Vulkan (Rec.709
+///   gamut only), and browser WebGPU on HDR-capable displays. The web HDR path.
+/// - [`Pq`] (HDR10): Vulkan, DX12, and Metal when the OS has HDR output
+///   enabled.
+///
+/// Unfulfillable requests degrade with a warning.
 ///
 /// [`Srgb`]: DisplayTransfer::Srgb
 /// [`ScRgbLinear`]: DisplayTransfer::ScRgbLinear
@@ -299,83 +279,72 @@ pub enum DisplayGamut {
 )]
 pub enum DisplayTransfer {
     /// The sRGB transfer function (IEC 61966-2-1), the standard-dynamic-range
-    /// default. Currently applied in hardware via `*UnormSrgb` surface
-    /// formats.
+    /// default. Applied in hardware via `*UnormSrgb` surface formats.
     #[default]
     Srgb,
     /// scRGB linear (IEC 61966-2-2): a linear, extended-range encoding where
-    /// signal value `1.0` corresponds to 80 nits and values above `1.0` (and
-    /// below `0.0`) are valid. Used with `Rgba16Float` surfaces. The encoder
-    /// scales by `paper_white_nits / 80` so that scene paper white lands on
-    /// the display's configured paper white.
+    /// signal value `1.0` is 80 nits and values above `1.0` (and below `0.0`)
+    /// are valid. Used with `Rgba16Float` surfaces. The encoder scales by
+    /// `paper_white_nits / 80` so that scene paper white lands on the display's
+    /// configured paper white.
     ///
-    /// This is the linear extended-range transfer and is **native-only**
-    /// (Metal, Vulkan, DX12); browser WebGPU cannot express a linear-transfer
-    /// canvas, so on the web request
-    /// [`ExtendedSrgb`](Self::ExtendedSrgb) — the encoded sibling — for HDR
-    /// output instead.
+    /// Native-only; on the web, request the encoded sibling
+    /// [`ExtendedSrgb`](Self::ExtendedSrgb) for HDR output instead.
     ///
-    /// scRGB signals are always expressed in (extended) **Rec.709/sRGB
-    /// coordinates**, whatever the physical gamut of the panel: the OS
-    /// compositor performs the mapping to the panel's primaries, and wide
-    /// gamut is carried by out-of-range (including negative) component
-    /// values. [`DisplayTarget::gamut`] therefore does not change how scRGB
-    /// is encoded (the renderer ignores it for this transfer, with a log
-    /// notice); it still usefully describes the panel itself.
+    /// scRGB signals are always expressed in (extended) Rec.709/sRGB
+    /// coordinates, whatever the physical gamut of the panel: the OS compositor
+    /// maps to the panel's primaries, and wide gamut is carried by out-of-range
+    /// (including negative) component values. [`DisplayTarget::gamut`]
+    /// therefore does not change how scRGB is encoded (the renderer ignores it
+    /// for this transfer, with a log notice); it still describes the panel.
     ScRgbLinear,
     /// The Perceptual Quantizer (SMPTE ST 2084, ITU-R BT.2100), the absolute
     /// transfer function used by HDR10. Encodes absolute luminance normalized
-    /// to 10000 nits. Canonically paired with [`DisplayGamut::Rec2020`] (the
-    /// renderer coerces the encode to Rec.2020 — HDR10 *is* Rec.2020).
+    /// to 10000 nits. Canonically paired with [`DisplayGamut::Rec2020`]: the
+    /// renderer coerces the encode to Rec.2020, since HDR10 is Rec.2020.
     ///
     /// Negotiated as an HDR10 swapchain (typically `Rgb10a2Unorm`) where the
-    /// backend and OS advertise it: Vulkan, DX12, and Metal with HDR output
-    /// enabled. When unavailable, the request downgrades to
+    /// backend and OS advertise it. When unavailable, the request downgrades to
     /// [`ScRgbLinear`](Self::ScRgbLinear) if possible, else to SDR sRGB,
-    /// with a warning each step.
+    /// warning at each step.
     Pq,
-    /// Extended-range sRGB (IEC 61966-2-2, **encoded** form): the sRGB transfer
+    /// Extended-range sRGB (IEC 61966-2-2, encoded form): the sRGB transfer
     /// function continued past `[0, 1]` by mirroring the curve through the
-    /// origin (odd-symmetric, sign-preserving), an HDR signal where `1.0` is
-    /// SDR reference white and values above `1.0` (and below `0.0`) carry
-    /// brighter-than-SDR and out-of-gamut color.
+    /// origin (odd-symmetric, sign-preserving). `1.0` is SDR reference white;
+    /// values above `1.0` (and below `0.0`) carry brighter-than-SDR and
+    /// out-of-gamut color.
     ///
-    /// This is the *encoded* (gamma) sibling of [`ScRgbLinear`](Self::ScRgbLinear):
-    /// the renderer applies the same `paper_white_nits / 80` scRGB
-    /// normalization, then the extended sRGB OETF (`srgb_oetf_extended` in
-    /// `bevy_render::transfer_functions`) instead of
-    /// leaving the signal linear. An 80-nit paper white therefore round-trips
-    /// SDR through this transfer (the OETF coincides with the plain sRGB curve
-    /// on `[0, 1]`).
+    /// The encoded (gamma) sibling of [`ScRgbLinear`](Self::ScRgbLinear): the
+    /// renderer applies the same `paper_white_nits / 80` scRGB normalization,
+    /// then the extended sRGB OETF (`srgb_oetf_extended` in
+    /// `bevy_render::transfer_functions`) instead of leaving the signal linear.
+    /// An 80-nit paper white therefore round-trips SDR through this transfer,
+    /// since the OETF coincides with the plain sRGB curve on `[0, 1]`.
     ///
-    /// Unlike `ScRgbLinear`, this transfer is **not** gamut-agnostic — it pairs
-    /// with [`DisplayTarget::gamut`] to select the surface color space:
-    /// - [`DisplayGamut::Rec709`] → wgpu `ExtendedSrgb` (Vulkan
+    /// Unlike `ScRgbLinear` this transfer is not gamut-agnostic: it pairs with
+    /// [`DisplayTarget::gamut`] to select the surface color space.
+    ///
+    /// - [`DisplayGamut::Rec709`] -> wgpu `ExtendedSrgb` (Vulkan
     ///   `EXTENDED_SRGB_NONLINEAR_EXT`, Metal `kCGColorSpaceExtendedSRGB`,
-    ///   browser WebGPU `srgb` canvas + `toneMapping: "extended"`);
-    /// - [`DisplayGamut::DisplayP3`] → wgpu `ExtendedDisplayP3` (Metal
+    ///   browser WebGPU `srgb` canvas + `toneMapping: "extended"`).
+    /// - [`DisplayGamut::DisplayP3`] -> wgpu `ExtendedDisplayP3` (Metal
     ///   `kCGColorSpaceExtendedDisplayP3`, browser WebGPU `display-p3` canvas +
     ///   `toneMapping: "extended"`); the encoder converts Rec.709/Rec.2020
     ///   tone-map output into P3 primaries before the OETF.
+    /// - [`DisplayGamut::Rec2020`] has no encoded-extended surface and is
+    ///   coerced to Rec.709.
     ///
-    /// [`DisplayGamut::Rec2020`] has no encoded-extended surface and is coerced
-    /// to Rec.709 for this transfer. Not available on DX12 (DXGI has no
-    /// encoded-extended-range swapchain color space); the P3 variant is also
-    /// unavailable on Vulkan. This is the **web HDR path**: browser WebGPU
-    /// cannot express a linear-transfer canvas, so `ScRgbLinear` is native-only
-    /// and the web reaches HDR through this transfer.
+    /// Not available on DX12 (DXGI has no encoded-extended-range swapchain
+    /// color space); the P3 variant is also unavailable on Vulkan.
     ExtendedSrgb,
 }
 
 impl DisplayTransfer {
-    /// Returns `true` if this is a high-dynamic-range transfer function
-    /// ([`ScRgbLinear`](Self::ScRgbLinear), [`Pq`](Self::Pq), or
-    /// [`ExtendedSrgb`](Self::ExtendedSrgb)).
+    /// Returns `true` if this is a high-dynamic-range transfer function.
     ///
-    /// This is the single-sourced predicate the display pipeline uses to
-    /// decide whether a target takes the HDR path (shader-side transfer
-    /// encoding, HDR operator modes) or the plain SDR path (hardware sRGB
-    /// encode).
+    /// The single predicate the display pipeline uses to decide whether a
+    /// target takes the HDR path (shader-side transfer encoding, HDR operator
+    /// modes) or the plain SDR path (hardware sRGB encode).
     pub const fn is_hdr(&self) -> bool {
         matches!(self, Self::ScRgbLinear | Self::Pq | Self::ExtendedSrgb)
     }
@@ -385,7 +354,7 @@ impl DisplayTransfer {
 /// than allocated.
 ///
 /// [`iter`](Self::iter) yields members in the stable cycle order apps step
-/// through — [`Srgb`], [`ScRgbLinear`], [`ExtendedSrgb`], [`Pq`] — which is
+/// through: [`Srgb`], [`ScRgbLinear`], [`ExtendedSrgb`], [`Pq`]. That is
 /// neither the declaration order of [`DisplayTransfer`] nor the bit order.
 ///
 /// [`Srgb`]: DisplayTransfer::Srgb
@@ -409,9 +378,9 @@ impl DisplayTransfers {
     /// The empty set.
     pub const EMPTY: Self = Self(0);
 
-    /// The order [`iter`](Self::iter) walks: the stable cycle order, kept
-    /// explicit because it differs from both the declaration order of
-    /// [`DisplayTransfer`] and the bit order `bit` assigns.
+    /// The order [`iter`](Self::iter) walks. Explicit because it matches
+    /// neither the declaration order of [`DisplayTransfer`] nor the bit order
+    /// `bit` assigns.
     const CYCLE_ORDER: [DisplayTransfer; 4] = [
         DisplayTransfer::Srgb,
         DisplayTransfer::ScRgbLinear,
@@ -450,7 +419,6 @@ impl DisplayTransfers {
 }
 
 impl core::fmt::Debug for DisplayTransfers {
-    /// Prints the members in cycle order, e.g. `[Srgb, ExtendedSrgb, Pq]`.
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_list().entries(self.iter()).finish()
     }
@@ -459,21 +427,18 @@ impl core::fmt::Debug for DisplayTransfers {
 /// What a window's surface negotiated: the [`DisplayTransfer`] it currently
 /// presents, and every transfer it could present right now.
 ///
-/// [`DisplayTarget::transfer`] is the *request*; surface negotiation can
-/// downgrade it (PQ → scRGB → plain sRGB, with a warning) when the backend or
-/// OS cannot fulfil it. [`resolved`](Self::resolved) reports the outcome, so
-/// apps can adapt to the actual output mode — for example, skip an HDR
-/// calibration flow or switch UI assets when an HDR request resolved to SDR —
-/// and [`supported`](Self::supported) lists the requests that would be
-/// fulfilled verbatim, so an app can offer only the modes that will actually
-/// work instead of requesting one that silently downgrades.
+/// [`DisplayTarget::transfer`] is the request; surface negotiation can
+/// downgrade it (PQ -> scRGB -> plain sRGB, with a warning) when the backend or
+/// OS cannot fulfil it. [`resolved`](Self::resolved) reports the outcome, so an
+/// app can adapt to the real output mode, and [`supported`](Self::supported)
+/// lists the requests that would be fulfilled verbatim, so an app can offer
+/// only the modes that will not silently downgrade.
 ///
-/// The renderer inserts and updates this on window entities once their surface
-/// is configured; the values lag the negotiation by one frame, and update again
-/// if the surface is later renegotiated against changed capabilities. Treat it
-/// as read-only: writing it has no effect on the surface. It is absent until
-/// the window's first surface configuration (and on windows that never get a
-/// surface, e.g. headless).
+/// The renderer inserts and updates this once a window's surface is configured;
+/// the values lag the negotiation by one frame, and update again if the surface
+/// is later renegotiated against changed capabilities. Treat it as read-only:
+/// writing it has no effect on the surface. It is absent until the first
+/// surface configuration, and on windows that never get a surface (headless).
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(
     feature = "bevy_reflect",
@@ -486,7 +451,7 @@ impl core::fmt::Debug for DisplayTransfers {
     reflect(Serialize, Deserialize)
 )]
 pub struct WindowSurfaceTransfers {
-    /// The transfer the configured surface currently carries — the negotiated
+    /// The transfer the configured surface currently carries: the negotiated
     /// outcome of the [`DisplayTarget::transfer`] request.
     pub resolved: DisplayTransfer,
     /// The transfers this surface can present, derived from the color spaces it
@@ -643,8 +608,8 @@ mod tests {
             .with(DisplayTransfer::ExtendedSrgb);
         // Every variant reaches `iter`, so `CYCLE_ORDER` lists them all.
         assert_eq!(all.iter().count(), DisplayTransfers::CYCLE_ORDER.len());
-        // Two transfers sharing a bit survive that count — both still report as
-        // members — but not a singleton set.
+        // Two transfers sharing a bit survive that count (both still report as
+        // members) but not a singleton set.
         for transfer in DisplayTransfers::CYCLE_ORDER {
             assert!(DisplayTransfers::EMPTY.with(transfer).iter().eq([transfer]));
         }

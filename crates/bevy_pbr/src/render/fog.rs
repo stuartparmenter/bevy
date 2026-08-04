@@ -65,8 +65,7 @@ pub fn prepare_fog(
         return;
     };
     for (entity, fog) in views_iter {
-        // Fog colors enter the GPU uniform in the working color space
-        // (identity for the default Rec.709 working space).
+        // Fog colors enter the GPU uniform in the working color space.
         let base_color =
             linear_rgba_rec709_to_working(LinearRgba::from(fog.color), *working_color_space)
                 .to_vec4();

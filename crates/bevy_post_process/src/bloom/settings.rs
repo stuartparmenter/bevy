@@ -119,9 +119,8 @@ pub struct Bloom {
     /// Maximum size of each dimension for the largest mipchain texture used in downscaling/upscaling.
     /// Only tweak if you are seeing visual artifacts.
     ///
-    /// The [`BloomScatterModel::Gt7Glare`] glare pattern's on-screen angular
-    /// size is calibrated for the default value of `512`; other values rescale
-    /// the glare pattern accordingly.
+    /// The [`BloomScatterModel::Gt7Glare`] glare size is calibrated for the
+    /// default value of `512`. Other values rescale the glare pattern.
     pub max_mip_dimension: u32,
 
     /// Amount to stretch the bloom on each axis. Artistic control, can be used to emulate
@@ -129,15 +128,7 @@ pub struct Bloom {
     /// [`Bloom::max_mip_dimension`] to reduce sampling artifacts.
     pub scale: Vec2,
 
-    /// Selects how the blurred pyramid levels are weighted when composited
-    /// back onto the image (default: [`BloomScatterModel::Aesthetic`], the
-    /// parametric curve).
-    ///
-    /// [`BloomScatterModel::Gt7Glare`] replaces the parametric curve with
-    /// per-level weights derived from the diffraction pattern of a camera
-    /// aperture, turning bloom into a physically based veiling glare in the
-    /// style of Gran Turismo 7. See [`BloomScatterModel`] for the parameters
-    /// it overrides.
+    /// Default: [`BloomScatterModel::Aesthetic`].
     pub scatter: BloomScatterModel,
 }
 
@@ -163,10 +154,8 @@ impl Bloom {
         scatter: BloomScatterModel::Aesthetic,
     };
 
-    /// Physically based veiling glare in the style of Gran Turismo 7: the
-    /// pyramid levels are weighted by the diffraction pattern of an f/5.6
-    /// camera aperture instead of the parametric curve. See
-    /// [`BloomScatterModel::Gt7Glare`].
+    /// A preset that uses physically based veiling glare at f/5.6.
+    /// See [`BloomScatterModel::Gt7Glare`].
     pub const GT7_GLARE: Self = Self {
         scatter: BloomScatterModel::Gt7Glare {
             f_number: BloomScatterModel::DEFAULT_F_NUMBER,
@@ -216,25 +205,15 @@ impl Bloom {
         scatter: BloomScatterModel::Aesthetic,
     };
 
-    /// Returns `true` when the downsampling passes must apply the
-    /// soft-threshold prefilter curve.
-    ///
-    /// This is [`BloomPrefilter::is_active`] gated on the scatter model:
-    /// [`BloomScatterModel::Gt7Glare`] always integrates the total scene
-    /// energy (a physical point-spread function has no brightness cutoff;
-    /// GT7's glare is threshold-free), so any configured prefilter is
-    /// ignored under it.
+    /// Returns `true` when the downsampling passes must apply the soft-threshold
+    /// prefilter curve. [`BloomScatterModel::Gt7Glare`] never does.
     pub(crate) fn thresholding_active(&self) -> bool {
         matches!(self.scatter, BloomScatterModel::Aesthetic) && self.prefilter.is_active()
     }
 
-    /// The composite mode the upsampling pipeline actually uses.
-    ///
-    /// [`BloomScatterModel::Gt7Glare`] derives its blend constants as
-    /// chained energy-conserving lerp factors (see `bloom::glare`), so it
-    /// forces [`BloomCompositeMode::EnergyConserving`] regardless of
-    /// [`composite_mode`](Self::composite_mode);
-    /// [`BloomScatterModel::Aesthetic`] uses the configured mode unchanged.
+    /// The composite mode the upsampling pipeline uses.
+    /// [`BloomScatterModel::Gt7Glare`] forces
+    /// [`BloomCompositeMode::EnergyConserving`].
     pub(crate) fn effective_composite_mode(&self) -> BloomCompositeMode {
         match self.scatter {
             BloomScatterModel::Aesthetic => self.composite_mode,
@@ -254,57 +233,45 @@ impl Default for Bloom {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Reflect)]
 #[reflect(Default, Clone, PartialEq)]
 pub enum BloomScatterModel {
-    /// The hand-tuned parametric curve, shaped
-    /// by [`Bloom::intensity`], [`Bloom::low_frequency_boost`],
-    /// [`Bloom::low_frequency_boost_curvature`] and
-    /// [`Bloom::high_pass_frequency`]. This is the default.
+    /// The hand-tuned parametric curve, shaped by [`Bloom::intensity`],
+    /// [`Bloom::low_frequency_boost`], [`Bloom::low_frequency_boost_curvature`]
+    /// and [`Bloom::high_pass_frequency`]. This is the default.
     #[default]
     Aesthetic,
 
     /// Physically based veiling glare inspired by Gran Turismo 7 (SIGGRAPH
-    /// 2025): the per-level weights are derived from the Fraunhofer
-    /// diffraction point-spread function (the polychromatic Airy pattern) of
-    /// an ideal circular aperture at the given F-number, instead of the
-    /// parametric curve.
-    ///
-    /// GT7's own 240 hand-calibrated weights are unpublished; Bevy derives
-    /// the weights from the documented physical model (see the
-    /// `bloom::glare` module docs for the derivation and references), so
-    /// this is *inspired by* GT7 rather than a clone of its constants.
+    /// 2025). The per-level weights come from the Fraunhofer diffraction
+    /// point-spread function (the polychromatic Airy pattern) of an ideal
+    /// circular aperture at the given F-number, instead of the parametric curve.
+    /// GT7's own 240 hand-calibrated weights are unpublished, so Bevy derives
+    /// its weights from the same physical model.
     ///
     /// Under this model:
-    /// - [`Bloom::intensity`] keeps its meaning as the total fraction of
-    ///   energy scattered out of the sharp image (energy-conserving), while
-    ///   the F-number shapes how that energy spreads across blur radii.
-    /// - The [`Bloom::prefilter`] threshold is ignored (a physical PSF
-    ///   applies to all light; GT7's glare is threshold-free) and
-    ///   [`Bloom::composite_mode`] is forced to
-    ///   [`BloomCompositeMode::EnergyConserving`].
-    /// - [`Bloom::low_frequency_boost`],
+    /// * [`Bloom::intensity`] is the total fraction of energy scattered out of
+    ///   the sharp image, and the F-number sets how that energy spreads across
+    ///   blur radii
+    /// * The [`Bloom::prefilter`] threshold is ignored, because a physical PSF
+    ///   scatters all light, and [`Bloom::composite_mode`] is forced to
+    ///   [`BloomCompositeMode::EnergyConserving`], because the blend constants
+    ///   are a chain of energy-conserving lerps
+    /// * [`Bloom::low_frequency_boost`],
     ///   [`Bloom::low_frequency_boost_curvature`] and
-    ///   [`Bloom::high_pass_frequency`] are unused.
-    ///
-    /// The glare's on-screen angular size is calibrated for the default
-    /// [`Bloom::max_mip_dimension`] of `512`; other values rescale the glare
-    /// pattern accordingly.
+    ///   [`Bloom::high_pass_frequency`] are unused
     Gt7Glare {
-        /// The aperture F-number (focal length over aperture diameter) of
-        /// the virtual camera, clamped to the standard full-stop ladder
-        /// range `[1.0, 22.0]`.
+        /// The aperture F-number (focal length over aperture diameter) of the
+        /// virtual camera, clamped to `[1.0, 22.0]`.
         ///
-        /// Diffraction scales with the F-number: small values (f/1.0, wide
-        /// aperture) produce a tight glare that falls off steeply with
-        /// radius, large values (f/22, stopped down) spread the energy into
-        /// a wide, soft veil. Defaults to f/5.6
-        /// ([`BloomScatterModel::DEFAULT_F_NUMBER`]). Non-finite or
-        /// non-positive values fall back to the default with a warning.
+        /// Small values (f/1.0, wide aperture) give a tight glare that falls off
+        /// steeply with radius. Large values (f/22, stopped down) spread the
+        /// energy into a wide, soft veil. Non-finite or non-positive values fall
+        /// back to [`BloomScatterModel::DEFAULT_F_NUMBER`] with a warning.
         f_number: f32,
     },
 }
 
 impl BloomScatterModel {
-    /// The default aperture F-number for [`Self::Gt7Glare`] (mid-ladder,
-    /// a common photographic walk-around aperture).
+    /// The default aperture F-number for [`Self::Gt7Glare`]: mid-ladder, and a
+    /// common photographic walk-around aperture.
     pub const DEFAULT_F_NUMBER: f32 = super::glare::DEFAULT_F_NUMBER;
 }
 
@@ -323,26 +290,21 @@ pub struct BloomPrefilter {
     ///
     /// RGB values under the threshold curve will not contribute to the effect.
     ///
-    /// This is expressed in raw scene-linear framebuffer values, where `1.0`
-    /// corresponds to SDR paper white at the tone-map operator output. On HDR
-    /// display targets, where paper white is configurable
-    /// (`DisplayTarget::paper_white_nits` on the window), consider
-    /// [`threshold_nits`](Self::threshold_nits) instead so the cutoff keeps a
-    /// fixed physical meaning.
+    /// Expressed in scene-linear framebuffer values, where `1.0` is paper white
+    /// at the tone-map operator output. On HDR display targets paper white is
+    /// configurable, so use [`threshold_nits`](Self::threshold_nits) there to
+    /// keep the cutoff at a fixed brightness.
     pub threshold: f32,
 
-    /// Optional luminance threshold expressed in nits (default: `None`).
+    /// Optional luminance threshold in nits (default: `None`).
     ///
-    /// When set, this takes precedence over [`threshold`](Self::threshold):
-    /// at prepare time it is divided by the paper white (in nits) of the
-    /// view's *resolved* display target (`DisplayTarget::paper_white_nits`,
-    /// 100 nits for plain SDR targets) to produce the framebuffer-value
-    /// threshold the shader uses. This keeps the cutoff anchored to a
-    /// physical brightness on displays with a non-default paper white,
-    /// instead of silently re-scaling with it.
+    /// When set, this takes precedence over [`threshold`](Self::threshold). It is
+    /// divided by the paper white of the view's resolved display target
+    /// (`DisplayTarget::paper_white_nits`, 100 nits for plain SDR targets) to get
+    /// the framebuffer value the shader compares against.
     ///
-    /// `Some(0.0)` (or a negative value) disables thresholding, like a
-    /// `threshold` of `0.0` does.
+    /// `Some(0.0)` or a negative value disables thresholding, like a `threshold`
+    /// of `0.0`.
     pub threshold_nits: Option<f32>,
 
     /// Controls how much to blend between the thresholded and non-thresholded colors (default: 0.0).
@@ -355,10 +317,7 @@ pub struct BloomPrefilter {
 }
 
 impl BloomPrefilter {
-    /// Returns `true` when this prefilter requests any thresholding, i.e.
-    /// when the bloom downsampling pipeline must apply the soft-threshold
-    /// curve ([`threshold_nits`](Self::threshold_nits) takes precedence over
-    /// [`threshold`](Self::threshold)).
+    /// Returns `true` when this prefilter requests any thresholding.
     pub fn is_active(&self) -> bool {
         match self.threshold_nits {
             Some(nits) => nits > 0.0,
@@ -366,14 +325,11 @@ impl BloomPrefilter {
         }
     }
 
-    /// Resolves the threshold to scene-linear framebuffer units (`1.0` =
-    /// paper white at the tone-map operator output) against the given paper
-    /// white in nits.
+    /// Resolves the threshold to scene-linear framebuffer units, where `1.0` is
+    /// paper white.
     ///
-    /// Returns [`threshold`](Self::threshold) unchanged when
-    /// [`threshold_nits`](Self::threshold_nits) is `None`; `paper_white_nits`
-    /// must be positive and finite (use
-    /// `DisplayTarget::sanitized_paper_white_nits`).
+    /// `paper_white_nits` must be positive and finite: use
+    /// `DisplayTarget::sanitized_paper_white_nits`.
     pub fn resolve_threshold(&self, paper_white_nits: f32) -> f32 {
         match self.threshold_nits {
             Some(nits) => (nits / paper_white_nits).max(0.0),
@@ -399,11 +355,10 @@ impl ExtractComponent<RenderApp> for Bloom {
     type Out = Self;
 
     fn extract_component((bloom, camera): QueryItem<'_, '_, Self::QueryData>) -> Option<Self::Out> {
-        // `prepare_bloom_uniforms` builds the `BloomUniforms` in the render
-        // world, where the view's resolved display target is available. This
-        // guard admits only active cameras with a drawable viewport, so the
-        // uniform math (aspect ratio, viewport normalization) never sees a
-        // zero dimension.
+        // `prepare_bloom_uniforms` builds the uniforms in the render world, where
+        // the resolved display target is available. This guard admits only active
+        // cameras with a drawable viewport, so that math never sees a zero
+        // dimension.
         match (
             camera.physical_viewport_rect(),
             camera.physical_viewport_size(),
@@ -423,8 +378,7 @@ mod tests {
     use super::*;
     use bevy_math::Vec4;
 
-    /// The precomputation packing must stay bit-identical to the reference
-    /// inline math for `threshold`-based prefilters.
+    /// The packing must stay bit-identical to the reference inline math.
     #[test]
     fn threshold_precomputations_match_reference_inline_math() {
         for (threshold, threshold_softness) in [
@@ -451,7 +405,6 @@ mod tests {
 
     #[test]
     fn prefilter_activity() {
-        // A non-zero framebuffer-value `threshold` activates the prefilter.
         let fb = BloomPrefilter {
             threshold: 0.6,
             ..Default::default()
@@ -459,8 +412,7 @@ mod tests {
         assert!(fb.is_active());
         assert!(!BloomPrefilter::default().is_active());
 
-        // `threshold_nits` takes precedence, including `Some(0.0)` disabling
-        // a non-zero `threshold`.
+        // `threshold_nits` takes precedence, and `Some(0.0)` disables.
         let nits = BloomPrefilter {
             threshold: 0.0,
             threshold_nits: Some(120.0),
@@ -482,8 +434,7 @@ mod tests {
 
     #[test]
     fn resolve_threshold_converts_nits_by_paper_white() {
-        // Without nits the framebuffer value passes through untouched, for
-        // any paper white.
+        // Without nits the framebuffer value passes through unchanged.
         let fb = BloomPrefilter {
             threshold: 0.6,
             ..Default::default()
@@ -491,8 +442,7 @@ mod tests {
         assert_eq!(fb.resolve_threshold(100.0), 0.6);
         assert_eq!(fb.resolve_threshold(203.0), 0.6);
 
-        // 200 nits is 2x paper white on a 100-nit target and exactly paper
-        // white on a 200-nit target.
+        // 200 nits is 2x paper white at 100 nits, and 1x at 200 nits.
         let nits = BloomPrefilter {
             threshold: 123.0, // ignored
             threshold_nits: Some(200.0),

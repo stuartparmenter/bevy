@@ -682,19 +682,7 @@ pub struct Image {
     pub asset_usage: RenderAssetUsages,
     /// Whether this image should be copied on the GPU when resized.
     pub copy_on_resize: bool,
-    /// The color primaries the image data is expressed in. See
-    /// [`SourceColorPrimaries`] for details.
-    ///
-    /// This is *metadata only* and does not currently affect rendering: it records
-    /// the source gamut so that a wide working color space can convert the data
-    /// correctly at sample or upload time. Defaults to
-    /// [`SourceColorPrimaries::Bt709`] (the sRGB / Rec. 709 primaries), matching
-    /// the previously implicit assumption for all image data.
-    ///
-    /// Loaders stamp this field from explicit loader settings when provided (for
-    /// example [`ImageLoaderSettings::source_primaries`](crate::ImageLoaderSettings)),
-    /// falling back to color metadata carried by the file itself, and finally to
-    /// [`SourceColorPrimaries::Bt709`].
+    /// The color primaries the image data is expressed in.
     pub source_primaries: SourceColorPrimaries,
 }
 
@@ -2532,7 +2520,6 @@ mod test {
 
     #[test]
     fn image_source_primaries_default_to_bt709() {
-        // Every constructor must preserve the previously implicit BT.709 assumption.
         for image in [
             Image::default(),
             Image::default_uninit(),

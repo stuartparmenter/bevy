@@ -249,7 +249,7 @@ struct FragmentOutput {
     @location(0) color: vec4<f32>,
 };
 
-// See lines.wgsl: the writer-side encode is a pass-through on default views.
+// See lines.wgsl for the writer-side encode.
 @fragment
 fn fragment(in: FragmentInput) -> FragmentOutput {
     return FragmentOutput(writer_encode(in.color));

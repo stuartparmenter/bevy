@@ -216,12 +216,10 @@ fn example_control_system(
     if input.just_pressed(KeyCode::KeyP) {
         auto_exposure.physiological = match auto_exposure.physiological {
             Some(_) => None,
-            // The default `PhysiologicalAdaptation` models real human time scales — full
-            // dark adaptation takes tens of minutes — which would be invisible in a short
-            // demo session. This example therefore uses heavily accelerated long-term
-            // speeds and a tight bounding range, so that turning towards the bright slot
-            // (or away from it) visibly hits the long-term bound within a second and then
-            // slowly continues adapting over the following seconds.
+            // The defaults model human eyes, where full dark adaptation takes tens
+            // of minutes. These speeds are much faster and the bounds tighter, so
+            // turning the camera hits the bound within a second, then keeps adapting
+            // slowly after that.
             None => Some(PhysiologicalAdaptation {
                 speed_brighten: 0.4,
                 speed_darken: 0.1,
@@ -236,18 +234,16 @@ fn example_control_system(
             commands.entity(camera_entity).remove::<AutoWhiteBalance>();
         } else {
             commands.entity(camera_entity).insert(AutoWhiteBalance {
-                // The default adaptation speed (0.5/s) mimics a real camera settling over
-                // a few seconds; the demo uses a snappier value so toggling the warm
-                // light (L) gives quick feedback.
+                // The default speed of 0.5/s settles over a few seconds, like a real
+                // camera. This is faster so toggling the warm light (L) is easy to see.
                 speed: 2.0,
                 ..default()
             });
         }
     }
 
-    // A heavily tungsten-tinted light: with auto white balance enabled, the camera
-    // slowly neutralizes the orange cast (the correction is bounded by the 2500 K
-    // clamp, like a real camera's AWB).
+    // A tungsten-tinted light. With auto white balance on, the camera pulls the orange
+    // cast back out, limited by the 2500 K - 7000 K clamp on the estimated temperature.
     let warm_light = Color::srgb(1.0, 0.6, 0.3);
     if input.just_pressed(KeyCode::KeyL) {
         light.color = if light.color == warm_light {

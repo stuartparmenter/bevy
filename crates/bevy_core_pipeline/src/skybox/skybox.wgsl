@@ -1,8 +1,6 @@
 #import bevy_render::view::View
 #import bevy_pbr::utils::coords_to_viewport_uv
 
-// Only pulled in when the project opted into the Rec.2020 working space, so
-// default (Rec.709) projects do not reference this import.
 #ifdef WORKING_COLOR_SPACE_REC2020
 #import bevy_render::working_color_space::rec709_to_rec2020
 #endif
@@ -84,10 +82,8 @@ fn skybox_fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // Cube maps are left-handed so we negate the z coordinate.
     let out = textureSample(skybox, skybox_sampler, ray_direction * vec3(1.0, 1.0, -1.0));
 #ifdef WORKING_COLOR_SPACE_REC2020
-    // Skybox cubemaps are assumed Rec.709-authored: convert the sampled
-    // radiance into the Rec.2020 working space. Cubemaps stamped with wide
-    // source primaries currently have no per-texture escape hatch (see
-    // `GpuImage::source_primaries`).
+    // Skybox cubemaps are assumed Rec.709-authored, so convert the sampled
+    // radiance into the working space (see `GpuImage::source_primaries`).
     return vec4(rec709_to_rec2020(out.rgb) * uniforms.brightness, out.a);
 #else
     return vec4(out.rgb * uniforms.brightness, out.a);

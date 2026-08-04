@@ -564,7 +564,7 @@ pub fn extract_lights(
         let mut entity_commands = commands.entity(render_entity);
         let extracted_point_light = ExtractedPointLight {
             // Light colors enter the render world in the working color space
-            // (identity for the default Rec.709 working space).
+            // (identity for the default Rec.709 space).
             color: linear_rgba_rec709_to_working(point_light.color.into(), *working_color_space),
             // NOTE: Map from luminous power in lumens to luminous intensity in lumens per steradian
             // for a point light. See https://google.github.io/filament/Filament.md.html#mjx-eqn-pointLightLuminousPower
@@ -701,8 +701,6 @@ pub fn extract_lights(
 
         let mut entity_commands = commands.entity(render_entity);
         let extracted_spot_light = ExtractedPointLight {
-            // See the point-light comment: working-space conversion happens
-            // once, at extract.
             color: linear_rgba_rec709_to_working(spot_light.color.into(), *working_color_space),
             // NOTE: Map from luminous power in lumens to luminous intensity in lumens per steradian
             // for a point light. See https://google.github.io/filament/Filament.md.html#mjx-eqn-pointLightLuminousPower
@@ -864,8 +862,6 @@ pub fn extract_lights(
         }
 
         let extracted_directional_light = ExtractedDirectionalLight {
-            // See the point-light comment: working-space conversion happens
-            // once, at extract.
             color: linear_rgba_rec709_to_working(
                 directional_light.color.into(),
                 *working_color_space,
@@ -927,8 +923,6 @@ pub fn extract_lights(
             .expect("RectLight entity wasn't synced.");
         entity_commands.insert((
             ExtractedRectLight {
-                // See the point-light comment: working-space conversion
-                // happens once, at extract.
                 color: linear_rgba_rec709_to_working(rect_light.color.into(), *working_color_space),
                 intensity: rect_light.intensity
                     / (effective_width * effective_height * core::f32::consts::PI),
@@ -1822,8 +1816,7 @@ pub fn prepare_lights(
 
         let mut gpu_lights = GpuLights {
             directional_lights: gpu_directional_lights,
-            // Ambient light enters the GPU buffers in the working color
-            // space (identity for the default Rec.709 working space).
+            // Ambient light enters the GPU buffers in the working color space.
             ambient_color: Vec4::from_slice(
                 &linear_rgba_rec709_to_working(
                     LinearRgba::from(ambient_light.color),

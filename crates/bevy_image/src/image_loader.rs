@@ -157,12 +157,11 @@ pub struct ImageLoaderSettings {
     #[serde(default)]
     pub array_layout: Option<ImageArrayLayout>,
     /// The color primaries the image data is expressed in, stamped on
-    /// [`Image::source_primaries`]. This is metadata only and does not affect how
-    /// the image is decoded or rendered.
+    /// [`Image::source_primaries`].
     ///
-    /// `None` (the default) trusts color-primary metadata carried by the file
-    /// itself (currently the KTX2 data format descriptor), falling back to
-    /// [`SourceColorPrimaries::Bt709`]. `Some` overrides whatever the file says.
+    /// `None` (the default) uses color metadata from the file itself (currently only
+    /// the KTX2 data format descriptor), falling back to
+    /// [`SourceColorPrimaries::Bt709`]. `Some` overrides the file.
     #[serde(default)]
     pub source_primaries: Option<SourceColorPrimaries>,
 }
@@ -252,9 +251,7 @@ impl AssetLoader for ImageLoader {
             image.texture_descriptor.format = format;
         }
 
-        // An explicit loader setting takes priority over the file's own color
-        // metadata (stamped by `Image::from_buffer`), which in turn defaults to
-        // BT.709.
+        // `Image::from_buffer` already stamped the file's own color metadata, if any.
         if let Some(source_primaries) = settings.source_primaries {
             image.source_primaries = source_primaries;
         }

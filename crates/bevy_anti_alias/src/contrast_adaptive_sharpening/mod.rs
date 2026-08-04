@@ -192,14 +192,13 @@ pub fn init_cas_pipeline(
 pub struct CasPipelineKey {
     target_format: TextureFormat,
     denoise: bool,
-    /// Whether the view's display-encoding pass runs; see
-    /// [`ViewStackContract::is_hdr_encode`].
+    /// Whether the view's display-encoding pass runs.
+    /// See [`ViewStackContract::is_hdr_encode`].
     ///
-    /// The post-tonemap input on such views is paper-white-relative
+    /// Post-tonemap input on these views is paper-white-relative
     /// display-linear and exceeds 1.0, which breaks RCAS's `[0, 1]` limiter
-    /// math, so the shader compiles with the `HDR_DISPLAY_TARGET` def and
-    /// range-compresses the neighborhood before sharpening. SDR views keep
-    /// the def-less pipeline byte-for-byte.
+    /// math. The shader then compiles with the `HDR_DISPLAY_TARGET` def and
+    /// range-compresses the neighborhood before sharpening.
     hdr: bool,
 }
 
@@ -276,17 +275,15 @@ pub struct ViewCasPipeline(CachedRenderPipelineId);
 #[cfg(test)]
 mod tests {
     //! CPU mirrors of the RCAS math in
-    //! `robust_contrast_adaptive_sharpening.wgsl`, locking the HDR
-    //! range-compression contract (and documenting the [0, 1] limiter failure
-    //! it fixes). Single-channel mirrors are exact for grayscale
-    //! neighborhoods, where the per-channel WGSL vector math collapses to the
-    //! same scalars.
+    //! `robust_contrast_adaptive_sharpening.wgsl`. The single-channel mirrors
+    //! are exact for grayscale neighborhoods, where the per-channel WGSL
+    //! vector math collapses to the same scalars.
 
     /// Mirror of `FSR_RCAS_LIMIT`.
     const FSR_RCAS_LIMIT: f32 = 0.1875;
     /// Mirror of `peakC`.
     const PEAK_C: (f32, f32) = (10.0, -40.0);
-    /// The f16 maximum, the largest value the `Rgba16Float` target can store.
+    /// The largest value an `Rgba16Float` target can store.
     const F16_MAX: f32 = 65504.0;
 
     /// Mirror of `rcas_range_compress` (single channel).
@@ -319,8 +316,7 @@ mod tests {
     }
 
     /// Mirror of the `HDR_DISPLAY_TARGET` path: compress, RCAS, decompress,
-    /// then bound overshoot by `max(local_max, 1.0)` (the SDR target-clamp
-    /// semantic transplanted into the unbounded buffer).
+    /// then bound overshoot by `max(local_max, 1.0)`.
     fn rcas_hdr(b: f32, d: f32, e: f32, f: f32, h: f32, sharpness: f32) -> f32 {
         let sharpened = decompress(rcas(
             compress(b),
@@ -338,11 +334,10 @@ mod tests {
     fn range_compression_round_trips() {
         // decompress(compress(x)) == x across the HDR range the post-tonemap
         // buffer can carry. The `1 - v` in the inverse cancels catastrophically
-        // as v approaches 1, so the achievable round-trip precision degrades
-        // quadratically with x (relative error ~ x * epsilon): exact to ~7
-        // significant digits at paper white, ~3 at x = 10000. That is far
-        // below what an Rgba16Float target can even store (f16 has ~3 decimal
-        // digits), so the tolerance scales as x^2 * epsilon.
+        // as v approaches 1, so precision degrades quadratically with x: exact
+        // to ~7 significant digits at paper white, ~3 at x = 10000. That is
+        // still finer than an `Rgba16Float` target can store (f16 keeps ~3
+        // decimal digits), so the tolerance scales as x^2 * epsilon.
         for x in [0.0_f32, 0.001, 0.18, 0.5, 1.0, 2.5, 10.0, 100.0, 10000.0] {
             let round_tripped = decompress(compress(x));
             let tolerance = (x * x * f32::EPSILON * 4.0).max(1e-7);
@@ -357,33 +352,29 @@ mod tests {
     fn range_compression_edge_cases() {
         // Negative inputs clamp to zero (monotonic, invertible domain).
         assert_eq!(compress(-5.0), 0.0);
-        // The compressed domain is strictly below 1.
         assert!(compress(F16_MAX) < 1.0);
-        // Decompression saturates at the f16 maximum instead of producing
-        // infinity, even for an (out-of-contract) input of exactly 1.0.
+        // Decompression saturates at the f16 maximum instead of infinity,
+        // even for an out-of-contract input of exactly 1.0.
         assert_eq!(decompress(1.0), F16_MAX);
         assert!(decompress(2.0).is_finite());
     }
 
     #[test]
     fn sdr_limiter_breaks_on_hdr_range_input() {
-        // Documents the bugs the HDR path fixes.
-        //
-        // (1) Division blow-up: the `hitMax` denominator `-40 + 4 * mn4` is
-        // exactly zero at `mn4 == 10`; with `mx4 == 10` the numerator is also
-        // zero, so the clip solve is 0/0 = NaN. In WGSL, NaN propagation
-        // through min/max is indeterminate, so the lobe (and the output
-        // pixel) can become NaN — a firefly on float targets.
+        // (1) Division blow-up. The `hitMax` denominator `-40 + 4 * mn4` is
+        // zero at `mn4 == 10`, and with `mx4 == 10` the numerator is zero
+        // too, so the clip solve is 0/0 = NaN. NaN propagation through
+        // min/max is indeterminate in WGSL, so the lobe can become NaN, which
+        // is a firefly on float targets.
         let mn4 = 10.0_f32;
         let mx4 = 10.0_f32;
         let hit_max_nan = (PEAK_C.0 - mx4) / (PEAK_C.1 + 4.0 * mn4);
         assert!(hit_max_nan.is_nan());
 
-        // (2) Sign inversion: when the neighborhood straddles 10 (`mn4 < 10 <
-        // mx4`), numerator and denominator are both negative-to-positive
-        // mismatched and the solve flips positive — the `min(0.0, ...)` clamp
-        // then forces the lobe to zero, silently disabling sharpening exactly
-        // around bright HDR highlights.
+        // (2) Sign inversion. When the neighborhood straddles 10 (`mn4 < 10 <
+        // mx4`) the solve flips positive. The `min(0.0, ...)` clamp then
+        // forces the lobe to zero, silently disabling sharpening around bright
+        // HDR highlights.
         let mn4 = 5.0_f32;
         let mx4 = 20.0_f32;
         let hit_max_flipped = (PEAK_C.0 - mx4) / (PEAK_C.1 + 4.0 * mn4);
@@ -391,7 +382,7 @@ mod tests {
         let lobe = rcas_lobe(20.0, 20.0, 5.0, 5.0, 1.0);
         assert_eq!(lobe, 0.0, "inverted limiter disables sharpening");
 
-        // The HDR path keeps a working (bounded, negative) lobe on the same
+        // The HDR path keeps a bounded, negative lobe on the same
         // neighborhood because the compressed taps are inside [0, 1).
         let lobe_hdr = rcas_lobe(
             compress(20.0),
@@ -405,8 +396,8 @@ mod tests {
 
     #[test]
     fn hdr_path_is_bounded_and_finite_on_hdr_input() {
-        // The exact neighborhoods that break the SDR math: flat and edged
-        // regions up to a 100x-paper-white peak.
+        // Neighborhoods that break the SDR math: flat and edged regions up to
+        // 100x paper white.
         for peak in [2.5_f32, 4.0, 10.0, 16.0, 100.0] {
             for (b, d, e, f, h) in [
                 (peak, peak, peak, peak, peak),
@@ -420,9 +411,9 @@ mod tests {
                 );
                 let out = rcas_hdr(b, d, e, f, h, 1.0);
                 assert!(out.is_finite(), "HDR RCAS produced a non-finite value");
-                // RCAS limits its output to the neighborhood range; after
-                // decompression that bound still holds (the compression is
-                // monotonic), modulo f32 rounding.
+                // RCAS limits its output to the neighborhood range. The
+                // compression is monotonic, so that bound survives
+                // decompression, modulo f32 rounding.
                 let neighborhood_max = b.max(d).max(e).max(f).max(h);
                 assert!(
                     (0.0..=neighborhood_max * (1.0 + 1e-4) + 1e-6).contains(&out),
@@ -434,8 +425,8 @@ mod tests {
 
     #[test]
     fn hdr_path_sharpens_sdr_range_edges() {
-        // Sanity: on an in-range edge the HDR path still sharpens (darkens a
-        // dark center pixel surrounded by brights, like the SDR path does).
+        // On an in-range edge the HDR path still sharpens: it darkens a dark
+        // center pixel surrounded by bright ones, like the SDR path does.
         let sdr = rcas(1.0, 1.0, 0.2, 1.0, 1.0, 1.0);
         let hdr = rcas_hdr(1.0, 1.0, 0.2, 1.0, 1.0, 1.0);
         assert!(sdr < 0.2);

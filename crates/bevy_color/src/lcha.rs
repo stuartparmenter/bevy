@@ -369,13 +369,11 @@ mod tests {
 
     #[test]
     fn wide_gamut_chroma_preserved() {
-        // A very saturated wide-gamut color's chroma (beyond the old `1.5` clamp)
-        // must survive the `Laba` -> `Lcha` conversion.
+        // A saturated wide-gamut color's chroma must survive `Laba` -> `Lcha`.
         let laba = Laba::new(0.8, 1.5, -1.2, 1.0);
         let lcha: Lcha = laba.into();
         assert!(lcha.chroma > 1.9, "chroma was clamped: {:?}", lcha);
 
-        // And the polar <-> cartesian round trip preserves the components.
         let back: Laba = lcha.into();
         assert_approx_eq!(laba.lightness, back.lightness, 1e-4);
         assert_approx_eq!(laba.a, back.a, 1e-4);

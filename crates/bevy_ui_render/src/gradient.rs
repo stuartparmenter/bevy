@@ -138,8 +138,7 @@ pub struct UiGradientPipelineKey {
     anti_alias: bool,
     color_space: InterpolationColorSpace,
     pub target_format: TextureFormat,
-    /// Writer-side encode of the fragment output (see
-    /// [`UiWriterEncodeKey`](crate::pipeline::UiWriterEncodeKey)).
+    /// Writer-side encode of the fragment output (see [`UiWriterEncodeKey`]).
     writer_encode: UiWriterEncodeKey,
 }
 

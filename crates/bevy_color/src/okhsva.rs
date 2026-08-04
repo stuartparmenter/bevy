@@ -11,14 +11,9 @@ use bevy_reflect::prelude::*;
 /// Color in Okhsv color space with alpha.
 /// Further information on this color model can be found on <https://bottosson.github.io/posts/colorpicker>.
 ///
-/// # Gamut limitation
-///
-/// Okhsv is defined *relative to the sRGB (Rec. 709) gamut*: its saturation and
-/// value components describe positions within the sRGB gamut hull, and the
-/// conversion math hardcodes that hull. It cannot represent wide-gamut colors
-/// (e.g. [`LinearRec2020`](crate::LinearRec2020) colors outside sRGB) or HDR
-/// intensities; converting such colors through this space produces in-gamut
-/// approximations.
+/// Okhsv is defined relative to the sRGB (Rec. 709) gamut, and the conversion math
+/// hardcodes that gamut hull. Converting a wide-gamut or HDR color into Okhsv can push
+/// saturation and value outside `[0.0, 1.0]`.
 #[doc = include_str!("../docs/conversion.md")]
 /// <div>
 #[doc = include_str!("../docs/diagrams/model_graph.svg")]

@@ -1,21 +1,20 @@
-//! Transfer functions (OETFs / EOTFs) converting between *display-linear*
-//! light and the encoded signal a display expects.
+//! Transfer functions (OETFs and EOTFs) between display-linear light and the
+//! encoded signal a display expects.
 //!
-//! The subset the display-encoding pass runs on the GPU — [`srgb_oetf_extended`],
-//! [`scrgb_encode`] and the PQ inverse EOTF — mirrors `transfer_functions.wgsl`
-//! (importable in WGSL as `bevy_render::transfer_functions`) operation for
-//! operation and is the `f32` parity reference for it; keep both files in sync.
-//! The rest — the EOTFs and the plain [`srgb_oetf`] — is CPU-only, consumed by
-//! the screenshot readback and save paths.
+//! The display-encoding pass runs [`srgb_oetf_extended`], [`scrgb_encode`] and
+//! the PQ inverse EOTF on the GPU. Those three mirror
+//! `transfer_functions.wgsl` operation for operation and are its `f32` parity
+//! reference, so keep both in sync. The EOTFs and the plain [`srgb_oetf`] are
+//! CPU-only, used by the screenshot readback and save paths.
 //!
-//! All math uses [`bevy_math::ops`] so results are deterministic across
-//! platforms and match the parity policy used by the GT7 CPU reference
-//! (`gt7.rs` in `bevy_core_pipeline::tonemapping`).
+//! All math uses [`bevy_math::ops`], so results are deterministic across
+//! platforms and match the GT7 CPU reference (`gt7.rs` in
+//! `bevy_core_pipeline::tonemapping`).
 
 use bevy_math::ops;
 
-/// Luminance, in nits (cd/m²), of scRGB signal value 1.0 (the IEC 61966-2-2
-/// D65 reference white).
+/// Luminance of scRGB signal value 1.0, in nits (cd/m^2): the IEC 61966-2-2
+/// D65 reference white.
 pub const SCRGB_REFERENCE_WHITE_NITS: f32 = 80.0;
 
 /// Maximum luminance the PQ (SMPTE ST 2084) signal can carry, in nits.
@@ -24,25 +23,25 @@ pub const PQ_MAX_LUMINANCE_NITS: f32 = 10000.0;
 
 /// ST-2084 constant `m1` = (2610 / 4096) / 4.
 const PQ_M1: f32 = 0.159_301_76;
-/// ST-2084 constant `m2` = (2523 / 4096) × 128.
+/// ST-2084 constant `m2` = (2523 / 4096) * 128.
 const PQ_M2: f32 = 78.84375;
 /// ST-2084 constant `c1` = 3424 / 4096.
 const PQ_C1: f32 = 0.8359375;
-/// ST-2084 constant `c2` = (2413 / 4096) × 32 = 18.8515625 (exact in `f32`).
+/// ST-2084 constant `c2` = (2413 / 4096) * 32 = 18.8515625 (exact in `f32`).
 const PQ_C2: f32 = 18.851_563;
-/// ST-2084 constant `c3` = (2392 / 4096) × 32.
+/// ST-2084 constant `c3` = (2392 / 4096) * 32.
 const PQ_C3: f32 = 18.6875;
 
-/// The sRGB (IEC 61966-2-1) OETF (inverse EOTF): display-linear `[0, 1]` →
+/// The sRGB (IEC 61966-2-1) OETF, the inverse EOTF: display-linear `[0, 1]` to
 /// encoded signal.
 ///
-/// `V = 12.92·L` for `L ≤ 0.0031308`, `V = 1.055·L^(1/2.4) − 0.055` otherwise.
-/// Negative inputs take the linear segment, which keeps `powf` away from a
-/// negative base.
+/// `V = 12.92*L` for `L <= 0.0031308`, `V = 1.055*L^(1/2.4) - 0.055`
+/// otherwise. Negative inputs take the linear segment, which keeps `powf` off
+/// a negative base.
 ///
-/// There is no shader counterpart: sRGB swapchains apply this curve in hardware
-/// on the `*UnormSrgb` writeback. The screenshot path uses it to quantize a
-/// display-linear capture into an 8-bit image.
+/// No counterpart in `transfer_functions.wgsl`: sRGB swapchains apply this
+/// curve in hardware on the `*UnormSrgb` writeback. The screenshot path uses
+/// it to quantize a display-linear capture into an 8-bit image.
 pub fn srgb_oetf(linear: f32) -> f32 {
     if linear <= 0.003_130_8 {
         12.92 * linear
@@ -51,9 +50,9 @@ pub fn srgb_oetf(linear: f32) -> f32 {
     }
 }
 
-/// `f32::signum` but matching WGSL `sign`: returns `0.0` (not `±1.0`) at
-/// `±0.0`, so the extended-sRGB parity tests agree bit-for-bit with the shader
-/// even when fed exactly `±0.0`.
+/// `f32::signum` but matching WGSL `sign`: returns `0.0` at zero rather than
+/// `1.0` or `-1.0`, so the extended-sRGB encode matches the shader bit for bit
+/// at `0.0` and `-0.0`.
 fn wgsl_sign(x: f32) -> f32 {
     if x > 0.0 {
         1.0
@@ -68,16 +67,15 @@ fn wgsl_sign(x: f32) -> f32 {
 /// continued past `[0, 1]` by mirroring the full curve through the origin, so
 /// `srgb_oetf_extended(-c) == -srgb_oetf_extended(c)`.
 ///
-/// `V = sign(c) · ( |c|·12.92` for `|c| ≤ 0.0031308`, `1.055·|c|^(1/2.4) −
-/// 0.055` otherwise `)`. This is the transfer the
+/// `V = sign(c) * (|c|*12.92` for `|c| <= 0.0031308`, `1.055*|c|^(1/2.4) -
+/// 0.055` otherwise `)`. This is what the
 /// [`ExtendedSrgb`](bevy_window::DisplayTransfer::ExtendedSrgb) display target
-/// encodes for (wgpu's `ExtendedSrgb` / `ExtendedDisplayP3` surface color
-/// spaces).
+/// encodes for.
 ///
-/// Unlike [`srgb_oetf`], which extends only the linear segment below zero, this
-/// applies the full gamma curve to the magnitude of negative (wide-gamut /
-/// out-of-gamut) components and preserves their sign — `abs` keeps `powf` away
-/// from a negative base, so the result is finite for every finite input.
+/// [`srgb_oetf`] extends only the linear segment below zero. This one applies
+/// the whole curve to the magnitude of a negative (wide-gamut) component and
+/// restores its sign. `abs` keeps `powf` off a negative base, so the result is
+/// finite for every finite input.
 pub fn srgb_oetf_extended(c: f32) -> f32 {
     let a = c.abs();
     let lo = a * 12.92;
@@ -85,9 +83,8 @@ pub fn srgb_oetf_extended(c: f32) -> f32 {
     wgsl_sign(c) * if a <= 0.003_130_8 { lo } else { hi }
 }
 
-/// The odd-symmetric extended sRGB EOTF: encoded signal → display-linear.
-/// Exact inverse of [`srgb_oetf_extended`], sign preserved (the screenshot
-/// readback path decodes an extended-sRGB capture with it).
+/// The odd-symmetric extended sRGB EOTF: encoded signal to display-linear.
+/// Exact inverse of [`srgb_oetf_extended`], sign preserved.
 pub fn srgb_eotf_extended(s: f32) -> f32 {
     let a = s.abs();
     let lo = a / 12.92;
@@ -95,40 +92,38 @@ pub fn srgb_eotf_extended(s: f32) -> f32 {
     wgsl_sign(s) * if a <= 0.04045 { lo } else { hi }
 }
 
-/// Encodes paper-white-relative display-linear color (1.0 = paper white at
-/// the tone-map operator output) as scRGB-linear signal (1.0 = 80 nits):
-/// `V = L × paper_white_nits / 80`.
+/// Encodes paper-white-relative display-linear color (1.0 = paper white at the
+/// tone-map operator output) as an scRGB-linear signal (1.0 = 80 nits):
+/// `V = L * paper_white_nits / 80`.
 ///
-/// scRGB is unbounded and permits negative components; no clamping is
-/// applied.
+/// scRGB is unbounded and allows negative components, so nothing is clamped.
 pub fn scrgb_encode(color: f32, paper_white_nits: f32) -> f32 {
     color * (paper_white_nits / SCRGB_REFERENCE_WHITE_NITS)
 }
 
 /// The PQ (SMPTE ST 2084) inverse EOTF: normalized display-linear luminance
-/// (`Y = nits / 10000`) → PQ signal in `[0, 1]`.
+/// (`Y = nits / 10000`) to a PQ signal in `[0, 1]`.
 ///
-/// Negative inputs are clamped to zero **before** the `pow` — `powf` with a
-/// negative base and the non-integer exponent `m1` is NaN, and (unlike the
-/// GT7 operator's internal copy, whose callers guarantee non-negative input)
-/// a general-purpose encoder entry point must tolerate slightly-negative
-/// values. Inputs above 1.0 are not clamped; the signal exceeds 1.0 and is
-/// clamped by the target format on store.
+/// Negative inputs are clamped to zero before the `pow`, since `powf` with a
+/// negative base and the non-integer exponent `m1` is NaN. The GT7 copy in
+/// `gt7.rs` skips the clamp because its callers guarantee non-negative input.
+/// Inputs above 1.0 are not clamped, so the signal can exceed 1.0 and the
+/// target format clamps it on store.
 pub fn pq_inverse_eotf(y: f32) -> f32 {
     let y = y.max(0.0);
     let ym = ops::powf(y, PQ_M1);
-    // Numerically-stabler form of ((c1 + c2·ym) / (1 + c3·ym))^m2, identical
-    // to the GT7 operator's self-contained copy in gt7.wgsl / gt7.rs.
+    // Numerically stabler form of ((c1 + c2*ym) / (1 + c3*ym))^m2, identical
+    // to the GT7 operator's own copy in gt7.wgsl and gt7.rs.
     ops::exp2(PQ_M2 * (ops::log2(PQ_C1 + PQ_C2 * ym) - ops::log2(1.0 + PQ_C3 * ym)))
 }
 
 /// [`pq_inverse_eotf`] taking absolute luminance in nits.
-/// `pq_inverse_eotf_from_nits(1000.0)` ≈ 0.7518.
+/// `pq_inverse_eotf_from_nits(1000.0)` is about 0.7518.
 pub fn pq_inverse_eotf_from_nits(nits: f32) -> f32 {
     pq_inverse_eotf(nits / PQ_MAX_LUMINANCE_NITS)
 }
 
-/// The PQ EOTF: PQ signal (clamped to `[0, 1]`) → normalized display-linear
+/// The PQ EOTF: PQ signal (clamped to `[0, 1]`) to normalized display-linear
 /// luminance (1.0 = 10000 nits). Inverse of [`pq_inverse_eotf`].
 pub fn pq_eotf(signal: f32) -> f32 {
     let n = signal.clamp(0.0, 1.0);
@@ -141,8 +136,8 @@ pub fn pq_eotf(signal: f32) -> f32 {
 mod tests {
     use super::*;
 
-    /// `f64` reference for the PQ inverse EOTF, used to compute exact
-    /// expectations independently of the `f32` implementation.
+    /// `f64` reference for the PQ inverse EOTF, so the expected values do not
+    /// come from the `f32` implementation under test.
     fn pq_inverse_eotf_f64(y: f64) -> f64 {
         let m1 = 2610.0 / 4096.0 / 4.0;
         let m2 = 2523.0 / 4096.0 * 128.0;
@@ -164,14 +159,13 @@ mod tests {
 
     #[test]
     fn pq_inverse_eotf_matches_reference_values() {
-        // 1000 nits: the canonical check value from the encoder spec (~0.7518).
+        // 1000 nits, the canonical check value from the encoder spec.
         let expected_1000 = pq_inverse_eotf_f64(0.1); // 0.75182700871...
         assert!((expected_1000 - 0.751_827).abs() < 1e-6);
         assert!((pq_inverse_eotf_from_nits(1000.0) as f64 - expected_1000).abs() < 1e-5);
 
-        // Endpoint and mid-range sweep against the f64 reference. The f32
-        // implementation accumulates ~1 ULP per pow/exp2/log2 step, so allow
-        // a slightly wider (still sub-quantization-step) tolerance here.
+        // Endpoint and mid-range sweep. The f32 form picks up about 1 ULP per
+        // pow/exp2/log2 step: a wider but sub-quantization-step tolerance.
         for nits in [0.0, 0.1, 1.0, 80.0, 100.0, 203.0, 2000.0, 10000.0] {
             let expected = pq_inverse_eotf_f64(nits as f64 / 10000.0);
             let actual = pq_inverse_eotf_from_nits(nits) as f64;
@@ -186,8 +180,8 @@ mod tests {
 
     #[test]
     fn pq_negative_input_is_clamped_not_nan() {
-        // pow(negative, m1) would be NaN; the clamp must make negative inputs
-        // behave exactly like zero. (The GT7 cpp's unclamped form NaNs here.)
+        // The clamp must make negative inputs behave exactly like zero. The
+        // unclamped GT7 form returns NaN here.
         let at_zero = pq_inverse_eotf(0.0);
         assert!(at_zero.is_finite());
         for y in [-1e-6, -0.5, -10.0] {
@@ -213,9 +207,8 @@ mod tests {
 
     #[test]
     fn srgb_round_trips_and_is_continuous() {
-        // On `[0, 1]` the extended EOTF *is* the plain sRGB EOTF (`abs` and
-        // `sign` are no-ops for non-negative input), so it inverts `srgb_oetf`
-        // exactly here.
+        // On `[0, 1]` `abs` and `sign` are no-ops, so the extended EOTF is the
+        // plain sRGB EOTF and inverts `srgb_oetf` exactly.
         for l in [0.0, 0.001, 0.0031308, 0.004, 0.1, 0.18, 0.5, 0.9, 1.0] {
             let signal = srgb_oetf(l);
             let back = srgb_eotf_extended(signal);
@@ -228,25 +221,21 @@ mod tests {
         let below = srgb_oetf(0.0031308);
         let above = srgb_oetf(0.0031309);
         assert!((below - above).abs() < 1e-5);
-        // Reference values: OETF(1) = 1, OETF(0) = 0.
         assert_eq!(srgb_oetf(0.0), 0.0);
         assert!((srgb_oetf(1.0) - 1.0).abs() < 1e-6);
-        // 18% gray encodes to ~0.4613 (well-known sRGB anchor).
+        // 18% gray encodes to about 0.4613, a well-known sRGB anchor.
         assert!((srgb_oetf(0.18) - 0.461_356).abs() < 1e-4);
-        // Negatives use the linear extension (no NaN).
+        // Negatives take the linear segment, so no NaN.
         assert_eq!(srgb_oetf(-0.5), 12.92 * -0.5);
     }
 
     #[test]
     fn srgb_oetf_extended_is_odd_symmetric_and_anchored() {
-        // SDR reference white (scRGB 1.0 = 80 nits) maps to encoded 1.0 (to
-        // within one f32 ULP — `1.055 - 0.055` rounds to 0.99999994, exactly as
-        // the plain `srgb_oetf(1.0)` does): an 80-nit paper white round-trips
-        // SDR through the extended path.
+        // SDR reference white (scRGB 1.0 = 80 nits) encodes to 0.99999994
+        // (`1.055 - 0.055` in f32, the same as `srgb_oetf(1.0)`), so an 80-nit
+        // paper white round-trips SDR through the extended path.
         assert!((srgb_oetf_extended(1.0) - 1.0).abs() < 1e-6);
         assert_eq!(srgb_oetf_extended(0.0), 0.0);
-        // Odd symmetry: f(-c) == -f(c) for representative magnitudes (negatives
-        // carry wide-gamut / out-of-gamut residue).
         for c in [0.001, 0.0031308, 0.05, 0.18, 0.625, 1.0, 1.25, 2.0] {
             assert!(
                 (srgb_oetf_extended(-c) + srgb_oetf_extended(c)).abs() < 1e-6,
@@ -257,22 +246,21 @@ mod tests {
         let below = srgb_oetf_extended(0.0031308);
         let above = srgb_oetf_extended(0.0031309);
         assert!((below - above).abs() < 1e-5);
-        // Below the SDR ceiling the extended OETF coincides with the plain sRGB
-        // OETF (it is a superset, not a different curve, on [0, 1]).
+        // On [0, 1] the extended OETF is the plain sRGB OETF.
         for l in [0.0031308, 0.05, 0.18, 0.5, 1.0] {
             assert!(
                 (srgb_oetf_extended(l) - srgb_oetf(l)).abs() < 1e-6,
                 "diverges at {l}"
             );
         }
-        // f64-evaluated reference fixtures (the encoder feeds color*paper_white/80
-        // into this curve): scrgb 0.625 (=0.5 at pw100), 1.25 (=1.0 at pw100,
-        // brighter-than-SDR), -0.125, and 18% gray at pw80.
+        // f64-evaluated fixtures. The encoder feeds color * paper_white / 80
+        // into this curve, so at 100-nit paper white scRGB 0.625 is 0.5 and
+        // 1.25 is 1.0, brighter than SDR.
         assert!((srgb_oetf_extended(0.625) - 0.812_366).abs() < 1e-4);
         assert!((srgb_oetf_extended(1.25) - 1.102_795).abs() < 1e-4);
         assert!((srgb_oetf_extended(-0.125) + 0.388_573).abs() < 1e-4);
         assert!((srgb_oetf_extended(0.18) - 0.461_356).abs() < 1e-4);
-        // Large negatives stay finite (no NaN from a negative pow base).
+        // Large negatives stay finite: no NaN from a negative pow base.
         assert!(srgb_oetf_extended(-1e30).is_finite());
     }
 
@@ -282,7 +270,6 @@ mod tests {
             let back = srgb_eotf_extended(srgb_oetf_extended(c));
             assert!((back - c).abs() < 1e-4, "round trip at {c}: got {back}");
         }
-        // Exact sign handling at ±0.0 (the wgsl_sign(0.0)==0.0 contract).
         assert_eq!(srgb_oetf_extended(0.0), 0.0);
         assert_eq!(srgb_eotf_extended(0.0), 0.0);
     }
@@ -291,12 +278,11 @@ mod tests {
     fn scrgb_scale_is_paper_white_over_80() {
         // At an 80-nit paper white the encoding is the identity.
         assert_eq!(scrgb_encode(1.0, 80.0), 1.0);
-        // Default SDR paper white (100 nits): 1.0 → 1.25.
+        // Default SDR paper white, 100 nits.
         assert_eq!(scrgb_encode(1.0, 100.0), 1.25);
-        // ITU-R BT.2408 reference paper white (203 nits).
+        // ITU-R BT.2408 reference paper white, 203 nits.
         assert!((scrgb_encode(1.0, 203.0) - 2.5375).abs() < 1e-6);
-        // Linear in the color value; negatives pass through (scRGB permits
-        // them).
+        // Linear in the color value, and negatives pass through.
         assert_eq!(scrgb_encode(0.5, 100.0), 0.625);
         assert_eq!(scrgb_encode(-0.5, 100.0), -0.625);
     }

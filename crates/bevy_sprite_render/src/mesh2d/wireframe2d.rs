@@ -147,11 +147,8 @@ impl Plugin for Wireframe2dPlugin {
             .add_systems(
                 Render,
                 (
-                    // Reads `ViewKeyCache`, which
-                    // `check_views_need_specialization` writes in
-                    // `CreateViews`; running in `Specialize` (after
-                    // `CreateViews` by set chaining) keeps the lookup on this
-                    // frame's keys.
+                    // Reads `ViewKeyCache`, which `check_views_need_specialization`
+                    // writes in `CreateViews`, so this runs in the later `Specialize` set.
                     specialize_wireframes
                         .in_set(RenderSystems::Specialize)
                         .after(prepare_assets::<RenderWireframeMaterial>)
@@ -474,9 +471,8 @@ impl RenderAsset for RenderWireframeMaterial {
         working_color_space: &mut SystemParamItem<Self::Param>,
         _previous_asset: Option<&Self>,
     ) -> Result<Self, PrepareAssetError<Self::SourceAsset>> {
-        // The wireframe color is written to the framebuffer with no texture
-        // composition, so it converts into the working space here at the
-        // CPU seam, like the other 2D color inputs.
+        // The color goes to the framebuffer with no texture composition, so it
+        // converts into the working space here on the CPU, like other 2d inputs.
         Ok(RenderWireframeMaterial {
             color: vec4_rec709_to_working(
                 Vec4::from_array(source_asset.color.to_linear().to_f32_array()),

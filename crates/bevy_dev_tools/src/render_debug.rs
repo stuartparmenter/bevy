@@ -95,10 +95,9 @@ impl Plugin for RenderDebugOverlayPlugin {
                 render_debug_overlay
                     .after(Core3dSystems::PostProcess)
                     .before(ui_pass)
-                    // The explicit edge to `display_encoding` matters: the overlay
-                    // writes display-linear values and must run before the encoder.
-                    // Ordering only `.before(ui_pass)` is not enough — that edge is
-                    // silently dropped when `UiRenderPlugin` is not installed.
+                    // The overlay writes display-linear values, so it has to run
+                    // before the encoder. `.before(ui_pass)` alone is not enough:
+                    // that edge is dropped when `UiRenderPlugin` is not installed.
                     .before(display_encoding)
                     .before(upscaling),
             );

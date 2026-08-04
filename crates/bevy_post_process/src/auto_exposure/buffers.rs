@@ -13,9 +13,8 @@ use super::{
     AutoExposure, AutoWhiteBalance,
 };
 
-/// The CIE 1931 *xy* chromaticity of the D65 white point, matching `D65_XY`
-/// in `bevy_render::view` and `AWB_D65_XY` in `auto_exposure.wgsl`; keep them
-/// in sync.
+/// The CIE 1931 xy chromaticity of the D65 white point. Must stay in sync with
+/// `D65_XY` in `bevy_render::view` and `AWB_D65_XY` in `auto_exposure.wgsl`.
 const D65_XY: (f32, f32) = (0.31272, 0.32903);
 
 /// The per-view GPU adaptation state, keyed by render-world view entity.
@@ -25,11 +24,10 @@ pub(super) struct AutoExposureBuffers {
 }
 
 /// Creates the adaptation state buffer for views that started metering and
-/// drops the buffer of views that stopped.
+/// drops it for views that stopped.
 ///
-/// An existing state buffer is never rewritten, so the adaptation animation
-/// stays continuous across settings changes; removing and re-adding
-/// [`AutoExposure`] drops and recreates the buffer, resetting the adaptation.
+/// An existing buffer is never rewritten, so the adaptation stays continuous
+/// across settings changes. Removing and re-adding [`AutoExposure`] resets it.
 pub(super) fn prepare_buffers(
     device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
@@ -44,21 +42,18 @@ pub(super) fn prepare_buffers(
     }
 
     // Dropping the buffer is enough to stop the metering pass: the render node
-    // bails out when the view has no entry in this map, so the stale
-    // `ViewAutoExposurePipeline` the queue system left behind is inert.
-    // `AutoExposureUniform` is the liveness anchor because the sync machinery
-    // removes it from the render entity when the main-world camera stops
-    // metering, and a despawned view fails the query as well; the components
-    // the node reads are insert-only and would leak the buffer.
+    // bails out when the view has no entry here, so the stale
+    // `ViewAutoExposurePipeline` left behind is inert. That component is never
+    // removed, so keying on it would leak the buffer. `AutoExposureUniform` is
+    // the liveness anchor: the sync machinery removes it when the main-world
+    // camera stops metering, and a despawned view fails this query too.
     buffers.buffers.retain(|&entity, _| views.contains(entity));
 }
 
 /// Builds the settings uniform for one view, sanitizing invalid values.
 ///
-/// When [`AutoExposure::physiological`] is `None`, the long-term envelope parameters are
-/// still filled in (with their defaults) because the compute shader keeps the envelope
-/// tracking the short-term exposure even while it is disabled; only the
-/// `physiological` flag controls whether the envelope actually bounds the exposure.
+/// The long-term envelope parameters are filled in even when
+/// [`AutoExposure::physiological`] is `None`. See [`PhysiologicalAdaptation`].
 pub(super) fn build_uniform(
     settings: &AutoExposure,
     white_balance: Option<&AutoWhiteBalance>,
@@ -107,11 +102,10 @@ pub(super) fn build_uniform(
     }
 }
 
-/// Builds the initial per-view adaptation state for one view.
+/// Builds the initial per-view adaptation state.
 ///
-/// Both the short-term exposure and the long-term envelope start at the neutral value the
-/// classic implementation used, clamped into [`AutoExposure::range`]. The adapted
-/// white-balance chromaticity always starts at the neutral D65 white point.
+/// The short-term exposure and the long-term envelope both start at 0 EV, clamped into
+/// [`AutoExposure::range`]. The adapted chromaticity starts at the D65 white point.
 pub(super) fn initial_state(settings: &AutoExposure) -> AutoExposureState {
     let (min_log_lum, max_log_lum) = settings.range.clone().into_inner();
     let exposure = 0.0f32.clamp(min_log_lum, max_log_lum);
@@ -121,8 +115,7 @@ pub(super) fn initial_state(settings: &AutoExposure) -> AutoExposureState {
         long_term: exposure,
         chroma_x: D65_XY.0,
         chroma_y: D65_XY.1,
-        // The initial upload is the only CPU write that ever zeroes the
-        // accumulator sums; the shader drains them back to zero each frame.
+        // The shader drains these back to zero every frame; this is the only CPU write.
         chroma_sums: [0; 3],
     }
 }

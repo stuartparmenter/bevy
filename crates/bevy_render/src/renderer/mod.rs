@@ -270,8 +270,8 @@ pub async fn initialize_renderer(
         power_preference: options.power_preference,
         compatible_surface: surface.as_ref(),
         force_fallback_adapter,
-        // Keep adapter limits exactly as reported by the driver (wgpu's new
-        // limit-bucketing is opt-in and defaults to `false`).
+        // Keep adapter limits exactly as the driver reports them. wgpu's
+        // limit bucketing is opt-in.
         apply_limit_buckets: false,
     };
 

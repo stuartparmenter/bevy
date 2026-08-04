@@ -1,23 +1,20 @@
 //! Drives the reusable HDR calibration screen
-//! ([`HdrCalibrationPlugin`](hdr_calibration::HdrCalibrationPlugin)) as a tiny
-//! app, the way a game would: enter a calibration [`State`](AppState), let the
-//! player tune their display, then act on [`CalibrationComplete`].
+//! ([`HdrCalibrationPlugin`](hdr_calibration::HdrCalibrationPlugin)) the way a game
+//! would: enter `AppState::Calibrating` at startup, let the player tune their
+//! display, then act on [`CalibrationComplete`] and move to `AppState::Done`.
 //!
-//! The calibration screen, its measurement patches, and its player UI all live
-//! in `examples/helpers/hdr_calibration.rs` - copy that plugin into your own app.
-//! This file is only the harness around it: it picks an HDR transfer with the
-//! `hdr_helper` [`HdrPlugin`](hdr::HdrPlugin), enters `AppState::Calibrating` at
-//! startup, and on confirm prints the result and moves to `AppState::Done`.
+//! The screen, its measurement patches, and its player UI all live in
+//! `examples/helpers/hdr_calibration.rs` - copy that plugin into your own app.
+//! This file is the harness, and it picks an HDR transfer with
+//! [`HdrPlugin`](hdr::HdrPlugin).
 //!
-//! Press the backtick key (`` ` ``) for an engine-telemetry overlay: the
-//! intent / effective / sensed comparison your real UI would never show, plus
-//! `T` to cycle the requested transfer, `G` for a Gran Turismo 7 tone-mapping
-//! preview, and saturated swatches to spot-check gamut. Pass `--rec2020` to
-//! render the scene in the wide working color space.
+//! Press the backtick key (`` ` ``) for an engine-telemetry overlay, `T` to cycle
+//! the requested transfer, and `G` for a Gran Turismo 7 tone-mapping preview.
+//! Pass `--rec2020` to render the scene in the wide working color space.
 //!
-//! **An HDR display is required to calibrate anything real.** On the SDR
-//! fallback everything above paper white clips, so the peak step looks flat; the
-//! example still runs (this is the path CI exercises headless).
+//! Calibrating anything real needs an HDR display. On the SDR fallback everything
+//! above paper white clips, so the peak step looks flat. The example still runs,
+//! and that is the path CI exercises headless.
 
 use bevy::{
     color::palettes::css,
@@ -37,9 +34,8 @@ mod hdr_calibration;
 
 use hdr_calibration::{CalibrationComplete, HdrCalibrationPlugin};
 
-/// The app's states. The calibration screen runs in `Calibrating`, which is the
-/// default so the example (and the headless CI screenshot) shows the wizard at
-/// startup. Confirming moves to `Done`.
+/// The app's states. `Calibrating` is the default, so the headless CI screenshot
+/// captures the calibration screen.
 #[derive(States, Default, Debug, Clone, PartialEq, Eq, Hash)]
 enum AppState {
     #[default]
@@ -48,9 +44,8 @@ enum AppState {
 }
 
 fn main() {
-    // Working color space is a startup-time `RenderPlugin` setting. Grayscale
-    // calibration patches are gamut-invariant, so `--rec2020` only affects the
-    // saturated debug swatches and gizmos.
+    // The grayscale calibration patches are gamut-invariant, so `--rec2020` only
+    // affects the saturated debug swatches and gizmos.
     let working_color_space = if std::env::args().any(|arg| arg == "--rec2020") {
         bevy::render::WorkingColorSpace::Rec2020
     } else {
@@ -63,8 +58,7 @@ fn main() {
             ..default()
         }))
         .init_state::<AppState>()
-        // Request the best HDR output the surface can present (PQ/HDR10 first,
-        // then scRGB-linear, then encoded extended-range sRGB; SDR otherwise).
+        // Request the best HDR output the surface can present.
         .add_plugins(hdr::HdrPlugin {
             preference: vec![
                 (DisplayTransfer::Pq, DisplayGamut::Rec2020),
@@ -95,9 +89,8 @@ fn main() {
         .run();
 }
 
-/// Saves the confirmed calibration (the plugin already persisted it) and advances
-/// out of the calibration screen, the way a real app reacts to
-/// [`CalibrationComplete`].
+/// Reacts to [`CalibrationComplete`]. The plugin has already persisted the result,
+/// so this logs it and leaves the calibration screen.
 fn on_calibration_complete(
     complete: On<CalibrationComplete>,
     mut next: ResMut<NextState<AppState>>,
@@ -115,7 +108,7 @@ fn on_calibration_complete(
     next.set(AppState::Done);
 }
 
-/// A 2D card shown after calibration; press any key to recalibrate.
+/// A 2D card shown after calibration.
 fn spawn_done_screen(mut commands: Commands) {
     commands.spawn((Camera2d, DespawnOnExit(AppState::Done)));
     commands.spawn((
@@ -140,11 +133,10 @@ fn leave_done(keys: Res<ButtonInput<KeyCode>>, mut next: ResMut<NextState<AppSta
     }
 }
 
-// --- Engine-telemetry overlay (debug only) ---------------------------------
+// --- Engine-telemetry overlay (debug only) ---
 
-/// Whether the engine-telemetry overlay (data panel + gamut demo) is shown. Off
-/// by default; the backtick key toggles it. A real calibration UI shows none of
-/// this.
+/// Whether the engine-telemetry overlay (data panel + gamut demo) is shown. A real
+/// calibration UI shows none of this.
 #[derive(Resource, Default)]
 struct DebugOverlay(bool);
 
@@ -241,8 +233,7 @@ fn toggle_debug_overlay(
     }
 }
 
-/// The transfers `toggle_transfer` steps through: sRGB -> scRGB-linear ->
-/// extended-sRGB -> PQ.
+/// The transfers `toggle_transfer` steps through.
 const TRANSFER_CYCLE: [DisplayTransfer; 4] = [
     DisplayTransfer::Srgb,
     DisplayTransfer::ScRgbLinear,
@@ -250,9 +241,8 @@ const TRANSFER_CYCLE: [DisplayTransfer; 4] = [
     DisplayTransfer::Pq,
 ];
 
-/// Cycles the requested transfer with `T` through only the transfers the surface
-/// advertises, and hands transfer control to the user (so `HdrPlugin` stops
-/// auto-selecting).
+/// Cycles the requested transfer with `T`, skipping any the surface does not
+/// advertise. Also takes manual control, so `HdrPlugin` stops auto-selecting.
 fn toggle_transfer(
     keys: Res<ButtonInput<KeyCode>>,
     window: Single<(&mut DisplayTarget, Option<&WindowSurfaceTransfers>), With<PrimaryWindow>>,
@@ -276,7 +266,7 @@ fn toggle_transfer(
 }
 
 /// Toggles a Gran Turismo 7 tone-mapping preview on the calibration camera. The
-/// patches are no longer exact while it is on; calibrate with it off.
+/// patches are not exact while it is on, so calibrate with it off.
 fn toggle_gt7(
     keys: Res<ButtonInput<KeyCode>>,
     tonemapping: Single<&mut Tonemapping, With<Camera3d>>,
@@ -312,8 +302,7 @@ fn draw_gamut_gizmos(overlay: Res<DebugOverlay>, mut gizmos: Gizmos) {
 }
 
 /// Writes the right-hand telemetry panel: requested vs negotiated transfer, the
-/// intent / effective[prov] / sensed comparison table, the policy line, and the
-/// live sensed footers. Every sensing field the example surfaces lives here.
+/// intent / effective / sensed table, the policy line, and the live sensed footers.
 fn update_data_panel(
     overlay: Res<DebugOverlay>,
     text: Single<&mut Text, With<DataPanelText>>,
@@ -456,10 +445,9 @@ fn provenance_tag(provenance: FieldProvenance) -> &'static str {
 /// Which reporting model the sensed display values came from, inferred from
 /// which of them the platform filled in.
 ///
-/// Absolute nits — the SDR-white anchor on the live state, or the monitor's
-/// peak — mean the OS reported real luminance (the Windows path). A headroom
-/// multiplier with no absolute nits anywhere is the Apple EDR path, which
-/// reports a unitless ratio and nothing else.
+/// Absolute nits, either the SDR-white anchor or the monitor's peak, mean the OS
+/// reported real luminance. That is the Windows path. A headroom multiplier with
+/// no absolute nits is the Apple EDR path, which reports only a unitless ratio.
 fn source_name(live: &WindowDisplayState, sensed_peak: Option<f32>) -> &'static str {
     if live.sdr_white_nits.is_some() || sensed_peak.is_some() {
         "OS / windowing system"
@@ -470,8 +458,7 @@ fn source_name(live: &WindowDisplayState, sensed_peak: Option<f32>) -> &'static 
     }
 }
 
-/// Renders one optional sensed nits value, or "-" when the platform did not
-/// report it.
+/// Renders a sensed nits value, or "-" when the platform did not report it.
 fn fmt_nits(value: Option<f32>) -> String {
     value.map_or_else(|| "      -".into(), |nits| format!("{nits:7.1}"))
 }

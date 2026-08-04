@@ -86,9 +86,9 @@ impl Plugin for Core2dPlugin {
                         .chain()
                         .in_set(Core2dSystems::MainPass),
                     tonemapping.in_set(Core2dSystems::PostProcess),
-                    // Gamut transform + transfer encoding for HDR display
-                    // targets (no-op early-return on plain SDR targets);
-                    // after the UI pass, before the upscaling blit.
+                    // Gamut transform and transfer encoding for HDR display
+                    // targets; a no-op on SDR targets. The UI pass orders
+                    // itself before this, see `bevy_ui_render`.
                     display_encoding
                         .after(Core2dSystems::PostProcess)
                         .before(upscaling),

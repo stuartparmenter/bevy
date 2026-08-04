@@ -1,28 +1,24 @@
 //! CPU side of the Gran Turismo 7 tone-mapping operator.
 //!
-//! The operator itself runs in `gt7.wgsl`; this module prepares the per-view
-//! constants the shader consumes ([`Gt7ParamsUniform`]). Under `cfg(test)` it
-//! also carries a port of Polyphony Digital's reference implementation
-//! (`gt7_tone_mapping.cpp`, MIT License, Copyright (c) 2025 Polyphony Digital
-//! Inc., published as part of the SIGGRAPH 2025 course "Physically Based Tone
-//! Mapping in Gran Turismo 7") as the shader's parity oracle.
-//!
-//! # Unit convention (native)
+//! The operator runs in `gt7.wgsl`. This module prepares the per-view constants
+//! it consumes ([`Gt7ParamsUniform`]). Under `cfg(test)` it also carries a port
+//! of Polyphony Digital's reference implementation (`gt7_tone_mapping.cpp`, MIT
+//! License, Copyright (c) 2025 Polyphony Digital Inc., published with the
+//! SIGGRAPH 2025 course "Physically Based Tone Mapping in Gran Turismo 7") as
+//! the shader's parity oracle.
 //!
 //! The operator works on linear Rec.2020 RGB "frame buffer values" where `1.0`
-//! corresponds to [`REFERENCE_LUMINANCE`] (100 cd/m²) of physical luminance:
+//! corresponds to [`REFERENCE_LUMINANCE`] (100 cd/m²):
 //!
-//! - In SDR mode the operator tone-maps against Gran Turismo's 250-nit SDR paper
-//!   white ([`GRAN_TURISMO_SDR_PAPER_WHITE`]) and rescales the result by
-//!   `1 / 2.5` so the output fits `[0, 1]`, ready for the sRGB OETF.
+//! - In SDR mode it tone-maps against Gran Turismo's 250-nit SDR paper white
+//!   ([`GRAN_TURISMO_SDR_PAPER_WHITE`]) and rescales the result into `[0, 1]`
+//!   for the sRGB OETF.
 //! - In HDR mode the output range is `[0, peak_nits / paper_white_nits]`, ready
-//!   for the display encoder. HDR peak luminance is valid in the range
-//!   250–10000 nits.
+//!   for the display encoder. Peak luminance is valid from 250 to 10000 nits.
 //!
-//! The `cpu_reference` module below mirrors both the C++ reference and
-//! `gt7.wgsl` operation-for-operation, and fixtures from the C++ harness
-//! (tolerance `1e-4` per channel) gate changes to the shader. All math is
-//! deliberately `f32` for that reason.
+//! The `cpu_reference` module below mirrors the C++ reference and `gt7.wgsl`
+//! operation for operation, and fixtures from the C++ harness gate changes to
+//! the shader. The math is `f32` throughout for that reason.
 
 use bevy_camera::{Camera, NeedsNodeTonemapping};
 use bevy_ecs::{
@@ -46,51 +42,41 @@ use bevy_window::DisplayTarget;
 use super::{gt7_params_uniform_active, resolve_tonemapping, Tonemapping};
 use crate::camera_stack::{StackRole, ViewStackContract};
 
-/// Physical luminance in cd/m² that a linear frame-buffer value of `1.0`
-/// corresponds to in Gran Turismo's native unit convention.
+/// Physical luminance in cd/m² of a linear frame-buffer value of `1.0`, in
+/// Gran Turismo's native unit convention.
 pub const REFERENCE_LUMINANCE: f32 = 100.0;
 
-/// The SDR reference (paper) white level used by Gran Turismo's tone mapping,
-/// in cd/m². This is Polyphony's artistic calibration, not sRGB's 80/100 nits.
+/// SDR reference (paper) white for Gran Turismo's tone mapping, in cd/m². This
+/// is Polyphony's artistic calibration, not sRGB's 80/100 nits.
 pub const GRAN_TURISMO_SDR_PAPER_WHITE: f32 = 250.0;
 
-/// The lowest HDR peak luminance, in nits, the GT7 operator supports.
+/// Lowest HDR peak luminance, in nits, the GT7 operator supports.
 ///
-/// The reference implementation documents 250 nits as the valid lower bound
-/// (the curve parameters assume a 250-nit SDR paper white) but does not
-/// enforce it; Bevy clamps to it at prepare time and warns.
+/// The reference implementation documents this bound but does not enforce it.
+/// The curve parameters assume a 250-nit SDR paper white. Bevy clamps to it at
+/// prepare time and warns.
 const GT7_MIN_HDR_PEAK_NITS: f32 = 250.0;
 
-/// The highest HDR peak luminance, in nits, the GT7 operator supports
-/// (the PQ ceiling). Clamped to at prepare time, with a warning.
+/// Highest HDR peak luminance, in nits, the GT7 operator supports: the PQ
+/// ceiling. Clamped to at prepare time, with a warning.
 const GT7_MAX_HDR_PEAK_NITS: f32 = 10000.0;
 
 /// Per-camera parameters for the [`Tonemapping::GranTurismo7`] operator.
 ///
 /// Defaults match Polyphony Digital's reference implementation. All parameters
-/// are dimensionless except where noted; the curve parameters are expressed in
-/// GT7's native frame-buffer units where `1.0` = 100 nits (see the module docs
-/// for the unit contract).
+/// are dimensionless except [`Self::mid_point`], which is in GT7's native
+/// frame-buffer units where `1.0` = 100 nits (see the module docs).
 ///
 /// Add this component to a camera that uses [`Tonemapping::GranTurismo7`] to
-/// customize the operator. Whenever the view's tonemapping pipeline binds the
-/// prepared parameters (`gt7_params_uniform_active` in the parent module:
-/// when this component is present, and always on HDR-transfer targets),
-/// [`queue_gt7_params_uniforms`] validates the values with
-/// [`Self::sanitized`] each frame and produces a [`Gt7ParamsUniform`] that
-/// replaces the shader's baked defaults — falling back to [`Self::default`]
-/// for cameras without the component. Cameras **without** this component on
-/// SDR targets keep using the shader's baked SDR defaults.
+/// customize the operator. On each view that binds the params uniform (see
+/// [`gt7_params_uniform_active`]), [`queue_gt7_params_uniforms`] runs the
+/// values through [`Self::sanitized`] and builds the [`Gt7ParamsUniform`].
+/// Without the component a GT7 camera keeps the shader's baked SDR defaults on
+/// an SDR target, and uses [`Self::default`] on an HDR-transfer target.
 ///
 /// The component requires [`NeedsNodeTonemapping`], which keeps the camera on
-/// the node-side tone-mapping pass: the in-shader SDR fold has no path to bind
-/// the params uniform and would silently run the baked defaults instead.
-///
-/// The operator's mode follows the view's resolved [`DisplayTarget`], with
-/// or without this component: on a target that requests an HDR transfer, the
-/// uniform is computed in HDR mode (peak taken from
-/// [`DisplayTarget::peak_luminance_nits`]); otherwise in
-/// SDR mode. See [`Gt7ParamsUniform::new`] for the exact rules.
+/// the node-side tone-mapping pass. The in-shader SDR fold cannot bind the
+/// params uniform and would silently run the baked defaults instead.
 ///
 /// [`Tonemapping::GranTurismo7`]: crate::tonemapping::Tonemapping::GranTurismo7
 #[derive(Component, Debug, Clone, Copy, PartialEq, Reflect, ExtractComponent)]
@@ -100,23 +86,22 @@ const GT7_MAX_HDR_PEAK_NITS: f32 = 10000.0;
 #[require(NeedsNodeTonemapping)]
 pub struct GranTurismo7Params {
     /// Mix between the per-channel tone-mapped color and the hue-preserving
-    /// UCS (`ICtCp`) processed color. `0.0` = fully per-channel ("camera-like"
-    /// skew), `1.0` = fully UCS (hue-stable). Polyphony markets this as the
-    /// main artistic dial. Clamped to `[0, 1]`. Default: `0.6`.
+    /// UCS (`ICtCp`) color. `0.0` is fully per-channel ("camera-like" skew),
+    /// `1.0` is fully UCS (hue-stable). Clamped to `[0, 1]`. Default: `0.6`.
     pub blend_ratio: f32,
     /// Start of the highlight chroma fade band, as a fraction of the peak
-    /// luminance in UCS (`ICtCp` `I`) units. Original-luminance values above this
-    /// begin losing chroma. Clamped to `[0, 1]`. Default: `0.98`.
+    /// luminance in UCS (`ICtCp` `I`) units. Colors whose original luminance is
+    /// above this start losing chroma. Clamped to `[0, 1]`. Default: `0.98`.
     pub fade_start: f32,
     /// End of the highlight chroma fade band, as a fraction of the peak
-    /// luminance in UCS units. Values above this are fully desaturated.
-    /// Intentionally allowed to exceed `1.0` so over-peak colors keep some
-    /// chroma; must be greater than [`Self::fade_start`]. Default: `1.16`.
+    /// luminance in UCS units. Colors above this are fully desaturated. Allowed
+    /// to exceed `1.0` so over-peak colors keep some chroma. Must be greater
+    /// than [`Self::fade_start`]. Default: `1.16`.
     pub fade_end: f32,
     /// Curvature control for the shoulder region. Must be less than `1.0`.
     /// Default: `0.25`.
     pub alpha: f32,
-    /// Gray point in frame-buffer units: the end of the toe→linear blend
+    /// Gray point in frame-buffer units: the end of the toe-to-linear blend
     /// region. The curve is exactly linear from here to the shoulder. Must be
     /// greater than `0.0`. Default: `0.538`.
     pub mid_point: f32,
@@ -143,41 +128,34 @@ impl Default for GranTurismo7Params {
 }
 
 impl GranTurismo7Params {
-    /// The smallest allowed width of the chroma fade band
-    /// (`fade_end - fade_start`); prevents a division by zero in the
-    /// `smoothstep` underlying the chroma fade.
+    /// Smallest allowed width of the chroma fade band
+    /// (`fade_end - fade_start`). Keeps the chroma fade's `smoothstep` from
+    /// dividing by zero.
     const MIN_FADE_BAND: f32 = 1e-4;
-    /// Margin keeping `alpha` and `linear_section` strictly below `1.0`,
-    /// preventing divisions by zero in the shoulder constant derivation.
+    /// Margin keeping `alpha` and `linear_section` below `1.0` and `mid_point`
+    /// above `0.0`. At those bounds the closed-form shoulder constants and the
+    /// toe divide by zero.
     const UNIT_MARGIN: f32 = 1e-3;
 
-    /// Returns a copy with all parameters validated and clamped to safe ranges,
-    /// emitting [`warn_once!`] if anything had to be adjusted.
+    /// Returns a copy with every parameter clamped to a safe range, emitting
+    /// [`warn_once!`] if anything had to be adjusted.
     ///
-    /// This implements the prepare-time validation table for the GT7 operator:
-    ///
-    /// - Any non-finite (NaN/∞) field is reset to its default.
-    /// - `blend_ratio` is clamped to `[0, 1]`.
-    /// - `fade_start` is clamped to `[0, 1]`.
-    /// - `fade_end` is clamped to at least `fade_start + 1e-4`. The upper bound
-    ///   is intentionally NOT clamped: `fade_end > 1` lets over-peak colors
-    ///   keep some chroma.
-    /// - `alpha` and `linear_section` are clamped to `[0, 1 - 1e-3]` (values of
-    ///   exactly `1.0` produce divisions by zero in the closed-form shoulder
-    ///   constants).
-    /// - `mid_point` is clamped to at least `1e-3` (a zero mid point produces
-    ///   divisions by zero in the toe).
+    /// - Any non-finite field is reset to its default.
+    /// - `blend_ratio` and `fade_start` are clamped to `[0, 1]`.
+    /// - `fade_end` is clamped to at least `fade_start + 1e-4`, with no upper
+    ///   bound.
+    /// - `alpha` and `linear_section` are clamped to `[0, 1 - 1e-3]`.
+    /// - `mid_point` is clamped to at least `1e-3`.
     /// - `toe_strength` is clamped to be non-negative.
     ///
-    /// Called by [`queue_gt7_params_uniforms`] before the parameters reach
-    /// the GPU.
+    /// [`queue_gt7_params_uniforms`] calls this before the parameters reach the
+    /// GPU.
     pub fn sanitized(&self) -> Self {
         let defaults = Self::default();
         let mut sanitized = *self;
         let mut adjusted = false;
 
-        // Reset non-finite fields to their defaults first so the range clamps
-        // below operate on real numbers.
+        // Reset non-finite fields first so the clamps below see real numbers.
         let fields = [
             (&mut sanitized.blend_ratio, defaults.blend_ratio),
             (&mut sanitized.fade_start, defaults.fade_start),
@@ -208,7 +186,6 @@ impl GranTurismo7Params {
         clamp(&mut sanitized.linear_section, 0.0, 1.0 - Self::UNIT_MARGIN);
         clamp(&mut sanitized.mid_point, Self::UNIT_MARGIN, f32::MAX);
         clamp(&mut sanitized.toe_strength, 0.0, f32::MAX);
-        // No upper clamp on `fade_end`: values past 1.0 are intentional.
         clamp(
             &mut sanitized.fade_end,
             sanitized.fade_start + Self::MIN_FADE_BAND,
@@ -235,12 +212,12 @@ const PQ_C3: f32 = 18.6875; // (2392 / 4096) * 32
 /// Maximum luminance supported by PQ (cd/m²).
 const PQ_C: f32 = 10000.0;
 
-/// ST-2084 (PQ) inverse EOTF: linear frame-buffer value (`1.0` = 100 nits) →
+/// ST-2084 (PQ) inverse EOTF: linear frame-buffer value (`1.0` = 100 nits) ->
 /// normalized PQ signal.
 ///
-/// Deliberately does NOT clamp its input (mirroring the reference): values
-/// above 10000 nits encode above `1.0`. Negative inputs would produce NaN;
-/// callers clamp at zero before calling (see [`rgb_to_ictcp`]).
+/// Does not clamp its input, mirroring the reference: values above 10000 nits
+/// encode above `1.0`. Negative inputs produce NaN, so callers clamp at zero
+/// first (see [`rgb_to_ictcp`]).
 fn inverse_eotf_st2084(v: f32) -> f32 {
     let physical = v * REFERENCE_LUMINANCE;
     let y = physical / PQ_C;
@@ -249,13 +226,12 @@ fn inverse_eotf_st2084(v: f32) -> f32 {
     ops::exp2(PQ_M2 * (ops::log2(PQ_C1 + PQ_C2 * ym) - ops::log2(1.0 + PQ_C3 * ym)))
 }
 
-/// Linear Rec.2020 RGB → `ICtCp` (ITU-R BT.2100 / ITU-T T.302).
+/// Linear Rec.2020 RGB -> `ICtCp` (ITU-R BT.2100 / ITU-T T.302).
 ///
-/// Deviation from the C++ reference: the LMS intermediates are clamped at zero
-/// before the PQ encode. The reference would produce NaN for inputs saturated
-/// enough to drive LMS negative; the clamp is the recommended port policy and
-/// matches the WGSL implementation. All parity fixtures keep LMS positive, so
-/// fixture outputs are unaffected.
+/// Deviates from the C++ reference: the LMS intermediates are clamped at zero
+/// before the PQ encode, so inputs saturated enough to drive LMS negative do
+/// not produce NaN. `gt7.wgsl` clamps the same way. Every parity fixture keeps
+/// LMS positive, so fixture outputs are unaffected.
 fn rgb_to_ictcp(rgb: [f32; 3]) -> [f32; 3] {
     let l = (rgb[0] * 1688.0 + rgb[1] * 2146.0 + rgb[2] * 262.0) / 4096.0;
     let m = (rgb[0] * 683.0 + rgb[1] * 2951.0 + rgb[2] * 462.0) / 4096.0;
@@ -275,37 +251,34 @@ fn rgb_to_ictcp(rgb: [f32; 3]) -> [f32; 3] {
 /// GPU uniform feeding the GT7 operator's `Gt7Params` WGSL struct (see
 /// `gt7.wgsl`; field order and meaning must stay identical).
 ///
-/// All derived curve constants (`k_a`/`k_b`/`k_c`, `peak_ucs`) are computed
-/// CPU-side from the closed forms in `from_params` so the shader stays cheap.
+/// The derived curve constants (`k_a`, `k_b`, `k_c`, `peak_ucs`) are computed
+/// on the CPU from the closed forms in `from_params` so the shader stays cheap.
 ///
-/// This is also a render-world component: [`queue_gt7_params_uniforms`] puts
-/// one on each view that needs it via [`Gt7ParamsUniform::new`], and
-/// [`UniformComponentPlugin`](bevy_render::extract_component::UniformComponentPlugin)
-/// packs those into the dynamic uniform buffer the tonemapping pass binds —
-/// only when the `GT7_PARAMS_UNIFORM` shader def is pushed. Without that def
-/// the shader keeps its baked SDR defaults (`gt7_default_sdr_params()` in
-/// `gt7.wgsl`).
+/// This is also a render-world component. [`queue_gt7_params_uniforms`] puts
+/// one on each view that needs it, and its presence is what pushes the
+/// `GT7_PARAMS_UNIFORM` shader def.
 #[derive(Component, Clone, Copy, Debug, PartialEq, ShaderType)]
 pub struct Gt7ParamsUniform {
     /// Display peak in frame-buffer units (`peak_nits / 100`).
     pub peak: f32,
-    /// Shoulder asymptote of the tone curve, `shoulder(x) = k_a + k_b ·
-    /// exp(x · k_c)`. At the default parameters it sits ~18% above `peak`,
-    /// which the operator's peak clamp keeps out of the output.
+    /// Shoulder asymptote of the tone curve,
+    /// `shoulder(x) = k_a + k_b * exp(x * k_c)`. At the default parameters it
+    /// sits about 18% above `peak`, which the operator's peak clamp keeps out
+    /// of the output.
     pub k_a: f32,
     /// Shoulder scale (negative).
     pub k_b: f32,
     /// Shoulder exponent factor (negative).
     pub k_c: f32,
-    /// Gray point in frame-buffer units (end of the toe→linear blend).
+    /// Gray point in frame-buffer units (end of the toe-to-linear blend).
     pub mid_point: f32,
     /// Fraction of `peak` where the linear section ends and the shoulder
     /// begins.
     pub linear_section: f32,
     /// Exponent of the toe's power curve.
     pub toe_strength: f32,
-    /// `ICtCp` `I` of peak white, precomputed at prepare time; normalizes the
-    /// luminance driving the chroma fade.
+    /// `ICtCp` `I` of peak white; normalizes the luminance driving the chroma
+    /// fade.
     pub peak_ucs: f32,
     /// UCS share of the final per-channel/UCS blend.
     pub blend_ratio: f32,
@@ -313,11 +286,10 @@ pub struct Gt7ParamsUniform {
     pub fade_start: f32,
     /// Chroma fade band end (may exceed `1.0`).
     pub fade_end: f32,
-    /// Post-clamp output scale. `1 / 2.5` in SDR mode (Polyphony's native
-    /// rescale of the 250-nit-referred result into `[0, 1]`);
-    /// `100 / paper_white_nits` in HDR mode (the paper-white renormalization
-    /// at the operator/encoder seam, so `1.0` = paper white at the operator
-    /// output — identity at the default 100-nit paper white).
+    /// Post-clamp output scale. In SDR mode it is `1 / 2.5`, Polyphony's
+    /// rescale of the 250-nit-referred result into `[0, 1]`. In HDR mode it is
+    /// `100 / paper_white_nits`, the renormalization at the operator/encoder
+    /// seam that makes `1.0` at the operator output mean paper white.
     pub sdr_correction_factor: f32,
 }
 
@@ -326,11 +298,10 @@ impl Gt7ParamsUniform {
     /// peak in cd/m² and an already-[sanitized](GranTurismo7Params::sanitized)
     /// parameter set.
     ///
-    /// The closed forms for `k_a`/`k_b`/`k_c` are the C++ reference's
-    /// `GT7ToneMappingCurve` initializer; `peak_ucs` is the `ICtCp` `I` of peak
-    /// white. `sdr_correction_factor` is the caller's post-clamp output scale
-    /// (see the field docs) — [`Self::new`] passes `100 / paper_white_nits` in
-    /// both modes, where SDR's paper white is Gran Turismo's 250 nits.
+    /// The closed forms for `k_a`, `k_b` and `k_c` are the C++ reference's
+    /// `GT7ToneMappingCurve` initializer. `sdr_correction_factor` is passed
+    /// through: [`Self::new`] computes it as `100 / paper_white` in both modes,
+    /// with SDR's paper white at 250 nits.
     fn from_params(
         physical_target_luminance: f32,
         params: &GranTurismo7Params,
@@ -356,12 +327,11 @@ impl Gt7ParamsUniform {
 
     /// Whether every constant the operator evaluates with is finite.
     ///
-    /// [`GranTurismo7Params::sanitized`] bounds each parameter individually,
-    /// but combinations can still overflow the closed-form shoulder and toe
-    /// math — e.g. a `linear_section` close to 1 sends
-    /// `exp(linear_section / k)` past `f32::MAX`, and a non-finite shoulder
-    /// constant turns every highlight into NaN. The toe is probed at the
-    /// shoulder seam, its largest input.
+    /// [`GranTurismo7Params::sanitized`] bounds each parameter on its own, but
+    /// combinations can still overflow the closed-form shoulder and toe math. A
+    /// `linear_section` close to 1 sends `exp(linear_section / k)` past
+    /// `f32::MAX`, and a non-finite shoulder constant turns every highlight
+    /// into NaN. The toe is probed at the shoulder seam, its largest input.
     fn has_finite_curve(&self) -> bool {
         let seam = self.linear_section * self.peak;
         let toe_probe = self.mid_point * ops::powf(seam / self.mid_point, self.toe_strength);
@@ -395,43 +365,38 @@ impl Gt7ParamsUniform {
         )
     }
 
-    /// Builds the uniform for a view from its (unsanitized) user parameters
-    /// and resolved [`DisplayTarget`], implementing the prepare-time
-    /// validation policy:
+    /// Builds the uniform for a view from its unsanitized user parameters and
+    /// resolved [`DisplayTarget`].
     ///
-    /// - `params` is passed through [`GranTurismo7Params::sanitized`]
-    ///   (non-finite fields reset, ranges clamped, one warning).
-    /// - If the display target requests an HDR transfer (scRGB-linear, PQ, or
-    ///   extended-range sRGB), the operator is configured in **HDR mode**:
-    ///   - `paper_white_nits` is sanitized through
-    ///     [`DisplayTarget::sanitized_paper_white_nits`] (non-finite or
-    ///     non-positive → 100 nits, clamped to the 10000-nit PQ ceiling, each
-    ///     with a warning) — the same method the display pipeline's uniform
-    ///     writer uses, so the operator and the display encoder always fold
-    ///     the identical paper-white value; non-finite
-    ///     `peak_luminance_nits` is reset to 100 (with a warning);
-    ///   - the peak is clamped to `[250, 10000]` nits, with a warning;
-    ///   - a peak below `paper_white_nits` is raised to `paper_white_nits`,
-    ///     with a warning;
-    ///   - [`Gt7ParamsUniform::sdr_correction_factor`] is set to
-    ///     `100 / paper_white_nits`: the seam renormalization that scales the
-    ///     operator's native output (`1.0` = 100 nits) so `1.0` = paper white.
-    ///     On these views the tonemapping pipeline is specialized with the
-    ///     `TONEMAP_OUTPUT_REC2020` shader def (same HDR predicate), so the
-    ///     operator emits this paper-white-relative output in its native
-    ///     Rec.2020 primaries — unclamped, `[0, peak / paper_white]` — for
-    ///     the display-encoding pass.
-    /// - Otherwise the operator is configured in **SDR mode**, identical to
-    ///   the baked defaults except for the user parameters: peak 2.5
-    ///   frame-buffer units (Gran Turismo's 250-nit paper white), output
-    ///   rescaled into `[0, 1]`.
+    /// `params` goes through [`GranTurismo7Params::sanitized`] first. The
+    /// display target then selects the mode, and every adjustment below warns.
+    ///
+    /// On a target that requests an HDR transfer (scRGB-linear, PQ, or
+    /// extended-range sRGB) the operator runs in HDR mode:
+    ///
+    /// - `paper_white_nits` is sanitized with
+    ///   [`DisplayTarget::sanitized_paper_white_nits`], the same method the
+    ///   display pipeline's uniform writer uses: non-finite or non-positive
+    ///   becomes 100 nits, and the value is clamped to the 10000-nit PQ
+    ///   ceiling.
+    /// - A non-finite `peak_luminance_nits` is reset to 100 nits, the peak is
+    ///   clamped to `[250, 10000]` nits, and a peak below `paper_white_nits` is
+    ///   raised to it.
+    /// - [`Gt7ParamsUniform::sdr_correction_factor`] becomes
+    ///   `100 / paper_white_nits`. These views are also specialized with the
+    ///   `TONEMAP_OUTPUT_REC2020` shader def, off the same HDR predicate, so
+    ///   the operator's output stays unclamped and in its native Rec.2020
+    ///   primaries.
+    ///
+    /// Otherwise the operator runs in SDR mode, at peak 2.5 frame-buffer units
+    /// (Gran Turismo's 250-nit paper white), matching the shader's baked
+    /// defaults apart from the user parameters.
     pub fn new(display_target: &DisplayTarget, params: &GranTurismo7Params) -> Self {
         let params = params.sanitized();
-        // Single-source the HDR predicate with the rest of the display
-        // pipeline (`DisplayTransfer::is_hdr`, which also backs
-        // `ViewDisplayTarget::is_hdr_transfer`). Callers pass the *resolved*
-        // display target, so a downgraded HDR request configures plain SDR
-        // mode here too.
+        // Same HDR predicate as the rest of the display pipeline
+        // (`DisplayTransfer::is_hdr`, which also backs
+        // `ViewDisplayTarget::is_hdr_transfer`). Callers pass the resolved
+        // display target, so a downgraded HDR request lands in SDR mode here.
         if !display_target.transfer.is_hdr() {
             return Self::from_params_checked(
                 GRAN_TURISMO_SDR_PAPER_WHITE,
@@ -440,13 +405,12 @@ impl Gt7ParamsUniform {
             );
         }
 
-        // Single-sourced with the display pipeline's uniform producer
-        // (`prepare_view_display_targets` in bevy_render): the operator's
-        // seam renormalization (× 100 / paper_white) and the display
-        // encoder's transfer encoding (× paper_white / 80 for scRGB,
-        // × paper_white for PQ) must fold the IDENTICAL paper-white value or
-        // the paper-white factors fail to cancel for degenerate/out-of-range
-        // inputs.
+        // Same value the display pipeline's uniform producer computes
+        // (`prepare_view_display_targets` in bevy_render). The seam
+        // renormalization here (100 / paper_white) and the encoder's transfer
+        // encoding (paper_white / 80 for scRGB, paper_white for PQ) only cancel
+        // if both fold the identical paper white, including for degenerate and
+        // out-of-range inputs.
         let paper_white = display_target.sanitized_paper_white_nits();
         if !display_target.paper_white_nits.is_finite() || display_target.paper_white_nits <= 0.0 {
             warn_once!(
@@ -484,38 +448,31 @@ impl Gt7ParamsUniform {
             peak = paper_white;
         }
 
-        // Paper-white renormalization at the operator/encoder seam: rescale
-        // the operator's native output (1.0 = 100 nits) so that 1.0 = paper
-        // white. The shader applies it after the peak clamp.
         Self::from_params_checked(peak, &params, REFERENCE_LUMINANCE / paper_white)
     }
 }
 
-/// Gives a [`Gt7ParamsUniform`] to every view whose tonemapping pipeline
-/// binds one, and takes it away from every view that stops qualifying.
+/// Gives a [`Gt7ParamsUniform`] to every view whose tonemapping pipeline binds
+/// one, and removes it from every view that stops qualifying.
 ///
-/// [`UniformComponentPlugin`](bevy_render::extract_component::UniformComponentPlugin)
-/// — registered for [`Gt7ParamsUniform`] in the tonemapping plugin — packs
-/// the components this system inserts into
+/// [`UniformComponentPlugin`](bevy_render::extract_component::UniformComponentPlugin),
+/// registered for [`Gt7ParamsUniform`] in the tonemapping plugin, packs the
+/// components this system inserts into
 /// [`ComponentUniforms<Gt7ParamsUniform>`](bevy_render::extract_component::ComponentUniforms)
 /// and gives each view a
 /// [`DynamicUniformIndex<Gt7ParamsUniform>`](bevy_render::extract_component::DynamicUniformIndex)
-/// addressing its entry, which the tonemapping node binds as the pass's
-/// dynamic offset.
+/// that the tonemapping node binds as the pass's dynamic offset.
 ///
 /// A view qualifies when [`gt7_params_uniform_active`] holds for it. The
-/// uniform is then built from the camera's [`GranTurismo7Params`] if present
-/// and [`GranTurismo7Params::default`] otherwise, with the SDR/HDR mode and
-/// the HDR peak taken from the view's resolved [`ViewDisplayTarget`] (see
-/// [`Gt7ParamsUniform::new`]).
+/// uniform is then built by [`Gt7ParamsUniform::new`] from the camera's
+/// [`GranTurismo7Params`] if present and [`GranTurismo7Params::default`]
+/// otherwise, together with the view's resolved [`ViewDisplayTarget`].
 ///
-/// Views authored with `GranTurismo7` but without the component on SDR
-/// targets keep the shader's baked SDR defaults, and a stack member whose
-/// tone-mapping pass is deferred to its finalizer ([`StackRole::Deferred`])
-/// never runs the pass at all — neither gets a uniform. That absence is what
-/// `prepare_view_tonemapping_pipelines` reads to leave `GT7_PARAMS_UNIFORM`
-/// off the pipeline key, so the two systems cannot disagree about the pass's
-/// bind group layout.
+/// A `GranTurismo7` view on an SDR target without the component gets no
+/// uniform, and neither does a stack member whose tone-mapping pass is
+/// deferred to its finalizer ([`StackRole::Deferred`]) and never runs. That
+/// absence is what keeps `GT7_PARAMS_UNIFORM` off the pipeline key in
+/// `prepare_view_tonemapping_pipelines`.
 ///
 /// Runs in [`RenderSystems::Queue`](bevy_render::RenderSystems::Queue): after
 /// `PrepareViews`, where [`ViewDisplayTarget`] and [`ViewStackContract`] are
@@ -529,23 +486,23 @@ pub fn queue_gt7_params_uniforms(
             // Optional so a camera that drops its `Tonemapping` still
             // reaches the removal branch below instead of keeping a stale
             // `Gt7ParamsUniform`. `prepare_view_tonemapping_pipelines`, which
-            // reads the resulting flag, likewise defaults a missing component
-            // to `Tonemapping::None`.
+            // reads the resulting flag, also defaults a missing component to
+            // `Tonemapping::None`.
             Option<&Tonemapping>,
             Option<&GranTurismo7Params>,
             &ViewDisplayTarget,
             Option<&ViewStackContract>,
             Has<Gt7ParamsUniform>,
         ),
-        // The liveness gate for `ViewStackContract`, which is overwritten in
-        // place and never removed; also the view set
+        // Liveness gate for `ViewStackContract`, which is overwritten in
+        // place and never removed. Also the view set
         // `prepare_view_tonemapping_pipelines` specializes over.
         With<ViewTarget>,
     >,
 ) {
     for (entity, tonemapping, params, view_display_target, contract, has_uniform) in &views {
         // Cameras stacked on a shared main texture tone-map once, on the
-        // stack's finalizer; the deferred members never run the pass.
+        // stack's finalizer. The deferred members never run the pass.
         let deferred =
             contract.is_some_and(|contract| matches!(contract.tonemap, StackRole::Deferred(_)));
         let active = !deferred
@@ -556,9 +513,9 @@ pub fn queue_gt7_params_uniforms(
             );
 
         if !active {
-            // Render-world entities are retained across frames, so a view
-            // that stops qualifying must have the component actively removed
-            // — but only if it has one, so plain SDR views issue no command.
+            // Render-world entities are kept across frames, so a view that
+            // stops qualifying must have the component removed. Checking
+            // first keeps plain SDR views from issuing a command.
             if has_uniform {
                 commands.entity(entity).remove::<Gt7ParamsUniform>();
             }
@@ -575,16 +532,16 @@ pub fn queue_gt7_params_uniforms(
 /// CPU port of the operator `gt7.wgsl` evaluates per pixel, driven by the same
 /// [`Gt7ParamsUniform`] the shader binds.
 ///
-/// Only the constants in that uniform are needed at runtime, so this half of
-/// the reference implementation is test-only.
+/// The shader needs only the constants in that uniform, so this half of the
+/// reference implementation is test-only.
 #[cfg(test)]
 mod cpu_reference {
     use super::*;
 
     /// `smoothstep` with the C++ reference's exact semantics: strict
-    /// comparisons, and the interpolant computed before the range checks (so
-    /// `edge0 == edge1` yields NaN/∞ rather than a clamp — parameter
-    /// validation prevents that).
+    /// comparisons, and the interpolant computed before the range checks. That
+    /// makes `x == edge0 == edge1` yield NaN rather than a clamp. Parameter
+    /// validation keeps that case from reaching here.
     fn smooth_step(x: f32, edge0: f32, edge1: f32) -> f32 {
         let t = (x - edge0) / (edge1 - edge0);
         if x < edge0 {
@@ -601,7 +558,7 @@ mod cpu_reference {
         1.0 - smooth_step(x, a, b)
     }
 
-    /// ST-2084 (PQ) EOTF: normalized PQ signal (clamped to `[0, 1]`) → linear
+    /// ST-2084 (PQ) EOTF: normalized PQ signal (clamped to `[0, 1]`) -> linear
     /// frame-buffer value (`1.0` = 100 nits).
     fn eotf_st2084(n: f32) -> f32 {
         let n = n.clamp(0.0, 1.0);
@@ -616,7 +573,7 @@ mod cpu_reference {
         l * PQ_C / REFERENCE_LUMINANCE
     }
 
-    /// `ICtCp` → linear Rec.2020 RGB (ITU-R BT.2100 / ITU-T T.302).
+    /// `ICtCp` -> linear Rec.2020 RGB (ITU-R BT.2100 / ITU-T T.302).
     ///
     /// Output channels are clamped at zero, mirroring the reference. The PQ
     /// decode in [`eotf_st2084`] clamps its input to `[0, 1]`, so per-LMS-channel
@@ -638,14 +595,14 @@ mod cpu_reference {
     }
 
     /// The "GT Tone Mapping" curve (V2) with a convergent shoulder, evaluated
-    /// per channel at `x` (frame-buffer units): a power-curve toe blended into
-    /// an exactly-linear middle section, followed by a convergent exponential
-    /// shoulder. Negative inputs map to zero.
+    /// per channel at `x` in frame-buffer units: a power-curve toe blended into
+    /// an exactly-linear middle section, then an exponential shoulder. Negative
+    /// inputs map to zero.
     ///
-    /// With default parameters the regions are: toe→linear blend on
-    /// `(0, mid_point)`, exactly linear on
-    /// `[mid_point, linear_section × peak)`, shoulder on
-    /// `[linear_section × peak, ∞)`.
+    /// With default parameters the regions are the toe-to-linear blend on
+    /// `(0, mid_point)`, the exactly linear part on
+    /// `[mid_point, linear_section * peak)`, and the shoulder from
+    /// `linear_section * peak` up.
     pub(super) fn evaluate_curve(params: &Gt7ParamsUniform, x: f32) -> f32 {
         if x < 0.0 {
             return 0.0;
@@ -655,7 +612,7 @@ mod cpu_reference {
         let weight_toe = 1.0 - weight_linear;
 
         // Shoulder mapping for highlights. For extreme inputs `exp(x * k_c)`
-        // underflows cleanly to zero (`k_c < 0`), converging on `k_a`.
+        // underflows to zero (`k_c < 0`), converging on `k_a`.
         let shoulder = params.k_a + params.k_b * ops::exp(x * params.k_c);
 
         if x < params.linear_section * params.peak {
@@ -667,14 +624,9 @@ mod cpu_reference {
         }
     }
 
-    /// Applies the full tone-mapping pipeline (curve + hue-preserving `ICtCp`
-    /// branch) to a linear Rec.2020 frame-buffer color (native GT7 units,
-    /// `1.0` = 100 nits).
-    ///
-    /// Steps: per-channel curve ("skewed" color); chroma fade driven by the
-    /// ORIGINAL color's UCS luminance; recombination of skewed luminance with
-    /// faded original chroma; constant per-channel/UCS blend; clamp at peak;
-    /// SDR correction factor.
+    /// Applies the full tone-mapping pipeline (curve plus the hue-preserving
+    /// `ICtCp` branch) to a linear Rec.2020 frame-buffer color in native GT7
+    /// units, where `1.0` = 100 nits.
     pub(super) fn apply(params: &Gt7ParamsUniform, rgb: [f32; 3]) -> [f32; 3] {
         // Convert to UCS to separate luminance and chroma.
         let ucs = rgb_to_ictcp(rgb);
@@ -741,14 +693,12 @@ mod tests {
         }
     }
 
-    /// The SDR-mode uniform: peak 2.5 fb, output rescaled into `[0, 1]`.
     fn sdr_uniform(params: &GranTurismo7Params) -> Gt7ParamsUniform {
         Gt7ParamsUniform::new(&DisplayTarget::SDR_SRGB, params)
     }
 
     /// The HDR-mode uniform at the default 100-nit paper white, where the seam
-    /// renormalization is the identity and the operator's output is its native
-    /// `[0, peak_nits / 100]`.
+    /// renormalization is the identity.
     fn hdr_uniform(peak_nits: f32, params: &GranTurismo7Params) -> Gt7ParamsUniform {
         Gt7ParamsUniform::new(
             &hdr_target(peak_nits, 100.0, DisplayTransfer::ScRgbLinear),
@@ -771,7 +721,7 @@ mod tests {
 
         let inputs: [[f32; 3]; 3] = [[0.5, 1.23, 0.75], [12.3, 34.3, 56.9], [1504.7, 64.51, 0.5]];
 
-        // SDR (peak 250 nits internal, output rescaled into [0, 1]).
+        // SDR, 250-nit peak.
         assert_rgb_eq(
             apply(&sdr, inputs[0]),
             [1.996_225e-1, 4.907_029_6e-1, 2.995_677_6e-1],
@@ -816,16 +766,16 @@ mod tests {
         let sdr = sdr_uniform(&defaults);
         let hdr1000 = hdr_uniform(1000.0, &defaults);
 
-        // Mid-band chroma fade (chromaScale ≈ 0.55): one clamped + two
+        // Mid-band chroma fade (chroma scale about 0.55): one clamped and two
         // unclamped channels.
         assert_rgb_eq(
             apply(&hdr1000, [20.0, 15.0, 5.0]),
             [10.0, 9.912_016, 5.249_325_3],
         );
 
-        // Achromatic in the SDR fade band: UCS path is ~no-op on gray (tiny
-        // channel asymmetry comes from the f32 ICtCp matrices, itself a
-        // parity probe).
+        // Achromatic in the SDR fade band: the UCS path is close to a no-op on
+        // gray. The tiny channel asymmetry comes from the f32 ICtCp matrices
+        // and is itself a parity probe.
         assert_rgb_eq(
             apply(&sdr, [3.0, 3.0, 3.0]),
             [9.179_522e-1, 9.179_485_4e-1, 9.179_471e-1],
@@ -877,8 +827,7 @@ mod tests {
     }
 
     /// The closed-form curve constants and precomputed peak UCS, against the
-    /// C++ reference harness (`%.9e`). `from_params` is the only producer of
-    /// these values, so this is the fixture lock for the shader's inputs.
+    /// C++ reference harness (`%.9e`).
     #[test]
     fn cpp_parity_init_products() {
         let defaults = GranTurismo7Params::default();
@@ -907,8 +856,8 @@ mod tests {
 
     #[test]
     fn curve_matches_reference_values() {
-        // Curve-only values from the C++ reference harness; covers each
-        // curve region (toe, exact-linear region, shoulder, asymptote).
+        // Curve-only values from the C++ reference harness, covering the toe,
+        // the exact-linear region, the shoulder and the asymptote.
         let defaults = GranTurismo7Params::default();
         let curve25 = sdr_uniform(&defaults);
         let curve10 = hdr_uniform(1000.0, &defaults);
@@ -929,7 +878,7 @@ mod tests {
             (2.5, 2.087_880_6),
             (4.0, 2.573_628_7),
             (10.0, 2.948_031_2),
-            (1504.7, 2.963_333_1), // exp underflow → k_a
+            (1504.7, 2.963_333_1), // exp underflow -> k_a
         ];
         for (x, expected) in cases25 {
             assert!(
@@ -947,10 +896,7 @@ mod tests {
         assert_eq!(evaluate_curve(&curve25, -1.0), 0.0);
     }
 
-    /// With the paper-white renormalization prepared by
-    /// `Gt7ParamsUniform::new` for an HDR target, the operator's ceiling is
-    /// exactly `peak / paper_white` — paper-white-relative display-linear, the
-    /// encoder's input convention.
+    /// On an HDR target the ceiling is exactly `peak_nits / paper_white_nits`.
     #[test]
     fn hdr_output_is_paper_white_relative() {
         let uniform = Gt7ParamsUniform::new(
@@ -958,9 +904,6 @@ mod tests {
             &GranTurismo7Params::default(),
         );
 
-        // A far-over-peak gray saturates every channel at the peak clamp
-        // (10 fb); the seam renormalization scales it to peak / paper_white
-        // = 1000 / 200 = 5.0 exactly.
         for c in apply(&uniform, [2.5e4; 3]) {
             assert_eq!(c, 1000.0 / 200.0);
         }
@@ -996,7 +939,6 @@ mod tests {
         assert!(sanitized.linear_section < 1.0);
         assert!(sanitized.toe_strength >= 0.0);
 
-        // fade_end > 1 is intentional: must NOT be clamped down.
         let wide_fade = GranTurismo7Params {
             fade_end: 4.0,
             ..Default::default()
@@ -1014,9 +956,9 @@ mod tests {
         }
     }
 
-    /// SDR-target uniform must reproduce the C++ reference's SDR init
-    /// products (the same fixtures as `cpp_parity_init_products`), i.e. the
-    /// values baked into `gt7_default_sdr_params()` in gt7.wgsl.
+    /// The SDR-target uniform must reproduce the C++ reference's SDR init
+    /// products, the same fixtures as `cpp_parity_init_products` and the values
+    /// baked into `gt7_default_sdr_params()` in gt7.wgsl.
     #[test]
     fn uniform_sdr_mode_matches_init_fixtures() {
         let uniform =
@@ -1047,8 +989,7 @@ mod tests {
         assert!((bright_sdr.sdr_correction_factor - 0.4).abs() < 1e-7);
     }
 
-    /// HDR-target uniform must match the C++ reference's HDR init products
-    /// and apply the paper-white renormalization (`100 / paper_white`).
+    /// The HDR-target uniform must match the C++ reference's HDR init products.
     #[test]
     fn uniform_hdr_mode_matches_init_fixtures() {
         let params = GranTurismo7Params::default();
@@ -1058,8 +999,6 @@ mod tests {
         assert!((uniform.k_b - -13.493_404).abs() < 1e-4);
         assert!((uniform.k_c - -1.348_920_9e-1).abs() < 1e-6);
         assert!((uniform.peak_ucs - 7.518_299e-1).abs() < 1e-5);
-        // Seam renormalization is identity at the default 100-nit paper white
-        // (native HDR-mode factor).
         assert_eq!(uniform.sdr_correction_factor, 1.0);
 
         // Non-default paper white scales the output so 1.0 = paper white.
@@ -1121,12 +1060,6 @@ mod tests {
         assert!((uniform.sdr_correction_factor - 0.01).abs() < 1e-9);
     }
 
-    /// The seam renormalization must fold the *exact* value
-    /// [`DisplayTarget::sanitized_paper_white_nits`] returns — the same
-    /// method the display pipeline's uniform writer applies before the
-    /// encoder multiplies by paper white — so the paper-white factors
-    /// (`× 100 / paper_white` here, `× paper_white / 80` or
-    /// `× paper_white` at the encoder) cancel bit-for-bit for every input.
     #[test]
     fn paper_white_fold_is_single_sourced_with_the_display_pipeline() {
         let params = GranTurismo7Params::default();
@@ -1172,11 +1105,6 @@ mod tests {
         assert_eq!(uniform.mid_point, GranTurismo7Params::default().mid_point);
     }
 
-    /// Parameter combinations whose individual values pass sanitization can
-    /// still overflow the closed-form curve constants (`linear_section`
-    /// close to 1 sends `exp(linear_section / k)` past `f32::MAX`); the
-    /// uniform must fall back to the defaults instead of uploading
-    /// non-finite constants that turn highlights into NaN.
     #[test]
     fn uniform_falls_back_when_curve_constants_overflow() {
         let overflowing = GranTurismo7Params {
@@ -1192,7 +1120,6 @@ mod tests {
             assert!(uniform.k_c.is_finite(), "k_c must stay finite");
             assert!(uniform.peak_ucs.is_finite(), "peak_ucs must stay finite");
         }
-        // The fallback recomputes from the default parameters.
         assert_eq!(
             sdr.linear_section,
             GranTurismo7Params::default().linear_section
