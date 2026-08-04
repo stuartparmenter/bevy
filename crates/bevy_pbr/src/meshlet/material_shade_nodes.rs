@@ -1,7 +1,7 @@
 use super::{
     material_pipeline_prepare::{
-        MeshletViewMaterialsDeferredGBufferPrepass, MeshletViewMaterialsMainOpaquePass,
-        MeshletViewMaterialsPrepass,
+        MeshletViewMaterial, MeshletViewMaterialsDeferredGBufferPrepass,
+        MeshletViewMaterialsMainOpaquePass, MeshletViewMaterialsPrepass,
     },
     resource_manager::{MeshletViewBindGroups, MeshletViewResources},
     InstanceManager,
@@ -15,13 +15,67 @@ use bevy_core_pipeline::prepass::{
 use bevy_ecs::{prelude::*, query::Has};
 use bevy_render::{
     camera::ExtractedCamera,
+    material_bind_groups::MaterialBindGroupAllocators,
+    render_phase::TrackedRenderPass,
     render_resource::{
-        LoadOp, Operations, PipelineCache, RenderPassDepthStencilAttachment, RenderPassDescriptor,
-        StoreOp,
+        BindGroup, LoadOp, Operations, PipelineCache, RenderPassDepthStencilAttachment,
+        RenderPassDescriptor, RenderPipeline, StoreOp,
     },
     renderer::{RenderContext, ViewQuery},
     view::{ViewTarget, ViewUniformOffset},
 };
+
+/// The pipeline and bind group to draw `material` with, or `None` while it cannot be drawn.
+///
+/// A material mutated this frame has no bind group until `RenderSystems::PrepareBindGroups` rebuilds
+/// its slab, and every material sharing that slab goes with it. So "the list is non-empty" is not
+/// the same question as "there is anything to draw", and beginning a pass that draws nothing still
+/// costs an attachment load and store.
+fn drawable_material<'a>(
+    material: &MeshletViewMaterial,
+    instance_manager: &InstanceManager,
+    pipeline_cache: &'a PipelineCache,
+    allocators: &'a MaterialBindGroupAllocators,
+) -> Option<(&'a RenderPipeline, &'a BindGroup)> {
+    if !instance_manager.material_present_in_scene(&material.material_id) {
+        return None;
+    }
+    Some((
+        pipeline_cache.get_render_pipeline(material.pipeline)?,
+        material.bind_group(allocators)?,
+    ))
+}
+
+fn any_material_is_drawable(
+    materials: &[MeshletViewMaterial],
+    instance_manager: &InstanceManager,
+    pipeline_cache: &PipelineCache,
+    allocators: &MaterialBindGroupAllocators,
+) -> bool {
+    materials.iter().any(|material| {
+        drawable_material(material, instance_manager, pipeline_cache, allocators).is_some()
+    })
+}
+
+/// One fullscreen triangle draw per drawable material.
+fn draw_meshlet_materials<'a>(
+    render_pass: &mut TrackedRenderPass<'a>,
+    materials: &[MeshletViewMaterial],
+    instance_manager: &InstanceManager,
+    pipeline_cache: &'a PipelineCache,
+    allocators: &'a MaterialBindGroupAllocators,
+) {
+    for material in materials {
+        if let Some((pipeline, bind_group)) =
+            drawable_material(material, instance_manager, pipeline_cache, allocators)
+        {
+            let x = material.material_id * 3;
+            render_pass.set_render_pipeline(pipeline);
+            render_pass.set_bind_group(3, bind_group, &[]);
+            render_pass.draw(x..(x + 3), 0..1);
+        }
+    }
+}
 
 ///
 /// Fullscreen shading pass based on the visibility buffer generated from rasterizing meshlets.
@@ -37,6 +91,7 @@ pub fn meshlet_main_opaque_pass(
     )>,
     instance_manager: Res<InstanceManager>,
     pipeline_cache: Res<PipelineCache>,
+    material_bind_group_allocators: Res<MaterialBindGroupAllocators>,
     mut ctx: RenderContext,
 ) {
     let (
@@ -49,7 +104,12 @@ pub fn meshlet_main_opaque_pass(
         meshlet_view_resources,
     ) = view.into_inner();
 
-    if meshlet_view_materials.is_empty() {
+    if !any_material_is_drawable(
+        meshlet_view_materials,
+        &instance_manager,
+        &pipeline_cache,
+        &material_bind_group_allocators,
+    ) {
         return;
     }
 
@@ -90,18 +150,13 @@ pub fn meshlet_main_opaque_pass(
     render_pass.set_bind_group(1, &mesh_view_bind_group.binding_array, &[]);
     render_pass.set_bind_group(2, meshlet_material_shade_bind_group, &[]);
 
-    // 1 fullscreen triangle draw per material
-    for (material_id, material_pipeline_id, material_bind_group) in meshlet_view_materials.iter() {
-        if instance_manager.material_present_in_scene(material_id)
-            && let Some(material_pipeline) =
-                pipeline_cache.get_render_pipeline(*material_pipeline_id)
-        {
-            let x = *material_id * 3;
-            render_pass.set_render_pipeline(material_pipeline);
-            render_pass.set_bind_group(3, material_bind_group, &[]);
-            render_pass.draw(x..(x + 3), 0..1);
-        }
-    }
+    draw_meshlet_materials(
+        &mut render_pass,
+        meshlet_view_materials,
+        &instance_manager,
+        &pipeline_cache,
+        &material_bind_group_allocators,
+    );
 }
 
 ///
@@ -121,6 +176,7 @@ pub fn meshlet_prepass(
     prepass_view_bind_group: Res<PrepassViewBindGroup>,
     instance_manager: Res<InstanceManager>,
     pipeline_cache: Res<PipelineCache>,
+    material_bind_group_allocators: Res<MaterialBindGroupAllocators>,
     mut ctx: RenderContext,
 ) {
     let (
@@ -135,7 +191,12 @@ pub fn meshlet_prepass(
         meshlet_view_resources,
     ) = view.into_inner();
 
-    if meshlet_view_materials.is_empty() {
+    if !any_material_is_drawable(
+        meshlet_view_materials,
+        &instance_manager,
+        &pipeline_cache,
+        &material_bind_group_allocators,
+    ) {
         return;
     }
 
@@ -202,18 +263,13 @@ pub fn meshlet_prepass(
     render_pass.set_bind_group(1, &prepass_view_bind_group.empty_bind_group, &[]);
     render_pass.set_bind_group(2, meshlet_material_shade_bind_group, &[]);
 
-    // 1 fullscreen triangle draw per material
-    for (material_id, material_pipeline_id, material_bind_group) in meshlet_view_materials.iter() {
-        if instance_manager.material_present_in_scene(material_id)
-            && let Some(material_pipeline) =
-                pipeline_cache.get_render_pipeline(*material_pipeline_id)
-        {
-            let x = *material_id * 3;
-            render_pass.set_render_pipeline(material_pipeline);
-            render_pass.set_bind_group(3, material_bind_group, &[]);
-            render_pass.draw(x..(x + 3), 0..1);
-        }
-    }
+    draw_meshlet_materials(
+        &mut render_pass,
+        meshlet_view_materials,
+        &instance_manager,
+        &pipeline_cache,
+        &material_bind_group_allocators,
+    );
 }
 
 /// Fullscreen pass to generate a gbuffer based on the visibility buffer generated from rasterizing meshlets.
@@ -232,6 +288,7 @@ pub fn meshlet_deferred_gbuffer_prepass(
     prepass_view_bind_group: Res<PrepassViewBindGroup>,
     instance_manager: Res<InstanceManager>,
     pipeline_cache: Res<PipelineCache>,
+    material_bind_group_allocators: Res<MaterialBindGroupAllocators>,
     mut ctx: RenderContext,
 ) {
     let (
@@ -246,7 +303,12 @@ pub fn meshlet_deferred_gbuffer_prepass(
         meshlet_view_resources,
     ) = view.into_inner();
 
-    if meshlet_view_materials.is_empty() {
+    if !any_material_is_drawable(
+        meshlet_view_materials,
+        &instance_manager,
+        &pipeline_cache,
+        &material_bind_group_allocators,
+    ) {
         return;
     }
 
@@ -318,16 +380,11 @@ pub fn meshlet_deferred_gbuffer_prepass(
     render_pass.set_bind_group(1, &prepass_view_bind_group.empty_bind_group, &[]);
     render_pass.set_bind_group(2, meshlet_material_shade_bind_group, &[]);
 
-    // 1 fullscreen triangle draw per material
-    for (material_id, material_pipeline_id, material_bind_group) in meshlet_view_materials.iter() {
-        if instance_manager.material_present_in_scene(material_id)
-            && let Some(material_pipeline) =
-                pipeline_cache.get_render_pipeline(*material_pipeline_id)
-        {
-            let x = *material_id * 3;
-            render_pass.set_render_pipeline(material_pipeline);
-            render_pass.set_bind_group(3, material_bind_group, &[]);
-            render_pass.draw(x..(x + 3), 0..1);
-        }
-    }
+    draw_meshlet_materials(
+        &mut render_pass,
+        meshlet_view_materials,
+        &instance_manager,
+        &pipeline_cache,
+        &material_bind_group_allocators,
+    );
 }
