@@ -25,9 +25,10 @@ use bevy_window::{
 use wgpu::{DisplayGamut as WgpuDisplayGamut, DisplayHdrInfo};
 
 use crate::renderer::RenderAdapter;
+use crate::sync_world::MainEntity;
 use crate::MainWorld;
 
-use super::{ExtractedWindows, WindowSurfaces};
+use super::{ExtractedWindow, SurfaceData};
 
 /// Maps a wgpu coarse [`DisplayGamut`](WgpuDisplayGamut) onto the plain-data
 /// [`DisplayGamut`] the window crate carries. `Srgb` and any unrecognized
@@ -183,24 +184,22 @@ pub(crate) fn poll_display_state(
     // Apple's relative-headroom query gates on the main thread; pin the system
     // there, matching `create_surfaces`.
     #[cfg(any(target_os = "macos", target_os = "ios"))] _marker: bevy_ecs::system::NonSendMarker,
-    window_surfaces: Res<WindowSurfaces>,
-    extracted_windows: Res<ExtractedWindows>,
+    windows: Query<(MainEntity, &ExtractedWindow, &SurfaceData)>,
     render_adapter: Res<RenderAdapter>,
     mut store: ResMut<DisplayStateStore>,
 ) {
     // Drop bookkeeping for surfaces that went away.
-    store
-        .states
-        .retain(|e, _| window_surfaces.surfaces.contains_key(e));
-    store
-        .capabilities
-        .retain(|e, _| window_surfaces.surfaces.contains_key(e));
+    let live: bevy_ecs::entity::EntityHashSet = windows
+        .iter()
+        .map(|(main_entity, ..)| main_entity)
+        .collect();
+    store.states.retain(|e, _| live.contains(e));
+    store.capabilities.retain(|e, _| live.contains(e));
 
-    for (&entity, surface_data) in window_surfaces.surfaces.iter() {
-        let extracted = extracted_windows.get(&entity);
+    for (entity, extracted, surface_data) in windows.iter() {
         let first_time = !store.states.contains_key(&entity);
-        let reconfigured = extracted.is_some_and(|w| w.display_target_transfer_changed);
-        let event_requery = extracted.is_some_and(|w| w.request_display_requery);
+        let reconfigured = extracted.display_target_transfer_changed;
+        let event_requery = extracted.request_display_requery;
 
         let resolved = surface_data.resolved_transfer;
 
@@ -211,7 +210,7 @@ pub(crate) fn poll_display_state(
         // without an event" until wgpu exposes it as a surface capability.
         let continuous = cfg!(any(target_os = "macos", target_os = "ios"))
             && resolved.is_hdr()
-            && extracted.is_some_and(|w| w.display_calibration_auto);
+            && extracted.display_calibration_auto;
 
         if !(first_time || reconfigured || event_requery || continuous) {
             continue;
@@ -248,10 +247,10 @@ pub(crate) fn poll_display_state(
 /// [`Monitor`]: bevy_window::Monitor
 pub(crate) fn write_back_display_state(
     mut main_world: ResMut<MainWorld>,
-    window_surfaces: Res<WindowSurfaces>,
+    windows: Query<(MainEntity, &SurfaceData)>,
     store: Res<DisplayStateStore>,
 ) {
-    for (&entity, surface_data) in window_surfaces.surfaces.iter() {
+    for (entity, surface_data) in windows.iter() {
         super::insert_on_change(
             &mut main_world,
             entity,

@@ -1,7 +1,7 @@
 use crate::{
     color_difference::EuclideanDistance, impl_componentwise_vector_space, Alpha, ColorToComponents,
-    Gray, Hsla, Hsva, Hwba, Laba, Lcha, LinearRgba, Luminance, Mix, Okhsla, Okhsva, Oklaba, Oklcha,
-    Srgba, StandardColor, Xyza,
+    Gray, Hsla, Hsva, Hwba, Laba, Lcha, LinearRgba, Luminance, Mix, Okhsla, Okhsva, Okhwba, Oklaba,
+    Oklcha, Srgba, StandardColor, Xyza,
 };
 use bevy_math::{Vec3, Vec4};
 #[cfg(feature = "bevy_reflect")]
@@ -517,6 +517,18 @@ impl From<Okhsva> for LinearRec2020 {
 }
 
 impl From<LinearRec2020> for Okhsva {
+    fn from(value: LinearRec2020) -> Self {
+        Xyza::from(value).into()
+    }
+}
+
+impl From<Okhwba> for LinearRec2020 {
+    fn from(value: Okhwba) -> Self {
+        Xyza::from(value).into()
+    }
+}
+
+impl From<LinearRec2020> for Okhwba {
     fn from(value: LinearRec2020) -> Self {
         Xyza::from(value).into()
     }

@@ -52,7 +52,6 @@ git checkout v0.4.0
   - [Embedded](#embedded)
   - [Games](#games)
   - [Gizmos](#gizmos)
-  - [Helpers](#helpers)
   - [Input](#input)
   - [Math](#math)
   - [Movement](#movement)
@@ -381,6 +380,7 @@ Example | Description
 [Desk Toy](../examples/showcase/desk_toy.rs) | Bevy logo as a desk toy using transparent windows! Now with Googly Eyes!
 [Game Menu](../examples/showcase/game_menu.rs) | A simple game menu
 [Loading Screen](../examples/showcase/loading_screen.rs) | Demonstrates how to create a loading screen that waits for all assets to be loaded and render pipelines to be compiled.
+[Mines](../examples/showcase/mines.rs) | A simple minesweeper-style game in Bevy UI
 
 ### Gizmos
 
@@ -402,7 +402,6 @@ Example | Description
 --- | ---
 [HDR Calibration Helper](../examples/helpers/hdr_calibration.rs) | Reusable guided HDR display-calibration screen that runs inside an app state
 [HDR Helper](../examples/helpers/hdr.rs) | Reusable plugin that requests the best supported HDR output, falling back to SDR
-[Widgets](../examples/helpers/widgets.rs) | Example UI Widgets
 
 ### Input
 
@@ -522,6 +521,7 @@ Example | Description
 
 Example | Description
 --- | ---
+[Deferred Gbuffer Raymarching](../examples/shader_advanced/deferred_raymarch.rs) | Writes a raymarched SDF into the deferred gbuffer so it is lit by the standard PBR deferred lighting pass
 [Fullscreen Material](../examples/shader_advanced/fullscreen_material.rs) | Demonstrates how to write a fullscreen material
 [Manual Material Implementation](../examples/shader_advanced/manual_material.rs) | Demonstrates how to implement a material manually using the mid-level render APIs
 
@@ -707,6 +707,8 @@ Example | Description
 [How to Test Systems](../tests/how_to_test_systems.rs) | How to test systems with commands, queries or resources
 
 ## Platform-Specific Examples
+
+`bevy_mobile_example` sets `strip = true` in the workspace `Cargo.toml` to keep app bundles reasonable. Remove the `strip` override if you need native debug symbols.
 
 ### Android
 

@@ -11,7 +11,7 @@ use crate::{
     texture::{GpuImage, ManualTextureViews},
     view::{
         display_target_uniform::{resolve_view_display_target, ViewDisplayTarget},
-        ColorGrading, ExtractedView, ExtractedWindows, ManualDisplayTargets, Msaa,
+        ColorGrading, ExtractedView, ExtractedWindow, ManualDisplayTargets, Msaa,
         NeedsSceneLinearTarget, NoIndirectDrawing, RenderExtractedVisibleEntities,
         RenderVisibleEntities, RenderVisibleEntitiesClass, ResolvedCompositingSpace,
         RetainedViewEntity, Tonemapping, ViewUniformOffset, VisibilityExtractionSystemParam,
@@ -98,9 +98,9 @@ impl Plugin for CameraPlugin {
                     ExtractSchedule,
                     (
                         DirtySpecializationSystems::Clear
-                            .before(DirtySpecializationSystems::CheckForChanges),
+                            .before_weak(DirtySpecializationSystems::CheckForChanges),
                         DirtySpecializationSystems::CheckForChanges
-                            .before(DirtySpecializationSystems::CheckForRemovals),
+                            .before_weak(DirtySpecializationSystems::CheckForRemovals),
                     ),
                 )
                 .add_systems(
@@ -201,7 +201,7 @@ impl CameraRenderGraph {
 pub trait NormalizedRenderTargetExt {
     fn get_texture_view<'a>(
         &self,
-        windows: &'a ExtractedWindows,
+        windows: &'a Query<(MainEntity, &ExtractedWindow)>,
         images: &'a RenderAssets<GpuImage>,
         manual_texture_views: &'a ManualTextureViews,
     ) -> Option<&'a TextureView>;
@@ -209,7 +209,7 @@ pub trait NormalizedRenderTargetExt {
     /// Retrieves the [`TextureFormat`] of this render target, if it exists.
     fn get_texture_view_format<'a>(
         &self,
-        windows: &'a ExtractedWindows,
+        windows: &'a Query<(MainEntity, &ExtractedWindow)>,
         images: &'a RenderAssets<GpuImage>,
         manual_texture_views: &'a ManualTextureViews,
     ) -> Option<TextureFormat>;
@@ -232,14 +232,15 @@ pub trait NormalizedRenderTargetExt {
 impl NormalizedRenderTargetExt for NormalizedRenderTarget {
     fn get_texture_view<'a>(
         &self,
-        windows: &'a ExtractedWindows,
+        windows: &'a Query<(MainEntity, &ExtractedWindow)>,
         images: &'a RenderAssets<GpuImage>,
         manual_texture_views: &'a ManualTextureViews,
     ) -> Option<&'a TextureView> {
         match self {
             NormalizedRenderTarget::Window(window_ref) => windows
-                .get(&window_ref.entity())
-                .and_then(|window| window.swap_chain_texture_view.as_ref()),
+                .iter()
+                .find(|(e, _)| *e == window_ref.entity())
+                .and_then(|(_, window)| window.swap_chain_texture_view.as_ref()),
             NormalizedRenderTarget::Image(image_target) => images
                 .get(&image_target.handle)
                 .map(|image| &image.texture_view),
@@ -253,14 +254,15 @@ impl NormalizedRenderTargetExt for NormalizedRenderTarget {
     /// Retrieves the texture view's [`TextureFormat`] of this render target, if it exists.
     fn get_texture_view_format<'a>(
         &self,
-        windows: &'a ExtractedWindows,
+        windows: &'a Query<(MainEntity, &ExtractedWindow)>,
         images: &'a RenderAssets<GpuImage>,
         manual_texture_views: &'a ManualTextureViews,
     ) -> Option<TextureFormat> {
         match self {
             NormalizedRenderTarget::Window(window_ref) => windows
-                .get(&window_ref.entity())
-                .and_then(|window| window.swap_chain_texture_view_format),
+                .iter()
+                .find(|(e, _)| *e == window_ref.entity())
+                .and_then(|(_, window)| window.swap_chain_texture_view_format),
             NormalizedRenderTarget::Image(image_target) => {
                 images.get(&image_target.handle).map(GpuImage::view_format)
             }
@@ -508,7 +510,6 @@ pub fn extract_cameras(
         )>,
     >,
     primary_window: Extract<Query<Entity, With<PrimaryWindow>>>,
-    extracted_windows: Res<ExtractedWindows>,
     manual_display_targets: Res<ManualDisplayTargets>,
     manual_texture_views: Res<ManualTextureViews>,
     images: Res<RenderAssets<GpuImage>>,
@@ -518,6 +519,7 @@ pub fn extract_cameras(
     >,
     gpu_preprocessing_support: Res<GpuPreprocessingSupport>,
     visibility_extraction_system_param: VisibilityExtractionSystemParam,
+    extracted_swap_chains: Query<(MainEntity, &ExtractedWindow)>,
 ) {
     main_pass_formats.clear();
     let primary_window = primary_window.iter().next();
@@ -642,7 +644,11 @@ pub fn extract_cameras(
                 .as_ref()
                 .and_then(|target| {
                     target
-                        .get_texture_view_format(&extracted_windows, &images, &manual_texture_views)
+                        .get_texture_view_format(
+                            &extracted_swap_chains,
+                            &images,
+                            &manual_texture_views,
+                        )
                         .map(|format| normalize_bgra8(target, format))
                 })
                 .unwrap_or(TextureFormat::Rgba8UnormSrgb);
@@ -651,7 +657,7 @@ pub fn extract_cameras(
             // read above. `MainTextureMode` documents the format policy.
             let view_display_target = resolve_view_display_target(
                 target.as_ref(),
-                &extracted_windows,
+                extracted_swap_chains.iter(),
                 &manual_display_targets,
             );
             let mode = main_texture_mode(MainTextureCamera {

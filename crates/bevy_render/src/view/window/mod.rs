@@ -1,14 +1,16 @@
 use crate::extract_resource::ExtractResourcePlugin;
 use crate::renderer::WgpuWrapper;
+use crate::sync_world::{MainEntity, RenderEntity, SyncToRenderWorld};
 use crate::{camera::extract_cameras, renderer::RenderQueue};
 use crate::{
     render_resource::{SurfaceTexture, TextureView},
     renderer::{RenderAdapter, RenderDevice, RenderInstance},
-    Extract, ExtractSchedule, GpuResourceAppExt, MainWorld, Render, RenderApp, RenderSystems,
+    Extract, ExtractSchedule, MainWorld, Render, RenderApp, RenderSystems,
 };
 use bevy_app::{App, Plugin, PostUpdate};
 use bevy_ecs::entity::EntityHashSet;
-use bevy_ecs::{entity::EntityHashMap, prelude::*};
+use bevy_ecs::prelude::*;
+use bevy_ecs::system::RunSystemOnce;
 use bevy_log::{debug, info, warn, warn_once};
 use bevy_utils::default;
 use bevy_window::{
@@ -16,10 +18,7 @@ use bevy_window::{
     DisplayTransfers, EffectiveDisplayTarget, OnMonitor, PresentMode, PrimaryWindow,
     RawHandleWrapper, Window, WindowClosing, WindowFocused, WindowMoved,
 };
-use core::{
-    num::NonZero,
-    ops::{Deref, DerefMut},
-};
+use core::num::NonZero;
 use wgpu::{
     SurfaceColorSpace, SurfaceColorSpaces, SurfaceConfiguration, SurfaceFormatCapabilities,
     SurfaceTargetUnsafe, TextureFormat, TextureUsages, TextureViewDescriptor,
@@ -46,6 +45,24 @@ impl Plugin for WindowRenderPlugin {
         // `EffectiveDisplayTarget` the render world reads has zero frame lag.
         .add_systems(PostUpdate, resolve_calibration);
 
+        // We need to sync the window entity in the render world
+        // We can't use [`SyncComponentPlugin`] because it would introduce `bevy_render` as
+        // a dependency to `bevy_window`
+        {
+            app.add_observer(|trigger: On<Add, Window>, mut commands: Commands| {
+                commands.entity(trigger.entity).insert(SyncToRenderWorld);
+            });
+
+            // The primary window gets added before this plugin so we can't rely on the observer
+            let _ = app.world_mut().run_system_once(
+                |mut commands: Commands, windows: Query<Entity, With<Window>>| {
+                    for entity in &windows {
+                        commands.entity(entity).insert(SyncToRenderWorld);
+                    }
+                },
+            );
+        }
+
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
             render_app
                 // Also initialized in the main world. Extraction overwrites
@@ -54,8 +71,6 @@ impl Plugin for WindowRenderPlugin {
                 // `extract_cameras`, which reads it the same frame.
                 .init_resource::<ManualDisplayTargets>()
                 .init_resource::<DisplayStateStore>()
-                .init_gpu_resource::<ExtractedWindows>()
-                .init_gpu_resource::<WindowSurfaces>()
                 .add_systems(
                     ExtractSchedule,
                     (
@@ -80,10 +95,8 @@ impl Plugin for WindowRenderPlugin {
     }
 }
 
+#[derive(Component)]
 pub struct ExtractedWindow {
-    /// An entity that contains the components in [`Window`].
-    pub entity: Entity,
-    pub handle: RawHandleWrapper,
     pub physical_width: u32,
     pub physical_height: u32,
     pub present_mode: PresentMode,
@@ -213,37 +226,19 @@ impl ExtractedWindow {
     }
 }
 
-#[derive(Default, Resource)]
-pub struct ExtractedWindows {
-    pub primary: Option<Entity>,
-    pub windows: EntityHashMap<ExtractedWindow>,
-}
-
-impl Deref for ExtractedWindows {
-    type Target = EntityHashMap<ExtractedWindow>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.windows
-    }
-}
-
-impl DerefMut for ExtractedWindows {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.windows
-    }
-}
-
 fn extract_windows(
-    mut extracted_windows: ResMut<ExtractedWindows>,
+    mut commands: Commands,
+    mut extracted_windows: Query<&mut ExtractedWindow>,
     mut closing: Extract<MessageReader<WindowClosing>>,
     windows: Extract<
         Query<(
             Entity,
+            RenderEntity,
             &Window,
             Option<&EffectiveDisplayTarget>,
             Option<&DisplayCalibrationPolicy>,
             &RawHandleWrapper,
-            Option<&PrimaryWindow>,
+            Has<PrimaryWindow>,
         )>,
     >,
     // Signals that the backing display may have changed, so `poll_display_state`
@@ -254,7 +249,8 @@ fn extract_windows(
     changed_monitor: Extract<Query<Entity, Changed<OnMonitor>>>,
     mut removed_monitor: Extract<RemovedComponents<OnMonitor>>,
     mut removed: Extract<RemovedComponents<RawHandleWrapper>>,
-    mut window_surfaces: ResMut<WindowSurfaces>,
+    mut removed_primary: Extract<RemovedComponents<PrimaryWindow>>,
+    mapper: Extract<Query<&RenderEntity>>,
 ) {
     // Collect the windows whose backing display may have changed this frame: a
     // move or a retargeted/removed `OnMonitor` link (a possible new display), or
@@ -271,8 +267,15 @@ fn extract_windows(
         .collect();
     display_requery.extend(focused.read().filter(|f| f.focused).map(|f| f.window));
 
-    for (entity, window, effective_display_target, calibration_policy, handle, primary) in
-        windows.iter()
+    for (
+        entity,
+        render_entity,
+        window,
+        effective_display_target,
+        calibration_policy,
+        handle,
+        is_primary,
+    ) in windows.iter()
     {
         // The renderer consumes the resolved `EffectiveDisplayTarget`. It is
         // computed in the main world before extraction; removing the (required)
@@ -281,8 +284,8 @@ fn extract_windows(
         let display_target = effective_display_target
             .map(|effective| effective.target)
             .unwrap_or_default();
-        if primary.is_some() {
-            extracted_windows.primary = Some(entity);
+        if is_primary {
+            commands.entity(render_entity).insert(PrimaryWindow);
         }
 
         let (new_width, new_height) = (
@@ -290,27 +293,36 @@ fn extract_windows(
             window.resolution.physical_height().max(1),
         );
 
-        let extracted_window = extracted_windows.entry(entity).or_insert(ExtractedWindow {
-            entity,
-            handle: handle.clone(),
-            physical_width: new_width,
-            physical_height: new_height,
-            present_mode: window.present_mode,
-            desired_maximum_frame_latency: window.desired_maximum_frame_latency,
-            swap_chain_texture: None,
-            swap_chain_texture_view: None,
-            size_changed: false,
-            swap_chain_texture_format: None,
-            swap_chain_texture_view_format: None,
-            present_mode_changed: false,
-            alpha_mode: window.composite_alpha_mode,
-            display_target,
-            display_target_transfer_changed: false,
-            request_display_requery: false,
-            display_calibration_auto: false,
-            resolved_transfer: None,
-            needs_initial_present: true,
-        });
+        let Ok(mut extracted_window) = extracted_windows.get_mut(render_entity) else {
+            commands.entity(render_entity).insert((
+                ExtractedWindow {
+                    physical_width: new_width,
+                    physical_height: new_height,
+                    present_mode: window.present_mode,
+                    desired_maximum_frame_latency: window.desired_maximum_frame_latency,
+                    swap_chain_texture: None,
+                    swap_chain_texture_view: None,
+                    size_changed: false,
+                    swap_chain_texture_format: None,
+                    swap_chain_texture_view_format: None,
+                    present_mode_changed: false,
+                    alpha_mode: window.composite_alpha_mode,
+                    display_target,
+                    display_target_transfer_changed: false,
+                    // Apply the per-frame display-sensing flags here too: the
+                    // insert path skips the sync block below, and a window
+                    // event on the window's first extracted frame would
+                    // otherwise be lost.
+                    request_display_requery: display_requery.contains(&entity),
+                    display_calibration_auto: calibration_policy
+                        .is_some_and(DisplayCalibrationPolicy::has_auto),
+                    resolved_transfer: None,
+                    needs_initial_present: true,
+                },
+                handle.clone(),
+            ));
+            continue;
+        };
 
         // Keep the extracted `DisplayTarget` in sync every frame, diffing the
         // fields that affect surface negotiation: a transfer change requires
@@ -346,6 +358,7 @@ fn extract_windows(
             // swap chain texture if needed.
             extracted_window.swap_chain_texture_view = None;
         }
+
         extracted_window.size_changed = new_width != extracted_window.physical_width
             || new_height != extracted_window.physical_height;
         extracted_window.present_mode_changed =
@@ -373,12 +386,21 @@ fn extract_windows(
     }
 
     for closing_window in closing.read() {
-        extracted_windows.remove(&closing_window.window);
-        window_surfaces.remove(&closing_window.window);
+        if let Ok(render_entity) = mapper.get(closing_window.window) {
+            commands.entity(render_entity.entity()).despawn();
+        }
     }
     for removed_window in removed.read() {
-        extracted_windows.remove(&removed_window);
-        window_surfaces.remove(&removed_window);
+        if let Ok(render_entity) = mapper.get(removed_window) {
+            commands.entity(render_entity.entity()).despawn();
+        }
+    }
+    for removed_window in removed_primary.read() {
+        if let Ok(render_entity) = mapper.get(removed_window) {
+            commands
+                .entity(render_entity.entity())
+                .remove::<PrimaryWindow>();
+        }
     }
 }
 
@@ -398,7 +420,8 @@ pub(super) fn insert_on_change<C: Component + PartialEq>(
     }
 }
 
-struct SurfaceData {
+#[derive(Component)]
+pub struct SurfaceData {
     // TODO: what lifetime should this be?
     surface: WgpuWrapper<wgpu::Surface<'static>>,
     configuration: SurfaceConfiguration,
@@ -518,20 +541,6 @@ impl SurfaceData {
     }
 }
 
-#[derive(Resource, Default)]
-pub struct WindowSurfaces {
-    surfaces: EntityHashMap<SurfaceData>,
-    /// List of windows that we have already called the initial `configure_surface` for
-    configured_windows: EntityHashSet,
-}
-
-impl WindowSurfaces {
-    fn remove(&mut self, window: &Entity) {
-        self.surfaces.remove(window);
-        self.configured_windows.remove(window);
-    }
-}
-
 /// (re)configures window surfaces, and obtains a swapchain texture for rendering.
 ///
 /// NOTE: `get_current_texture` in `prepare_windows` can take a long time if the GPU workload is
@@ -554,16 +563,14 @@ impl WindowSurfaces {
 ///   [`Backends::GL`](crate::settings::Backends::GL) with the `gles` feature enabled if your
 ///   GPU/drivers support `OpenGL 4.3` / `OpenGL ES 3.0` or later.
 pub fn prepare_windows(
-    mut windows: ResMut<ExtractedWindows>,
-    mut window_surfaces: ResMut<WindowSurfaces>,
+    mut windows: Query<(MainEntity, &mut ExtractedWindow, Option<&mut SurfaceData>)>,
     render_device: Res<RenderDevice>,
     render_adapter: Res<RenderAdapter>,
     sorted_cameras: Res<crate::camera::SortedCameras>,
     #[cfg(target_os = "linux")] render_instance: Res<RenderInstance>,
 ) {
-    for window in windows.windows.values_mut() {
-        let window_surfaces = window_surfaces.deref_mut();
-        let Some(surface_data) = window_surfaces.surfaces.get_mut(&window.entity) else {
+    for (main_entity, mut window, maybe_surface_data) in &mut windows {
+        let Some(mut surface_data) = maybe_surface_data else {
             continue;
         };
         // Retire last frame's record before any early exit below, so it can only
@@ -578,7 +585,7 @@ pub fn prepare_windows(
         let is_camera_target = sorted_cameras.0.iter().any(|c| {
             matches!(
                 &c.target,
-                Some(bevy_camera::NormalizedRenderTarget::Window(w)) if w.entity() == window.entity
+                Some(bevy_camera::NormalizedRenderTarget::Window(w)) if w.entity() == main_entity
             ) && matches!(c.output_mode, bevy_camera::CameraOutputMode::Write { .. })
         });
         if !is_camera_target && !window.needs_initial_present {
@@ -686,12 +693,9 @@ pub fn prepare_windows(
     }
 }
 
-pub fn need_surface_configuration(
-    windows: Res<ExtractedWindows>,
-    window_surfaces: Res<WindowSurfaces>,
-) -> bool {
-    for window in windows.windows.values() {
-        if !window_surfaces.configured_windows.contains(&window.entity)
+pub fn need_surface_configuration(windows: Query<(&ExtractedWindow, Has<SurfaceData>)>) -> bool {
+    for (window, has_surface_data) in &windows {
+        if !has_surface_data
             || window.size_changed
             || window.present_mode_changed
             || window.display_target_transfer_changed
@@ -1103,20 +1107,25 @@ const DEFAULT_DESIRED_MAXIMUM_FRAME_LATENCY: u32 = 2;
 
 /// Creates window surfaces.
 pub fn create_surfaces(
+    mut commands: Commands,
     // By accessing a NonSend resource, we tell the scheduler to put this system on the main thread,
     // which is necessary for some OS's
     #[cfg(any(target_os = "macos", target_os = "ios"))] _marker: bevy_ecs::system::NonSendMarker,
-    mut windows: ResMut<ExtractedWindows>,
-    mut window_surfaces: ResMut<WindowSurfaces>,
+    mut windows: Query<(
+        Entity,
+        &mut ExtractedWindow,
+        &RawHandleWrapper,
+        Option<&mut SurfaceData>,
+    )>,
     render_instance: Res<RenderInstance>,
     render_adapter: Res<RenderAdapter>,
     render_device: Res<RenderDevice>,
 ) {
-    for window in windows.windows.values_mut() {
-        if !window_surfaces.surfaces.contains_key(&window.entity) {
+    for (entity, mut window, handle, mut maybe_surface_data) in &mut windows {
+        let Some(data) = maybe_surface_data.as_mut() else {
             let surface_target = SurfaceTargetUnsafe::RawHandle {
-                raw_display_handle: Some(window.handle.get_display_handle()),
-                raw_window_handle: window.handle.get_window_handle(),
+                raw_display_handle: Some(handle.get_display_handle()),
+                raw_window_handle: handle.get_window_handle(),
             };
             // SAFETY: The window handles in ExtractedWindows will always be valid objects to create surfaces on
             let surface = unsafe {
@@ -1127,7 +1136,7 @@ pub fn create_surfaces(
                     .expect("Failed to create wgpu surface")
             };
             let caps = surface.get_capabilities(&render_adapter);
-            let present_mode = present_mode(window, &caps);
+            let present_mode = present_mode(&window, &caps);
             let negotiated = negotiate_surface_format(
                 &caps.formats,
                 &caps.format_capabilities,
@@ -1187,22 +1196,23 @@ pub fn create_surfaces(
 
             render_device.configure_surface(&surface, &configuration);
 
-            window_surfaces.surfaces.insert(
-                window.entity,
-                SurfaceData {
-                    surface: WgpuWrapper::new(surface),
-                    configuration,
-                    texture_view_format,
-                    resolved_transfer: negotiated.resolved_transfer,
-                    supported_transfers,
-                    transfer_before_renegotiation: None,
-                },
-            );
-        }
-        let data = window_surfaces
-            .surfaces
-            .get_mut(&window.entity)
-            .expect("surface was just created");
+            // Report the transfer the configured surface can actually carry
+            // back to the extracted window, where
+            // `prepare_view_display_targets` picks it up to build each view's
+            // resolved `ViewDisplayTarget`. The `SurfaceData` component insert
+            // is deferred to the sync point before `prepare_windows`, so the
+            // extracted window carries the result for this frame's consumers.
+            window.resolved_transfer = Some(negotiated.resolved_transfer);
+            commands.entity(entity).insert(SurfaceData {
+                surface: WgpuWrapper::new(surface),
+                configuration,
+                texture_view_format,
+                resolved_transfer: negotiated.resolved_transfer,
+                supported_transfers,
+                transfer_before_renegotiation: None,
+            });
+            continue;
+        };
 
         if window.size_changed
             || window.present_mode_changed
@@ -1220,7 +1230,7 @@ pub fn create_surfaces(
             data.configuration.width = window.physical_width;
             data.configuration.height = window.physical_height;
             let caps = data.surface.get_capabilities(&render_adapter);
-            data.configuration.present_mode = present_mode(window, &caps);
+            data.configuration.present_mode = present_mode(&window, &caps);
             // Refresh the supported-transfer set from the fresh capabilities so
             // it tracks runtime changes (e.g. the OS HDR toggle adding or
             // removing HDR10), mirrored back below.
@@ -1258,15 +1268,10 @@ pub fn create_surfaces(
         // to the extracted window, where `prepare_view_display_targets` picks
         // it up to build each view's resolved `ViewDisplayTarget`.
         window.resolved_transfer = Some(data.resolved_transfer);
-
-        window_surfaces.configured_windows.insert(window.entity);
     }
 }
 
-fn present_mode(
-    window: &mut ExtractedWindow,
-    caps: &wgpu::SurfaceCapabilities,
-) -> wgpu::PresentMode {
+fn present_mode(window: &ExtractedWindow, caps: &wgpu::SurfaceCapabilities) -> wgpu::PresentMode {
     let present_mode = match window.present_mode {
         PresentMode::Fifo => wgpu::PresentMode::Fifo,
         PresentMode::FifoRelaxed => wgpu::PresentMode::FifoRelaxed,

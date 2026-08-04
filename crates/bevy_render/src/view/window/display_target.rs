@@ -24,7 +24,7 @@ use bevy_window::{
     OnMonitor, Window, WindowDisplayState,
 };
 
-use super::ExtractedWindows;
+use super::ExtractedWindow;
 use crate::RenderApp;
 
 /// Resource that stores the [`DisplayTarget`] for render targets that are not
@@ -77,9 +77,9 @@ impl core::ops::DerefMut for ManualDisplayTargets {
 /// This is the seam view-preparation code should use to parameterize
 /// per-display work (tone mapping, gamut mapping, transfer encoding) for a
 /// view: pass the view's [`NormalizedRenderTarget`] (e.g.
-/// `ExtractedCamera::target`) together with the [`ExtractedWindows`] and
-/// [`ManualDisplayTargets`] resources. All cameras rendering to the same
-/// target resolve to the same `DisplayTarget`.
+/// `ExtractedCamera::target`) together with the extracted-window query items
+/// and the [`ManualDisplayTargets`] resource. All cameras rendering to the
+/// same target resolve to the same `DisplayTarget`.
 ///
 /// Resolution rules:
 /// - [`NormalizedRenderTarget::Window`]: the window's extracted
@@ -96,15 +96,16 @@ impl core::ops::DerefMut for ManualDisplayTargets {
 ///   the default.
 /// - [`NormalizedRenderTarget::None`], `target == None`, or any missing
 ///   entry: [`DisplayTarget::SDR_SRGB`].
-pub fn resolve_display_target(
+pub fn resolve_display_target<'a>(
     target: Option<&NormalizedRenderTarget>,
-    extracted_windows: &ExtractedWindows,
+    windows: impl IntoIterator<Item = (Entity, &'a ExtractedWindow)>,
     manual_display_targets: &ManualDisplayTargets,
 ) -> DisplayTarget {
     match target {
-        Some(NormalizedRenderTarget::Window(window_ref)) => extracted_windows
-            .get(&window_ref.entity())
-            .map(|window| window.display_target)
+        Some(NormalizedRenderTarget::Window(window_ref)) => windows
+            .into_iter()
+            .find(|(entity, _)| *entity == window_ref.entity())
+            .map(|(_, window)| window.display_target)
             .unwrap_or_default(),
         Some(
             target @ (NormalizedRenderTarget::Image(_) | NormalizedRenderTarget::TextureView(_)),
@@ -298,6 +299,10 @@ mod resolve_display_target_tests {
     use bevy_image::Image;
     use bevy_window::{DisplayGamut, DisplayTransfer};
 
+    fn no_windows() -> core::iter::Empty<(Entity, &'static ExtractedWindow)> {
+        core::iter::empty()
+    }
+
     fn image_target(scale_factor: f32) -> NormalizedRenderTarget {
         NormalizedRenderTarget::Image(ImageRenderTarget {
             handle: Handle::<Image>::default(),
@@ -323,10 +328,12 @@ mod resolve_display_target_tests {
         manual.insert(image.clone(), pq);
         manual.insert(texture_view.clone(), scrgb);
 
-        let windows = ExtractedWindows::default();
-        assert_eq!(resolve_display_target(Some(&image), &windows, &manual), pq);
         assert_eq!(
-            resolve_display_target(Some(&texture_view), &windows, &manual),
+            resolve_display_target(Some(&image), no_windows(), &manual),
+            pq
+        );
+        assert_eq!(
+            resolve_display_target(Some(&texture_view), no_windows(), &manual),
             scrgb
         );
     }
@@ -342,11 +349,10 @@ mod resolve_display_target_tests {
             DisplayTarget::SDR_SRGB.with_transfer(DisplayTransfer::Pq),
         );
 
-        let windows = ExtractedWindows::default();
         // Same image handle, different scale factor: the key is the whole
         // `NormalizedRenderTarget`, so this misses.
         assert_eq!(
-            resolve_display_target(Some(&image_target(2.0)), &windows, &manual),
+            resolve_display_target(Some(&image_target(2.0)), no_windows(), &manual),
             DisplayTarget::SDR_SRGB
         );
         assert_eq!(
@@ -354,7 +360,7 @@ mod resolve_display_target_tests {
                 Some(&NormalizedRenderTarget::TextureView(
                     ManualTextureViewHandle(7)
                 )),
-                &windows,
+                no_windows(),
                 &manual
             ),
             DisplayTarget::SDR_SRGB
@@ -365,13 +371,13 @@ mod resolve_display_target_tests {
                     width: 64,
                     height: 64
                 }),
-                &windows,
+                no_windows(),
                 &manual
             ),
             DisplayTarget::SDR_SRGB
         );
         assert_eq!(
-            resolve_display_target(None, &windows, &manual),
+            resolve_display_target(None, no_windows(), &manual),
             DisplayTarget::SDR_SRGB
         );
     }

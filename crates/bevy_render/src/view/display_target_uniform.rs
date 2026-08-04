@@ -48,11 +48,11 @@ use bevy_window::{DisplayTarget, DisplayTransfer};
 use super::{
     window::{
         display_target::{resolve_display_target, ManualDisplayTargets},
-        ExtractedWindows,
+        ExtractedWindow,
     },
     ExtractedView,
 };
-use crate::{camera::ExtractedCamera, render_resource::ShaderType};
+use crate::{camera::ExtractedCamera, render_resource::ShaderType, sync_world::MainEntity};
 
 /// Render-world component holding the post-negotiation [`DisplayTarget`] of
 /// the surface (window, image, or manual texture view) a view renders to.
@@ -167,19 +167,29 @@ pub(crate) fn resolve_window_display_target(
 /// picks the main-texture format — there the surface transfer is the
 /// *previous* frame's negotiation result, exactly as fresh as the swapchain
 /// format the extraction already reads for the output format).
-pub(crate) fn resolve_view_display_target(
+pub(crate) fn resolve_view_display_target<'a>(
     target: Option<&NormalizedRenderTarget>,
-    extracted_windows: &ExtractedWindows,
+    windows: impl IntoIterator<Item = (Entity, &'a ExtractedWindow)>,
     manual_display_targets: &ManualDisplayTargets,
 ) -> ViewDisplayTarget {
-    let requested = resolve_display_target(target, extracted_windows, manual_display_targets);
-
-    let surface_transfer = match target {
-        Some(NormalizedRenderTarget::Window(window_ref)) => extracted_windows
-            .get(&window_ref.entity())
-            .and_then(|window| window.resolved_transfer),
+    // A window target resolves through its extracted window (found once here
+    // and reused for both the requested target and the negotiated surface
+    // transfer); every other target kind has no surface, so
+    // `resolve_display_target` needs no window access for it.
+    let window = match target {
+        Some(NormalizedRenderTarget::Window(window_ref)) => windows
+            .into_iter()
+            .find(|(entity, _)| *entity == window_ref.entity())
+            .map(|(_, window)| window),
         _ => None,
     };
+    let requested = match target {
+        Some(NormalizedRenderTarget::Window(_)) => window
+            .map(|window| window.display_target)
+            .unwrap_or_default(),
+        _ => resolve_display_target(target, core::iter::empty(), manual_display_targets),
+    };
+    let surface_transfer = window.and_then(|window| window.resolved_transfer);
     ViewDisplayTarget(resolve_window_display_target(requested, surface_transfer))
 }
 
@@ -225,14 +235,14 @@ pub(crate) fn resolve_view_display_target(
 /// `× paper_white` (PQ) — cancel for every authored input.
 pub fn prepare_view_display_targets(
     mut commands: Commands,
-    extracted_windows: Res<ExtractedWindows>,
+    windows: Query<(MainEntity, &ExtractedWindow)>,
     manual_display_targets: Res<ManualDisplayTargets>,
     views: Query<(Entity, &ExtractedCamera, Has<DisplayTargetUniform>), With<ExtractedView>>,
 ) {
     for (entity, camera, has_uniform) in &views {
         let view_display_target = resolve_view_display_target(
             camera.target.as_ref(),
-            &extracted_windows,
+            windows.iter(),
             &manual_display_targets,
         );
         let authored = view_display_target.paper_white_nits;
@@ -320,7 +330,6 @@ mod tests {
     #[test]
     fn uniform_inserted_only_for_hdr_transfer_views() {
         let mut world = World::new();
-        world.init_resource::<ExtractedWindows>();
 
         let sdr_target = NormalizedRenderTarget::TextureView(ManualTextureViewHandle(0));
         let hdr_target = NormalizedRenderTarget::TextureView(ManualTextureViewHandle(1));
