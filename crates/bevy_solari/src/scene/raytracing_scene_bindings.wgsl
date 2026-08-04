@@ -4,7 +4,7 @@ enable wgpu_binding_array;
 #define_import_path bevy_solari::scene_bindings
 
 #import bevy_pbr::pbr_functions::calculate_tbn_mikktspace
-#import bevy_render::maths::affine3_to_square
+#import bevy_render::maths::{affine3_to_square, orthonormalize}
 
 struct InstanceGeometryIds {
     vertex_buffer_id: u32,
@@ -350,6 +350,7 @@ fn resolve_triangle_data_full(instance_id: u32, triangle_id: u32, barycentrics: 
     let raw_uv = mat3x2(vertices[0].uv, vertices[1].uv, vertices[2].uv) * barycentrics;
     let uv = (material.uv_transform * vec3(raw_uv, 1.0)).xy;
 
+    let local_normal = mat3x3(vertices[0].normal, vertices[1].normal, vertices[2].normal) * barycentrics;
     var local_tangent = mat3x3(vertices[0].tangent.xyz, vertices[1].tangent.xyz, vertices[2].tangent.xyz) * barycentrics;
     var tangent_sign = vertices[0].tangent.w;
     if instance_geometry_ids.vertex_stride_words < 12u {
@@ -365,13 +366,14 @@ fn resolve_triangle_data_full(instance_id: u32, triangle_id: u32, barycentrics: 
         if abs(determinant) > 1e-6 * uv_edge_scale_squared {
             local_tangent = normalize((edge1 * uv_edge2.y - edge2 * uv_edge1.y) / determinant);
             let local_bitangent = normalize((edge2 * uv_edge1.x - edge1 * uv_edge2.x) / determinant);
-            let local_normal_for_sign = normalize(
-                mat3x3(vertices[0].normal, vertices[1].normal, vertices[2].normal) * barycentrics
-            );
-            tangent_sign = select(-1.0, 1.0, dot(cross(local_normal_for_sign, local_tangent), local_bitangent) >= 0.0);
+            // Only the sign of the triple product matters and it survives a positive scale, so use
+            // the raw interpolation, which cancelling vertex normals can zero out but not misdirect.
+            tangent_sign = select(-1.0, 1.0, dot(cross(local_normal, local_tangent), local_bitangent) >= 0.0);
         } else {
-            let fallback_axis = select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), abs(vertices[0].normal.x) > 0.9);
-            local_tangent = normalize(cross(fallback_axis, vertices[0].normal));
+            // The tangent guard below builds a fallback frame from the normalized world normal.
+            // Picking an axis against a raw vertex normal instead needs that normal to be unit,
+            // which an arbitrary mesh's NORMAL attribute does not promise.
+            local_tangent = vec3(0.0);
             tangent_sign = 1.0;
         }
     }
@@ -389,23 +391,28 @@ fn resolve_triangle_data_full(instance_id: u32, triangle_id: u32, barycentrics: 
             cross(linear_transform[0], linear_transform[1]) * inverse_determinant,
         );
     }
-    let local_normal = mat3x3(vertices[0].normal, vertices[1].normal, vertices[2].normal) * barycentrics;
-    var world_normal = normalize(normal_transform * local_normal);
-
-    var transformed_tangent = linear_transform * local_tangent;
-    transformed_tangent -= world_normal * dot(world_normal, transformed_tangent);
-    if dot(transformed_tangent, transformed_tangent) <= 1e-12 {
-        let fallback_axis = select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), abs(world_normal.x) > 0.9);
-        transformed_tangent = cross(fallback_axis, world_normal);
-    }
     let transform_handedness = select(-1.0, 1.0, linear_determinant >= 0.0);
-    let world_tangent = vec4(normalize(transformed_tangent), tangent_sign * transform_handedness);
+
+    let interpolated_world_normal = normal_transform * local_normal;
+    // A coarse LOD can collapse a plate into a single triangle carrying near-opposite vertex
+    // normals, and a mesh can supply zero normals outright; either way the interpolation is
+    // zero-length and normalizing it is NaN. Test the local normal, a convex combination of unit
+    // normals, so the threshold carries no instance scale - the same test and threshold
+    // bevy_pbr::meshlet_visibility_buffer_resolve uses.
+    let interpolated_normal_is_usable = dot(local_normal, local_normal) > 1e-12;
 
     let triangle_cross = cross(
         world_vertices[1] - world_vertices[0],
         world_vertices[2] - world_vertices[0],
     );
     let triangle_cross_length_squared = dot(triangle_cross, triangle_cross);
+
+    // Only a triangle with no direction at all and no usable vertex normals reaches the axis; it is
+    // here so that no NaN can leave this function.
+    var world_normal = vec3<f32>(0.0, 1.0, 0.0);
+    if interpolated_normal_is_usable {
+        world_normal = normalize(interpolated_world_normal);
+    }
     var geometric_world_normal = world_normal;
     if triangle_cross_length_squared > 1e-20 {
         // cross(M*e1, M*e2) carries a factor of det(M), which points the winding normal inward on
@@ -413,7 +420,18 @@ fn resolve_triangle_data_full(instance_id: u32, triangle_id: u32, barycentrics: 
         // still points outward. Undo that sign so both agree, and so the geometric normal keeps the
         // same sidedness as RayIntersection::front_face, which the driver derives in object space.
         geometric_world_normal = triangle_cross * (inverseSqrt(triangle_cross_length_squared) * transform_handedness);
+        if !interpolated_normal_is_usable {
+            world_normal = geometric_world_normal;
+        }
     }
+
+    var transformed_tangent = linear_transform * local_tangent;
+    transformed_tangent -= world_normal * dot(world_normal, transformed_tangent);
+    if dot(transformed_tangent, transformed_tangent) <= 1e-12 {
+        transformed_tangent = orthonormalize(world_normal)[0];
+    }
+    let world_tangent = vec4(normalize(transformed_tangent), tangent_sign * transform_handedness);
+
     if material.normal_map_texture_id != TEXTURE_MAP_NONE {
         let TBN = calculate_tbn_mikktspace(world_normal, world_tangent);
         let T = TBN[0];
