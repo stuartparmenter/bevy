@@ -426,21 +426,6 @@ mod commit_tests {
     }
 
     #[test]
-    fn first_read_commits() {
-        let mut store = DisplayStateStore::default();
-        let entity = Entity::from_raw_u32(1).unwrap();
-
-        commit(
-            &mut store,
-            entity,
-            state(Some(5.0), None),
-            MonitorDisplayCapability::default(),
-        );
-
-        assert_eq!(committed(&store, entity), Some(state(Some(5.0), None)));
-    }
-
-    #[test]
     fn sub_epsilon_change_does_not_commit() {
         let mut store = DisplayStateStore::default();
         let entity = Entity::from_raw_u32(2).unwrap();

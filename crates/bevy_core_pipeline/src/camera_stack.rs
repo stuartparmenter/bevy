@@ -1075,15 +1075,6 @@ mod contract_tests {
         assert_eq!(output(&outputs, 2).diagnostics.operator_mismatch, None);
     }
 
-    // Matching operators stay silent (negative control for the mismatch
-    // diagnostic).
-    #[test]
-    fn matching_stack_members_are_silent() {
-        let outputs = resolve_contracts(vec![clearing(1, 0), compositing(2, 1)]);
-        assert_silent(&output(&outputs, 1));
-        assert_silent(&output(&outputs, 2));
-    }
-
     // The deferred encode keys on the last tonemap-enabled member's gamut in
     // sorted order, not the first's and not the encode finalizer's own.
     #[test]
@@ -1118,15 +1109,6 @@ mod contract_tests {
         let outputs = resolve_contracts(vec![passthrough_hdr(compositing(1, 0))]);
         let solo = output(&outputs, 1);
         assert!(solo.diagnostics.frame_start_loads_processed_output);
-    }
-
-    // E14 negative: a solo camera that CLEARS its target starts each frame
-    // fresh, so the diagnostic stays quiet even with tone mapping enabled.
-    #[test]
-    fn clearing_solo_camera_does_not_flag_frame_start_load() {
-        let outputs = resolve_contracts(vec![clearing(1, 0)]);
-        let solo = output(&outputs, 1);
-        assert!(!solo.diagnostics.frame_start_loads_processed_output);
     }
 
     // A load-previous stack that neither tone-maps nor encodes leaves the

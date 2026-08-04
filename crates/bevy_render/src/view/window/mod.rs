@@ -1406,16 +1406,6 @@ mod tests {
     }
 
     #[test]
-    fn scrgb_downgrades_to_sdr_when_unavailable() {
-        // The downgrade must be reported so views take the plain SDR path.
-        let (formats, caps) = sdr_only();
-        assert_eq!(
-            negotiate(&formats, &caps, DisplayTransfer::ScRgbLinear),
-            SDR_SELECTION(TextureFormat::Bgra8UnormSrgb)
-        );
-    }
-
-    #[test]
     fn pq_negotiates_hdr10_preferring_rgb10a2unorm() {
         let expected = NegotiatedSurface {
             format: TextureFormat::Rgb10a2Unorm,

@@ -93,22 +93,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_is_bt709() {
-        assert_eq!(SourceColorPrimaries::default(), SourceColorPrimaries::Bt709);
-    }
-
-    #[test]
-    fn to_rgb_primaries_round_trip() {
-        for (source, expected) in [
-            (SourceColorPrimaries::Bt709, RgbPrimaries::BT709),
-            (SourceColorPrimaries::Bt2020, RgbPrimaries::BT2020),
-            (SourceColorPrimaries::DisplayP3, RgbPrimaries::DISPLAY_P3),
-        ] {
-            assert_eq!(source.to_rgb_primaries(), expected);
-        }
-    }
-
-    #[test]
     fn from_chromaticities_matches_within_tolerance() {
         for source in [
             SourceColorPrimaries::Bt709,

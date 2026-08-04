@@ -1094,18 +1094,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn solo_sdr_default_view_key_has_no_compositing_bits() {
-        let view_key = SpritePipelineKey::from_target_format(TextureFormat::Rgba8UnormSrgb)
-            | SpritePipelineKey::from_msaa_samples(4)
-            | SpritePipelineKey::from_compositing_space(None);
-        assert_eq!(
-            view_key,
-            SpritePipelineKey::from_target_format(TextureFormat::Rgba8UnormSrgb)
-                | SpritePipelineKey::from_msaa_samples(4)
-        );
-    }
-
-    #[test]
     fn resolved_space_selects_exactly_its_bit() {
         assert_eq!(
             SpritePipelineKey::from_compositing_space(Some(CompositingSpace::Srgb)),

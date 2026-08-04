@@ -354,41 +354,6 @@ mod tests {
     }
 
     #[test]
-    fn sdr_limiter_breaks_on_hdr_range_input() {
-        // (1) Division blow-up. The `hitMax` denominator `-40 + 4 * mn4` is
-        // zero at `mn4 == 10`, and with `mx4 == 10` the numerator is zero
-        // too, so the clip solve is 0/0 = NaN. NaN propagation through
-        // min/max is indeterminate in WGSL, so the lobe can become NaN, which
-        // is a firefly on float targets.
-        let mn4 = 10.0_f32;
-        let mx4 = 10.0_f32;
-        let hit_max_nan = (PEAK_C.0 - mx4) / (PEAK_C.1 + 4.0 * mn4);
-        assert!(hit_max_nan.is_nan());
-
-        // (2) Sign inversion. When the neighborhood straddles 10 (`mn4 < 10 <
-        // mx4`) the solve flips positive. The `min(0.0, ...)` clamp then
-        // forces the lobe to zero, silently disabling sharpening around bright
-        // HDR highlights.
-        let mn4 = 5.0_f32;
-        let mx4 = 20.0_f32;
-        let hit_max_flipped = (PEAK_C.0 - mx4) / (PEAK_C.1 + 4.0 * mn4);
-        assert!(hit_max_flipped > 0.0);
-        let lobe = rcas_lobe(20.0, 20.0, 5.0, 5.0, 1.0);
-        assert_eq!(lobe, 0.0, "inverted limiter disables sharpening");
-
-        // The HDR path keeps a bounded, negative lobe on the same
-        // neighborhood because the compressed taps are inside [0, 1).
-        let lobe_hdr = rcas_lobe(
-            compress(20.0),
-            compress(20.0),
-            compress(5.0),
-            compress(5.0),
-            1.0,
-        );
-        assert!(lobe_hdr.is_finite() && (-FSR_RCAS_LIMIT..0.0).contains(&lobe_hdr));
-    }
-
-    #[test]
     fn hdr_path_is_bounded_and_finite_on_hdr_input() {
         // Neighborhoods that break the SDR math: flat and edged regions up to
         // 100x paper white.

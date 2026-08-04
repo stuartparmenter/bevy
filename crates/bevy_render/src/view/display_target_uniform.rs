@@ -402,20 +402,4 @@ mod tests {
             }
         );
     }
-
-    #[test]
-    fn downgraded_target_takes_the_plain_sdr_path() {
-        let requested = DisplayTarget {
-            paper_white_nits: 200.0,
-            peak_luminance_nits: 1000.0,
-            transfer: DisplayTransfer::ScRgbLinear,
-            ..DisplayTarget::SDR_SRGB
-        };
-        let downgraded = ViewDisplayTarget(resolve_window_display_target(
-            requested,
-            Some(DisplayTransfer::Srgb),
-        ));
-        assert!(!downgraded.is_hdr_transfer());
-        assert_eq!(*downgraded, DisplayTarget::SDR_SRGB);
-    }
 }

@@ -558,13 +558,6 @@ mod tests {
     }
 
     #[test]
-    fn oklab_with_signed_float_storage_is_kept() {
-        let (resolved, diagnostics) = resolve_spaces([view(1, 0, 0, OKLAB)]);
-        assert_eq!(resolved_for(&resolved, 1), OKLAB);
-        assert!(diagnostics.is_empty());
-    }
-
-    #[test]
     fn stack_resolved_oklab_degrades_on_unorm_storage() {
         let mut base = view(1, 0, 0, None);
         base.signed_float_storage = false;

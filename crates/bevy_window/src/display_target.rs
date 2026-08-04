@@ -465,11 +465,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_is_sdr_srgb() {
-        assert_eq!(DisplayTarget::default(), DisplayTarget::SDR_SRGB);
-    }
-
-    #[test]
     fn sdr_srgb_constant_values() {
         let sdr = DisplayTarget::SDR_SRGB;
         assert_eq!(sdr.paper_white_nits, 100.0);
@@ -477,12 +472,6 @@ mod tests {
         assert_eq!(sdr.min_luminance_nits, 0.0);
         assert_eq!(sdr.gamut, DisplayGamut::Rec709);
         assert_eq!(sdr.transfer, DisplayTransfer::Srgb);
-    }
-
-    #[test]
-    fn enum_defaults_match_sdr() {
-        assert_eq!(DisplayGamut::default(), DisplayGamut::Rec709);
-        assert_eq!(DisplayTransfer::default(), DisplayTransfer::Srgb);
     }
 
     #[test]

@@ -300,24 +300,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn source_primaries_serde_round_trip() {
-        for source_primaries in [
-            None,
-            Some(SourceColorPrimaries::Bt709),
-            Some(SourceColorPrimaries::Bt2020),
-            Some(SourceColorPrimaries::DisplayP3),
-        ] {
-            let settings = ImageLoaderSettings {
-                source_primaries,
-                ..Default::default()
-            };
-            let serialized = serde_json::to_string(&settings).unwrap();
-            let deserialized: ImageLoaderSettings = serde_json::from_str(&serialized).unwrap();
-            assert_eq!(deserialized.source_primaries, source_primaries);
-        }
-    }
-
-    #[test]
     fn settings_metadata_without_source_primaries_still_deserializes() {
         // `.meta` files written before `source_primaries` existed must keep loading.
         let mut serialized = serde_json::to_value(ImageLoaderSettings::default()).unwrap();

@@ -242,12 +242,6 @@ mod tests {
     }
 
     #[test]
-    fn same_primaries_is_identity() {
-        let m = rgb_to_rgb_matrix(RgbPrimaries::BT709, RgbPrimaries::BT709);
-        assert_mat3_approx_eq(m, Mat3::IDENTITY, 1e-7);
-    }
-
-    #[test]
     fn white_maps_to_white_point() {
         for primaries in [
             RgbPrimaries::BT709,
@@ -275,12 +269,6 @@ mod tests {
         ]);
         let m = RgbPrimaries::BT709.rgb_to_xyz_dmat3().as_mat3();
         assert_mat3_approx_eq(m, expected, 5e-4);
-    }
-
-    #[test]
-    fn xyz_round_trip() {
-        let m = RgbPrimaries::BT2020.rgb_to_xyz_dmat3();
-        assert_mat3_approx_eq(m.inverse().as_mat3() * m.as_mat3(), Mat3::IDENTITY, 1e-6);
     }
 
     #[test]

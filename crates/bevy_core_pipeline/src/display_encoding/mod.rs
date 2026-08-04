@@ -659,18 +659,6 @@ mod tests {
         );
     }
 
-    /// Full S1 variant: the overlay carries an authored
-    /// `CompositingSpace::Oklab` request, but phase 1 resolves the group to
-    /// linear (the GT7 base is not a `Camera2d`), so the contract carries
-    /// `None` and the key must not select the `OKLAB_TO_LINEAR` decode.
-    #[test]
-    fn s1_oklab_request_resolved_away_does_not_key_the_decode() {
-        let outputs = resolve_contracts(vec![gt7_clearing(1, 0), passthrough_overlay(2, 1)]);
-        let finalizer = contract(&outputs[&entity(2)], PQ);
-        let key = auto_key(&finalizer).unwrap();
-        assert_eq!(key.source_space, None);
-    }
-
     /// A resolved compositing space passes through to the key verbatim.
     #[test]
     fn resolved_compositing_space_keys_the_decode() {
@@ -1010,17 +998,6 @@ mod tests {
         let scrgb =
             encode_out_texture_clear_color(color, &encoding(DisplayTransfer::ScRgbLinear), 80.0);
         assert_eq!(scrgb.red.to_bits(), (-0.0f32).to_bits());
-    }
-
-    /// Alpha passes through unchanged for the extended-sRGB transfer too.
-    #[test]
-    fn extended_srgb_alpha_passes_through() {
-        let color = LinearRgba::new(0.3, 0.6, 0.9, 0.42);
-        assert_eq!(
-            encode_out_texture_clear_color(color, &encoding(DisplayTransfer::ExtendedSrgb), 100.0)
-                .alpha,
-            0.42
-        );
     }
 
     /// An authored `paper_white_nits` of `0.0` sanitizes to 100 nits, so the

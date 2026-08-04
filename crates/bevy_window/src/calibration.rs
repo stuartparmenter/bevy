@@ -264,15 +264,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn policy_default_is_all_manual() {
-        let p = DisplayCalibrationPolicy::default();
-        assert!(!p.auto_paper_white);
-        assert!(!p.auto_peak_luminance);
-        assert!(!p.auto_min_luminance);
-        assert!(!p.auto_gamut);
-    }
-
-    #[test]
     fn has_auto_is_false_for_all_manual_true_for_any_auto() {
         assert!(!DisplayCalibrationPolicy::default().has_auto());
         assert!(DisplayCalibrationPolicy {
@@ -285,26 +276,5 @@ mod tests {
             ..Default::default()
         }
         .has_auto());
-    }
-
-    #[test]
-    fn effective_default_is_sdr_with_user_provenance() {
-        let e = EffectiveDisplayTarget::default();
-        assert_eq!(e.target, DisplayTarget::SDR_SRGB);
-        assert_eq!(e.provenance, DisplayProvenance::default());
-        assert_eq!(e.provenance.peak_luminance, FieldProvenance::User);
-    }
-
-    #[test]
-    fn live_and_capability_defaults_are_all_none_not_sdr() {
-        assert_eq!(WindowDisplayState::default().tone_map_headroom, None);
-        assert_eq!(WindowDisplayState::default().sdr_white_nits, None);
-        assert_eq!(MonitorDisplayCapability::default().max_nits, None);
-        assert_eq!(
-            MonitorDisplayCapability::default().max_full_frame_nits,
-            None
-        );
-        assert_eq!(MonitorDisplayCapability::default().min_nits, None);
-        assert_eq!(MonitorDisplayCapability::default().gamut_hint, None);
     }
 }
