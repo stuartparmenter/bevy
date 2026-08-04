@@ -729,24 +729,40 @@ impl MeshUniform {
 /// starts inside the traced proxy and instantly self-intersects. Scaled into world space and
 /// quantized into [`MeshFlags`], it reaches the deferred G-buffer's flag byte.
 ///
-/// Absence of this component is distinct from `MeshGeometryError(0.0)`: absent means "not stated"
-/// and leaves the consumer on its own conservative bound, zero means "provably exact".
+/// `MeshGeometryError(0.0)` means "provably exact" and is a far tighter claim than saying nothing:
+/// it drops the consumer to its smallest bias. Anything negative, [`GEOMETRY_ERROR_UNKNOWN`]
+/// included, states no error and leaves the consumer on its own conservative bound. That is the
+/// [`Default`], so a mesh that never authored one is not mistaken for an exact one.
 ///
 /// Removing the component does not clear the flag until the entity changes for some other reason.
 /// The stale value is the previously quantized, larger code, so it stays conservative.
-#[derive(
-    Component, FromTemplate, Clone, Copy, Debug, Default, Deref, DerefMut, Reflect, PartialEq,
-)]
+#[derive(Component, FromTemplate, Clone, Copy, Debug, Deref, DerefMut, Reflect, PartialEq)]
 #[reflect(Component, Default, Clone, PartialEq)]
 pub struct MeshGeometryError(pub f32);
+
+impl Default for MeshGeometryError {
+    fn default() -> Self {
+        Self(GEOMETRY_ERROR_UNKNOWN)
+    }
+}
+
+/// The geometry error that states no error at all, as opposed to an exact `0.0`.
+///
+/// Dequantizing [`GEOMETRY_ERROR_CODE_UNKNOWN`] yields this, and so does scaling an unusable error
+/// into world space, so one comparison against zero separates "unknown" from "exact" everywhere.
+pub const GEOMETRY_ERROR_UNKNOWN: f32 = -1.0;
 
 /// Scales a mesh-local geometry error into world space, conservatively.
 ///
 /// `sqrt(||M||_1 * ||M||_inf)` bounds the largest singular value of the transform's linear part,
-/// including shear, so the result is never an underestimate. Non-finite or non-positive input
-/// disables the error rather than propagating garbage into a ray bias.
+/// including shear, so the result is never an underestimate. Input that cannot be scaled - negative,
+/// NaN, infinite, or overflowing - states no error, because claiming exactness on garbage hands the
+/// consumer the tightest bias in the system.
 pub fn world_geometry_error(local_error: f32, world_from_local: &Affine3A) -> f32 {
-    if !local_error.is_finite() || local_error <= 0.0 {
+    if !local_error.is_finite() || local_error < 0.0 {
+        return GEOMETRY_ERROR_UNKNOWN;
+    }
+    if local_error == 0.0 {
         return 0.0;
     }
 
@@ -766,7 +782,7 @@ pub fn world_geometry_error(local_error: f32, world_from_local: &Affine3A) -> f3
     if error.is_finite() {
         error
     } else {
-        0.0
+        GEOMETRY_ERROR_UNKNOWN
     }
 }
 
@@ -783,10 +799,10 @@ pub const GEOMETRY_ERROR_CODE_ZERO: u32 = 1;
 /// from it stays an upper bound. Anything past the top step returns [`GEOMETRY_ERROR_CODE_UNKNOWN`]
 /// rather than rounding down.
 pub fn quantize_geometry_error(world_error: f32) -> u32 {
-    if !world_error.is_finite() {
+    if !world_error.is_finite() || world_error < 0.0 {
         return GEOMETRY_ERROR_CODE_UNKNOWN;
     }
-    if world_error <= 0.0 {
+    if world_error == 0.0 {
         return GEOMETRY_ERROR_CODE_ZERO;
     }
     let step = (3.0 * (ops::log2(world_error) + 10.0)).ceil();
@@ -796,13 +812,13 @@ pub fn quantize_geometry_error(world_error: f32) -> u32 {
     2 + step.max(0.0) as u32
 }
 
-/// Inverse of [`quantize_geometry_error`]. Returns a negative value for
+/// Inverse of [`quantize_geometry_error`]. Returns [`GEOMETRY_ERROR_UNKNOWN`] for
 /// [`GEOMETRY_ERROR_CODE_UNKNOWN`].
 ///
 /// Mirrored in WGSL by `bevy_pbr::pbr_deferred_types::deferred_geometry_error`.
 pub fn dequantize_geometry_error(code: u32) -> f32 {
     match code {
-        GEOMETRY_ERROR_CODE_UNKNOWN => -1.0,
+        GEOMETRY_ERROR_CODE_UNKNOWN => GEOMETRY_ERROR_UNKNOWN,
         GEOMETRY_ERROR_CODE_ZERO => 0.0,
         code => ops::exp2((code as f32 - 2.0) / 3.0 - 10.0),
     }
@@ -4972,7 +4988,7 @@ mod tests {
     use super::{
         dequantize_geometry_error, quantize_geometry_error, world_geometry_error,
         AtomicU64ZeroBitIter, MeshFlags, MeshGeometryError, MeshPipelineKey,
-        GEOMETRY_ERROR_CODE_UNKNOWN, GEOMETRY_ERROR_CODE_ZERO,
+        GEOMETRY_ERROR_CODE_UNKNOWN, GEOMETRY_ERROR_CODE_ZERO, GEOMETRY_ERROR_UNKNOWN,
     };
     use bevy_math::{ops, Affine3A, Vec3};
     use core::f32::consts::FRAC_PI_4;
@@ -5015,9 +5031,30 @@ mod tests {
         );
         assert_eq!(quantize_geometry_error(1e6), GEOMETRY_ERROR_CODE_UNKNOWN);
         assert_eq!(quantize_geometry_error(0.0), GEOMETRY_ERROR_CODE_ZERO);
-        assert_eq!(quantize_geometry_error(-1.0), GEOMETRY_ERROR_CODE_ZERO);
-        assert!(dequantize_geometry_error(GEOMETRY_ERROR_CODE_UNKNOWN) < 0.0);
+        // Only an exact zero may claim exactness; a negative error states none.
+        assert_eq!(
+            quantize_geometry_error(GEOMETRY_ERROR_UNKNOWN),
+            GEOMETRY_ERROR_CODE_UNKNOWN
+        );
+        assert_eq!(
+            dequantize_geometry_error(GEOMETRY_ERROR_CODE_UNKNOWN),
+            GEOMETRY_ERROR_UNKNOWN
+        );
         assert_eq!(dequantize_geometry_error(GEOMETRY_ERROR_CODE_ZERO), 0.0);
+    }
+
+    #[test]
+    fn the_default_geometry_error_states_no_error() {
+        // `RaytracingMesh3d` requires this component, so its default is what every mesh that never
+        // authored one reports, and it has to mean the same as not having the component at all.
+        assert_eq!(
+            MeshFlags::from_geometry_error(
+                Some(&MeshGeometryError::default()),
+                &Affine3A::IDENTITY
+            )
+            .bits(),
+            MeshFlags::from_geometry_error(None, &Affine3A::IDENTITY).bits()
+        );
     }
 
     #[test]
@@ -5064,13 +5101,16 @@ mod tests {
     }
 
     #[test]
-    fn invalid_geometry_error_is_disabled() {
-        assert_eq!(world_geometry_error(-1.0, &Affine3A::IDENTITY), 0.0);
-        assert_eq!(world_geometry_error(f32::NAN, &Affine3A::IDENTITY), 0.0);
-        assert_eq!(
-            world_geometry_error(f32::INFINITY, &Affine3A::IDENTITY),
-            0.0
-        );
+    fn unusable_geometry_error_states_no_error_rather_than_an_exact_one() {
+        for unusable in [-1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(
+                world_geometry_error(unusable, &Affine3A::IDENTITY),
+                GEOMETRY_ERROR_UNKNOWN,
+                "{unusable}"
+            );
+        }
+        // An authored exact zero is a real claim and must survive.
+        assert_eq!(world_geometry_error(0.0, &Affine3A::IDENTITY), 0.0);
     }
 
     #[test]

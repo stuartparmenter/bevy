@@ -633,6 +633,38 @@ mod tests {
             "const MATERIAL_FLAGS_FLIP_NORMAL_MAP_Y = {MATERIAL_FLAGS_FLIP_NORMAL_MAP_Y}u;"
         )));
     }
+
+    #[test]
+    fn only_a_rasterized_surface_pays_the_shading_normal_safety_factor() {
+        // Both bias sites resolve an unknown error through the same bound, so the scene-wide maximum
+        // cannot end up less conservative than the per-instance path of the instance that set it.
+        // Only the rasterized one is offset along a normal-mapped normal, so only it needs the
+        // factor; a ray hit carries a true geometric normal.
+        let shader = include_str!("raytracing_scene_bindings.wgsl");
+        let body = |name: &str| {
+            shader
+                .split_once(&format!("fn {name}"))
+                .unwrap_or_else(|| panic!("{name} must exist"))
+                .1
+                .split_once("\n}")
+                .unwrap_or_else(|| panic!("{name} must have a body"))
+                .0
+                .to_string()
+        };
+
+        let rasterized = body("rasterized_surface_ray_origin_bias");
+        let per_instance = body("ray_origin_bias_for_instance");
+        for bias in [&rasterized, &per_instance] {
+            assert!(bias.contains("bounded_world_geometry_error("), "{bias}");
+        }
+        assert!(rasterized.contains("RAY_ORIGIN_BIAS_SHADING_NORMAL_SAFETY *"));
+        assert!(
+            !per_instance.contains("RAY_ORIGIN_BIAS_SHADING_NORMAL_SAFETY"),
+            "{per_instance}"
+        );
+        assert!(body("bounded_world_geometry_error")
+            .contains("max(scene_parameters.max_world_geometry_error, 0.0)"));
+    }
 }
 
 #[derive(ShaderType)]

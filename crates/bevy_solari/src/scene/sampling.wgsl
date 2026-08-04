@@ -300,7 +300,10 @@ fn setup_visibility_ray(ray_origin_in: vec3<f32>, origin_world_normal: vec3<f32>
     if !isfinite3(toward_light) { return visibility_without_tracing(0.0); }
 
     // Lift the origin clear of its own instance's simplified BLAS first, then measure the ray from
-    // where it actually starts, so the bias is spent once instead of at both ends.
+    // where it actually starts, so the bias is spent once instead of at both ends. A light below
+    // `origin_world_normal` lifts the origin into the surface, which is correct for a geometric
+    // normal and would not be for a shading normal - but every caller weights the result by a cosine
+    // against that same normal, so no shading normal reaches the flip with a nonzero weight.
     let side = select(-1.0, 1.0, dot(origin_world_normal, toward_light) >= 0.0);
     let ray_origin = ray_origin_in + origin_world_normal * side * max(ray_origin_bias, RAY_T_MIN);
 

@@ -150,13 +150,23 @@ const RAY_ORIGIN_BIAS_SHADING_NORMAL_SAFETY = 1.5f;
 // props' shadow rays above the prop itself. `world_geometry_error` comes from the G-buffer, and is
 // negative when the texel was written by something that states none - a custom deferred material,
 // the prepass fallback - in which case fall back to the scene-wide maximum, which bounds every
-// instance. The safety factor is deliberately not applied to that fallback, so a scene that plumbs
-// no geometry error keeps exactly the bias it had.
+// instance that states one. That fallback is a rasterized surface like any other and takes the same
+// safety factor: the instance setting the maximum is biased by the factor on its own texels, and it
+// is a likely occupant of the fallback, since an error past the quantizer's top step also codes as
+// unknown. A scene that states no error anywhere has a zero maximum, where the factor is a no-op.
 fn rasterized_surface_ray_origin_bias(world_geometry_error: f32) -> f32 {
-    if world_geometry_error < 0.0 {
-        return RAY_T_MIN + max(scene_parameters.max_world_geometry_error, 0.0);
-    }
-    return RAY_T_MIN + RAY_ORIGIN_BIAS_SHADING_NORMAL_SAFETY * world_geometry_error;
+    return RAY_T_MIN
+        + RAY_ORIGIN_BIAS_SHADING_NORMAL_SAFETY * bounded_world_geometry_error(world_geometry_error);
+}
+
+// A negative error states none at all, in which case the only bound available is the scene-wide
+// maximum over the instances that do state one.
+fn bounded_world_geometry_error(world_geometry_error: f32) -> f32 {
+    return select(
+        world_geometry_error,
+        max(scene_parameters.max_world_geometry_error, 0.0),
+        world_geometry_error < 0.0,
+    );
 }
 
 fn sample_environment_radiance(direction: vec3<f32>) -> vec3<f32> {
@@ -173,8 +183,11 @@ fn environment_light_pdf(direction: vec3<f32>) -> f32 {
     return 1.0 / scene_parameters.inverse_environment_light_pdf;
 }
 
+// A ray hit lies on the traced surface and carries a true geometric normal, so unlike a rasterized
+// surface it needs no shading-normal margin.
 fn ray_origin_bias_for_instance(instance_id: u32) -> f32 {
-    return RAY_T_MIN + max(geometry_ids[instance_id].world_geometry_error, 0.0);
+    return RAY_T_MIN
+        + bounded_world_geometry_error(geometry_ids[instance_id].world_geometry_error);
 }
 
 // The visibility buffer rasterizes whichever meshlet LOD keeps its simplification error under about
