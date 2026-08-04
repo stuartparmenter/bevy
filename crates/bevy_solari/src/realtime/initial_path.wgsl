@@ -272,7 +272,10 @@ fn sample_light_ris(ray_origin: vec3<f32>, ray_origin_bias: f32, normal: vec3<f3
     if di_samples == 0u {
         return DiSample(0.0, LightSample(NULL_LIGHT_ID, 0u), vec3(0.0), vec3(0.0), 0.0, false, false);
     }
-    var workgroup_rng = (workgroup_id.x * 5782582u) + workgroup_id.y + bounce;
+    // Without a frame term every workgroup reads the same light tile forever, correlating the
+    // variance of the workgroups sharing it into a screen-aligned pattern. The multiplier must
+    // differ from `frame_rng`'s stride, or the frame term only slides that pattern along x.
+    var workgroup_rng = (workgroup_id.x * 0x9E3779B9u) + workgroup_id.y + bounce + constants.frame_rng;
     let light_tile_start = rand_range_u(128u, &workgroup_rng) * 1024u;
 
     var weight_sum = 0.0;

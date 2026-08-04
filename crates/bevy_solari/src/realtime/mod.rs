@@ -322,6 +322,21 @@ mod shader_source_tests {
     }
 
     #[test]
+    fn light_tile_selection_is_reshuffled_every_frame() {
+        // The tiles are refilled every frame, so a frozen choice is not a frozen set of lights. It
+        // does keep each workgroup sharing its tile with exactly the same others, whose variance
+        // then correlates into a pattern the temporal filter reproduces instead of averaging out.
+        let initial_path = include_str!("initial_path.wgsl");
+        assert!(initial_path.contains(
+            "var workgroup_rng = (workgroup_id.x * 0x9E3779B9u) + workgroup_id.y + bounce + constants.frame_rng;"
+        ));
+        let world_cache_update = include_str!("world_cache_update.wgsl");
+        assert!(world_cache_update.contains(
+            "var workgroup_rng = (workgroup_id.x * 0x9E3779B9u) + workgroup_id.y + constants.frame_rng;"
+        ));
+    }
+
+    #[test]
     fn rasterized_surfaces_widen_the_ray_origin_bias_with_distance() {
         // The G-buffer surface is whichever meshlet LOD stays under ~1px of screen error, so it
         // drifts from the traced geometry by an amount that grows with camera distance. A constant

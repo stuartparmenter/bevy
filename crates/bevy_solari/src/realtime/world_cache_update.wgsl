@@ -111,7 +111,9 @@ fn sample_random_light_ris(world_position: vec3<f32>, world_normal: vec3<f32>, r
     if constants.world_cache_direct_light_sample_count == 0u {
         return vec3(0.0);
     }
-    var workgroup_rng = (workgroup_id.x * 5782582u) + workgroup_id.y;
+    // Indirect 1D dispatch, so `workgroup_id.y` is always 0 and without a frame term each block's
+    // cells share one fixed light-tile subset for the life of the app.
+    var workgroup_rng = (workgroup_id.x * 0x9E3779B9u) + workgroup_id.y + constants.frame_rng;
     let light_tile_start = rand_range_u(128u, &workgroup_rng) * 1024u;
 
     var weight_sum = 0.0;
