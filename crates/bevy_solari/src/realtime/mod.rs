@@ -200,6 +200,8 @@ impl Default for SolariLighting {
 
 #[cfg(test)]
 mod shader_source_tests {
+    use bevy_math::{ops, Vec3};
+
     #[test]
     fn ris_visibility_is_part_of_candidate_evaluation() {
         let initial_path = include_str!("initial_path.wgsl");
@@ -244,6 +246,60 @@ mod shader_source_tests {
         let world_cache_query = include_str!("world_cache_query.wgsl");
         assert!(world_cache_query.contains("key = wrap_key(key + 1u);"));
         assert!(!world_cache_query.contains("\n            key += 1u;"));
+    }
+
+    #[test]
+    fn world_cache_normal_buckets_split_perpendicular_surfaces() {
+        // A bucket one unit wide over a component's [-1, 1] range reduces the key to the sign of
+        // each component, so a floor and the wall it meets share a cell whenever both normals tip
+        // into the same octant, and the seeding surface owns the hemisphere sample_gi samples and
+        // the albedo folded into that cell's radiance.
+        let world_cache_query = include_str!("world_cache_query.wgsl");
+        assert!(world_cache_query.contains(
+            "return quantize_position(world_normal, WORLD_CACHE_NORMAL_QUANTIZATION_FACTOR);"
+        ));
+
+        // Read the width and the epsilon out of the shader rather than repeating them, so widening
+        // the bucket fails the separation check below instead of only the text pin above.
+        let shader_f32 = |prefix: &str, terminator: char| -> f32 {
+            world_cache_query
+                .split_once(prefix)
+                .and_then(|(_, rest)| rest.split_once(terminator))
+                .and_then(|(value, _)| value.trim().parse().ok())
+                .unwrap_or_else(|| panic!("the shader must declare a parsable {prefix}"))
+        };
+        let factor = shader_f32("const WORLD_CACHE_NORMAL_QUANTIZATION_FACTOR: f32 = ", ';');
+        let epsilon = shader_f32("return floor(world_position / quantization_factor + ", ')');
+
+        // The key is bitcast, so two normals share a cell only when their bucket bits match.
+        let quantize = |normal: Vec3| {
+            (normal / factor + Vec3::splat(epsilon))
+                .floor()
+                .to_array()
+                .map(f32::to_bits)
+        };
+
+        const GRID: usize = 16;
+        let mut buckets = Vec::new();
+        for i in 0..GRID {
+            for j in 0..GRID {
+                let (sin_theta, cos_theta) =
+                    ops::sin_cos(core::f32::consts::PI * (i as f32 + 0.5) / GRID as f32);
+                let (sin_phi, cos_phi) =
+                    ops::sin_cos(core::f32::consts::TAU * (j as f32 + 0.5) / GRID as f32);
+                let normal = Vec3::new(sin_theta * cos_phi, sin_theta * sin_phi, cos_theta);
+                buckets.push((quantize(normal), normal));
+            }
+        }
+
+        for (index, (key, normal)) in buckets.iter().enumerate() {
+            for (other_key, other_normal) in &buckets[index + 1..] {
+                assert!(
+                    key != other_key || normal.dot(*other_normal) > 0.5,
+                    "{normal} and {other_normal} are over 60 degrees apart in one cell"
+                );
+            }
+        }
     }
 
     #[test]
