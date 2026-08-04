@@ -192,14 +192,9 @@ pub fn init_cas_pipeline(
 pub struct CasPipelineKey {
     target_format: TextureFormat,
     denoise: bool,
-    /// Whether the view's display-encoding pass runs.
-    /// See [`ViewStackContract::is_hdr_encode`].
-    ///
-    /// Post-tonemap input on these views is paper-white-relative
-    /// display-linear and exceeds 1.0, which breaks RCAS's `[0, 1]` limiter
-    /// math. The shader then compiles with the `HDR_DISPLAY_TARGET` def and
-    /// range-compresses the neighborhood before sharpening.
-    hdr: bool,
+    /// [`ViewStackContract::is_hdr_encode`]; selects the `HDR_DISPLAY_TARGET`
+    /// shader path.
+    hdr_encode: bool,
 }
 
 pub struct CasPipelineSpecializer;
@@ -218,7 +213,7 @@ impl Specializer<RenderPipeline> for CasPipelineSpecializer {
             fragment.shader_defs.push("RCAS_DENOISE".into());
         }
 
-        if key.hdr {
+        if key.hdr_encode {
             fragment.shader_defs.push("HDR_DISPLAY_TARGET".into());
         }
 
@@ -259,7 +254,7 @@ fn prepare_cas_pipelines(
             CasPipelineKey {
                 denoise: denoise_cas.0,
                 target_format: view.target_format,
-                hdr: contract.is_hdr_encode(),
+                hdr_encode: contract.is_hdr_encode(),
             },
         )?;
 
@@ -274,32 +269,31 @@ pub struct ViewCasPipeline(CachedRenderPipelineId);
 
 #[cfg(test)]
 mod tests {
-    //! CPU mirrors of the RCAS math in
-    //! `robust_contrast_adaptive_sharpening.wgsl`. The single-channel mirrors
-    //! are exact for grayscale neighborhoods, where the per-channel WGSL
-    //! vector math collapses to the same scalars.
+    //! Single-channel CPU mirrors of the RCAS math in
+    //! `robust_contrast_adaptive_sharpening.wgsl`, exact for grayscale
+    //! neighborhoods, where the per-channel WGSL vector math collapses to the
+    //! same scalars.
 
-    /// Mirror of `FSR_RCAS_LIMIT`.
     const FSR_RCAS_LIMIT: f32 = 0.1875;
-    /// Mirror of `peakC`.
+    /// `peakC` in the shader.
     const PEAK_C: (f32, f32) = (10.0, -40.0);
     /// The largest value an `Rgba16Float` target can store.
     const F16_MAX: f32 = 65504.0;
 
-    /// Mirror of `rcas_range_compress` (single channel).
+    /// `rcas_range_compress` in the shader.
     fn compress(c: f32) -> f32 {
         let v = c.max(0.0);
         v / (1.0 + v)
     }
 
-    /// Mirror of `rcas_range_decompress` (single channel).
+    /// `rcas_range_decompress` in the shader.
     fn decompress(c: f32) -> f32 {
         let v = c.clamp(0.0, 1.0);
         v / (1.0 - v).max(1.0 / F16_MAX)
     }
 
-    /// Mirror of the RCAS limiter ("Limiters" block in the fragment shader)
-    /// for a grayscale cross neighborhood.
+    /// The "Limiters" block of the fragment shader, for a grayscale cross
+    /// neighborhood.
     fn rcas_lobe(b: f32, d: f32, f: f32, h: f32, sharpness: f32) -> f32 {
         let mn4 = b.min(d).min(f.min(h));
         let mx4 = b.max(d).max(f.max(h));
@@ -309,14 +303,14 @@ mod tests {
         (-FSR_RCAS_LIMIT).max(lobe_rgb.min(0.0)) * sharpness
     }
 
-    /// Mirror of the full grayscale RCAS filter (def-less / SDR shape).
+    /// The full grayscale RCAS filter (def-less / SDR shape).
     fn rcas(b: f32, d: f32, e: f32, f: f32, h: f32, sharpness: f32) -> f32 {
         let lobe = rcas_lobe(b, d, f, h, sharpness);
         (lobe * b + lobe * d + lobe * f + lobe * h + e) / (4.0 * lobe + 1.0)
     }
 
-    /// Mirror of the `HDR_DISPLAY_TARGET` path: compress, RCAS, decompress,
-    /// then bound overshoot by `max(local_max, 1.0)`.
+    /// The `HDR_DISPLAY_TARGET` path: compress, RCAS, decompress, then bound
+    /// overshoot by `max(local_max, 1.0)`.
     fn rcas_hdr(b: f32, d: f32, e: f32, f: f32, h: f32, sharpness: f32) -> f32 {
         let sharpened = decompress(rcas(
             compress(b),

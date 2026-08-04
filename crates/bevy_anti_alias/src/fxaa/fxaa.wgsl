@@ -75,16 +75,19 @@ fn rgb2luma(rgb: vec3<f32>) -> f32 {
     // already a perceptual lightness, in [0, 1] for SDR content. The color
     // resample reads the unmodified texel.
     return saturate(rgb.x);
-#else ifdef HDR_DISPLAY_TARGET
+#else
+    let luma = dot(rgb, vec3<f32>(0.299, 0.587, 0.114));
+#ifdef HDR_DISPLAY_TARGET
     // On HDR display targets the post-tonemap input is paper-white-relative
     // display-linear and exceeds 1.0 (up to peak / paper white), while FXAA's
     // absolute EDGE_THRESHOLD_MIN presets and the sqrt() proxy were tuned for
     // a [0, 1] signal. Saturating keeps every threshold in that domain: edges
     // above paper white are detected at their 1.0-clamped contrast, and values
     // at or below paper white behave as on SDR targets.
-    return sqrt(saturate(dot(rgb, vec3<f32>(0.299, 0.587, 0.114))));
+    return sqrt(saturate(luma));
 #else
-    return sqrt(dot(rgb, vec3<f32>(0.299, 0.587, 0.114)));
+    return sqrt(luma);
+#endif
 #endif
 }
 

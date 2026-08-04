@@ -26,8 +26,8 @@ use bevy_camera::{
     visibility::{self, RenderLayers, VisibleEntities},
     Camera, Camera2d, Camera3d, CameraMainTextureUsages, CameraOutputMode, CameraUpdateSystems,
     ClearColor, ClearColorConfig, CompositingSpace, Exposure, Hdr, ManualTextureViewHandle,
-    MsaaWriteback, NeedsNodeTonemapping, NormalizedRenderTarget, Projection, RenderTarget,
-    RenderTargetInfo, Viewport,
+    MsaaWriteback, NormalizedRenderTarget, Projection, RenderTarget, RenderTargetInfo,
+    TonemappingPass, Viewport,
 };
 use bevy_derive::{Deref, DerefMut};
 use bevy_ecs::{
@@ -505,7 +505,7 @@ pub fn extract_cameras(
                 Option<&Projection>,
                 Has<NoIndirectDrawing>,
                 Has<NeedsSceneLinearTarget>,
-                Has<NeedsNodeTonemapping>,
+                Has<TonemappingPass>,
             ),
         )>,
     >,
@@ -874,7 +874,7 @@ fn main_texture_mode(camera: MainTextureCamera) -> MainTextureMode {
     // node-side path. The compositing space must be the default linear one:
     // `Srgb` routes to `Rgba8Unorm`, which has no hardware sRGB encode for the
     // 3D fold to rely on, and `Oklab` needs signed-float storage.
-    // `NeedsNodeTonemapping` excludes operators whose config the fold cannot
+    // `TonemappingPass` excludes operators whose config the fold cannot
     // reproduce, such as custom GT7 parameters. The display target is the
     // post-negotiation value, so a downgraded HDR request folds like any other
     // SDR view.
@@ -1421,7 +1421,7 @@ mod tests {
                 MainTextureMode::SceneLinear,
             ),
             (
-                "NeedsNodeTonemapping",
+                "TonemappingPass",
                 MainTextureCamera {
                     needs_node_tonemapping: true,
                     ..base

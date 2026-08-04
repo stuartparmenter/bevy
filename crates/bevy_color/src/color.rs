@@ -705,7 +705,7 @@ impl Color {
     /// * `x` - CIE 1931 x chromaticity coordinate. Typically [0.0, 0.8]
     /// * `y` - CIE 1931 y chromaticity coordinate. Typically (0.0, 0.9]; must be non-zero
     /// * `luminance` - Luminance (Y). 1.0 is the reference white luminance; above 1.0 is HDR
-    pub const fn xy_y(x: f32, y: f32, luminance: f32) -> Self {
+    pub const fn cie_xy_y(x: f32, y: f32, luminance: f32) -> Self {
         let xyz = Chromaticity::new(x, y).to_xyz(luminance);
         Self::xyz(xyz.x, xyz.y, xyz.z)
     }
@@ -1394,11 +1394,11 @@ mod tests {
     }
 
     #[test]
-    fn xy_y_constructor() {
+    fn cie_xy_y_constructor() {
         // D65 white at unit luminance.
-        let white = Color::xy_y(0.3127, 0.3290, 1.0);
+        let white = Color::cie_xy_y(0.3127, 0.3290, 1.0);
         let Color::Xyza(xyza) = white else {
-            panic!("xy_y must produce a Color::Xyza, got {white:?}");
+            panic!("cie_xy_y must produce a Color::Xyza, got {white:?}");
         };
         assert_approx_eq!(xyza.x, 0.9504559, 1e-5);
         assert_approx_eq!(xyza.y, 1.0, 1e-6);
@@ -1406,7 +1406,7 @@ mod tests {
         assert_approx_eq!(xyza.alpha, 1.0, 1e-6);
 
         // HDR luminance scales linearly.
-        let bright = Color::xy_y(0.3127, 0.3290, 5.0);
+        let bright = Color::cie_xy_y(0.3127, 0.3290, 5.0);
         let Color::Xyza(bright) = bright else {
             unreachable!();
         };

@@ -20,7 +20,7 @@ let red = Color::rec2020(1.0, 0.0, 0.0);
 // A Display P3 color, exactly as shown in a macOS/CSS color picker:
 let p3 = Color::display_p3(1.0, 0.2, 0.1);
 // Any visible chromaticity via CIE xyY coordinates, e.g. D65 white at 5x paper white:
-let bright = Color::xy_y(0.3127, 0.3290, 5.0);
+let bright = Color::cie_xy_y(0.3127, 0.3290, 5.0);
 ```
 
 The new `primaries` module holds `Chromaticity` (CIE 1931 xy coordinates),

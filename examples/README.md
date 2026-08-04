@@ -52,6 +52,7 @@ git checkout v0.4.0
   - [Embedded](#embedded)
   - [Games](#games)
   - [Gizmos](#gizmos)
+  - [Helpers](#helpers)
   - [Input](#input)
   - [Math](#math)
   - [Movement](#movement)

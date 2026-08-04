@@ -1,11 +1,3 @@
-// Headless probe for the HDR calibration example. Which path it exercises
-// depends on the runner's backend: macOS Metal negotiates an scRGB-linear
-// surface unconditionally (EDR), so CI hits the real scRGB encode path there;
-// on backends that report no HDR surface the scRGB-linear request resolves
-// back to plain SDR (warn + degrade) and the patterns render through the
-// byte-identical SDR pipeline. Either way the example runs to a screenshot.
-// Frame 200 leaves headroom for surface (re)negotiation and the first pattern
-// to settle.
 (
     setup: (
         fixed_frame_time: Some(0.05),

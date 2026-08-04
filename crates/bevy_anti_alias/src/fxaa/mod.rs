@@ -169,15 +169,9 @@ pub struct FxaaPipelineKey {
     edge_threshold: Sensitivity,
     edge_threshold_min: Sensitivity,
     target_format: TextureFormat,
-    /// Whether the view's display-encoding pass runs.
-    /// See [`ViewStackContract::is_hdr_encode`].
-    ///
-    /// Post-tonemap input on these views is paper-white-relative
-    /// display-linear and exceeds 1.0, which defeats FXAA's absolute
-    /// `EDGE_THRESHOLD_MIN` presets and its `sqrt` luma proxy. The shader
-    /// then compiles with the `HDR_DISPLAY_TARGET` def and saturates the
-    /// edge-detection luma to [0, 1].
-    hdr: bool,
+    /// [`ViewStackContract::is_hdr_encode`]; selects the `HDR_DISPLAY_TARGET`
+    /// shader path.
+    hdr_encode: bool,
     /// Whether [`ViewStackContract::compositing_space`] resolved to
     /// [`CompositingSpace::Oklab`], not what the camera requested. The shader
     /// then compiles with the `COMPOSITING_SPACE_OKLAB` def and reads the
@@ -192,7 +186,7 @@ fn fxaa_shader_defs(key: &FxaaPipelineKey) -> Vec<ShaderDefVal> {
         format!("EDGE_THRESH_{}", key.edge_threshold.get_str()).into(),
         format!("EDGE_THRESH_MIN_{}", key.edge_threshold_min.get_str()).into(),
     ];
-    if key.hdr {
+    if key.hdr_encode {
         shader_defs.push("HDR_DISPLAY_TARGET".into());
     }
     if key.oklab_compositing {
@@ -246,7 +240,7 @@ pub fn prepare_fxaa_pipelines(
                 edge_threshold: fxaa.edge_threshold,
                 edge_threshold_min: fxaa.edge_threshold_min,
                 target_format: view.target_format,
-                hdr: contract.is_hdr_encode(),
+                hdr_encode: contract.is_hdr_encode(),
                 oklab_compositing: contract.compositing_space == Some(CompositingSpace::Oklab),
             },
         );
@@ -261,18 +255,18 @@ pub fn prepare_fxaa_pipelines(
 mod tests {
     use super::*;
 
-    fn base_key(hdr: bool, oklab_compositing: bool) -> FxaaPipelineKey {
+    fn base_key(hdr_encode: bool, oklab_compositing: bool) -> FxaaPipelineKey {
         FxaaPipelineKey {
             edge_threshold: Sensitivity::High,
             edge_threshold_min: Sensitivity::High,
             target_format: TextureFormat::Rgba8UnormSrgb,
-            hdr,
+            hdr_encode,
             oklab_compositing,
         }
     }
 
     /// A key with `oklab_compositing: false` pushes no
-    /// `COMPOSITING_SPACE_OKLAB` def, for both `hdr` values.
+    /// `COMPOSITING_SPACE_OKLAB` def, for both `hdr_encode` values.
     #[test]
     fn non_oklab_def_vector_is_byte_identical() {
         let sdr = fxaa_shader_defs(&base_key(false, false));
@@ -298,7 +292,7 @@ mod tests {
     }
 
     /// `oklab_compositing: true` appends the `COMPOSITING_SPACE_OKLAB` def,
-    /// for both `hdr` values.
+    /// for both `hdr_encode` values.
     #[test]
     fn oklab_def_present_only_when_set() {
         let sdr = fxaa_shader_defs(&base_key(false, true));

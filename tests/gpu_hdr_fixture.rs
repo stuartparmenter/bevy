@@ -9,7 +9,7 @@
 //!   renders correctly without it;
 //! - each GT7 view's `Gt7ParamsUniform` matches the CPU-computed uniform, an
 //!   in-place `GranTurismo7Params` mutation refreshes it, and every GT7 view
-//!   tone-maps node-side (the `NeedsNodeTonemapping` veto);
+//!   tone-maps node-side (the `TonemappingPass` veto);
 //! - the PQ encode/decode round trip matches the CPU reference chain in
 //!   `expected_decoded`;
 //! - auto exposure and auto white balance render and move exposure over time.
@@ -735,7 +735,7 @@ fn gpu_hdr_fixture() {
             format!("got {:?}\n        want {:?}", v.gt7_uniform, Some(want)),
         );
         c.check(
-            &format!("3b {label} tone-maps node-side (NeedsNodeTonemapping veto path)"),
+            &format!("3b {label} tone-maps node-side (TonemappingPass veto path)"),
             v.has_tonemap_pipeline,
             format!("has ViewTonemappingPipeline = {}", v.has_tonemap_pipeline),
         );

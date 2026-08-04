@@ -198,7 +198,7 @@ fn long_term_envelope_bounds_short_term_exposure() {
 
     // The scene becomes 10 EV darker, so the short-term stage wants +10 EV at 1 EV/s.
     let target = 10.0;
-    for _ in 0..(10.0 / DT) as usize {
+    for _ in 0..600 {
         let applied = adaptation_step(&mut state, target, DT, &settings);
         assert!(
             applied <= state.long_term + adaptation.bound_darken + 1e-4,

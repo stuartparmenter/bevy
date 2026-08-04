@@ -187,15 +187,10 @@ pub struct SmaaNeighborhoodBlendingPipelineKey {
 pub struct SmaaEdgeDetectionPipelineKey {
     /// The quality preset.
     preset: SmaaPreset,
-    /// Whether the view's display-encoding pass runs.
-    /// See [`ViewStackContract::is_hdr_encode`].
-    ///
-    /// Post-tonemap input on these views is paper-white-relative
-    /// display-linear and exceeds 1.0, which shifts `SMAA_THRESHOLD`'s
-    /// effective sensitivity. The shader then compiles with the
-    /// `HDR_DISPLAY_TARGET` def and saturates the edge-detection luma
-    /// to [0, 1]. Only phase 1 reads luma, so phases 2 and 3 need no such key.
-    hdr: bool,
+    /// [`ViewStackContract::is_hdr_encode`]; selects the `HDR_DISPLAY_TARGET`
+    /// shader path. Only phase 1 reads luma, so phases 2 and 3 need no such
+    /// key.
+    hdr_encode: bool,
 }
 
 /// A render world component that holds the pipeline IDs for the SMAA passes.
@@ -478,7 +473,7 @@ impl SpecializedRenderPipeline for SmaaEdgeDetectionPipeline {
 
     fn specialize(&self, key: Self::Key) -> RenderPipelineDescriptor {
         let mut shader_defs = vec!["SMAA_EDGE_DETECTION".into(), key.preset.shader_def()];
-        if key.hdr {
+        if key.hdr_encode {
             shader_defs.push("HDR_DISPLAY_TARGET".into());
         }
 
@@ -645,7 +640,7 @@ fn prepare_smaa_pipelines(
             &smaa_pipelines.edge_detection,
             SmaaEdgeDetectionPipelineKey {
                 preset: smaa.preset,
-                hdr: contract.is_hdr_encode(),
+                hdr_encode: contract.is_hdr_encode(),
             },
         );
 

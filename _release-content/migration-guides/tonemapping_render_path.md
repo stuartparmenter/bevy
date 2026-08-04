@@ -15,7 +15,7 @@ in-shader path, with no tonemapping node, as long as all of these hold:
 - no `bevy_render::view::NeedsSceneLinearTarget`, which bloom, auto exposure,
   auto white balance, depth of field, motion blur, TAA and DLSS all pull in as a
   required component,
-- no `bevy_camera::NeedsNodeTonemapping`, which `GranTurismo7Params` pulls in as
+- no `bevy_camera::TonemappingPass`, which `GranTurismo7Params` pulls in as
   a required component,
 - `CompositingSpace` absent or `Linear`,
 - resolved `DisplayTarget` is `DisplayTarget::SDR_SRGB`,
@@ -52,7 +52,7 @@ still work. Their reflected type paths changed to
 `bevy_render::view::Tonemapping` and `bevy_render::view::DebandDither`: update
 scene files and Bevy Remote Protocol component keys that name them.
 
-`NeedsSceneLinearTarget` and `NeedsNodeTonemapping` are ordinary required
+`NeedsSceneLinearTarget` and `TonemappingPass` are ordinary required
 components, so `remove_with_requires` on an effect also strips the shared
 marker, re-enabling the in-shader fold. Any other scene-linear effect still on
 the camera then samples a tone-mapped 8-bit buffer. Use plain `remove::<T>()`

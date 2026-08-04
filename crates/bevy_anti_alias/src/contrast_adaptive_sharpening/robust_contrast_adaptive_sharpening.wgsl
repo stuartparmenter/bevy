@@ -32,7 +32,6 @@ const FSR_RCAS_LIMIT = 0.1875;
 // -4.0 instead of -1.0 to avoid issues with MSAA.
 const peakC = vec2<f32>(10.0, -40.0);
 
-#ifdef HDR_DISPLAY_TARGET
 // On HDR display targets the tone-mapped input is paper-white-relative
 // display-linear and can exceed 1.0 (up to peak / paper white, e.g. 10.0 for
 // a 1000-nit display at 100-nit paper white). RCAS's limiter constants
@@ -58,7 +57,6 @@ fn rcas_range_decompress(c: vec3<f32>) -> vec3<f32> {
     let v = clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
     return v / max(1.0 - v, vec3<f32>(1.0 / 65504.0));
 }
-#endif
 
 // Robust Contrast Adaptive Sharpening (RCAS)
 // Based on the following implementation:

@@ -102,7 +102,7 @@ pub struct Hdr;
 /// `Rgba16Float` intermediate and one fullscreen pass; the pixels match.
 #[derive(Component, Default, Copy, Clone, Reflect, PartialEq, Eq, Hash, Debug)]
 #[reflect(Component, Default, PartialEq, Hash, Debug)]
-pub struct NeedsNodeTonemapping;
+pub struct TonemappingPass;
 
 /// Color space for alpha compositing. Affects how overlapping semi-transparent layers blend.
 #[derive(Component, Copy, Clone, Reflect, PartialEq, Eq, Hash, Debug, Default)]

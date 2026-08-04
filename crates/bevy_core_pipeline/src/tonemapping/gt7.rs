@@ -20,7 +20,7 @@
 //! operation for operation, and fixtures from the C++ harness gate changes to
 //! the shader. The math is `f32` throughout for that reason.
 
-use bevy_camera::{Camera, NeedsNodeTonemapping};
+use bevy_camera::{Camera, TonemappingPass};
 use bevy_ecs::{
     component::Component,
     entity::Entity,
@@ -74,7 +74,7 @@ const GT7_MAX_HDR_PEAK_NITS: f32 = 10000.0;
 /// Without the component a GT7 camera keeps the shader's baked SDR defaults on
 /// an SDR target, and uses [`Self::default`] on an HDR-transfer target.
 ///
-/// The component requires [`NeedsNodeTonemapping`], which keeps the camera on
+/// The component requires [`TonemappingPass`], which keeps the camera on
 /// the node-side tone-mapping pass. The in-shader SDR fold cannot bind the
 /// params uniform and would silently run the baked defaults instead.
 ///
@@ -83,7 +83,7 @@ const GT7_MAX_HDR_PEAK_NITS: f32 = 10000.0;
 #[extract_component_filter(With<Camera>)]
 #[reflect(Component, Debug, Default, PartialEq, Clone)]
 #[extract_app(RenderApp)]
-#[require(NeedsNodeTonemapping)]
+#[require(TonemappingPass)]
 pub struct GranTurismo7Params {
     /// Mix between the per-channel tone-mapped color and the hue-preserving
     /// UCS (`ICtCp`) color. `0.0` is fully per-channel ("camera-like" skew),

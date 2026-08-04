@@ -1,7 +1,3 @@
-// Unlike the other testbeds, `testbed_full_ui` is a single static screen with no scene
-// states, so it cannot use `helpers::switch_scene_in_ci`. A one-shot `ScreenshotAndExit`
-// at a fixed frame (stable filename: `screenshot-100.png`) gives it golden-image coverage
-// on Pixel Eagle consistent with the other testbeds.
 (
     setup: (
         fixed_frame_time: Some(0.05),
