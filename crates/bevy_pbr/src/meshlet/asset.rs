@@ -73,6 +73,12 @@ pub struct MeshletRaytracingGeometry {
     pub normals: Vec<[f32; 3]>,
     pub uvs: Vec<[f32; 2]>,
     pub indices: Vec<u32>,
+    /// The largest geometric error any selected meshlet carries, which is what this geometry
+    /// actually deviates from the full-detail surface by - at most the requested `max_error`, and
+    /// usually far less. A consumer biasing rays off a rasterized surface wants this rather than the
+    /// request, because a mesh that simplifies to itself deviates by nothing and asking it to answer
+    /// for the request inflates every other instance's bias with it. Zero for empty geometry.
+    pub achieved_error: f32,
 }
 
 #[cfg(feature = "meshlet_processor")]
@@ -97,6 +103,10 @@ impl MeshletMesh {
             normals: Vec::with_capacity(vertex_count),
             uvs: Vec::with_capacity(vertex_count),
             indices: Vec::with_capacity(index_count),
+            achieved_error: selected
+                .iter()
+                .map(|&id| self.meshlet_cull_data[id].aabb.error)
+                .fold(0.0, f32::max),
         };
 
         for meshlet_id in selected {

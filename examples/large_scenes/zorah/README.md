@@ -108,7 +108,11 @@ redone.
 Useful tuning arguments are:
 
 - `--triangles 250000`
-- `--raytracing-error 0.02` (metres)
+- `--raytracing-error 0.02` (metres). An upper bound, not a claim: each partition
+  records `blas_achieved_error`, the largest error its selected cut actually
+  carries, which is zero for geometry that simplifies to itself. Solari biases
+  rays off a rasterized surface by that measurement, so a flat quad no longer
+  raises every other instance's bias with it.
 - `--max-texture-size 8192`
 - `--material-bake-size 8192`
 - `--texture-jobs 16` (defaults to min(16, host cores); the block compressors

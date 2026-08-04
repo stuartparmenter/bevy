@@ -1190,4 +1190,36 @@ mod tests {
         assert!(!simplified.indices.is_empty());
         assert!(simplified.indices.len() <= exact.indices.len());
     }
+
+    #[test]
+    fn raytracing_geometry_reports_the_error_it_achieved_not_the_one_requested() {
+        AsyncComputeTaskPool::get_or_init(bevy_tasks::TaskPool::default);
+        // Two triangles cannot be simplified, so this deviates from the reference by nothing no
+        // matter how loose a bound it is asked for. Reporting the request instead lets one such
+        // mesh set a scene-wide ray bias it has no error to justify.
+        let quad = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::all())
+            .with_inserted_attribute(
+                Mesh::ATTRIBUTE_POSITION,
+                vec![
+                    [-0.5, 0.0, -0.5],
+                    [0.5, 0.0, -0.5],
+                    [-0.5, 0.0, 0.5],
+                    [0.5, 0.0, 0.5],
+                ],
+            )
+            .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, vec![[0.0, 1.0, 0.0]; 4])
+            .with_inserted_attribute(
+                Mesh::ATTRIBUTE_UV_0,
+                vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
+            )
+            .with_inserted_indices(Indices::U32(vec![0, 2, 1, 1, 2, 3]));
+        let meshlet = MeshletMesh::from_mesh(&quad, 4).unwrap();
+
+        let geometry = meshlet.raytracing_geometry(0.02);
+        assert_eq!(geometry.indices.len() / 3, 2);
+        assert_eq!(geometry.achieved_error, 0.0);
+
+        // And a cut that does simplify never overstates the bound it was given.
+        assert!(meshlet.raytracing_geometry(0.0).achieved_error <= 0.0);
+    }
 }

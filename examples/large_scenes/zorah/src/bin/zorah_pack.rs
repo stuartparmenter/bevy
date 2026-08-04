@@ -484,6 +484,7 @@ struct PackedPartition {
     raytracing: Vec<u8>,
     blas_vertices: u64,
     blas_triangles: u64,
+    blas_achieved_error: f32,
     winding_repaired: bool,
 }
 
@@ -578,6 +579,7 @@ fn pack_partition(
     Ok(PackedPartition {
         blas_vertices: raytracing.positions.len() as u64,
         blas_triangles: (raytracing.indices.len() / 3) as u64,
+        blas_achieved_error: raytracing.achieved_error,
         raytracing: encode_meshlet_blas(&raytracing)?,
         meshlet: encode_meshlet(&meshlet)?,
         winding_repaired,
@@ -632,10 +634,13 @@ fn write_planned_meshes(
             )?);
             partition["blas_vertices"] = Value::from(converted.blas_vertices);
             partition["blas_triangles"] = Value::from(converted.blas_triangles);
-            // The requested LOD bound, which every selected meshlet satisfies.
-            // `raytracing_geometry` does not report the selected cut's own
-            // maximum error, so this stays an upper bound.
-            partition["blas_achieved_error"] = Value::from(settings.raytracing_error as f64);
+            // The selected cut's own largest meshlet error, not the bound that was requested. A
+            // mesh that simplifies to itself reports zero, so it stops inflating the scene-wide
+            // maximum that every unknown-error surface falls back to. The request rides along
+            // because that, not the achievement, is what decides whether a cached cut can be
+            // reused.
+            partition["blas_achieved_error"] = Value::from(converted.blas_achieved_error as f64);
+            partition["blas_error_target"] = Value::from(settings.raytracing_error as f64);
             totals.raytracing_triangles = totals
                 .raytracing_triangles
                 .saturating_add(converted.blas_triangles);
@@ -725,12 +730,15 @@ fn reusable_geometry_mesh(
         {
             return Ok(false);
         }
-        let previous_error = previous_partition["blas_achieved_error"]
+        // The bound the cached cut was selected against, not the error it achieved: a mesh that
+        // simplifies to itself achieves zero for every request, so comparing the achieved error
+        // would re-pack the whole scene on every run.
+        let previous_target = previous_partition["blas_error_target"]
             .as_f64()
             .unwrap_or(f64::NAN) as f32;
         let tolerance = 1.0e-6_f32.max(raytracing_error.abs() * 1.0e-5);
-        if !previous_error.is_finite()
-            || (previous_error - raytracing_error).abs() > tolerance
+        if !previous_target.is_finite()
+            || (previous_target - raytracing_error).abs() > tolerance
             || !previous_partition["geometry"]
                 .as_str()
                 .is_some_and(|value| value.starts_with("bundles/") && value.contains('#'))
@@ -1250,6 +1258,7 @@ mod tests {
             normals: vec![[0.0, 0.0, 1.0]; 3],
             uvs: vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
             indices: vec![0, 1, 2],
+            achieved_error: 0.0,
         };
         let bytes = encode_meshlet_blas(&source).unwrap();
         let mesh = zorah_bundle::meshlet_blas_from_bytes(&bytes).unwrap();
@@ -1468,11 +1477,20 @@ mod tests {
                 "meshlet_sha256": "aa",
                 "geometry_sha256": "bb",
                 "blas_achieved_error": 0.02,
+                "blas_error_target": 0.02,
                 "geometry": "bundles/zorah-000.zorah_bundle#g/000000/meshlet_blas",
                 "meshlet": "bundles/zorah-000.zorah_bundle#g/000000/meshlet",
             }],
         });
         assert!(reusable_geometry_mesh(&source, &mesh, &previous, 0.02).unwrap());
+
+        // Reuse turns on the bound the cut was selected against, never the error it achieved: a
+        // mesh that simplifies to itself achieves zero for every request.
+        previous["partitions"][0]["blas_achieved_error"] = Value::from(0.0);
+        assert!(reusable_geometry_mesh(&source, &mesh, &previous, 0.02).unwrap());
+        previous["partitions"][0]["blas_error_target"] = Value::from(0.05);
+        assert!(!reusable_geometry_mesh(&source, &mesh, &previous, 0.02).unwrap());
+        previous["partitions"][0]["blas_error_target"] = Value::from(0.02);
 
         previous["meshlet_asset_version"] = Value::from(MESHLET_MESH_ASSET_VERSION + 1);
         assert!(!reusable_geometry_mesh(&source, &mesh, &previous, 0.02).unwrap());
@@ -1530,6 +1548,7 @@ mod tests {
                 "meshlet_sha256": "aa",
                 "geometry_sha256": "bb",
                 "blas_achieved_error": 0.02,
+                "blas_error_target": 0.02,
                 "geometry": "bundles/zorah-000.zorah_bundle#g/000000/meshlet_blas",
                 "meshlet": "bundles/zorah-000.zorah_bundle#g/000000/meshlet",
             }],
