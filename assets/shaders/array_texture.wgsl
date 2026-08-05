@@ -56,6 +56,6 @@ fn fragment(
 
     pbr_input.V = fns::calculate_view(mesh.world_position, pbr_input.is_orthographic);
 
-    // Scene-linear output; the post-process tonemapping pass applies the operator.
+    // Scene-linear output
     return fns::apply_pbr_lighting(pbr_input);
 }

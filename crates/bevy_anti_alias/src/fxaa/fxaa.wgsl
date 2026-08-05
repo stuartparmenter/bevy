@@ -69,21 +69,12 @@ fn QUALITY(q: i32) -> f32 {
 
 fn rgb2luma(rgb: vec3<f32>) -> f32 {
 #ifdef COMPOSITING_SPACE_OKLAB
-    // On a resolved-Oklab view rgb.x is the Oklab lightness L and rgb.y/rgb.z
-    // are the signed a/b chroma channels. The Rec.601 dot would mix in the
-    // signed channels and can go negative, so sqrt() returns NaN. L is
-    // already a perceptual lightness, in [0, 1] for SDR content. The color
-    // resample reads the unmodified texel.
+    // rgb.x is already the Oklab perceptual lightness L, simply return it
     return saturate(rgb.x);
 #else
     let luma = dot(rgb, vec3<f32>(0.299, 0.587, 0.114));
 #ifdef HDR_DISPLAY_TARGET
-    // On HDR display targets the post-tonemap input is paper-white-relative
-    // display-linear and exceeds 1.0 (up to peak / paper white), while FXAA's
-    // absolute EDGE_THRESHOLD_MIN presets and the sqrt() proxy were tuned for
-    // a [0, 1] signal. Saturating keeps every threshold in that domain: edges
-    // above paper white are detected at their 1.0-clamped contrast, and values
-    // at or below paper white behave as on SDR targets.
+    // saturate HDR display target to keep it in the valid domain
     return sqrt(saturate(luma));
 #else
     return sqrt(luma);

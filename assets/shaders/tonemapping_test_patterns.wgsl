@@ -48,6 +48,6 @@ fn fragment(
     } else {
         out = continuous_hue(vec2(uv.y * 2.0, uv.x));
     }
-    // Scene-linear output; the post-process tonemapping pass applies the operator.
+    // Scene-linear output
     return vec4(out, 1.0);
 }

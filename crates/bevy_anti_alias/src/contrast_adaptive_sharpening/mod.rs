@@ -275,18 +275,15 @@ mod tests {
     //! same scalars.
 
     const FSR_RCAS_LIMIT: f32 = 0.1875;
-    /// `peakC` in the shader.
     const PEAK_C: (f32, f32) = (10.0, -40.0);
     /// The largest value an `Rgba16Float` target can store.
     const F16_MAX: f32 = 65504.0;
 
-    /// `rcas_range_compress` in the shader.
     fn compress(c: f32) -> f32 {
         let v = c.max(0.0);
         v / (1.0 + v)
     }
 
-    /// `rcas_range_decompress` in the shader.
     fn decompress(c: f32) -> f32 {
         let v = c.clamp(0.0, 1.0);
         v / (1.0 - v).max(1.0 / F16_MAX)
@@ -326,14 +323,9 @@ mod tests {
 
     #[test]
     fn range_compression_round_trips() {
-        // decompress(compress(x)) == x across the HDR range the post-tonemap
-        // buffer can carry. The `1 - v` in the inverse cancels catastrophically
-        // as v approaches 1, so precision degrades quadratically with x: exact
-        // to ~7 significant digits at paper white, ~3 at x = 10000. That is
-        // still finer than an `Rgba16Float` target can store (f16 keeps ~3
-        // decimal digits), so the tolerance scales as x^2 * epsilon.
         for x in [0.0_f32, 0.001, 0.18, 0.5, 1.0, 2.5, 10.0, 100.0, 10000.0] {
             let round_tripped = decompress(compress(x));
+            // scale tolerance quadratically with x because of precision limits
             let tolerance = (x * x * f32::EPSILON * 4.0).max(1e-7);
             assert!(
                 (round_tripped - x).abs() <= tolerance,

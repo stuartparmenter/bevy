@@ -179,8 +179,7 @@ pub struct FxaaPipelineKey {
     oklab_compositing: bool,
 }
 
-/// Returns the shader defs for an [`FxaaPipelineKey`]. Split out so the def
-/// vector can be unit-tested without a render device.
+/// Returns the shader defs for an [`FxaaPipelineKey`]
 fn fxaa_shader_defs(key: &FxaaPipelineKey) -> Vec<ShaderDefVal> {
     let mut shader_defs = vec![
         format!("EDGE_THRESH_{}", key.edge_threshold.get_str()).into(),

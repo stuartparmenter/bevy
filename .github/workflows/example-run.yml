@@ -10,10 +10,6 @@ on:
   push:
     branches:
       - main
-  # allow running on demand from any branch, e.g. to verify that a refactor leaves
-  # rendering byte-identical: all three OS capture jobs and their Pixel Eagle
-  # comparisons run (the `!= 'pull_request'` gates pass for `workflow_dispatch`)
-  workflow_dispatch:
 
 # Environment variables must be kept in sync with all workflows that defines them.
 env:
