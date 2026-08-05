@@ -52,12 +52,10 @@ impl Sensitivity {
 /// A component for enabling Fast Approximate Anti-Aliasing (FXAA)
 /// for a [`bevy_camera::Camera`].
 ///
-/// On a view whose resolved compositing space is [`CompositingSpace::Oklab`],
-/// edge detection reads the Oklab lightness channel instead of the Rec.601
-/// luma proxy, which is undefined on the signed Oklab chroma channels. An
-/// [`Srgb`](bevy_camera::CompositingSpace::Srgb) view keeps the proxy. FXAA
-/// expects a nonlinear signal, so on an already-sRGB-encoded buffer the `sqrt`
-/// double-compresses the thresholds rather than breaking them.
+/// On a view composited in [`CompositingSpace::Oklab`], edge detection uses
+/// the Oklab lightness channel as the luma. The default Rec.601 luma
+/// approximation only works for sRGB views; it would produce NaN on Oklab's
+/// signed chroma channels.
 #[derive(Reflect, Component, Clone, ExtractComponent)]
 #[reflect(Component, Default, Clone)]
 #[extract_component_filter(With<Camera>)]
