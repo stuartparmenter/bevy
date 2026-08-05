@@ -28,6 +28,10 @@ use bevy::{
     },
 };
 
+/// The transfer/gamut pair selection falls back to when no HDR transfer applies.
+const SDR_FALLBACK: (DisplayTransfer, DisplayGamut) =
+    (DisplayTarget::SDR_SRGB.transfer, DisplayTarget::SDR_SRGB.gamut);
+
 /// Requests the best supported HDR output for the primary window, falling back
 /// to SDR.
 ///
@@ -99,12 +103,6 @@ fn apply_hdr_preference(
     }
     let (mut target, surface, display_state) = window.into_inner();
 
-    // Windows advertises the PQ color space even when the OS HDR toggle is off, so
-    // the supported set alone can't tell SDR desktop mode from HDR. The live
-    // tone-map headroom can (it reads 1.0 for a definitively-SDR display); force
-    // SDR when it does. A no-op off Windows (see `display_reports_sdr`).
-    let force_sdr = display_reports_sdr(display_state.as_deref());
-
     // Act on a real surface transition, the app clearing the override, or -- on
     // Windows -- a live HDR enable/disable, which flips the headroom while leaving
     // the surface unchanged.
@@ -115,15 +113,16 @@ fn apply_hdr_preference(
         return;
     }
 
+    let force_sdr = display_reports_sdr(display_state.as_deref());
     let (transfer, gamut) = if force_sdr {
-        (DisplayTransfer::Srgb, DisplayGamut::Rec709)
+        SDR_FALLBACK
     } else {
         preference
             .order
             .iter()
             .copied()
             .find(|(transfer, _)| surface.supported.contains(*transfer))
-            .unwrap_or((DisplayTransfer::Srgb, DisplayGamut::Rec709))
+            .unwrap_or(SDR_FALLBACK)
     };
 
     let selection_changed = target.transfer != transfer || target.gamut != gamut;
@@ -163,32 +162,20 @@ fn apply_hdr_preference(
 ///
 /// Windows advertises the PQ (HDR10) color space on the surface even when the OS
 /// HDR toggle is off -- DXGI presents a PQ swapchain on an SDR desktop and the
-/// compositor tone-maps it down -- so [`WindowSurfaceTransfers`] can't tell the
-/// two apart. The live tone-map headroom does: it is `1.0` for a definitively-SDR
-/// display. Other platforms report their supported transfers accurately, so off
-/// Windows this is always `false` and selection is unchanged.
-#[cfg(target_os = "windows")]
+/// compositor tone-maps it down -- so [`WindowSurfaceTransfers::supported`]
+/// over-reports there. The live tone-map headroom disambiguates: it is `1.0` for
+/// a definitively-SDR display. Other platforms report their supported transfers
+/// accurately, so the gate is Windows-only.
 fn display_reports_sdr(state: Option<&WindowDisplayState>) -> bool {
-    state
-        .and_then(|state| state.tone_map_headroom)
-        .is_some_and(|headroom| headroom <= 1.0)
-}
-
-#[cfg(not(target_os = "windows"))]
-fn display_reports_sdr(_state: Option<&WindowDisplayState>) -> bool {
-    false
+    cfg!(target_os = "windows")
+        && state
+            .and_then(|state| state.tone_map_headroom)
+            .is_some_and(|headroom| headroom <= 1.0)
 }
 
 /// Whether the live display state changed this frame, so the Windows SDR gate
 /// re-runs on a runtime HDR toggle (which leaves [`WindowSurfaceTransfers`]
-/// unchanged). Off Windows the supported set already tracks HDR availability, so
-/// this stays `false` and the system keeps its original change detection.
-#[cfg(target_os = "windows")]
+/// unchanged). Off Windows the supported set already tracks HDR availability.
 fn hdr_state_changed(state: Option<&Ref<WindowDisplayState>>) -> bool {
-    state.is_some_and(|state| state.is_changed())
-}
-
-#[cfg(not(target_os = "windows"))]
-fn hdr_state_changed(_state: Option<&Ref<WindowDisplayState>>) -> bool {
-    false
+    cfg!(target_os = "windows") && state.is_some_and(|state| state.is_changed())
 }

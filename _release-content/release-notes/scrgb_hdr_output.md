@@ -48,7 +48,7 @@ picks a (format, color space) pair:
   instead. Vulkan, DX12, and Metal, when the OS has HDR output enabled.
 
 Press `O` in the `tonemapping` example to cycle sRGB, scRGB, extended-range
-sRGB 709/P3, and PQ, or `T` in the `hdr_calibration` example.
+sRGB 709/P3, and PQ.
 
 ## The display-encoding pass
 

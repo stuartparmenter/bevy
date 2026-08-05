@@ -62,30 +62,19 @@ But paper white is a viewing preference no display can report, and sensed
 values are missing or coarse on many platforms. An in-app HGIG-style
 calibration flow fills the gaps.
 
-`examples/helpers/hdr_calibration.rs` packages that flow as
-`HdrCalibrationPlugin<S>`. Drop it into one of your own `States` and it runs a
-three-step wizard, persists the result next to the executable, emits a
-`CalibrationComplete` event on confirm, and prompts to recalibrate when the
-window moves to another monitor. Pick a `CalibrationStrategy` up front: manual
-HGIG, where you tune every value, or trust-OS, where peak, black, and gamut
-resolve from sensed data and you only set paper white. The three steps are:
+`examples/3d/hdr_calibration.rs` runs that flow as a three-step wizard, the way
+most games calibrate: a probe square on a reference card, with per-step
+luminances. Raise peak until the max-signal probe disappears into the card, set
+paper white to a comfortable white level, and lower black level until the probe
+disappears into the black background. It persists the result via
+`bevy_settings`, reloads it on the next run, and prompts to recalibrate when
+the window moves to another monitor. `M` picks the mode up front: manual HGIG,
+where you tune every value, or trust-OS, where peak, black, and gamut resolve
+from sensed data (`DisplayCalibrationPolicy`) and you only set paper white.
 
-- `peak_luminance_nits`: a solid clipped near-peak surround, a true-black
-  separating frame, and a center patch at the candidate peak
-  (`PeakFraction(1.0)`). Raise the value until the patch merges into the
-  surround, then back off one tap.
-- `paper_white_nits`: a reference white card at exactly `1.0` next to a
-  203-nit ITU-R BT.2408 strip.
-- `min_luminance_nits`: near-black steps at fixed absolute luminances.
-
-All adjustments mutate the primary window's `DisplayTarget` live. The patterns
-render with `Tonemapping::None` and unlit materials, so they reach the display
-encoder at exact paper-white-relative values (above `1.0` reaches peak).
-
-`examples/3d/hdr_calibration.rs` is a harness around the plugin plus the `hdr`
-helper's `HdrPlugin`. `T` cycles the requested transfer through sRGB,
-scRGB-linear, extended-range sRGB, and PQ, renegotiating the swapchain on the
-fly. `G` toggles a Gran Turismo 7 tone-mapping preview over the same patterns.
-Backtick shows an engine-telemetry overlay. Calibrating needs an HDR display:
-macOS/iOS Metal, Windows Vulkan, or Wayland Vulkan with Mesa 25.1+. On SDR
-systems the example still runs, on the warn-and-degrade path.
+All adjustments mutate the primary window's `DisplayTarget` live. The pattern
+renders with `Tonemapping::Linear` and unlit materials, so it reaches the
+display encoder at exact paper-white-relative values (above `1.0` reaches
+peak). Calibrating needs an HDR display: macOS/iOS Metal, Windows Vulkan or
+DX12, or Wayland Vulkan with Mesa 25.1+. Without one the example shows a "no
+HDR output" notice.

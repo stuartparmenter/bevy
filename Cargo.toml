@@ -1453,6 +1453,7 @@ wasm = true
 name = "hdr_calibration"
 path = "examples/3d/hdr_calibration.rs"
 doc-scrape-examples = true
+required-features = ["bevy_settings"]
 
 [package.metadata.example.hdr_calibration]
 name = "HDR Calibration"
@@ -5433,18 +5434,6 @@ name = "HDR Helper"
 description = "Reusable plugin that requests the best supported HDR output, falling back to SDR"
 category = "Helpers"
 wasm = true
-
-[[example]]
-name = "hdr_calibration_helper"
-path = "examples/helpers/hdr_calibration.rs"
-doc-scrape-examples = true
-crate-type = ["lib"]
-
-[package.metadata.example.hdr_calibration_helper]
-name = "HDR Calibration Helper"
-description = "Reusable guided HDR display-calibration screen that runs inside an app state"
-category = "Helpers"
-wasm = false
 
 [[example]]
 name = "no_std_library"
