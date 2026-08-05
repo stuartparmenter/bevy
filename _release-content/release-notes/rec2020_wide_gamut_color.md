@@ -55,8 +55,16 @@ that Rec.709 cannot represent with non-negative components.
 
 The setting is project-global. `RenderPlugin` reads it once at build time, and
 mutating the resource afterwards has no effect. Custom materials and custom
-render passes need changes; see the "`RenderPlugin::working_color_space` and
-`GpuImage::source_primaries`" migration guide.
+render passes that inject Rec.709 colors must convert them:
+`linear_rgba_rec709_to_working` on the CPU, or `rec709_to_rec2020` in WGSL under
+the `WORKING_COLOR_SPACE_REC2020` shader def, both in
+`bevy_render::working_color_space`. 2D writer pipelines (sprites, 2D meshes and
+materials, gizmos, UI) receive the conversion as the `OUTPUT_GAMUT_REC2020`
+writer-encode def instead; a custom `Material2d` fragment shader can call
+`bevy_render::writer_encode::writer_encode` on its composed color to handle it.
+`LinearRgba` and the rest of `bevy_color` stay defined as linear Rec.709: the
+conversion happens at these render-world seams, so do not pre-convert colors you
+hand to standard Bevy APIs.
 
 Under `Rec2020`:
 
@@ -91,7 +99,9 @@ Image assets now carry their source gamut in the new `Image::source_primaries`
 field (`SourceColorPrimaries`: `Bt709`, `Bt2020`, or `DisplayP3`). The KTX2,
 Radiance HDR, and OpenEXR loaders fill it in from file metadata. A new optional
 `source_primaries` loader setting pins it per asset, in code or in a `.meta`
-file. The `Image::source_primaries` migration guide lists the per-format
-metadata sources and the resolution order.
+file. Resolution order is setting > file metadata > `Bt709`. The metadata
+sources are the KTX2 data format descriptor's `colorPrimaries`, Radiance HDR
+`PRIMARIES=` header lines, and the OpenEXR `chromaticities` attribute; the glTF
+loader stamps `Bt709`, as the glTF 2.0 specification requires.
 
 For now this is metadata only: decoding and rendering are unchanged.

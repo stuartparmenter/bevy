@@ -40,5 +40,5 @@ cancelled for the whole stack and Bevy warns.
 
 Default SDR projects render byte-for-byte identically. The changes above only
 affect camera stacks, non-default compositing spaces, and HDR output. See the
-"Camera compositing resolves once per frame" migration guide for adapting custom
+"`ViewTarget::compositing_space` removed" migration guide for adapting custom
 render code.
