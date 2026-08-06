@@ -107,8 +107,8 @@ impl Plugin for CameraPlugin {
                     ExtractSchedule,
                     (
                         extract_cameras
-                            .after(extract_resource::<ManualTextureViews, ()>)
-                            .after(extract_resource::<ManualDisplayTargets, ()>),
+                            .after(extract_resource::<ManualTextureViews, RenderApp, ()>)
+                            .after(extract_resource::<ManualDisplayTargets, RenderApp, ()>),
                         clear_dirty_specializations.in_set(DirtySpecializationSystems::Clear),
                         clear_dirty_wireframe_specializations
                             .in_set(DirtySpecializationSystems::Clear),
