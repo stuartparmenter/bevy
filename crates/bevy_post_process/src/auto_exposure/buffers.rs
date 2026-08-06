@@ -14,7 +14,7 @@ use super::{
 };
 
 /// The CIE 1931 xy chromaticity of the D65 white point. Must stay in sync with
-/// `D65_XY` in `bevy_render::view` and `AWB_D65_XY` in `auto_exposure.wgsl`.
+/// `D65_XY` in `bevy_render::view` and `AWB_D65_XY` in `auto_exposure.wesl`.
 const D65_XY: (f32, f32) = (0.31272, 0.32903);
 
 /// The per-view GPU adaptation state, keyed by render-world view entity.

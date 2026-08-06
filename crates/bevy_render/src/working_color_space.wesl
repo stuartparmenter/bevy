@@ -14,7 +14,7 @@
 // Linear Rec.709 -> Rec.2020 matrix (D65, per ITU-R BT.2087), derived in f64
 // by the Lindbloom primaries-to-XYZ method. The f64 literals round to f32
 // values bit-identical to `bevy_render::working_color_space::REC709_TO_REC2020`
-// on the Rust side and to `GT7_REC_709_TO_REC_2020` in gt7.wgsl. Keep them in
+// on the Rust side and to `GT7_REC_709_TO_REC_2020` in gt7.wesl. Keep them in
 // sync. Re-deriving from chromaticities (`bevy_color::rgb_to_rgb_matrix`) lands
 // a few ULP away and is not a substitute.
 const REC709_TO_REC2020 = mat3x3<f32>(

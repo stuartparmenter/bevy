@@ -27,7 +27,7 @@ pub struct ViewAutoExposurePipeline {
     pub metering_mask: Handle<Image>,
 }
 
-/// CPU mirror of the `AutoExposure` uniform in `auto_exposure.wgsl`.
+/// CPU mirror of the `AutoExposure` uniform in `auto_exposure.wesl`.
 /// Field order and types must match the WGSL struct.
 #[derive(Component, ShaderType, Clone, Copy)]
 pub struct AutoExposureUniform {
@@ -60,7 +60,7 @@ pub struct AutoExposureUniform {
     pub(super) pad_2: u32,
 }
 
-/// CPU mirror of the per-view `AutoExposureState` buffer in `auto_exposure.wgsl`.
+/// CPU mirror of the per-view `AutoExposureState` buffer in `auto_exposure.wesl`.
 /// Field order and types must match the WGSL struct.
 #[derive(ShaderType, Clone, Copy, Debug, PartialEq)]
 pub struct AutoExposureState {

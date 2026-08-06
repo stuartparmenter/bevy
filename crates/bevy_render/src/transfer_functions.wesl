@@ -10,10 +10,10 @@
 // `bevy_render::transfer_functions` (transfer_functions.rs), which also holds
 // the `f32` parity references for the functions here. Keep both in sync.
 //
-// `bevy_core_pipeline::tonemapping_gt7` (gt7.wgsl) carries its own PQ helpers
+// `bevy_core_pipeline::tonemapping::gt7` (gt7.wesl) carries its own PQ helpers
 // with the same ST-2084 constants and the same exp2/log2 form, because the GT7
 // operator is a verbatim, fixture-locked port that imports nothing. If you
-// change the PQ math here, check that gt7.wgsl stays consistent.
+// change the PQ math here, check that gt7.wesl stays consistent.
 
 // ---------------------------------------------------------------------------
 // Extended-range sRGB (IEC 61966-2-2 encoded form / "scRGB nonlinear")
@@ -75,7 +75,7 @@ fn scrgb_encode(color: vec3<f32>, paper_white_nits: f32) -> vec3<f32> {
 // ---------------------------------------------------------------------------
 
 // ST-2084 constants. Same values as the GT7 operator's own copies (`GT7_PQ_*`
-// in gt7.wgsl).
+// in gt7.wesl).
 const PQ_M1: f32 = 0.1593017578125; // (2610 / 4096) / 4
 const PQ_M2: f32 = 78.84375;        // (2523 / 4096) * 128
 const PQ_C1: f32 = 0.8359375;       // 3424 / 4096
@@ -93,7 +93,7 @@ const PQ_MAX_LUMINANCE_NITS: f32 = 10000.0;
 // base is indeterminate in WGSL and gives NaN on most backends. An encoder
 // entry point has to take slightly negative inputs from antialiasing fringes
 // and out-of-gamut residue. The GT7 reference (`gt7_inverse_eotf_st2084` in
-// gt7.wgsl, from gt7_tone_mapping.cpp) is deliberately unclamped because its
+// gt7.wesl, from gt7_tone_mapping.cpp) is deliberately unclamped because its
 // callers guarantee non-negative inputs. Do not copy that form here.
 //
 // Inputs above 1.0 (more than 10000 nits) are not clamped, matching the GT7

@@ -1,6 +1,6 @@
 //! CPU-side tests for the auto exposure and auto white balance adaptation math.
 //!
-//! The functions marked as mirrors below copy `auto_exposure.wgsl` operation for
+//! The functions marked as mirrors below copy `auto_exposure.wesl` operation for
 //! operation. If the shader math changes, they must be updated to match.
 
 use super::{

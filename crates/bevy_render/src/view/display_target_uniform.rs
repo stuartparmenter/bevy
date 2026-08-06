@@ -27,7 +27,7 @@
 //! the uniform buffer.
 //!
 //! The matching WGSL struct lives in `display_target.wesl` and is importable as
-//! `bevy_render::display_target`.
+//! `bevy_render::view::display_target`.
 
 use bevy_camera::NormalizedRenderTarget;
 use bevy_derive::Deref;
