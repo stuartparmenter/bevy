@@ -78,7 +78,7 @@ fn init_line_gizmo_pipelines(
     asset_server: Res<AssetServer>,
     working_color_space: Res<WorkingColorSpace>,
 ) {
-    let line_shader = load_embedded_asset!(asset_server.as_ref(), "lines.wgsl");
+    let line_shader = load_embedded_asset!(asset_server.as_ref(), "lines.wesl");
     let variants_line = Variants::new(
         LineGizmoPipelineSpecializer {
             mesh_pipeline: mesh_pipeline.clone(),
@@ -115,7 +115,7 @@ fn init_line_gizmo_pipelines(
     commands.insert_resource(LineJointGizmoPipeline {
         mesh_pipeline: mesh_pipeline.clone(),
         uniform_layout: uniform_bind_group_layout.layout.clone(),
-        shader: load_embedded_asset!(asset_server.as_ref(), "line_joints.wgsl"),
+        shader: load_embedded_asset!(asset_server.as_ref(), "line_joints.wesl"),
         working_color_space: *working_color_space,
     });
 }

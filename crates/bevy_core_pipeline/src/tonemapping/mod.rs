@@ -58,11 +58,10 @@ pub struct TonemappingPlugin;
 
 impl Plugin for TonemappingPlugin {
     fn build(&self, app: &mut App) {
-        load_shader_library!(app, "tonemapping_shared.wgsl");
-        load_shader_library!(app, "lut_bindings.wgsl");
-        load_shader_library!(app, "gt7.wgsl");
+        load_shader_library!(app, "lut_bindings.wesl");
+        load_shader_library!(app, "gt7.wesl");
 
-        embedded_asset!(app, "tonemapping.wgsl");
+        embedded_asset!(app, "tonemapping_frag.wesl");
 
         if !app.world().is_resource_added::<TonemappingLuts>() {
             let mut images = app.world_mut().resource_mut::<Assets<Image>>();
@@ -350,7 +349,7 @@ impl SpecializedRenderPipeline for TonemappingPipeline {
 
 /// Binding index of the per-view [`Gt7ParamsUniform`] in the tonemapping bind group. Only
 /// part of the layout when [`TonemappingPipelineKeyFlags::GT7_PARAMS_UNIFORM`] is set.
-/// Pushed into `gt7.wgsl` as a shader def so another bind group can use a different index.
+/// Pushed into `gt7.wesl` as a shader def so another bind group can use a different index.
 pub const GT7_PARAMS_BINDING_INDEX: u32 = 5;
 
 pub fn init_tonemapping_pipeline(
@@ -394,7 +393,7 @@ pub fn init_tonemapping_pipeline(
         gt7_params_bind_group: tonemap_gt7_params_bind_group,
         sampler,
         fullscreen_shader: fullscreen_shader.clone(),
-        fragment_shader: load_embedded_asset!(asset_server.as_ref(), "tonemapping.wgsl"),
+        fragment_shader: load_embedded_asset!(asset_server.as_ref(), "tonemapping_frag.wesl"),
     });
 }
 
@@ -443,9 +442,9 @@ pub struct ResolvedTonemapping {
     /// HDR transfer. The pipeline is then specialized with
     /// [`TonemappingPipelineKeyFlags::TONEMAP_OUTPUT_REC2020`] and GT7 emits its native
     /// linear Rec.2020 display-referred output with no Rec.709 back-conversion (see
-    /// `gt7.wgsl`). Every other configuration emits Rec.709 display-linear. Under the
+    /// `gt7.wesl`). Every other configuration emits Rec.709 display-linear. Under the
     /// Rec.2020 working space the Rec.709-fit operators get a Rec.2020 to Rec.709
-    /// conversion at the pass entry (see `tonemapping_shared.wgsl`).
+    /// conversion at the pass entry (see `tonemapping.wesl`).
     pub output_gamut: DisplayGamut,
 }
 

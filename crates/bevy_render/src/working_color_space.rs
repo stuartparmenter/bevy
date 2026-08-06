@@ -78,8 +78,8 @@ impl WorkingColorSpace {
 /// ITU-R BT.2087.
 ///
 /// Each literal is the shortest decimal that round-trips the correctly rounded
-/// `f32` of the matching f64 literal in `working_color_space.wgsl` and
-/// `gt7.wgsl`. The Rust and WGSL constants must stay bit-identical so the CPU
+/// `f32` of the matching f64 literal in `working_color_space.wesl` and
+/// `gt7.wesl`. The Rust and WGSL constants must stay bit-identical so the CPU
 /// code is an exact parity reference for the shaders
 /// (`matrices_match_wgsl_f64_literals`).
 ///
@@ -112,7 +112,7 @@ pub const REC2020_TO_REC709: Mat3 = Mat3::from_cols(
 /// The display-encoding pass uses this to carry Rec.709 tone-map output into
 /// the P3-gamut
 /// [`ExtendedDisplayP3`](bevy_window::DisplayTransfer::ExtendedSrgb) signal.
-/// Bit-identical to `REC709_TO_DISPLAYP3` in `working_color_space.wgsl`, and
+/// Bit-identical to `REC709_TO_DISPLAYP3` in `working_color_space.wesl`, and
 /// equal to `bevy_color::rgb_to_rgb_matrix(BT709, DISPLAY_P3)` within a few
 /// ULP.
 pub const REC709_TO_DISPLAYP3: Mat3 = Mat3::from_cols(
@@ -132,7 +132,7 @@ pub const DISPLAYP3_TO_REC709: Mat3 = Mat3::from_cols(
 );
 
 /// Linear Rec.2020 to Display-P3 conversion matrix, both D65. Bit-identical to
-/// `REC2020_TO_DISPLAYP3` in `working_color_space.wgsl`.
+/// `REC2020_TO_DISPLAYP3` in `working_color_space.wesl`.
 ///
 /// The display-encoding pass uses this on the GT7-on-HDR path, whose tone-map
 /// output is native Rec.2020, to reach a P3-gamut signal. Display-P3 sits
@@ -216,7 +216,7 @@ mod tests {
     }
 
     /// The Rust literals must round to the same `f32` as the f64 literals in
-    /// `working_color_space.wgsl` and in `gt7.wgsl`, which keeps its own
+    /// `working_color_space.wesl` and in `gt7.wesl`, which keeps its own
     /// fixture-locked copy. Drift shows up here before it reaches a readback
     /// comparison.
     #[test]

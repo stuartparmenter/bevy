@@ -26,7 +26,7 @@
 //! pipelines carry no display-target binding, and an SDR-only app never creates
 //! the uniform buffer.
 //!
-//! The matching WGSL struct lives in `display_target.wgsl` and is importable as
+//! The matching WGSL struct lives in `display_target.wesl` and is importable as
 //! `bevy_render::display_target`.
 
 use bevy_camera::NormalizedRenderTarget;
@@ -77,7 +77,7 @@ impl ViewDisplayTarget {
 /// GPU uniform carrying a view's resolved [`DisplayTarget`] calibration.
 ///
 /// Must stay field-for-field in sync with the WGSL `DisplayTargetUniform` in
-/// `display_target.wgsl`.
+/// `display_target.wesl`.
 ///
 /// Paper white is the only calibration value the GPU reads at runtime. The
 /// display gamut and transfer select compile-time shader defs in the

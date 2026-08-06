@@ -3,7 +3,7 @@
 //!
 //! The display-encoding pass runs [`srgb_oetf_extended`], [`scrgb_encode`] and
 //! the PQ inverse EOTF on the GPU. Those three mirror
-//! `transfer_functions.wgsl` operation for operation and are its `f32` parity
+//! `transfer_functions.wesl` operation for operation and are its `f32` parity
 //! reference, so keep both in sync. The EOTFs and the plain [`srgb_oetf`] are
 //! CPU-only, used by the screenshot readback and save paths.
 //!
@@ -39,7 +39,7 @@ const PQ_C3: f32 = 18.6875;
 /// otherwise. Negative inputs take the linear segment, which keeps `powf` off
 /// a negative base.
 ///
-/// No counterpart in `transfer_functions.wgsl`: sRGB swapchains apply this
+/// No counterpart in `transfer_functions.wesl`: sRGB swapchains apply this
 /// curve in hardware on the `*UnormSrgb` writeback. The screenshot path uses
 /// it to quantize a display-linear capture into an 8-bit image.
 pub fn srgb_oetf(linear: f32) -> f32 {
@@ -113,7 +113,7 @@ pub fn pq_inverse_eotf(y: f32) -> f32 {
     let y = y.max(0.0);
     let ym = ops::powf(y, PQ_M1);
     // Numerically stabler form of ((c1 + c2*ym) / (1 + c3*ym))^m2, identical
-    // to the GT7 operator's own copy in gt7.wgsl and gt7.rs.
+    // to the GT7 operator's own copy in gt7.wesl and gt7.rs.
     ops::exp2(PQ_M2 * (ops::log2(PQ_C1 + PQ_C2 * ym) - ops::log2(1.0 + PQ_C3 * ym)))
 }
 

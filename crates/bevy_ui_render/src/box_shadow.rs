@@ -44,7 +44,7 @@ pub struct BoxShadowPlugin;
 
 impl Plugin for BoxShadowPlugin {
     fn build(&self, app: &mut App) {
-        embedded_asset!(app, "box_shadow.wgsl");
+        embedded_asset!(app, "box_shadow.wesl");
 
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
             render_app
@@ -121,7 +121,7 @@ pub fn init_box_shadow_pipeline(mut commands: Commands, asset_server: Res<AssetS
 
     commands.insert_resource(BoxShadowPipeline {
         view_layout,
-        shader: load_embedded_asset!(asset_server.as_ref(), "box_shadow.wgsl"),
+        shader: load_embedded_asset!(asset_server.as_ref(), "box_shadow.wesl"),
     });
 }
 

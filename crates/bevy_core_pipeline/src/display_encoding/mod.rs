@@ -77,7 +77,7 @@ pub struct DisplayEncodingPlugin;
 
 impl Plugin for DisplayEncodingPlugin {
     fn build(&self, app: &mut App) {
-        embedded_asset!(app, "display_encoding.wgsl");
+        embedded_asset!(app, "display_encoding.wesl");
 
         app.register_type::<DisplayGamutCompression>()
             .init_resource::<DisplayGamutCompression>()
@@ -109,7 +109,7 @@ impl Plugin for DisplayEncodingPlugin {
 /// The main handling is a hue-approximate chroma compression toward the
 /// achromatic axis, in the style of the ACES 1.3 Reference Gamut Compression
 /// (Academy S-2020-001, "RGC"; reference implementation `lib/RGC_common.ctl`
-/// in `aces-dev`). `gamut_compress` in `display_encoding.wgsl` documents the
+/// in `aces-dev`). `gamut_compress` in `display_encoding.wesl` documents the
 /// algorithm and constants, and `gamut_compression.rs` holds the CPU mirror
 /// and its tests. A per-channel clip (`max(c, 0.0)`) follows the compression,
 /// because PQ encoding requires non-negative input. The sign-preserving
@@ -305,7 +305,7 @@ pub fn init_display_encoding_pipeline(
         layout,
         sampler,
         fullscreen_shader: fullscreen_shader.clone(),
-        fragment_shader: load_embedded_asset!(asset_server.as_ref(), "display_encoding.wgsl"),
+        fragment_shader: load_embedded_asset!(asset_server.as_ref(), "display_encoding.wesl"),
     });
 }
 

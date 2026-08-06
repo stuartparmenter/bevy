@@ -18,7 +18,7 @@ use bevy::{
 use std::f32::consts::PI;
 
 /// This example uses a shader source file from the assets subdirectory
-const SHADER_ASSET_PATH: &str = "shaders/tonemapping_test_patterns.wgsl";
+const SHADER_ASSET_PATH: &str = "shaders/tonemapping_test_patterns.wesl";
 
 fn main() {
     // Pass `--rec2020` to render in the Rec.2020 working color space, a startup-time

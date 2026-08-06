@@ -1,6 +1,6 @@
 //! CPU side of the Gran Turismo 7 tone-mapping operator.
 //!
-//! The operator runs in `gt7.wgsl`. This module prepares the per-view constants
+//! The operator runs in `gt7.wesl`. This module prepares the per-view constants
 //! it consumes ([`Gt7ParamsUniform`]). Under `cfg(test)` it also carries a port
 //! of Polyphony Digital's reference implementation (`gt7_tone_mapping.cpp`, MIT
 //! License, Copyright (c) 2025 Polyphony Digital Inc., published with the
@@ -16,7 +16,7 @@
 //! - In HDR mode the output range is `[0, peak_nits / paper_white_nits]`, ready
 //!   for the display encoder. Peak luminance is valid from 250 to 10000 nits.
 //!
-//! The `cpu_reference` module below mirrors the C++ reference and `gt7.wgsl`
+//! The `cpu_reference` module below mirrors the C++ reference and `gt7.wesl`
 //! operation for operation, and fixtures from the C++ harness gate changes to
 //! the shader. The math is `f32` throughout for that reason.
 
@@ -230,7 +230,7 @@ fn inverse_eotf_st2084(v: f32) -> f32 {
 ///
 /// Deviates from the C++ reference: the LMS intermediates are clamped at zero
 /// before the PQ encode, so inputs saturated enough to drive LMS negative do
-/// not produce NaN. `gt7.wgsl` clamps the same way. Every parity fixture keeps
+/// not produce NaN. `gt7.wesl` clamps the same way. Every parity fixture keeps
 /// LMS positive, so fixture outputs are unaffected.
 fn rgb_to_ictcp(rgb: [f32; 3]) -> [f32; 3] {
     let l = (rgb[0] * 1688.0 + rgb[1] * 2146.0 + rgb[2] * 262.0) / 4096.0;
@@ -249,7 +249,7 @@ fn rgb_to_ictcp(rgb: [f32; 3]) -> [f32; 3] {
 }
 
 /// GPU uniform feeding the GT7 operator's `Gt7Params` WGSL struct (see
-/// `gt7.wgsl`; field order and meaning must stay identical).
+/// `gt7.wesl`; field order and meaning must stay identical).
 ///
 /// The derived curve constants (`k_a`, `k_b`, `k_c`, `peak_ucs`) are computed
 /// on the CPU from the closed forms in `from_params` so the shader stays cheap.
@@ -529,7 +529,7 @@ pub fn queue_gt7_params_uniforms(
     }
 }
 
-/// CPU port of the operator `gt7.wgsl` evaluates per pixel, driven by the same
+/// CPU port of the operator `gt7.wesl` evaluates per pixel, driven by the same
 /// [`Gt7ParamsUniform`] the shader binds.
 ///
 /// The shader needs only the constants in that uniform, so this half of the
@@ -958,7 +958,7 @@ mod tests {
 
     /// The SDR-target uniform must reproduce the C++ reference's SDR init
     /// products, the same fixtures as `cpp_parity_init_products` and the values
-    /// baked into `gt7_default_sdr_params()` in gt7.wgsl.
+    /// baked into `gt7_default_sdr_params()` in gt7.wesl.
     #[test]
     fn uniform_sdr_mode_matches_init_fixtures() {
         let uniform =

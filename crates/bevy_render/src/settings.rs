@@ -213,7 +213,6 @@ impl RenderResources {
         let working_color_space = *render_world.resource::<WorkingColorSpace>();
         render_world.insert_resource(PipelineCache::new(
             device.clone(),
-            render_adapter.clone(),
             working_color_space,
             synchronous_pipeline_compilation,
         ));

@@ -364,13 +364,14 @@ impl Plugin for RenderPlugin {
     fn build(&self, app: &mut App) {
         app.init_asset::<Shader>()
             .init_asset_loader::<ShaderLoader>();
-        load_shader_library!(app, "utils.wgsl");
-        load_shader_library!(app, "maths.wgsl");
-        load_shader_library!(app, "color_operations.wgsl");
-        load_shader_library!(app, "transfer_functions.wgsl");
-        load_shader_library!(app, "working_color_space.wgsl");
-        load_shader_library!(app, "writer_encode.wgsl");
-        load_shader_library!(app, "bindless.wgsl");
+        load_shader_library!(app, "utils.wesl");
+        load_shader_library!(app, "view.wesl");
+        load_shader_library!(app, "maths.wesl");
+        load_shader_library!(app, "color_operations.wesl");
+        load_shader_library!(app, "transfer_functions.wesl");
+        load_shader_library!(app, "working_color_space.wesl");
+        load_shader_library!(app, "writer_encode.wesl");
+        load_shader_library!(app, "bindless.wesl");
 
         // Insert into the main world for user introspection.
         app.insert_resource(self.working_color_space);

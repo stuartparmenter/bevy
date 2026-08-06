@@ -1,5 +1,5 @@
 //! CPU mirror of the display-encoding pass's out-of-gamut chroma compression.
-//! Keep it in sync with `gamut_compress` in `display_encoding.wgsl`. That
+//! Keep it in sync with `gamut_compress` in `display_encoding.wesl`. That
 //! shader documents the ACES 1.3 Reference Gamut Compression this implements
 //! (Academy S-2020-001, "RGC"; reference implementation `lib/RGC_common.ctl`
 //! in `aces-dev`), and where the thresholds, limits and power come from.

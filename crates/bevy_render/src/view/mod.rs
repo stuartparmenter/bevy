@@ -175,8 +175,7 @@ pub struct ViewPlugin;
 
 impl Plugin for ViewPlugin {
     fn build(&self, app: &mut App) {
-        load_shader_library!(app, "view.wgsl");
-        load_shader_library!(app, "display_target.wgsl");
+        load_shader_library!(app, "display_target.wesl");
 
         app
             // NOTE: windows.is_changed() handles cases where a window was resized

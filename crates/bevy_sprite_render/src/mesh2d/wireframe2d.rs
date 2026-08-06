@@ -82,7 +82,7 @@ impl Wireframe2dPlugin {
 
 impl Plugin for Wireframe2dPlugin {
     fn build(&self, app: &mut App) {
-        embedded_asset!(app, "wireframe2d.wgsl");
+        embedded_asset!(app, "wireframe2d.wesl");
 
         app.add_plugins((
             BinnedRenderPhasePlugin::<Wireframe2dPhaseItem, Mesh2dPipeline>::new(self.debug_flags),
@@ -333,7 +333,7 @@ pub fn init_wireframe_2d_pipeline(
 ) {
     commands.insert_resource(Wireframe2dPipeline {
         mesh_pipeline: mesh_2d_pipeline.clone(),
-        shader: load_embedded_asset!(asset_server.as_ref(), "wireframe2d.wgsl"),
+        shader: load_embedded_asset!(asset_server.as_ref(), "wireframe2d.wesl"),
     });
 }
 
