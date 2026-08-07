@@ -582,6 +582,8 @@ fn apply_pbr_lighting(
 
     // directional lights (direct)
     let n_directional_lights = view_bindings::lights.n_directional_lights;
+    // Zero direction = the custom shadow factor applies to every light.
+    let directional_shadow_all_lights = all(in.directional_shadow_direction == vec3(0.0));
     for (var i: u32 = 0u; i < n_directional_lights; i = i + 1u) {
         // check if this light should be skipped, which occurs if this light does not intersect with the view
         // note point and spot lights aren't skippable, as the relevant lights are filtered in `assign_lights_to_clusters`
@@ -597,11 +599,18 @@ fn apply_pbr_lighting(
         @else   // LIGHTMAP
         let enable_diffuse = true;
 
+        // Custom shadow maps (`directional_shadow_factor`) apply even when the
+        // light's engine shadow maps are disabled, e.g. under raytraced lighting,
+        // scoped to the light the input names (`directional_shadow_direction`).
         var shadow: f32 = 1.0;
+        if (directional_shadow_all_lights
+                || dot((*light).direction_to_light.xyz, in.directional_shadow_direction)
+                    >= pbr_types::DIRECTIONAL_SHADOW_DIRECTION_ALIGNMENT) {
+            shadow = in.directional_shadow_factor;
+        }
         if ((in.flags & MESH_FLAGS_SHADOW_RECEIVER_BIT) != 0u
                 && (view_bindings::lights.directional_lights[i].flags & mesh_view_types::DIRECTIONAL_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) != 0u) {
-            shadow = shadows::fetch_directional_shadow(i, in.world_position, in.world_normal, view_z, in.frag_coord.xy);
-            shadow *= in.directional_shadow_factor;
+            shadow *= shadows::fetch_directional_shadow(i, in.world_position, in.world_normal, view_z, in.frag_coord.xy);
         }
 
         @if(CONTACT_SHADOWS && DEPTH_PREPASS)

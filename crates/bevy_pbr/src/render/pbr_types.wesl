@@ -117,10 +117,23 @@ struct PbrInput {
     anisotropy_B: vec3<f32>,
     is_orthographic: bool,
     flags: u32,
-    // Multiplier applied to all directional lights before cascade and contact shadows,
-    // use this for custom shadow maps. Defaults to 1.0. 
+    // Multiplier applied to directional lights before cascade and contact shadows,
+    // use this for custom shadow maps. Applies even when the light's engine shadow
+    // maps are disabled. Defaults to 1.0.
     directional_shadow_factor: f32,
+    // Direction towards the light `directional_shadow_factor` was computed for
+    // (world space). Lights not aligned with it (within
+    // `DIRECTIONAL_SHADOW_DIRECTION_ALIGNMENT`) keep their full contribution, so
+    // e.g. a moon isn't attenuated by a map marched for the sun. The zero vector
+    // (the default) applies the factor to every directional light.
+    directional_shadow_direction: vec3<f32>,
 };
+
+// Minimum dot between a light's direction-to-light and
+// `directional_shadow_direction` for the factor to apply: wide enough for
+// sun-disk-sized sampling wobble, narrow enough to exclude any other
+// celestial body.
+const DIRECTIONAL_SHADOW_DIRECTION_ALIGNMENT: f32 = 0.996;
 
 // Creates a PbrInput with default values
 fn pbr_input_new() -> PbrInput {
@@ -148,6 +161,7 @@ fn pbr_input_new() -> PbrInput {
 
     pbr_input.flags = 0u;
     pbr_input.directional_shadow_factor = 1.0;
+    pbr_input.directional_shadow_direction = vec3<f32>(0.0);
 
     return pbr_input;
 }
