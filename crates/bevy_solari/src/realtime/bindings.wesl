@@ -61,7 +61,16 @@ struct Reservoir {
     confidence_weight: f32,
     sample_point_world_normal: vec2<f32>,
     light_sample: LightSample,
+    // GI reconnection anchor (only when light_sample.light_id == NULL_LIGHT_ID): instance,
+    // triangle, and barycentrics of x2. Temporal reuse translates the instance id to the
+    // current frame and re-resolves the world position, so the anchor tracks moving and
+    // deforming geometry instead of freezing at a stale world point.
+    sample_point_instance_id: u32,
+    sample_point_triangle_id: u32,
+    sample_point_barycentrics: vec2<f32>,
 }
+
+const NO_SAMPLE_POINT_INSTANCE = 0xFFFFFFFFu;
 
 fn empty_reservoir() -> Reservoir {
     return Reservoir(
@@ -71,6 +80,9 @@ fn empty_reservoir() -> Reservoir {
         0.0,
         vec2(0.0),
         LightSample(NULL_LIGHT_ID, 0u),
+        NO_SAMPLE_POINT_INSTANCE,
+        0u,
+        vec2(0.0),
     );
 }
 

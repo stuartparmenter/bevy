@@ -184,14 +184,20 @@ fn resolve_light_sample(light_sample: LightSample, light_source: LightSource) ->
     );
 } else {
         let triangle_count = light_source.kind >> 1u;
-        let triangle_id = light_sample.light_id & 0xFFFFu;
+        var triangle_id = light_sample.light_id & 0xFFFFu;
+        // Reservoirs can carry a triangle_id sampled when this light had more
+        // triangles (temporal reuse translates light ids but not triangle ids).
+        // Clamp the fetch to stay in bounds and zero the radiance so the stale
+        // sample's target function is 0 and it dies out of the reservoir.
+        let stale_triangle = triangle_id >= triangle_count;
+        triangle_id = min(triangle_id, triangle_count - 1u);
         let barycentrics = triangle_barycentrics(light_sample.seed);
         let triangle_data = resolve_triangle_data_full(light_source.id, triangle_id, barycentrics);
 
         return ResolvedLightSample(
             vec4(triangle_data.world_position, 1.0),
             triangle_data.world_normal,
-            triangle_data.material.emissive.rgb,
+            select(triangle_data.material.emissive.rgb, vec3(0.0), stale_triangle),
             f32(triangle_count) * triangle_data.triangle_area,
         );
     }

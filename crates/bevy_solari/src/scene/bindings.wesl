@@ -72,6 +72,7 @@ struct DirectionalLight {
 }
 
 const LIGHT_NOT_PRESENT_THIS_FRAME = 0xFFFFFFFFu;
+const INSTANCE_NOT_PRESENT_THIS_FRAME = 0xFFFFFFFFu;
 
 @group(0) @binding(0) var<storage> vertex_buffers: binding_array<VertexBuffer>;
 @group(0) @binding(1) var<storage> index_buffers: binding_array<IndexBuffer>;
@@ -89,6 +90,7 @@ const LIGHT_NOT_PRESENT_THIS_FRAME = 0xFFFFFFFFu;
 @group(0) @binding(13) var<storage> previous_frame_light_id_translations: array<u32>;
 @group(0) @binding(14) var brdf_dfg_lut: texture_2d<f32>;
 @group(0) @binding(15) var brdf_dfg_lut_sampler: sampler;
+@group(0) @binding(16) var<storage> previous_frame_instance_id_translations: array<u32>;
 
 const RAY_T_MIN = 0.001f;
 const RAY_T_MAX = 100000.0f;
@@ -126,6 +128,10 @@ struct ResolvedMaterial {
 
 struct ResolvedRayHitFull {
     world_position: vec3<f32>,
+    // Rigid motion only: the previous-frame transform applied to CURRENT
+    // vertex positions. Vertex buffers are not double-buffered, so deformation
+    // (skinning, in-place-refilled RebuildEveryFrame geometry) contributes no
+    // motion here.
     previous_frame_world_position: vec3<f32>,
     world_normal: vec3<f32>,
     geometric_world_normal: vec3<f32>,
@@ -191,6 +197,24 @@ fn transform_positions(transform: mat4x4<f32>, vertices: array<Vertex, 3>) -> ar
     );
 }
 
+struct ResolvedSamplePoint {
+    world_position: vec3<f32>,
+    world_normal: vec3<f32>,
+}
+
+// Geometry-only subset of resolve_triangle_data_full, for re-resolving a stored sample point
+// against the current frame's transforms and vertex buffers. Skips material and texture work,
+// so the normal is the interpolated vertex normal without normal mapping.
+fn resolve_sample_point(instance_id: u32, triangle_id: u32, barycentrics: vec3<f32>) -> ResolvedSamplePoint {
+    let transform = affine3_to_square(transforms[instance_id]);
+    let vertices = load_vertices(geometry_ids[instance_id], triangle_id);
+    let world_vertices = transform_positions(transform, vertices);
+    let world_position = mat3x3(world_vertices[0], world_vertices[1], world_vertices[2]) * barycentrics;
+    let local_normal = mat3x3(vertices[0].normal, vertices[1].normal, vertices[2].normal) * barycentrics;
+    let world_normal = normalize(mat3x3(transform[0].xyz, transform[1].xyz, transform[2].xyz) * local_normal);
+    return ResolvedSamplePoint(world_position, world_normal);
+}
+
 fn resolve_triangle_data_full(instance_id: u32, triangle_id: u32, barycentrics: vec3<f32>) -> ResolvedRayHitFull {
     let material_id = material_ids[instance_id];
     let material = materials[material_id];
@@ -204,6 +228,8 @@ fn resolve_triangle_data_full(instance_id: u32, triangle_id: u32, barycentrics: 
     let world_vertices = transform_positions(transform, vertices);
     let world_position = mat3x3(world_vertices[0], world_vertices[1], world_vertices[2]) * barycentrics;
 
+    // Uses this frame's vertices: previous_frame_world_position carries rigid
+    // motion only (see ResolvedRayHitFull).
     let previous_frame_world_vertices = transform_positions(previous_frame_transform, vertices);
     let previous_frame_world_position = mat3x3(previous_frame_world_vertices[0], previous_frame_world_vertices[1], previous_frame_world_vertices[2]) * barycentrics;
 

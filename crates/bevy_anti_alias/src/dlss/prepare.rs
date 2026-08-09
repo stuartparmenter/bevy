@@ -85,6 +85,12 @@ pub fn prepare_dlss<F: DlssFeature>(
                 let render_resolution = F::render_resolution(&dlss_context);
                 temporal_jitter.offset =
                     F::suggested_jitter(&dlss_context, frame_count.0, render_resolution);
+                // Re-assert the shared override every frame: a live SR<->RR
+                // swap can remove it, or leave the other feature's resolution
+                // in it, while this feature's context survives on this path.
+                commands
+                    .entity(entity)
+                    .insert(MainPassResolutionOverride(render_resolution));
             }
             _ => {
                 let dlss_context = F::new_context(

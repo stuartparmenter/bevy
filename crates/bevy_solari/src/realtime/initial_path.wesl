@@ -40,6 +40,11 @@ struct PathState {
     // Reconnection vertex x2, the first BRDF-sampled hit shared by every length >= 2 candidate
     x2_position: vec3<f32>,
     x2_normal: vec3<f32>,
+    // Geometry anchor for x2, published with every reservoir candidate so temporal reuse can
+    // re-resolve the position on moving or deforming geometry
+    x2_instance_id: u32,
+    x2_triangle_id: u32,
+    x2_barycentrics: vec2<f32>,
     // If false, candidates built on x2 are shaded directly into non_resampled_radiance instead of
     // published to the reservoir
     x2_reusable: bool,
@@ -72,6 +77,9 @@ fn generate_initial_reservoir(world_position: vec3<f32>, world_normal: vec3<f32>
     path.throughput_past_first_hit = vec3(1.0);
     path.x2_position = vec3(0.0);
     path.x2_normal = vec3(0.0);
+    path.x2_instance_id = 0u;
+    path.x2_triangle_id = 0u;
+    path.x2_barycentrics = vec2(0.0);
     path.x2_reusable = false;
     path.x1_brdf = vec3(0.0);
 
@@ -113,6 +121,9 @@ fn generate_initial_reservoir(world_position: vec3<f32>, world_normal: vec3<f32>
         if bounce == 0u {
             path.x2_position = ray_hit.world_position;
             path.x2_normal = ray_hit.world_normal;
+            path.x2_instance_id = ray.instance_index;
+            path.x2_triangle_id = ray.primitive_index;
+            path.x2_barycentrics = ray.barycentrics;
 
             path.x1_brdf = evaluate_brdf(wo, next_bounce.wi, world_normal, material, primary_F_ab);
 
@@ -217,6 +228,9 @@ fn generate_nee_candidate(
                 (*reservoir).light_sample = LightSample(NULL_LIGHT_ID, 0u);
                 (*reservoir).sample_point_world_position = path.x2_position;
                 (*reservoir).sample_point_world_normal = octahedral_encode(path.x2_normal);
+                (*reservoir).sample_point_instance_id = path.x2_instance_id;
+                (*reservoir).sample_point_triangle_id = path.x2_triangle_id;
+                (*reservoir).sample_point_barycentrics = path.x2_barycentrics;
                 (*reservoir).radiance = L_at_reconnection;
                 *selected_target_function = target_function;
             }
@@ -317,6 +331,9 @@ fn generate_emissive_candidate(
             (*reservoir).light_sample = LightSample(NULL_LIGHT_ID, bitcast<u32>(area_pdf));
             (*reservoir).sample_point_world_position = path.x2_position;
             (*reservoir).sample_point_world_normal = octahedral_encode(path.x2_normal);
+            (*reservoir).sample_point_instance_id = path.x2_instance_id;
+            (*reservoir).sample_point_triangle_id = path.x2_triangle_id;
+            (*reservoir).sample_point_barycentrics = path.x2_barycentrics;
             (*reservoir).radiance = ray_hit.material.emissive;
             *selected_target_function = target_function;
         }
@@ -331,6 +348,9 @@ fn generate_emissive_candidate(
             (*reservoir).light_sample = LightSample(NULL_LIGHT_ID, 0u);
             (*reservoir).sample_point_world_position = path.x2_position;
             (*reservoir).sample_point_world_normal = octahedral_encode(path.x2_normal);
+            (*reservoir).sample_point_instance_id = path.x2_instance_id;
+            (*reservoir).sample_point_triangle_id = path.x2_triangle_id;
+            (*reservoir).sample_point_barycentrics = path.x2_barycentrics;
             (*reservoir).radiance = emissive_L_at_reconnection;
             *selected_target_function = target_function;
         }
@@ -379,6 +399,9 @@ fn terminate_into_cache(
         (*reservoir).light_sample = LightSample(NULL_LIGHT_ID, 0u);
         (*reservoir).sample_point_world_position = path.x2_position;
         (*reservoir).sample_point_world_normal = octahedral_encode(path.x2_normal);
+        (*reservoir).sample_point_instance_id = path.x2_instance_id;
+        (*reservoir).sample_point_triangle_id = path.x2_triangle_id;
+        (*reservoir).sample_point_barycentrics = path.x2_barycentrics;
         (*reservoir).radiance = cache_L_at_reconnection;
         *selected_target_function = target_function;
     }

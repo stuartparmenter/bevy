@@ -163,6 +163,13 @@ pub fn solari_lighting(
         return;
     };
 
+    // Past every guard: the dispatches below record unconditionally, so the
+    // reservoirs advance to this frame's instance/light ids and the binder
+    // may promote its pending translation state.
+    scene_bindings
+        .node_dispatched
+        .store(true, core::sync::atomic::Ordering::Relaxed);
+
     let view_target_attachment = view_target.get_unsampled_color_attachment();
 
     let s = solari_lighting_resources;

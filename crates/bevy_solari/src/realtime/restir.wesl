@@ -2,13 +2,13 @@
 
 import bevy_core_pipeline::tonemapping::tonemapping_luminance as luminance;
 import bevy_pbr::render::utils::{rand_f, rand_u, sample_disk};
-import bevy_render::utils::octahedral_decode;
+import bevy_render::utils::{octahedral_decode, octahedral_encode};
 import bevy_solari::scene::brdf::{brdf_pdf, evaluate_brdf, F_AB};
-import bevy_solari::realtime::gbuffer_utils::{gpixel_resolve, permute_pixel, pixel_dissimilar};
+import bevy_solari::realtime::gbuffer_utils::{gpixel_resolve, permute_pixel, pixel_dissimilar, pixel_dissimilar_motion_compensated, temporal_object_motion_slack};
 import bevy_solari::realtime::initial_path::{generate_initial_reservoir, InitialSamplingResult};
-import bevy_solari::realtime::bindings::{depth_buffer, empty_reservoir, gbuffer, motion_vectors, previous_depth_buffer, previous_gbuffer, previous_view, reservoirs_a, reservoirs_b, Reservoir, constants, view, view_output};
+import bevy_solari::realtime::bindings::{depth_buffer, empty_reservoir, gbuffer, motion_vectors, NO_SAMPLE_POINT_INSTANCE, previous_depth_buffer, previous_gbuffer, previous_view, reservoirs_a, reservoirs_b, Reservoir, constants, view, view_output};
 import bevy_solari::scene::sampling::{balance_heuristic, calculate_resolved_light_contribution, isinf, isnan, LightSample, NULL_LIGHT_ID, power_heuristic, resolve_light_sample, ResolvedLightSample, trace_visibility, trace_visibility_previous_frame};
-import bevy_solari::scene::bindings::{light_sources, LIGHT_NOT_PRESENT_THIS_FRAME, previous_frame_light_id_translations, RAY_T_MAX, RAY_T_MIN, ResolvedMaterial};
+import bevy_solari::scene::bindings::{geometry_ids, INSTANCE_NOT_PRESENT_THIS_FRAME, light_sources, LIGHT_NOT_PRESENT_THIS_FRAME, previous_frame_instance_id_translations, previous_frame_light_id_translations, RAY_T_MAX, RAY_T_MIN, resolve_sample_point, ResolvedMaterial};
 import bevy_solari::realtime::world_cache_query::{query_world_cache, WORLD_CACHE_CELL_LIFETIME};
 
 enable wgpu_ray_query;
@@ -88,17 +88,27 @@ fn load_temporal_reservoir(pixel_id: vec2<u32>, depth: f32, world_position: vec3
     // dropping history. The dissimilarity check below still validates the surface, and a same-pixel
     // guess that passes it beats restarting from a confidence-1 reservoir at the screen edge.
     var point_temporal_pixel_id = pixel_id;
+    var reprojection_on_screen = false;
     if all(temporal_pixel_id_float >= vec2(0.0)) && all(temporal_pixel_id_float < view.main_pass_viewport.zw) {
         point_temporal_pixel_id = vec2<u32>(temporal_pixel_id_float);
+        reprojection_on_screen = true;
     }
 
     var permute_rng = constants.frame_rng;
     let permuted_temporal_pixel_id = permute_pixel(point_temporal_pixel_id, rand_u(&permute_rng), view.main_pass_viewport.zw);
 
-    // Check if the pixel features have changed heavily between the current and previous frame
+    // Check if the pixel features have changed heavily between the current and previous frame.
+    // Widen the tangent-plane test by the surface's own estimated world-space motion so a moving
+    // (e.g. skinned) surface doesn't reject its history every frame; static pixels get zero slack.
+    // The same-pixel fallback holds a *different* surface's history for a fast mover entering the
+    // screen, so it gets no slack — motion-widening there would accept the background's reservoir.
+    var plane_slack = 0.0;
+    if reprojection_on_screen {
+        plane_slack = temporal_object_motion_slack(pixel_id, depth, world_position, motion_vector, view, previous_view.unjittered_clip_from_world);
+    }
     let temporal_depth = textureLoad(previous_depth_buffer, permuted_temporal_pixel_id, 0);
     let temporal_surface = gpixel_resolve(textureLoad(previous_gbuffer, permuted_temporal_pixel_id, 0), temporal_depth, permuted_temporal_pixel_id, view.main_pass_viewport.zw, previous_view.world_from_clip);
-    if pixel_dissimilar(depth, world_position, temporal_surface.world_position, world_normal, temporal_surface.world_normal, view) {
+    if pixel_dissimilar_motion_compensated(depth, world_position, temporal_surface.world_position, world_normal, temporal_surface.world_normal, plane_slack, view) {
         return NeighborInfo(empty_reservoir(), vec3(0.0), vec3(0.0), empty_material());
     }
 
@@ -114,6 +124,39 @@ fn load_temporal_reservoir(pixel_id: vec2<u32>, depth: f32, world_position: vec3
             return NeighborInfo(empty_reservoir(), vec3(0.0), vec3(0.0), empty_material());
         }
         temporal.reservoir.light_sample.light_id = (light_id << 16u) | triangle_id;
+    }
+
+    // Re-anchor GI reconnection vertices onto the current frame's geometry. The stored world
+    // position was resolved against last frame's transforms and vertex buffers; on moving or
+    // per-frame-rebuilt geometry it goes stale immediately, and the cross-domain visibility
+    // retrace against the current TLAS then randomly kills or keeps the sample. Re-resolving
+    // from instance/triangle/barycentrics keeps the anchor on the surface as it deforms.
+    if temporal.reservoir.light_sample.light_id == NULL_LIGHT_ID && temporal.reservoir.sample_point_instance_id != NO_SAMPLE_POINT_INSTANCE {
+        let instance_id = previous_frame_instance_id_translations[temporal.reservoir.sample_point_instance_id];
+        if instance_id == INSTANCE_NOT_PRESENT_THIS_FRAME {
+            return NeighborInfo(empty_reservoir(), vec3(0.0), vec3(0.0), empty_material());
+        }
+        if temporal.reservoir.sample_point_triangle_id >= geometry_ids[instance_id].triangle_count {
+            return NeighborInfo(empty_reservoir(), vec3(0.0), vec3(0.0), empty_material());
+        }
+        temporal.reservoir.sample_point_instance_id = instance_id;
+
+        let barycentrics = vec3(
+            1.0 - temporal.reservoir.sample_point_barycentrics.x - temporal.reservoir.sample_point_barycentrics.y,
+            temporal.reservoir.sample_point_barycentrics,
+        );
+        let sample_point = resolve_sample_point(instance_id, temporal.reservoir.sample_point_triangle_id, barycentrics);
+        // Keep the stored anchor (position + normal-mapped shading normal from generation time)
+        // unless the geometry actually moved: static scenes keep identical history, and the
+        // interpolated vertex normal only replaces the shading normal where deformation genuinely
+        // displaced the surface. The epsilon also absorbs the representation gap between the
+        // ray-hit position stored at generation and the barycentric interpolation used here.
+        let anchor_delta = sample_point.world_position - temporal.reservoir.sample_point_world_position;
+        let reanchor_epsilon = max(0.001, 0.001 * distance(world_position, sample_point.world_position));
+        if dot(anchor_delta, anchor_delta) > reanchor_epsilon * reanchor_epsilon {
+            temporal.reservoir.sample_point_world_position = sample_point.world_position;
+            temporal.reservoir.sample_point_world_normal = octahedral_encode(sample_point.world_normal);
+        }
     }
 
     temporal.reservoir.confidence_weight = min(temporal.reservoir.confidence_weight, constants.confidence_weight_cap);
@@ -292,6 +335,9 @@ fn merge_reservoirs(
     if rand_f(rng) * weight_sum < other_sample_resampling_weight {
         combined_reservoir.sample_point_world_position = other_reservoir.sample_point_world_position;
         combined_reservoir.sample_point_world_normal = other_reservoir.sample_point_world_normal;
+        combined_reservoir.sample_point_instance_id = other_reservoir.sample_point_instance_id;
+        combined_reservoir.sample_point_triangle_id = other_reservoir.sample_point_triangle_id;
+        combined_reservoir.sample_point_barycentrics = other_reservoir.sample_point_barycentrics;
         combined_reservoir.radiance = other_reservoir.radiance;
         combined_reservoir.light_sample = other_reservoir.light_sample;
 
@@ -302,6 +348,9 @@ fn merge_reservoirs(
     } else {
         combined_reservoir.sample_point_world_position = canonical_reservoir.sample_point_world_position;
         combined_reservoir.sample_point_world_normal = canonical_reservoir.sample_point_world_normal;
+        combined_reservoir.sample_point_instance_id = canonical_reservoir.sample_point_instance_id;
+        combined_reservoir.sample_point_triangle_id = canonical_reservoir.sample_point_triangle_id;
+        combined_reservoir.sample_point_barycentrics = canonical_reservoir.sample_point_barycentrics;
         combined_reservoir.radiance = canonical_reservoir.radiance;
         combined_reservoir.light_sample = canonical_reservoir.light_sample;
 

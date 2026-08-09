@@ -25,13 +25,21 @@ use bevy_render::{
     texture::{FallbackImage, GpuImage},
 };
 use bevy_transform::components::GlobalTransform;
-use core::{f32::consts::TAU, hash::Hash, num::NonZeroU32, ops::Deref};
+use core::{
+    f32::consts::TAU,
+    hash::Hash,
+    mem,
+    num::NonZeroU32,
+    ops::Deref,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 const MAX_MESH_SLAB_COUNT: NonZeroU32 = NonZeroU32::new(500).unwrap();
 const MAX_TEXTURE_COUNT: NonZeroU32 = NonZeroU32::new(5_000).unwrap();
 
 const TEXTURE_MAP_NONE: u32 = u32::MAX;
 const LIGHT_NOT_PRESENT_THIS_FRAME: u32 = u32::MAX;
+const INSTANCE_NOT_PRESENT_THIS_FRAME: u32 = u32::MAX;
 
 #[derive(Resource)]
 pub struct RaytracingSceneBindings {
@@ -40,8 +48,22 @@ pub struct RaytracingSceneBindings {
     /// Mesh BLASes stay alive through the retained TLAS's instance
     /// references; per-frame geometry BLASes double-buffer so last frame's
     /// build survives (see `GeometryBlasEntry::previous_blas`).
+    ///
+    /// The `previous_frame_*` fields describe the last frame whose lighting
+    /// node actually dispatched — the frame the surviving reservoirs were
+    /// built from. Each build stores its results in the `pending_*` fields,
+    /// promoted only after [`Self::node_dispatched`] confirms consumption, so
+    /// neither a degenerate build (early return) nor a built-but-skipped
+    /// frame (e.g. pipelines still compiling) can desync the translation
+    /// tables or previous-frame TLAS from the reservoir contents.
     previous_frame_tlas: Option<Tlas>,
     previous_frame_light_entities: Vec<Entity>,
+    previous_frame_instance_entities: Vec<Entity>,
+    pending_tlas: Option<Tlas>,
+    pending_light_entities: Vec<Entity>,
+    pending_instance_entities: Vec<Entity>,
+    /// Set by the lighting node once its dispatches are recorded.
+    pub(crate) node_dispatched: AtomicBool,
 }
 
 pub fn prepare_raytracing_scene_bindings(
@@ -78,18 +100,36 @@ pub fn prepare_raytracing_scene_bindings(
 ) {
     raytracing_scene_bindings.bind_group = None;
 
-    let previous_frame_tlas = raytracing_scene_bindings.previous_frame_tlas.take();
+    // Promote last build's pending state only if the lighting node consumed
+    // it (reservoirs advanced to that frame's ids). Otherwise drop it: the
+    // reservoirs still hold the older frame's ids and the retained
+    // previous_frame_* state must keep describing that frame.
+    if raytracing_scene_bindings
+        .node_dispatched
+        .swap(false, Ordering::Relaxed)
+    {
+        let bindings = &mut *raytracing_scene_bindings;
+        bindings.previous_frame_tlas = bindings.pending_tlas.take();
+        bindings.previous_frame_light_entities = mem::take(&mut bindings.pending_light_entities);
+        bindings.previous_frame_instance_entities =
+            mem::take(&mut bindings.pending_instance_entities);
+    } else {
+        let bindings = &mut *raytracing_scene_bindings;
+        bindings.pending_tlas = None;
+        bindings.pending_light_entities.clear();
+        bindings.pending_instance_entities.clear();
+    }
 
     let mut this_frame_entity_to_light_id = EntityHashMap::<u32>::default();
-    let previous_frame_light_entities: Vec<_> = raytracing_scene_bindings
-        .previous_frame_light_entities
-        .drain(..)
-        .collect();
+    let mut this_frame_light_entities = Vec::new();
 
     let instance_count = instances_query.iter().len() + geometry_query.iter().len();
     if instance_count == 0 {
         return;
     }
+
+    let mut this_frame_entity_to_instance_id = EntityHashMap::<u32>::default();
+    let mut this_frame_instance_entities: Vec<Entity> = Vec::with_capacity(instance_count);
 
     let mut vertex_buffers = CachedBindingArray::new();
     let mut index_buffers = CachedBindingArray::new();
@@ -111,6 +151,7 @@ pub fn prepare_raytracing_scene_bindings(
     let mut light_sources = StorageBufferList::<GpuLightSource>::default();
     let mut directional_lights = StorageBufferList::<GpuDirectionalLight>::default();
     let mut previous_frame_light_id_translations = StorageBufferList::<u32>::default();
+    let mut previous_frame_instance_id_translations = StorageBufferList::<u32>::default();
 
     let mut material_id_map: HashMap<AssetId<StandardMaterial>, u32, FixedHasher> =
         HashMap::default();
@@ -235,11 +276,11 @@ pub fn prepare_raytracing_scene_bindings(
                 ));
 
             this_frame_entity_to_light_id.insert(entity, light_sources.get().len() as u32 - 1);
-            raytracing_scene_bindings
-                .previous_frame_light_entities
-                .push(entity);
+            this_frame_light_entities.push(entity);
         }
 
+        this_frame_entity_to_instance_id.insert(entity, instance_id as u32);
+        this_frame_instance_entities.push(entity);
         instance_id += 1;
     }
 
@@ -322,11 +363,11 @@ pub fn prepare_raytracing_scene_bindings(
                 ));
 
             this_frame_entity_to_light_id.insert(entity, light_sources.get().len() as u32 - 1);
-            raytracing_scene_bindings
-                .previous_frame_light_entities
-                .push(entity);
+            this_frame_light_entities.push(entity);
         }
 
+        this_frame_entity_to_instance_id.insert(entity, instance_id as u32);
+        this_frame_instance_entities.push(entity);
         instance_id += 1;
     }
 
@@ -345,17 +386,32 @@ pub fn prepare_raytracing_scene_bindings(
             .push(GpuLightSource::new_directional_light(directional_light_id));
 
         this_frame_entity_to_light_id.insert(entity, light_sources.get().len() as u32 - 1);
-        raytracing_scene_bindings
-            .previous_frame_light_entities
-            .push(entity);
+        this_frame_light_entities.push(entity);
     }
 
-    for previous_frame_light_entity in previous_frame_light_entities {
+    // Iterated by reference, not drained: the lists must survive until a
+    // frame the node actually consumes, which is when promotion replaces them.
+    for previous_frame_light_entity in &raytracing_scene_bindings.previous_frame_light_entities {
         let current_frame_index = this_frame_entity_to_light_id
-            .get(&previous_frame_light_entity)
+            .get(previous_frame_light_entity)
             .copied()
             .unwrap_or(LIGHT_NOT_PRESENT_THIS_FRAME);
         previous_frame_light_id_translations
+            .get_mut()
+            .push(current_frame_index);
+    }
+
+    // Same scheme as the light id translation table, but for TLAS instance ids: maps a
+    // previous-frame instance id to this frame's id so GI reservoirs can re-anchor their
+    // reconnection vertices onto moved or rebuilt geometry.
+    for previous_frame_instance_entity in
+        &raytracing_scene_bindings.previous_frame_instance_entities
+    {
+        let current_frame_index = this_frame_entity_to_instance_id
+            .get(previous_frame_instance_entity)
+            .copied()
+            .unwrap_or(INSTANCE_NOT_PRESENT_THIS_FRAME);
+        previous_frame_instance_id_translations
             .get_mut()
             .push(current_frame_index);
     }
@@ -372,6 +428,7 @@ pub fn prepare_raytracing_scene_bindings(
     light_sources.write_buffer(&render_device, &render_queue);
     directional_lights.write_buffer(&render_device, &render_queue);
     previous_frame_light_id_translations.write_buffer(&render_device, &render_queue);
+    previous_frame_instance_id_translations.write_buffer(&render_device, &render_queue);
 
     let mut command_encoder = render_device.create_command_encoder(&CommandEncoderDescriptor {
         label: Some("tlas_build_command_encoder"),
@@ -400,6 +457,8 @@ pub fn prepare_raytracing_scene_bindings(
             &fallback_texture.d2.sampler,
         ));
 
+    let previous_frame_tlas = raytracing_scene_bindings.previous_frame_tlas.clone();
+
     raytracing_scene_bindings.bind_group = Some(render_device.create_bind_group(
         "raytracing_scene_bind_group",
         &pipeline_cache.get_bind_group_layout(&raytracing_scene_bindings.bind_group_layout),
@@ -420,10 +479,13 @@ pub fn prepare_raytracing_scene_bindings(
             previous_frame_light_id_translations.binding().unwrap(),
             dfg_view,
             dfg_sampler,
+            previous_frame_instance_id_translations.binding().unwrap(),
         )),
     ));
 
-    raytracing_scene_bindings.previous_frame_tlas = Some(tlas);
+    raytracing_scene_bindings.pending_tlas = Some(tlas);
+    raytracing_scene_bindings.pending_light_entities = this_frame_light_entities;
+    raytracing_scene_bindings.pending_instance_entities = this_frame_instance_entities;
 }
 
 impl RaytracingSceneBindings {
@@ -452,11 +514,17 @@ impl RaytracingSceneBindings {
                         storage_buffer_read_only_sized(false, None),
                         texture_2d(TextureSampleType::Float { filterable: true }),
                         sampler(SamplerBindingType::Filtering),
+                        storage_buffer_read_only_sized(false, None),
                     ),
                 ),
             ),
             previous_frame_tlas: None,
             previous_frame_light_entities: Vec::new(),
+            previous_frame_instance_entities: Vec::new(),
+            pending_tlas: None,
+            pending_light_entities: Vec::new(),
+            pending_instance_entities: Vec::new(),
+            node_dispatched: AtomicBool::new(false),
         }
     }
 }

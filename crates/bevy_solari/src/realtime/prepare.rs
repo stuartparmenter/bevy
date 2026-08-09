@@ -36,7 +36,7 @@ const LIGHT_SAMPLE_STRUCT_SIZE: u64 = 8;
 const RESOLVED_LIGHT_SAMPLE_STRUCT_SIZE: u64 = 24;
 
 /// Size of the `Reservoir` shader struct in bytes.
-const RESERVOIR_STRUCT_SIZE: u64 = 48;
+const RESERVOIR_STRUCT_SIZE: u64 = 64;
 
 pub const LIGHT_TILE_BLOCKS: u64 = 128;
 pub const LIGHT_TILE_SAMPLES_PER_BLOCK: u64 = 1024;

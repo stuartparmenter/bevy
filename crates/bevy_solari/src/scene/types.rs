@@ -66,6 +66,12 @@ pub enum RaytracingGeometryUpdateMode {
 /// Both buffers need `STORAGE | BLAS_INPUT` usage. Insert once; for
 /// [`RaytracingGeometryUpdateMode::RebuildEveryFrame`] the producer re-fills
 /// the contents in place each frame.
+///
+/// Motion contract: solari does not double-buffer these buffers, so
+/// previous-frame positions are reconstructed as the previous-frame transform
+/// applied to the *current* vertex data. Consumers (e.g. specular motion
+/// vectors) see rigid motion only; in-place re-fills contribute no
+/// deformation motion.
 #[derive(Component, Clone)]
 pub struct RaytracingGeometryBuffers {
     /// `array<PackedVertex>`, [`VERTEX_STRIDE`](Self::VERTEX_STRIDE) bytes each.
