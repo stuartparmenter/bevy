@@ -200,9 +200,16 @@ struct GeometryBlasEntry {
     /// Which buffers the BLAS was built from. Swapping in new buffers (even
     /// with the same counts) must trigger a fresh build.
     buffer_ids: (BufferId, BufferId),
-    /// Whether the binder should build this BLAS this frame. Recomputed here
-    /// every frame; the binder folds the builds into its TLAS build
-    /// submission, saving a separate encoder + submit.
+    /// The mode the BLAS was allocated for. A mode flip must reallocate: the
+    /// modes use different build flags, and `RebuildEveryFrame` needs
+    /// `previous_blas` provisioned — reusing a `BuildOnce` entry would
+    /// rebuild in place against the retained previous-frame TLAS.
+    update_mode: RaytracingGeometryUpdateMode,
+    /// Whether the binder should build this BLAS this frame. Set here; the
+    /// binder folds the builds into its TLAS build submission (saving a
+    /// separate encoder + submit) and clears the flag via
+    /// [`GeometryBlasManager::mark_built`]. A flag the binder never cleared
+    /// (it early-returned before submitting) stays pending and is retried.
     pending_build: bool,
 }
 
@@ -215,6 +222,15 @@ impl GeometryBlasManager {
         self.blas
             .get(entity)
             .map(|entry| (&entry.blas, entry.pending_build.then_some(&entry.size)))
+    }
+
+    /// Marks `entity`'s pending build as recorded. The binder calls this only
+    /// after the build actually made it into its submission; entries still
+    /// pending next frame are retried.
+    pub(crate) fn mark_built(&mut self, entity: Entity) {
+        if let Some(entry) = self.blas.get_mut(&entity) {
+            entry.pending_build = false;
+        }
     }
 }
 
@@ -252,14 +268,28 @@ pub fn prepare_raytracing_geometry_blas(
             Some(entry)
                 if entry.size.vertex_count == buffers.vertex_count
                     && entry.size.index_count == Some(buffers.index_count)
-                    && entry.buffer_ids == buffer_ids =>
+                    && entry.buffer_ids == buffer_ids
+                    && entry.update_mode == buffers.update_mode =>
             {
-                entry.pending_build = rebuild_every_frame;
-                if rebuild_every_frame && let Some(previous_blas) = &mut entry.previous_blas {
+                // A build the binder didn't consume last frame (it early-
+                // returned before submitting) must stay pending, or a
+                // `BuildOnce` BLAS would never be built while the TLAS
+                // references it. Skip the swap in that case too: it already
+                // happened when the build was first marked, and swapping
+                // again would target the BLAS the retained previous-frame
+                // TLAS still references.
+                let unconsumed = entry.pending_build;
+                entry.pending_build = unconsumed || rebuild_every_frame;
+                if rebuild_every_frame
+                    && !unconsumed
+                    && let Some(previous_blas) = &mut entry.previous_blas
+                {
                     core::mem::swap(&mut entry.blas, previous_blas);
                 }
             }
-            // New, resized, or re-buffered geometry: allocate fresh.
+            // New, resized, re-buffered, or mode-flipped geometry: allocate
+            // fresh. The old BLAS (if any) stays alive through the retained
+            // previous-frame TLAS's instance reference and is never rebuilt.
             _ => {
                 let (blas, size) = allocate_geometry_blas(buffers, &render_device);
                 let previous_blas =
@@ -271,6 +301,7 @@ pub fn prepare_raytracing_geometry_blas(
                         previous_blas,
                         size,
                         buffer_ids,
+                        update_mode: buffers.update_mode,
                         pending_build: true,
                     },
                 );

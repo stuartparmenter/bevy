@@ -12,7 +12,7 @@ pub use types::{
 };
 
 use crate::SolariPlugins;
-use bevy_app::{App, Plugin};
+use bevy_app::{App, Plugin, PreUpdate};
 use bevy_ecs::schedule::IntoScheduleConfigs;
 use bevy_render::{
     mesh::{
@@ -32,7 +32,7 @@ use blas::{
 use extract::{
     extract_raytracing_material_assets, extract_raytracing_scene_meshes_and_materials,
     extract_raytracing_scene_structural, extract_raytracing_scene_transforms,
-    StandardMaterialAssets,
+    update_raytracing_previous_global_transforms, StandardMaterialAssets,
 };
 use producer::submit_raytracing_producers;
 use tracing::warn;
@@ -45,6 +45,16 @@ impl Plugin for RaytracingScenePlugin {
         load_shader_library!(app, "brdf.wesl");
         load_shader_library!(app, "bindings.wesl");
         load_shader_library!(app, "sampling.wesl");
+
+        // Same cadence as bevy_pbr's `update_mesh_previous_global_transforms`,
+        // which only covers `Mesh3d` (and meshlet) entities. The two systems
+        // can both match a meshlet + raytracing entity, but write identical
+        // values, so their relative order is immaterial.
+        app.add_systems(
+            PreUpdate,
+            update_raytracing_previous_global_transforms
+                .ambiguous_with(bevy_pbr::update_mesh_previous_global_transforms),
+        );
     }
 
     fn finish(&self, app: &mut App) {

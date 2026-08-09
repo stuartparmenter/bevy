@@ -65,7 +65,7 @@ pub fn prepare_raytracing_scene_bindings(
     directional_lights_query: Query<(Entity, &ExtractedDirectionalLight)>,
     mesh_allocator: Res<MeshAllocator>,
     blas_manager: Res<BlasManager>,
-    geometry_blas_manager: Res<GeometryBlasManager>,
+    mut geometry_blas_manager: ResMut<GeometryBlasManager>,
     material_assets: Res<StandardMaterialAssets>,
     texture_assets: Res<RenderAssets<GpuImage>>,
     fallback_texture: Res<FallbackImage>,
@@ -249,12 +249,14 @@ pub fn prepare_raytracing_scene_bindings(
     // into this system's build_acceleration_structures call below, saving a
     // separate encoder + submit per frame.
     let mut geometry_blas_builds = Vec::new();
+    let mut built_geometry = Vec::new();
     for (entity, buffers, material, transform, previous_frame_transform) in &geometry_query {
         let Some((blas, pending_build)) = geometry_blas_manager.get_with_pending_build(&entity)
         else {
             continue;
         };
         if let Some(size) = pending_build {
+            built_geometry.push(entity);
             geometry_blas_builds.push(BlasBuildEntry {
                 blas,
                 geometry: BlasGeometries::TriangleGeometries(vec![BlasTriangleGeometry {
@@ -382,6 +384,13 @@ pub fn prepare_raytracing_scene_bindings(
         time_span.end(&mut command_encoder);
     }
     render_queue.submit([command_encoder.finish()]);
+
+    // The pending builds are now recorded and submitted; anything skipped by
+    // an early return above stays pending and is retried next frame.
+    drop(geometry_blas_builds);
+    for entity in built_geometry {
+        geometry_blas_manager.mark_built(entity);
+    }
 
     let (dfg_view, dfg_sampler) = texture_assets
         .get(&dfg_lut.texture)
