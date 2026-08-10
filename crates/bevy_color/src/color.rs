@@ -610,12 +610,8 @@ impl Color {
 
     /// Creates a new [`Color`] object storing a [`LinearRec2020`] color.
     ///
-    /// # Arguments
-    ///
-    /// * `red` - Red channel. [0.0, 1.0] for SDR colors
-    /// * `green` - Green channel. [0.0, 1.0] for SDR colors
-    /// * `blue` - Blue channel. [0.0, 1.0] for SDR colors
-    /// * `alpha` - Alpha channel. [0.0, 1.0]
+    /// Components are linear, with 1.0 as reference white. Values above 1.0 are brighter
+    /// than white, and negative values lie outside the Rec. 2020 gamut.
     pub const fn rec2020a(red: f32, green: f32, blue: f32, alpha: f32) -> Self {
         Self::LinearRec2020(LinearRec2020 {
             red,
@@ -642,16 +638,9 @@ impl Color {
     /// `color(display-p3 ...)`.
     ///
     /// The gamma-encoded components are decoded and converted into the [`LinearRec2020`]
-    /// color space.
+    /// color space. 1.0 is reference white, and values above it are brighter than white.
     /// Colors at the edge of P3's red corner lie just outside Rec. 2020 and can produce
     /// a small negative blue component.
-    ///
-    /// # Arguments
-    ///
-    /// * `red` - Red channel. [0.0, 1.0]
-    /// * `green` - Green channel. [0.0, 1.0]
-    /// * `blue` - Blue channel. [0.0, 1.0]
-    /// * `alpha` - Alpha channel. [0.0, 1.0]
     pub fn display_p3a(red: f32, green: f32, blue: f32, alpha: f32) -> Self {
         let matrix = rgb_to_rgb_matrix(RgbPrimaries::DISPLAY_P3, RgbPrimaries::BT2020);
         let linear = matrix
