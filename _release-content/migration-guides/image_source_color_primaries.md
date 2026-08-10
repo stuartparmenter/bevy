@@ -7,20 +7,14 @@ pull_requests: []
 `source_primaries: SourceColorPrimaries`, recording which color primaries (gamut) the
 image data is expressed in: `Bt709` (the sRGB primaries, and the default), `Bt2020`,
 or `DisplayP3`. It is metadata only: decoding, storage, and rendering are unchanged.
-See the "Wide-gamut color" release note.
+See the release note "Wide-gamut color: Rec.2020 in `bevy_color` and an opt-in wide
+working color space".
 
 Every `Image` constructor (`Image::new`, `Image::new_fill`, `Image::default`,
 `Image::from_buffer`, `Image::from_dynamic`, ...) initializes the field to
 `SourceColorPrimaries::Bt709`. Struct-literal construction must add it:
 
 ```rust
-// 0.19
-let image = Image {
-    data,
-    texture_descriptor,
-    // ...
-};
-
 // 0.20
 let image = Image {
     data,

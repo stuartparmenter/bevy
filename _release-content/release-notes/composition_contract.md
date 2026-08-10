@@ -5,40 +5,37 @@ pull_requests: []
 ---
 
 Cameras that share a main texture and form a stack now resolve their
-`CompositingSpace` as one group. Give every stack member the same
-`CompositingSpace`, or none: if they conflict, or if any member is not a 2D
-camera, the group resolves to linear with a warning. A solo camera, or one that
-clears or renders to a viewport, keeps its own request.
+`CompositingSpace` as one group. A group is a stack when every camera after the
+first has `ClearColorConfig::None` and no viewport. Give every stack member the
+same `CompositingSpace`, or none: if they conflict, or if any member is not a 2D
+camera, the group resolves to linear with a warning. Cameras that do not form a
+stack keep their own requests.
 
-A `Tonemapping::None` overlay can make one camera finalize tone mapping and a
-different camera finalize encoding. Bevy will not encode a buffer before it is
-tone-mapped, so when the stack shape would force that, tone-map deferral is
-cancelled for the whole stack and Bevy warns.
+Tone mapping and display encoding resolve per stack too. A buffer is never
+encoded before it is tone-mapped, so when the stack shape would force that,
+tone-map deferral is cancelled for the whole stack, with a warning.
 
 ## What this fixes
 
-- Encoder source gamut. A `Tonemapping::GranTurismo7` 3D camera under a
-  `Tonemapping::None` 2D overlay on a PQ target used to double-expand Rec.709
-  to Rec.2020 over a buffer already in Rec.2020, oversaturating the image.
+- The display encoder now takes its source gamut from the camera that
+  tone-mapped the stack. A `Tonemapping::None` overlay over a
+  `Tonemapping::GranTurismo7` camera used to expand Rec.709 to Rec.2020 twice on
+  a PQ target, oversaturating the image.
 
-- Uncovered regions on HDR targets. Regions no camera covers used to show a raw
+- Regions of an HDR display target that no camera covers used to show a raw
   linear value that read as full-peak nits. They now show the clear color,
   encoded for the resolved transfer, gamut, and paper white.
 
-- Deterministic mixed-HDR stacks. A default-tone-mapped 3D camera and an `Hdr`
-  2D overlay on one target used to overwrite each other in a nondeterministic
-  order. The overlay now composites over the base.
+- A default-tone-mapped 3D camera and an `Hdr` 2D overlay on one target used to
+  blit over each other with a replacing blend. The overlay now composites over
+  the base.
 
-- FXAA luma and UI encoding. FXAA's edge luma took the square root of a Rec.601
-  dot that goes negative on an Oklab buffer's signed chroma, producing NaN. UI
-  wrote linear values into the camera's encoded buffer, so its colors were wrong
-  on `Srgb` and `Oklab` views.
+- FXAA's edge luma called `sqrt` on a Rec.601 dot that goes negative on a
+  `CompositingSpace::Oklab` buffer's signed chroma, producing NaN. UI wrote
+  linear Rec.709 values into the camera's buffer, so its colors were wrong on
+  `Srgb` and `Oklab` views, and oversaturated on an HDR-target GT7 view whose
+  buffer holds Rec.2020 primaries.
 
-- UI and gizmo wide-gamut colors. UI and gizmos authored their colors in Rec.709
-  and wrote them unconverted into the post-tone-map buffer. On a GT7 HDR view
-  that buffer holds Rec.2020 primaries, so saturated colors oversaturated.
-
-Default SDR projects render byte-for-byte identically. The changes above only
-affect camera stacks, non-default compositing spaces, and HDR output. See the
-"`ViewTarget::compositing_space` removed" migration guide for adapting custom
-render code.
+Default SDR projects render byte-for-byte identically. For adapting custom
+render code, see the migration guide "`ViewTarget::compositing_space` removed:
+camera compositing resolves once per frame".
