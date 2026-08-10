@@ -433,12 +433,7 @@ fn receive_image_from_buffer(
         r.recv().expect("Failed to receive the map_async message");
 
         // This could fail on app exit, if Main world clears resources (including receiver) while Render world still renders
-        let _ = sender.send(
-            buffer_slice
-                .get_mapped_range()
-                .expect("buffer should be mapped")
-                .to_vec(),
-        );
+        let _ = sender.send(buffer_slice.get_mapped_range().unwrap().to_vec());
 
         // We need to make sure all `BufferView`'s are dropped before we do what we're about
         // to do.

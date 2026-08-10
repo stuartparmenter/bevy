@@ -270,7 +270,6 @@ pub async fn initialize_renderer(
         power_preference: options.power_preference,
         compatible_surface: surface.as_ref(),
         force_fallback_adapter,
-        // Keep adapter limits exactly as the driver reports them.
         apply_limit_buckets: false,
     };
 

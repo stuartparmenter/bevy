@@ -11,8 +11,8 @@ use bevy_ecs::system::{Res, ResMut};
 use bevy_platform::time::Instant;
 use std::sync::Mutex;
 use wgpu::{
-    Buffer, BufferDescriptor, BufferSlice, BufferUsages, CommandEncoder, ComputePass, Device,
-    Features, MapMode, PipelineStatisticsTypes, QuerySet, QuerySetDescriptor, QueryType,
+    Buffer, BufferDescriptor, BufferSize, BufferSlice, BufferUsages, CommandEncoder, ComputePass,
+    Device, Features, MapMode, PipelineStatisticsTypes, QuerySet, QuerySetDescriptor, QueryType,
     RenderPass,
 };
 
@@ -151,7 +151,7 @@ impl RecordDiagnostics for DiagnosticsRecorder {
     {
         assert_eq!(
             buffer.size(),
-            4,
+            BufferSize::new(4).unwrap().get(),
             "DiagnosticsRecorder::record_f32 buffer slice must be 4 bytes long"
         );
         assert!(
@@ -169,7 +169,7 @@ impl RecordDiagnostics for DiagnosticsRecorder {
     {
         assert_eq!(
             buffer.size(),
-            4,
+            BufferSize::new(4).unwrap().get(),
             "DiagnosticsRecorder::record_u32 buffer slice must be 4 bytes long"
         );
         assert!(
@@ -533,9 +533,7 @@ impl FrameData {
             }
 
             for (buffer, diagnostic_path, is_f32) in self.value_buffers.drain(..) {
-                let buffer = buffer
-                    .get_mapped_range(..)
-                    .expect("diagnostic value buffer should be mapped");
+                let buffer = buffer.get_mapped_range(..).unwrap();
                 diagnostics.push(RenderDiagnostic {
                     path: DiagnosticPath::from_components(
                         core::iter::once("render")
@@ -580,10 +578,7 @@ impl FrameData {
             return true;
         };
 
-        let data = read_buffer
-            .slice(..)
-            .get_mapped_range()
-            .expect("diagnostics read buffer should be mapped");
+        let data = read_buffer.slice(..).get_mapped_range().unwrap();
 
         let timestamps = data[..(self.num_timestamps * 8) as usize]
             .as_chunks()
@@ -680,9 +675,7 @@ impl FrameData {
         }
 
         for (buffer, diagnostic_path, is_f32) in self.value_buffers.drain(..) {
-            let buffer = buffer
-                .get_mapped_range(..)
-                .expect("diagnostic value buffer should be mapped");
+            let buffer = buffer.get_mapped_range(..).unwrap();
             diagnostics.push(RenderDiagnostic {
                 path: DiagnosticPath::from_components(
                     core::iter::once("render").chain(core::iter::once(diagnostic_path.as_ref())),

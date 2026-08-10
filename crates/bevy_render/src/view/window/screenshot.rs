@@ -784,9 +784,7 @@ pub(crate) fn collect_screenshots(world: &mut World) {
                 tx.try_send(()).unwrap();
             });
             rx.recv().await.unwrap();
-            let data = buffer_slice
-                .get_mapped_range()
-                .expect("screenshot buffer should be mapped");
+            let data = buffer_slice.get_mapped_range().unwrap();
             // we immediately move the data to CPU memory to avoid holding the mapped view for long
             let mut result = Vec::from(&*data);
             drop(data);
