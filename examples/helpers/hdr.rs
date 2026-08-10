@@ -29,8 +29,10 @@ use bevy::{
 };
 
 /// The transfer/gamut pair selection falls back to when no HDR transfer applies.
-const SDR_FALLBACK: (DisplayTransfer, DisplayGamut) =
-    (DisplayTarget::SDR_SRGB.transfer, DisplayTarget::SDR_SRGB.gamut);
+const SDR_FALLBACK: (DisplayTransfer, DisplayGamut) = (
+    DisplayTarget::SDR_SRGB.transfer,
+    DisplayTarget::SDR_SRGB.gamut,
+);
 
 /// Requests the best supported HDR output for the primary window, falling back
 /// to SDR.
