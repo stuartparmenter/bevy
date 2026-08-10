@@ -9,15 +9,13 @@
 // Unit convention: the operator works on linear Rec.2020 RGB "frame buffer
 // values" where 1.0 is 100 nits.
 
-// Precomputed parameters for the GT7 tone-mapping pipeline.
+// Precomputed parameters for the GT7 tone-mapping pipeline. Under
+// GT7_PARAMS_UNIFORM, filled per view from the `Gt7ParamsUniform` buffer in
+// gt7.rs; keep the field order in sync.
 //
 // `k_a`, `k_b`, `k_c` and `peak_ucs` are closed-form products of the
 // user-facing parameters, computed once on the CPU instead of per pixel (see
 // `Gt7ParamsUniform::from_params` in gt7.rs).
-//
-// Under the GT7_PARAMS_UNIFORM shader def this struct is filled per view from
-// the `Gt7ParamsUniform` buffer (gt7.rs; keep the field order in sync).
-// Without the def it holds the baked defaults from `gt7_default_sdr_params()`.
 struct Gt7Params {
     // Display peak in frame-buffer units (peak_nits / 100).
     peak: f32,
@@ -25,7 +23,6 @@ struct Gt7Params {
     k_a: f32,
     k_b: f32,
     k_c: f32,
-    // Curve shape.
     mid_point: f32,
     linear_section: f32,
     toe_strength: f32,
@@ -42,17 +39,15 @@ struct Gt7Params {
     sdr_correction_factor: f32,
 }
 
-// Per-view GT7 parameters prepared on the CPU (`Gt7ParamsUniform` in gt7.rs).
 // Bound only when the pipeline is specialized with the GT7_PARAMS_UNIFORM
 // shader def (see `gt7_params_uniform_active` in tonemapping/mod.rs). The
-// binding index is pushed as a shader def so other bind groups can rebind it
-// elsewhere; it is 5 in the tonemapping pass.
+// binding index is a shader def so other bind groups can rebind it elsewhere;
+// it is 5 in the tonemapping pass.
 @if(GT7_PARAMS_UNIFORM)
 @group(0) @binding(constants::GT7_PARAMS_BINDING_INDEX) var<uniform> gt7_params_uniform: Gt7Params;
 
-// Default SDR-mode parameters (curve defaults alpha = 0.25, mid_point = 0.538,
-// linear_section = 0.444, toe_strength = 1.28 at peak 2.5 fb = 250 nits).
-// Derived constants are f64-precision evaluations of the closed forms in
+// Default SDR-mode parameters, at alpha = 0.25 and peak 2.5 fb (250 nits).
+// The derived constants are f64-precision evaluations of the closed forms in
 // `Gt7ParamsUniform::from_params` (gt7.rs).
 fn gt7_default_sdr_params() -> Gt7Params {
     var params: Gt7Params;
@@ -86,12 +81,10 @@ const GT7_REFERENCE_LUMINANCE: f32 = 100.0;
 const GT7_SDR_PAPER_WHITE: f32 = 250.0;
 
 // Full-precision linear Rec.709 -> Rec.2020 matrix (D65, per ITU-R BT.2087).
-// Bevy's working space is currently scene-linear Rec.709 and the operator is
-// native Rec.2020, so the input is expanded unless WORKING_COLOR_SPACE_REC2020
-// is set. The literals are duplicated from
+// The literals are duplicated from
 // `bevy_render::working_color_space::REC709_TO_REC2020` because this module
-// imports nothing, which keeps it self-contained and fixture-locked. Keep them
-// identical: `matrices_match_wgsl_f64_literals` there locks them bitwise.
+// imports nothing. Keep them identical: `matrices_match_wgsl_f64_literals`
+// there locks them bitwise.
 const GT7_REC_709_TO_REC_2020 = mat3x3<f32>(
     0.627403895934699, 0.06909728935823199, 0.016391438875150228,   // column 0
     0.32928303837788375, 0.919540395075459, 0.08801330787722578,    // column 1
@@ -169,9 +162,8 @@ fn gt7_ictcp_to_rgb(ictcp: vec3<f32>) -> vec3<f32> {
 
 // The "GT Tone Mapping" curve (V2) with a convergent shoulder, evaluated per
 // channel: a power-curve toe blended into an exactly-linear middle section,
-// then an exponential shoulder. The shoulder asymptote (k_a is about
-// 1.185 * peak at default parameters) never reaches the operator output
-// because `gt7_tone_map` clamps at the peak.
+// then an exponential shoulder. The shoulder asymptote k_a is about
+// 1.185 * peak at default parameters, above the peak clamp in `gt7_tone_map`.
 fn gt7_evaluate_curve(x: f32, params: Gt7Params) -> f32 {
     if x < 0.0 {
         return 0.0;
@@ -199,7 +191,6 @@ fn gt7_tone_map(rgb: vec3<f32>, params: Gt7Params) -> vec3<f32> {
     // Convert to UCS to separate luminance and chroma.
     let ucs = gt7_rgb_to_ictcp(rgb);
 
-    // Per-channel tone mapping ("skewed" color).
     let skewed_rgb = vec3(
         gt7_evaluate_curve(rgb.r, params),
         gt7_evaluate_curve(rgb.g, params),
@@ -217,46 +208,32 @@ fn gt7_tone_map(rgb: vec3<f32>, params: Gt7Params) -> vec3<f32> {
 
     let scaled_rgb = gt7_ictcp_to_rgb(scaled_ucs);
 
-    // Final blend between per-channel and UCS-scaled results, clamped at the
-    // peak.
     let blended = (1.0 - params.blend_ratio) * skewed_rgb + params.blend_ratio * scaled_rgb;
     return params.sdr_correction_factor * min(blended, vec3(params.peak));
 }
 
 // Integration seam for Bevy's tone-mapping pass, dispatched as
-// `TONEMAP_METHOD_GRAN_TURISMO_7` from `tone_mapping()` in
-// tonemapping.wesl. The CPU reference in gt7.rs covers the operator
-// itself (`cpu_reference::apply`), not the four working-space/output-gamut
-// combinations below. Those are unverified until a GPU readback test exists.
+// `TONEMAP_METHOD_GRAN_TURISMO_7` from `tone_mapping()` in tonemapping.wesl.
+// The CPU reference in gt7.rs covers the operator itself, not the four
+// working-space/output-gamut combinations below. Those stay unverified until a
+// GPU readback test exists.
 //
-// Contract:
-// 1. Input is Bevy's scene-linear working space (1.0 is about SDR paper
-//    white). The default working space is Rec.709 and is converted to the
-//    operator's native linear Rec.2020. Under WORKING_COLOR_SPACE_REC2020 the
-//    input is already native Rec.2020 and the expansion is skipped. This is
-//    the one Bevy tonemapper that takes the wide working space without a
-//    gamut-clipping entry conversion (see tonemapping.wesl).
-// 2. Multiply by 2.5, so Bevy's 1.0 maps to GT7's 250-nit paper white
-//    (2.5 frame-buffer units). The input scaling is the same in SDR and HDR
-//    mode (paper-white strategy (a)), so the curve always sees Gran Turismo's
-//    250-nit-calibrated scene.
-// 3. Run the operator. The prepared params uniform selects SDR or HDR mode
-//    (see `Gt7ParamsUniform::new` in gt7.rs). The HDR output is relative to
-//    paper white.
-// 4. Pick the output gamut with the TONEMAP_OUTPUT_REC2020 shader def, pushed
-//    exactly when the view's resolved display transfer is HDR (see
-//    `ResolvedTonemapping::output_gamut` in tonemapping/mod.rs, the single
-//    source of truth shared with the display encoder's input-gamut contract):
-//    - Without the def (every SDR view): convert Rec.2020 -> Rec.709 and clamp
-//      to [0, 1], because out-of-gamut Rec.2020 results have no SDR Rec.709
-//      representation. The conversion is kept under
-//      WORKING_COLOR_SPACE_REC2020 too: the pass's SDR output contract is
-//      Rec.709 display-linear, which the SDR chain hardware-encodes to sRGB.
-//    - With the def (HDR-transfer views): emit the operator's native linear
-//      Rec.2020 display-referred output directly, with no back-conversion and
-//      no clamp. The display-encoding pass then does the Rec.2020 -> display
-//      transform: identity for PQ/Rec.2020, and the Rec.709 contraction plus
-//      out-of-gamut compression for scRGB.
+// The input is Bevy's scene-linear working space, where 1.0 is about SDR paper
+// white. This is the one Bevy tonemapper that takes the wide working space
+// without a gamut-clipping entry conversion (see tonemapping.wesl). The 2.5
+// scale maps Bevy's 1.0 to GT7's 250-nit paper white, in SDR and HDR mode
+// alike, so the curve always sees Gran Turismo's 250-nit-calibrated scene.
+//
+// TONEMAP_OUTPUT_REC2020 picks the output gamut. It is pushed exactly when the
+// view's resolved display transfer is HDR (see
+// `ResolvedTonemapping::output_gamut` in tonemapping/mod.rs, the single source
+// of truth shared with the display encoder's input-gamut contract):
+// - Without the def, convert Rec.2020 -> Rec.709 and clamp to [0, 1], because
+//   out-of-gamut Rec.2020 results have no SDR Rec.709 representation. The
+//   conversion also runs under WORKING_COLOR_SPACE_REC2020, because the pass's
+//   SDR output contract is Rec.709 display-linear.
+// - With the def, emit the operator's native linear Rec.2020 output. The
+//   display-encoding pass does the transform to the display.
 fn tone_mapping_gran_turismo_7(color: vec3<f32>) -> vec3<f32> {
 @if(GT7_PARAMS_UNIFORM)
     let params = gt7_params_uniform;

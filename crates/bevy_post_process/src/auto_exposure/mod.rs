@@ -42,16 +42,15 @@ use bevy_core_pipeline::{
     tonemapping::tonemapping,
 };
 
-/// Plugin for the auto exposure and auto white balance features, which share
-/// one metering compute pass.
+/// Plugin for auto exposure and auto white balance, which share one metering compute pass.
 ///
 /// See [`AutoExposure`] and [`AutoWhiteBalance`] for more details.
 pub struct AutoExposurePlugin;
 
 #[derive(Resource)]
 struct AutoExposureResources {
-    /// The luminance histogram bins, one global buffer shared by all views. Each
-    /// view's `compute_average` drains and clears it before the next view meters.
+    /// The luminance histogram bins, one buffer shared by all views. Each view's
+    /// `compute_average` drains and clears it before the next view meters.
     histogram: Buffer,
 }
 

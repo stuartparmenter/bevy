@@ -106,7 +106,6 @@ struct LineGizmoPipelineKey {
     mesh_key: Mesh2dPipelineKey,
     strip: bool,
     line_style: GizmoLineStyle,
-    /// Resolved compositing space of the buffer the gizmo blends into.
     compositing_space: Option<CompositingSpace>,
 }
 
@@ -196,7 +195,6 @@ struct LineJointGizmoPipeline {
 struct LineJointGizmoPipelineKey {
     mesh_key: Mesh2dPipelineKey,
     joints: GizmoLineJoint,
-    /// Resolved compositing space of the buffer the gizmo blends into.
     compositing_space: Option<CompositingSpace>,
 }
 

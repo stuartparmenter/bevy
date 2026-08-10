@@ -17,8 +17,7 @@ use bevy_utils::default;
 /// every UI pipeline key.
 ///
 /// UI colors are authored in Rec.709 and composite into the post-tonemap
-/// buffer, so the fragment converts and encodes them to match it. The default
-/// key pushes no defs, keeping the SDR shader-def vector byte-identical.
+/// buffer, so the fragment converts and encodes them to match it.
 #[derive(Clone, Copy, Default, Hash, PartialEq, Eq)]
 pub struct UiWriterEncodeKey {
     /// Resolved [`CompositingSpace`] of the view ([`ViewStackContract::compositing_space`]).
@@ -29,8 +28,7 @@ pub struct UiWriterEncodeKey {
 }
 
 impl UiWriterEncodeKey {
-    /// Appends this key's writer-encode shader defs onto `shader_defs`, in
-    /// buffer order: gamut convert first, then the compositing-space encode.
+    /// Appends the writer-encode defs: gamut convert first, then compositing space.
     pub fn push_shader_defs(&self, shader_defs: &mut Vec<ShaderDefVal>) {
         if self.buffer_gamut_rec2020 {
             shader_defs.push("OUTPUT_GAMUT_REC2020".into());
@@ -90,7 +88,6 @@ pub fn init_ui_pipeline(mut commands: Commands, asset_server: Res<AssetServer>) 
 pub struct UiPipelineKey {
     pub target_format: TextureFormat,
     pub anti_alias: bool,
-    /// Writer-side encode of the fragment output (see [`UiWriterEncodeKey`]).
     pub writer_encode: UiWriterEncodeKey,
 }
 
@@ -208,8 +205,7 @@ mod tests {
         );
     }
 
-    /// Def order is part of the shader-cache key, so it has to be the same
-    /// for every pipeline.
+    /// Def order is part of the shader-cache key, so it must be the same for every pipeline.
     #[test]
     fn combined_key_pushes_gamut_then_space() {
         assert_eq!(

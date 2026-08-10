@@ -610,9 +610,6 @@ impl Color {
 
     /// Creates a new [`Color`] object storing a [`LinearRec2020`] color.
     ///
-    /// The components are linear intensities relative to the wide-gamut
-    /// [Rec. 2020](RgbPrimaries::BT2020) primaries. Values above 1.0 are HDR.
-    ///
     /// # Arguments
     ///
     /// * `red` - Red channel. [0.0, 1.0] for SDR colors
@@ -631,12 +628,6 @@ impl Color {
     /// Creates a new [`Color`] object storing a [`LinearRec2020`] color with an alpha of 1.0.
     ///
     /// See [`Color::rec2020a`] for details.
-    ///
-    /// # Arguments
-    ///
-    /// * `red` - Red channel. [0.0, 1.0] for SDR colors
-    /// * `green` - Green channel. [0.0, 1.0] for SDR colors
-    /// * `blue` - Blue channel. [0.0, 1.0] for SDR colors
     pub const fn rec2020(red: f32, green: f32, blue: f32) -> Self {
         Self::LinearRec2020(LinearRec2020 {
             red,
@@ -648,13 +639,12 @@ impl Color {
 
     /// Creates a new [`Color`] object from a [Display P3](RgbPrimaries::DISPLAY_P3)
     /// color: P3 primaries with the sRGB transfer function, as used by CSS
-    /// `color(display-p3 ...)` and wide-gamut color pickers.
+    /// `color(display-p3 ...)`.
     ///
-    /// The gamma-encoded components are decoded and converted into the wider
-    /// [`LinearRec2020`] color space. Display P3 fits almost entirely inside
-    /// Rec. 2020, so nearly all in-range inputs produce non-negative components.
-    /// Colors at the very edge of P3's red corner lie marginally outside Rec. 2020
-    /// and may produce a tiny negative blue component.
+    /// The gamma-encoded components are decoded and converted into the [`LinearRec2020`]
+    /// color space.
+    /// Colors at the edge of P3's red corner lie just outside Rec. 2020 and can produce
+    /// a small negative blue component.
     ///
     /// # Arguments
     ///
@@ -682,12 +672,6 @@ impl Color {
     /// color with an alpha of 1.0.
     ///
     /// See [`Color::display_p3a`] for details.
-    ///
-    /// # Arguments
-    ///
-    /// * `red` - Red channel. [0.0, 1.0]
-    /// * `green` - Green channel. [0.0, 1.0]
-    /// * `blue` - Blue channel. [0.0, 1.0]
     pub fn display_p3(red: f32, green: f32, blue: f32) -> Self {
         Self::display_p3a(red, green, blue, 1.0)
     }
@@ -697,13 +681,12 @@ impl Color {
     /// coordinates: a [`Chromaticity`] `(x, y)` position plus a luminance `Y`, with an
     /// alpha of 1.0.
     ///
-    /// Any visible chromaticity can be expressed this way, including colors outside
-    /// the sRGB and Rec. 2020 gamuts.
+    /// Any visible chromaticity works, including colors outside the sRGB and Rec. 2020 gamuts.
     ///
     /// # Arguments
     ///
-    /// * `x` - CIE 1931 x chromaticity coordinate. Typically [0.0, 0.8]
-    /// * `y` - CIE 1931 y chromaticity coordinate. Typically (0.0, 0.9]; must be non-zero
+    /// * `x` - CIE 1931 x chromaticity coordinate. [0.0, 0.8] for physical colors
+    /// * `y` - CIE 1931 y chromaticity coordinate. (0.0, 0.9] for physical colors; must be non-zero
     /// * `luminance` - Luminance (Y). 1.0 is the reference white luminance; above 1.0 is HDR
     pub const fn cie_xy_y(x: f32, y: f32, luminance: f32) -> Self {
         let xyz = Chromaticity::new(x, y).to_xyz(luminance);
@@ -1388,14 +1371,12 @@ mod tests {
         assert_approx_eq!(linear.green, -0.0421, 1e-3);
         assert_approx_eq!(linear.blue, -0.0196, 1e-3);
 
-        // Alpha is carried through.
         let translucent = Color::display_p3a(0.5, 0.5, 0.5, 0.25);
         assert_approx_eq!(translucent.alpha(), 0.25, 1e-6);
     }
 
     #[test]
     fn cie_xy_y_constructor() {
-        // D65 white at unit luminance.
         let white = Color::cie_xy_y(0.3127, 0.3290, 1.0);
         let Color::Xyza(xyza) = white else {
             panic!("cie_xy_y must produce a Color::Xyza, got {white:?}");
@@ -1405,7 +1386,6 @@ mod tests {
         assert_approx_eq!(xyza.z, 1.0890578, 1e-5);
         assert_approx_eq!(xyza.alpha, 1.0, 1e-6);
 
-        // HDR luminance scales linearly.
         let bright = Color::cie_xy_y(0.3127, 0.3290, 5.0);
         let Color::Xyza(bright) = bright else {
             unreachable!();

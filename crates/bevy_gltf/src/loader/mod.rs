@@ -1256,7 +1256,6 @@ async fn load_image<'a, 'b>(
                     ImageSampler::Descriptor(sampler_descriptor),
                     settings.load_materials,
                 )?;
-                // glTF 2.0 core mandates sRGB (BT.709) primaries for all textures.
                 image.source_primaries = SourceColorPrimaries::Bt709;
                 Ok(ImageOrPath::Image {
                     image,

@@ -216,10 +216,9 @@ fn example_control_system(
     if input.just_pressed(KeyCode::KeyP) {
         auto_exposure.physiological = match auto_exposure.physiological {
             Some(_) => None,
-            // The defaults model human eyes, where full dark adaptation takes tens
-            // of minutes. These speeds are much faster and the bounds tighter, so
-            // turning the camera hits the bound within a second, then keeps adapting
-            // slowly after that.
+            // The defaults model human eyes, where full dark adaptation takes tens of
+            // minutes. These speeds are faster and the bounds tighter, so turning the
+            // camera hits the bound within a second.
             None => Some(PhysiologicalAdaptation {
                 speed_brighten: 0.4,
                 speed_darken: 0.1,
@@ -234,8 +233,8 @@ fn example_control_system(
             commands.entity(camera_entity).remove::<AutoWhiteBalance>();
         } else {
             commands.entity(camera_entity).insert(AutoWhiteBalance {
-                // The default speed of 0.5/s settles over a few seconds, like a real
-                // camera. This is faster so toggling the warm light (L) is easy to see.
+                // The default of 0.5/s settles over a few seconds, like a real camera.
+                // This is faster so toggling the warm light (L) is easy to see.
                 speed: 2.0,
                 ..default()
             });

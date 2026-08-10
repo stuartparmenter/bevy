@@ -62,10 +62,9 @@ pub fn tonemapping(
         tonemap_in_shader,
     ) = view.into_inner();
 
-    // `TonemapInShader` cameras fold tone mapping into their material shaders and keep an
-    // 8-bit main texture instead of the fp16 intermediate. Running this node for one would
-    // tone-map a second time. The 8-bit format check is a backstop: every camera that runs
-    // the node-side operator is on an `Rgba16Float` intermediate.
+    // `TonemapInShader` cameras fold tone mapping into their material shaders, so running
+    // this node for one would tone-map twice. Those cameras keep an 8-bit main texture, so
+    // the format check is a backstop: node-side operators always run on `Rgba16Float`.
     if tonemap_in_shader
         || matches!(
             target.main_texture_format(),
@@ -83,9 +82,8 @@ pub fn tonemapping(
     let view_uniforms_buffer = &view_uniforms.uniforms;
     let view_uniforms_id = view_uniforms_buffer.buffer().unwrap().id();
 
-    // Collect the optional GT7 params binding the pipeline was specialized with. The
-    // buffer and index should always be present, since the pipeline was specialized off
-    // `Gt7ParamsUniform`. Skip the pass rather than bind a mismatched layout.
+    // The buffer and index should always be present, since the pipeline was specialized
+    // off `Gt7ParamsUniform`. Skip the pass rather than bind a mismatched layout.
     let needs_gt7_params = view_tonemapping_pipeline.binds_gt7_params;
 
     let gt7_params_binding = if needs_gt7_params {

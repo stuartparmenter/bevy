@@ -98,15 +98,14 @@ pub struct AutoExposure {
 
     /// A constant bias, in exposure values (EV), added to the metered scene luminance.
     ///
-    /// A positive bias meters the scene as brighter than it measured, so the final image is
-    /// darker. A negative bias makes it brighter. It has the same effect as a constant offset
-    /// in the [`compensation_curve`](Self::compensation_curve), but applies before the curve.
+    /// A positive bias meters the scene as brighter than it is, so the image gets darker.
+    /// The offset applies before the [`compensation_curve`](Self::compensation_curve).
     ///
     /// The default value is 0.0.
     pub metering_bias: f32,
 
-    /// Two-stage "physiological" adaptation, layering a slow long-term envelope on top of
-    /// the regular short-term smoothing. See [`PhysiologicalAdaptation`] for details.
+    /// Two-stage adaptation, layering a slow long-term envelope on the short-term
+    /// smoothing. See [`PhysiologicalAdaptation`].
     ///
     /// The default value is `None`, which uses only the short-term smoothing.
     pub physiological: Option<PhysiologicalAdaptation>,
@@ -135,10 +134,9 @@ impl SyncComponent<RenderApp> for AutoExposure {
 impl ExtractComponent<RenderApp> for AutoExposure {
     type QueryData = (&'static AutoExposure, Option<&'static AutoWhiteBalance>);
     type QueryFilter = ();
-    // The uniform folds in the optional `AutoWhiteBalance`, so extraction builds
-    // it here. It runs every frame without change detection, which also covers
-    // `AutoWhiteBalance` being removed on its own. The sanitization warnings in
-    // `build_uniform` stay once-only regardless.
+    // The uniform folds in the optional `AutoWhiteBalance`, so extraction builds it here.
+    // It runs every frame without change detection, which also covers `AutoWhiteBalance`
+    // being removed on its own. The sanitization warnings in `build_uniform` stay once-only.
     type Out = (AutoExposure, AutoExposureUniform);
 
     fn extract_component(
@@ -149,50 +147,45 @@ impl ExtractComponent<RenderApp> for AutoExposure {
 }
 
 /// Settings for two-stage physiological exposure adaptation, enabled through
-/// [`AutoExposure::physiological`].
+/// [`AutoExposure::physiological`]. The model is the one Gran Turismo 7 presented at
+/// SIGGRAPH 2025 ("Physically Based Tone Mapping in Gran Turismo 7").
 ///
-/// Human vision adapts to brightness on two time scales. The model is the one Gran
-/// Turismo 7 presented at SIGGRAPH 2025 ("Physically Based Tone Mapping in Gran Turismo 7"):
+/// Human vision adapts to brightness on two time scales:
 ///
-/// * A short-term stage (pupil constriction and neural gain) that covers a few EV and reacts
+/// * A short-term stage (pupil constriction and neural gain) covers a few EV and reacts
 ///   within seconds. This is the regular [`AutoExposure`] smoothing, driven by
 ///   [`AutoExposure::speed_brighten`] and [`AutoExposure::speed_darken`].
-/// * A long-term stage (receptor sensitivity and photopigment bleaching) that covers the
-///   remaining range, on the order of 12 EV, over minutes to tens of minutes. Adapting to
-///   light is much faster than adapting to darkness.
+/// * A long-term stage (receptor sensitivity and photopigment bleaching) covers the
+///   remaining range, about 12 EV, over minutes to tens of minutes. Adapting to light is
+///   much faster than adapting to darkness.
 ///
-/// When enabled, a long-term envelope is tracked alongside the short-term exposure and
-/// bounds it: the short-term exposure is clamped to
-/// `[envelope - bound_brighten, envelope + bound_darken]`.
-///
-/// The envelope keeps tracking the short-term exposure while this setting is `None`, so
-/// enabling it at runtime transitions smoothly.
+/// The long-term envelope clamps the short-term exposure to
+/// `[envelope - bound_brighten, envelope + bound_darken]`. The envelope keeps tracking the
+/// short-term exposure while this setting is `None`, so enabling it at runtime is smooth.
 ///
 /// All speeds and bounds must be finite and non-negative. Invalid values are reset to their
 /// defaults when the settings are uploaded to the GPU.
 #[derive(Clone, Copy, Debug, PartialEq, Reflect)]
 #[reflect(Default, Clone, PartialEq)]
 pub struct PhysiologicalAdaptation {
-    /// The speed at which the long-term envelope adapts from dark to bright scenes,
-    /// in F-stops per second.
+    /// Speed of the long-term envelope when the scene gets brighter, in F-stops per second.
     ///
-    /// The default value is 0.05, which covers ~12 EV in about 4 minutes.
+    /// The default value is 0.05, which covers 12 EV in about 4 minutes.
     pub speed_brighten: f32,
 
-    /// The speed at which the long-term envelope adapts from bright to dark scenes,
-    /// in F-stops per second.
+    /// Speed of the long-term envelope when the scene gets darker, in F-stops per second.
     ///
-    /// The default value is 0.01, which covers ~12 EV in about 20 minutes.
+    /// The default value is 0.01, which covers 12 EV in about 20 minutes.
     pub speed_darken: f32,
 
     /// How far below the long-term envelope the short-term exposure may drop, in EV,
-    /// when adapting to a scene that became brighter.
+    /// when the scene gets brighter.
     ///
     /// The default value is 3.0.
     pub bound_brighten: f32,
 
     /// How far above the long-term envelope the short-term exposure may rise, in EV,
-    /// when adapting to a scene that became darker.
+    /// when the scene gets darker.
     ///
     /// The default value is 2.0.
     pub bound_darken: f32,

@@ -156,8 +156,8 @@ impl Image {
     /// - `TextureFormat::Rgba16Float` (converted to [`DynamicImage::ImageRgba32F`])
     /// - `TextureFormat::Rgba32Float`
     ///
-    /// The float formats keep their full HDR range, so screenshots of an HDR
-    /// (`Rgba16Float` scRGB-linear) swapchain can be saved.
+    /// The float formats are not clamped to `0..=1`, so screenshots of an HDR
+    /// swapchain keep their full range.
     ///
     /// To convert [`Image`] to a different format see: [`Image::convert`].
     pub fn try_into_dynamic(self) -> Result<DynamicImage, IntoDynamicImageError> {
@@ -274,8 +274,7 @@ mod test {
 
     #[test]
     fn rgba16float_to_dynamic_keeps_hdr_range() {
-        // 2x1 fp16 image with an above-range and a negative component, as an
-        // scRGB-linear screenshot can contain.
+        // 2x1 fp16 image with an above-range and a negative component.
         let pixels: [f32; 8] = [2.5, 1.0, -0.25, 1.0, 0.5, 0.0, 1.0, 0.25];
         let data: Vec<u8> = pixels
             .iter()

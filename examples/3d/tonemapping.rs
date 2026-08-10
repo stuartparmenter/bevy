@@ -22,8 +22,7 @@ const SHADER_ASSET_PATH: &str = "shaders/tonemapping_test_patterns.wesl";
 
 fn main() {
     // Pass `--rec2020` to render in the Rec.2020 working color space, a startup-time
-    // `RenderPlugin` setting. It is the native input space of `Tonemapping::GranTurismo7`.
-    // SDR output stays Rec.709.
+    // `RenderPlugin` setting and the native input space of `Tonemapping::GranTurismo7`.
     let working_color_space = if std::env::args().any(|arg| arg == "--rec2020") {
         bevy::render::WorkingColorSpace::Rec2020
     } else {
@@ -341,16 +340,13 @@ fn toggle_tonemapping_method(
 }
 
 /// Cycles the primary window's HDR output: SDR sRGB, scRGB-linear, extended-sRGB at
-/// Rec.709, extended-sRGB at Display-P3, PQ (HDR10), then back to SDR.
-/// Leaving SDR also switches to `GranTurismo7`, the only HDR-aware operator. GT7
-/// reads the peak luminance off the display target on its own, so this example
-/// never inserts `GranTurismo7Params`.
+/// Rec.709, extended-sRGB at Display-P3, PQ (HDR10), then back to SDR. Leaving SDR also
+/// switches to `GranTurismo7`, the only HDR-aware operator. GT7 reads the peak luminance
+/// off the display target, so this example never inserts `GranTurismo7Params`.
 ///
-/// Real HDR output needs an HDR-capable display and a backend that supports the
-/// requested transfer. See [`DisplayTransfer`] for which backends support which.
-/// The UI shows the requested transfer. If the surface cannot carry it, Bevy logs a
-/// warning and falls back to a supported transfer.
-/// `WindowSurfaceTransfers::resolved` on the window says what the surface got.
+/// Real HDR output needs an HDR-capable display and a backend that supports the requested
+/// transfer (see [`DisplayTransfer`]). If the surface cannot carry it, Bevy logs a warning
+/// and falls back; `WindowSurfaceTransfers::resolved` on the window says what it got.
 fn toggle_hdr_output(
     keys: Res<ButtonInput<KeyCode>>,
     mut display_target: Single<&mut DisplayTarget, With<PrimaryWindow>>,

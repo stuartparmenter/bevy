@@ -3,37 +3,26 @@
 //!
 //! The tone-mapping pass outputs display-linear color scaled so `1.0` is paper
 //! white, in per-view source primaries. Those are Rec.709 for every resolved
-//! operator except `Tonemapping::GranTurismo7` on an HDR target (authored or
-//! substituted for an SDR-only operator), which emits its native Rec.2020.
-//! See `resolve_tonemapping`. UI composites in that same space.
+//! operator except `Tonemapping::GranTurismo7` on an HDR target, which emits
+//! its native Rec.2020. See `resolve_tonemapping`. UI composites in that same
+//! space.
 //!
-//! This pass runs after the UI pass and before the upscaling blit. It applies a
-//! 3x3 gamut transform from the source primaries to the display primaries, an
-//! out-of-gamut handling step (see [`DisplayGamutCompression`]), and the
-//! display transfer function (OETF).
+//! This pass runs after the UI pass and before the upscaling blit. It applies
+//! the gamut transform from the source primaries to the display primaries,
+//! out-of-gamut handling (see [`DisplayGamutCompression`]), and the display
+//! transfer function.
 //!
-//! Plain SDR targets never run this pass. For the default
-//! [`DisplayTarget::SDR_SRGB`](bevy_window::DisplayTarget), and any other
-//! target whose transfer is [`DisplayTransfer::Srgb`], the hardware applies the
-//! exact sRGB OETF on the upscaling blit's `*UnormSrgb` writeback. Those views
-//! get no [`ViewDisplayEncodingPipeline`].
+//! Plain SDR targets never run this pass. On any target whose transfer is
+//! [`DisplayTransfer::Srgb`] the hardware applies the sRGB OETF on the
+//! upscaling blit's `*UnormSrgb` writeback, so those views get no
+//! [`ViewDisplayEncodingPipeline`].
 //!
-//! Surface negotiation (`create_surfaces` in `bevy_render::view::window`)
-//! configures the swapchain this pass's output is presented through, using
-//! wgpu's surface color-space API:
-//!
-//! - [`DisplayTransfer::ScRgbLinear`]: an `Rgba16Float` extended-sRGB-linear
-//!   swapchain (macOS/iOS Metal, Windows Vulkan/DX12, Wayland Vulkan).
-//! - [`DisplayTransfer::ExtendedSrgb`]: an encoded extended-range sRGB
-//!   swapchain, `ExtendedSrgb` or `ExtendedDisplayP3` (Metal, Vulkan, and
-//!   browser WebGPU, the web HDR path).
-//! - [`DisplayTransfer::Pq`]: an HDR10 swapchain, typically `Rgb10a2Unorm`,
-//!   where the backend and OS advertise it.
-//!
-//! None of these formats have an sRGB view, so the encoded output is blitted to
-//! the surface unchanged. If the backend cannot provide the requested transfer,
-//! the view's resolved display target degrades to plain SDR with a warning, so
-//! the resolved transfer this pass keys on always matches the surface.
+//! `create_surfaces` in `bevy_render::view::window` configures the swapchain
+//! this pass's output is presented through. No HDR surface format has an sRGB
+//! view, so the encoded output is blitted to the surface unchanged. A backend
+//! that cannot provide the requested transfer degrades the view's resolved
+//! display target to plain SDR with a warning, so the resolved transfer this
+//! pass keys on always matches the surface.
 
 use crate::FullscreenShader;
 use bevy_app::{App, Plugin};
@@ -71,8 +60,8 @@ pub use node::display_encoding;
 /// [`DisplayTarget`](bevy_window::DisplayTarget) requests an HDR transfer
 /// function.
 ///
-/// The `display_encoding` node itself is registered in the `Core2d` and
-/// `Core3d` schedules by their plugins.
+/// The `Core2d` and `Core3d` plugins register the `display_encoding` node
+/// itself.
 pub struct DisplayEncodingPlugin;
 
 impl Plugin for DisplayEncodingPlugin {
@@ -92,9 +81,9 @@ impl Plugin for DisplayEncodingPlugin {
             .add_systems(RenderStartup, init_display_encoding_pipeline)
             .add_systems(
                 Render,
-                // Mutates `PipelineCache` via `block_on_render_pipeline`.
-                // Ordering ambiguities against other pipeline-cache users are
-                // ignored, like the upscaling system.
+                // Mutates `PipelineCache` via `block_on_render_pipeline`. Like
+                // the upscaling system, this ignores ordering ambiguities
+                // against other pipeline-cache users.
                 // See https://github.com/bevyengine/bevy/issues/14770.
                 prepare_view_display_encoding_pipelines
                     .in_set(RenderSystems::Prepare)
@@ -108,26 +97,23 @@ impl Plugin for DisplayEncodingPlugin {
 ///
 /// The main handling is a hue-approximate chroma compression toward the
 /// achromatic axis, in the style of the ACES 1.3 Reference Gamut Compression
-/// (Academy S-2020-001, "RGC"; reference implementation `lib/RGC_common.ctl`
-/// in `aces-dev`). `gamut_compress` in `display_encoding.wesl` documents the
-/// algorithm and constants, and `gamut_compression.rs` holds the CPU mirror
-/// and its tests. A per-channel clip (`max(c, 0.0)`) follows the compression,
-/// because PQ encoding requires non-negative input. The sign-preserving
-/// extended-sRGB transfer skips it.
+/// (Academy S-2020-001, "RGC"). `gamut_compress` in `display_encoding.wesl`
+/// documents the algorithm and constants, and `gamut_compression.rs` holds the
+/// CPU mirror and its tests. A per-channel clip (`max(c, 0.0)`) follows the
+/// compression, because PQ encoding needs non-negative input. The
+/// sign-preserving extended-sRGB transfer skips it.
 ///
-/// The ideal strategy would be hue-preserving compression in `ICtCp`, in place
-/// of the `DISPLAY_GAMUT_COMPRESSION` shader path. An exact constant-hue
-/// mapping needs the distance to the RGB gamut boundary along the chroma
-/// direction, which has no closed form. Production implementations such as the
-/// ACES 2.0 output transform iterate a chroma bisection per pixel, through
-/// three matrix pairs and six PQ evaluations per step. The ACES RGC is the
-/// published cheap alternative: closed-form, monotonic, NaN-free, exactly
-/// identity below the threshold, and only approximately hue-preserving.
-/// Measured `ICtCp` hue drift here is about 1 to 4.5 degrees for moderately
-/// out-of-gamut colors, 5 to 6 degrees for the extreme Rec.2020 green and red
-/// primaries, and 16 degrees at worst for the Rec.2020 blue corner (see the
-/// fixture tests in `gamut_compression.rs`). The per-channel clip it replaces
-/// drifts more, and collapses distinct out-of-gamut colors onto one another.
+/// An exact constant-hue mapping in `ICtCp` needs the distance to the RGB
+/// gamut boundary along the chroma direction, which has no closed form.
+/// Implementations such as the ACES 2.0 output transform iterate a chroma
+/// bisection per pixel, through three matrix pairs and six PQ evaluations per
+/// step. The ACES RGC is the published cheap alternative: closed-form,
+/// monotonic, NaN-free, exactly identity below the threshold, and only
+/// approximately hue-preserving. Its `ICtCp` hue drift stays under 7 degrees
+/// except at the Rec.2020 blue corner, where it reaches 16 degrees; the
+/// fixture tests in `gamut_compression.rs` hold the bounds. The per-channel
+/// clip it replaces drifts more, and collapses distinct out-of-gamut colors
+/// onto one another.
 ///
 /// The gamut stage can only produce out-of-gamut colors when it contracts,
 /// which needs input primaries wider than the display primaries. The input
@@ -138,21 +124,19 @@ impl Plugin for DisplayEncodingPlugin {
 #[extract_app(RenderApp)]
 pub enum DisplayGamutCompression {
     /// Compress when the gamut stage contracts. Identity and expanding
-    /// transforms keep the plain clip. This is the default.
+    /// transforms keep the plain clip.
     #[default]
     Auto,
-    /// Always compress on every view the display-encoding pass runs for, to
-    /// exercise the path.
+    /// Compress on every view the display-encoding pass runs for.
     ///
     /// Compression is not free for in-gamut colors. Channels whose distance
-    /// from the achromatic axis exceeds the ACES RGC threshold (0.80 to 0.88) are
-    /// pulled slightly inward to make room for the compressed out-of-gamut
+    /// from the achromatic axis exceeds the ACES RGC threshold (0.80 to 0.88)
+    /// are pulled slightly inward to make room for the compressed out-of-gamut
     /// range.
     Always,
-    /// Debug fallback: replace the compression with the hue-shifting
-    /// per-channel clip, for A/B comparison. Maps to
-    /// [`OutOfGamutHandling::Clip`], the same pipeline a non-contracting view
-    /// gets under [`Self::Auto`].
+    /// Replace the compression with the hue-shifting per-channel clip, for A/B
+    /// comparison. Maps to [`OutOfGamutHandling::Clip`], the same pipeline a
+    /// non-contracting view gets under [`Self::Auto`].
     Clip,
 }
 
@@ -209,8 +193,7 @@ const fn is_gamut_contraction(source: DisplayGamut, display: DisplayGamut) -> bo
 /// # Panics
 ///
 /// Panics on [`DisplayTransfer::Srgb`], which is hardware-encoded on the blit
-/// and never reaches this helper. Same contract as the encoder's
-/// [`specialize`](DisplayEncodingPipeline::specialize).
+/// and never reaches this helper.
 pub fn encode_out_texture_clear_color(
     color: LinearRgba,
     encoding: &ResolvedEncoding,
@@ -218,8 +201,7 @@ pub fn encode_out_texture_clear_color(
 ) -> LinearRgba {
     // A hand-built encoding that skipped the resolver's coercion chain could
     // pair a transfer with a gamut the encoder never produces, such as PQ with
-    // Rec.709. Fail loudly in debug rather than encoding a signal no surface
-    // presents.
+    // Rec.709. Fail in debug rather than encode a signal no surface presents.
     debug_assert_eq!(
         coerce_display_encode(encoding.transfer, encoding.gamut),
         (encoding.transfer, encoding.gamut),
@@ -247,7 +229,6 @@ pub fn encode_out_texture_clear_color(
             pq_inverse_eotf_from_nits(linear.y.max(0.0) * paper_white_nits),
             pq_inverse_eotf_from_nits(linear.z.max(0.0) * paper_white_nits),
         ),
-        // The OETF is sign-preserving, so no `max(0)` clip, like the shader.
         DisplayTransfer::ExtendedSrgb => Vec3::new(
             srgb_oetf_extended(scrgb_encode(linear.x, paper_white_nits)),
             srgb_oetf_extended(scrgb_encode(linear.y, paper_white_nits)),
@@ -267,8 +248,6 @@ pub fn encode_out_texture_clear_color(
     }
 }
 
-/// Render-world resource holding the display-encoding pass's bind group
-/// layout, sampler, and shaders.
 #[derive(Resource)]
 pub struct DisplayEncodingPipeline {
     layout: BindGroupLayoutDescriptor,
@@ -277,7 +256,6 @@ pub struct DisplayEncodingPipeline {
     fragment_shader: Handle<Shader>,
 }
 
-/// Initializes [`DisplayEncodingPipeline`] at [`RenderStartup`].
 pub fn init_display_encoding_pipeline(
     mut commands: Commands,
     render_device: Res<RenderDevice>,
@@ -292,8 +270,7 @@ pub fn init_display_encoding_pipeline(
                 texture_2d(TextureSampleType::Float { filterable: false }),
                 sampler(SamplerBindingType::NonFiltering),
                 // Per-view display-target calibration (paper white), produced
-                // by `prepare_view_display_targets` in bevy_render. This pass
-                // is its only binder.
+                // by `prepare_view_display_targets` in bevy_render.
                 uniform_buffer::<DisplayTargetUniform>(true),
             ),
         ),
@@ -314,11 +291,7 @@ pub fn init_display_encoding_pipeline(
 /// Every field except `target_format` and `out_of_gamut` comes from the view's
 /// [`ViewStackContract`]. `gamut` and `transfer` are the resolved values, after
 /// the prepare-time coercions in
-/// [`resolve_camera_stack_contracts`](crate::camera_stack::resolve_camera_stack_contracts):
-/// PQ forces Rec.2020, scRGB forces Rec.709, and extended-sRGB keeps Rec.709 or
-/// Display P3 while coercing Rec.2020 to Rec.709. scRGB signals are by
-/// definition expressed in extended Rec.709/sRGB coordinates whatever the
-/// panel's physical gamut, and the compositor maps them to the panel.
+/// [`resolve_camera_stack_contracts`](crate::camera_stack::resolve_camera_stack_contracts).
 ///
 /// With the per-view [`source_gamut`](Self::source_gamut), the reachable
 /// source, display and transfer combinations are:
@@ -357,9 +330,7 @@ pub struct DisplayEncodingPipelineKey {
     /// meshes, 3D gizmos) convert off the global `WorkingColorSpace` instead, so
     /// they match `source_gamut` only when an operator marks the buffer
     /// Rec.2020. A `Tonemapping::None` view leaves `source_gamut` Rec.709 while
-    /// the buffer holds Rec.2020, which a tonemapping pass would otherwise
-    /// reconcile. Emissive UI above paper white is a follow-up (see
-    /// `plans/ui-hdr-rfc.md`).
+    /// the buffer holds Rec.2020.
     pub source_gamut: DisplayGamut,
     /// The resolved display gamut the source color is transformed to.
     pub gamut: DisplayGamut,
@@ -386,8 +357,6 @@ impl SpecializedRenderPipeline for DisplayEncodingPipeline {
             Some(CompositingSpace::Linear) | None => {}
         }
 
-        // Which of these pairs is an identity, an expansion or a contraction is
-        // listed in the table on `DisplayEncodingPipelineKey`.
         match (key.source_gamut, key.gamut) {
             (DisplayGamut::Rec709, DisplayGamut::Rec709)
             | (DisplayGamut::Rec2020, DisplayGamut::Rec2020) => {}
@@ -422,7 +391,7 @@ impl SpecializedRenderPipeline for DisplayEncodingPipeline {
         }
 
         match key.out_of_gamut {
-            // The max(0) safety clip is the entire handling, and the
+            // The `max(0)` safety clip is the whole handling, and the
             // extended-sRGB transfer skips even that.
             OutOfGamutHandling::Clip => {}
             OutOfGamutHandling::Compress => {
@@ -501,10 +470,9 @@ fn display_encoding_key(
 /// [`ViewStackContract`] carries resolved encode parameters and a non-deferred
 /// encode role, removed otherwise.
 ///
-/// The out-of-gamut handling is resolved here, from the
-/// [`DisplayGamutCompression`] policy and the contract's source and display
-/// gamuts, so a policy change re-keys the pipeline on the next prepare. The
-/// contract comes from
+/// The out-of-gamut handling resolves here, so a [`DisplayGamutCompression`]
+/// policy change re-keys the pipeline on the next prepare. The contract comes
+/// from
 /// [`resolve_camera_stack_contracts`](crate::camera_stack::resolve_camera_stack_contracts),
 /// which owns the coercion and display-target diagnostics.
 pub fn prepare_view_display_encoding_pipelines(
@@ -545,9 +513,8 @@ pub fn prepare_view_display_encoding_pipelines(
 
         // The pass-through upscaling blit for HDR transfers blocks on its own
         // pipeline and presents the main texture as-is, so an unready encoder
-        // pipeline would present raw display-linear values. On a PQ swapchain
-        // those read as badly distorted. Blocking here is O(1) once the encoder
-        // is compiled, and only ever runs for HDR-transfer views.
+        // pipeline would present raw display-linear values as HDR signal.
+        // Blocking here is O(1) once the encoder is compiled.
         pipeline_cache.block_on_render_pipeline(pipeline_id);
 
         commands
@@ -567,7 +534,6 @@ mod tests {
         Entity::from_raw_u32(raw).unwrap()
     }
 
-    /// A GT7 member on a PQ target that clears its target.
     fn gt7_clearing(raw: u32, index: usize) -> ContractInput<u32> {
         ContractInput {
             entity: entity(raw),
@@ -584,8 +550,6 @@ mod tests {
         }
     }
 
-    /// A `Tonemapping::None` fullscreen `ClearColorConfig::None` overlay on
-    /// the same PQ target.
     fn passthrough_overlay(raw: u32, index: usize) -> ContractInput<u32> {
         ContractInput {
             entity: entity(raw),
@@ -602,8 +566,6 @@ mod tests {
         }
     }
 
-    /// Builds the [`ViewStackContract`] the resolver's ECS layer inserts for
-    /// one resolved view.
     fn contract(
         output: &ContractOutput,
         encoding: Option<(DisplayTransfer, DisplayGamut)>,
@@ -618,9 +580,6 @@ mod tests {
         }
     }
 
-    /// Derives the pipeline key for one contract on the canonical
-    /// `Rgba16Float` target under the default `DisplayGamutCompression::Auto`.
-    /// The policy tests call [`display_encoding_key`] directly.
     fn auto_key(contract: &ViewStackContract) -> Option<DisplayEncodingPipelineKey> {
         display_encoding_key(
             TextureFormat::Rgba16Float,
@@ -632,15 +591,13 @@ mod tests {
     const PQ: Option<(DisplayTransfer, DisplayGamut)> =
         Some((DisplayTransfer::Pq, DisplayGamut::Rec2020));
 
-    /// Canonical S1 repro: a GT7 base plus a `Tonemapping::None` overlay on a
-    /// PQ window. The overlay finalizes the encode for the composed buffer the
-    /// base tone-mapped, so the key's source gamut is Rec.2020 (no 709->2020
-    /// double expansion) and its source space is the resolved linear.
+    /// The overlay finalizes the encode for the composed buffer the base
+    /// tone-mapped, so the key's source gamut is Rec.2020 and there is no
+    /// 709 to 2020 double expansion.
     #[test]
     fn s1_deferred_encode_keys_the_buffer_not_the_finalizer() {
         let outputs = resolve_contracts(vec![gt7_clearing(1, 0), passthrough_overlay(2, 1)]);
 
-        // The deferring base runs no encode pass and derives no key.
         let base = contract(&outputs[&entity(1)], PQ);
         assert_eq!(auto_key(&base), None);
 
@@ -659,7 +616,6 @@ mod tests {
         );
     }
 
-    /// A resolved compositing space passes through to the key verbatim.
     #[test]
     fn resolved_compositing_space_keys_the_decode() {
         let mut base = gt7_clearing(1, 0);
@@ -672,8 +628,8 @@ mod tests {
         assert_eq!(key.source_space, Some(CompositingSpace::Srgb));
     }
 
-    /// Negative control: a solo GT7 camera on PQ keys off its own gamut,
-    /// because its own operator produces the buffer.
+    /// A solo GT7 camera keys off its own gamut, because its own operator
+    /// produces the buffer.
     #[test]
     fn solo_gt7_on_pq_keys_its_own_gamut() {
         let outputs = resolve_contracts(vec![gt7_clearing(1, 0)]);
@@ -692,8 +648,8 @@ mod tests {
         );
     }
 
-    /// Negative control: a solo `Tonemapping::None` camera on PQ keys the
-    /// Rec.709 source gamut (the 709->2020 expansion is correct there).
+    /// A solo `Tonemapping::None` camera keys the Rec.709 source gamut, where
+    /// the 709 to 2020 expansion is correct.
     #[test]
     fn solo_passthrough_on_pq_keys_rec709_source() {
         let outputs = resolve_contracts(vec![passthrough_overlay(1, 0)]);
@@ -705,8 +661,6 @@ mod tests {
         assert_eq!(key.out_of_gamut, OutOfGamutHandling::Clip);
     }
 
-    /// A contraction (GT7's Rec.2020 output onto an scRGB Rec.709 signal)
-    /// keys the compression under the default `Auto` handling.
     #[test]
     fn gt7_onto_scrgb_keys_the_contraction_compression() {
         let outputs = resolve_contracts(vec![gt7_clearing(1, 0)]);
@@ -720,8 +674,7 @@ mod tests {
         assert_eq!(key.out_of_gamut, OutOfGamutHandling::Compress);
     }
 
-    /// A Rec.709 source onto an extended-Display-P3 signal is an expansion, so
-    /// the gamut stage cannot produce out-of-gamut colors and `Auto` keeps the
+    /// The expansion cannot produce out-of-gamut colors, so `Auto` keeps the
     /// plain clip.
     #[test]
     fn rec709_onto_extended_displayp3_keys_the_expansion() {
@@ -737,8 +690,6 @@ mod tests {
         assert_eq!(key.out_of_gamut, OutOfGamutHandling::Clip);
     }
 
-    /// GT7's Rec.2020 output onto an extended-Display-P3 signal is a
-    /// contraction, so `Auto` keys the compression.
     #[test]
     fn gt7_onto_extended_displayp3_keys_the_contraction_compression() {
         let outputs = resolve_contracts(vec![gt7_clearing(1, 0)]);
@@ -753,9 +704,6 @@ mod tests {
         assert_eq!(key.out_of_gamut, OutOfGamutHandling::Compress);
     }
 
-    /// `DisplayGamutCompression::Always` keys the compression even on a
-    /// non-contracting path (identity Rec.709 -> Rec.709 scRGB), where `Auto`
-    /// keeps the plain clip.
     #[test]
     fn always_policy_keys_compression_on_a_non_contracting_path() {
         let outputs = resolve_contracts(vec![passthrough_overlay(1, 0)]);
@@ -774,9 +722,6 @@ mod tests {
         assert_eq!(key.out_of_gamut, OutOfGamutHandling::Compress);
     }
 
-    /// `DisplayGamutCompression::Clip` keys the plain clip even on a
-    /// contracting path (GT7's Rec.2020 onto an scRGB Rec.709 signal), where
-    /// `Auto` keys the compression.
     #[test]
     fn clip_policy_keys_the_plain_clip_on_a_contracting_path() {
         let outputs = resolve_contracts(vec![gt7_clearing(1, 0)]);
@@ -795,7 +740,6 @@ mod tests {
         assert_eq!(key.out_of_gamut, OutOfGamutHandling::Clip);
     }
 
-    /// SDR groups carry no encode parameters and derive no key.
     #[test]
     fn sdr_contract_derives_no_key() {
         let mut solo_input = gt7_clearing(1, 0);
@@ -812,8 +756,7 @@ mod tests {
     use bevy_window::DisplayTarget;
 
     /// Builds a [`ResolvedEncoding`] with the given transfer at its canonical
-    /// gamut (Rec.709 for scRGB and extended-sRGB, Rec.2020 for PQ). See
-    /// [`encoding_with_gamut`] for the extended-sRGB Display-P3 case.
+    /// gamut.
     fn encoding(transfer: DisplayTransfer) -> ResolvedEncoding {
         ResolvedEncoding {
             transfer,
@@ -826,13 +769,10 @@ mod tests {
         }
     }
 
-    /// Builds a [`ResolvedEncoding`] with an explicit gamut.
     fn encoding_with_gamut(transfer: DisplayTransfer, gamut: DisplayGamut) -> ResolvedEncoding {
         ResolvedEncoding { transfer, gamut }
     }
 
-    /// PQ white at paper-white 100 encodes each channel as
-    /// `pq_inverse_eotf_from_nits(100.0)` (~0.5081).
     #[test]
     fn pq_white_at_paper_white_encodes_each_channel() {
         let out = encode_out_texture_clear_color(
@@ -840,8 +780,8 @@ mod tests {
             &encoding(DisplayTransfer::Pq),
             100.0,
         );
-        // Rec.709 white maps to Rec.2020 white (the matrix rows sum to 1), so
-        // every channel is 100 nits through PQ.
+        // Rec.709 white maps to Rec.2020 white, because the matrix rows sum to
+        // 1, so every channel is 100 nits through PQ.
         let expected = pq_inverse_eotf_from_nits(100.0);
         assert!((expected - 0.5081).abs() < 1e-3, "{expected}");
         assert_eq!(out.red.to_bits(), expected.to_bits());
@@ -849,8 +789,6 @@ mod tests {
         assert_eq!(out.blue.to_bits(), expected.to_bits());
     }
 
-    /// PQ red gamut-converts through `REC709_TO_REC2020` before the per-channel
-    /// transfer encode.
     #[test]
     fn pq_red_gamut_converts_before_encoding() {
         let out =
@@ -870,7 +808,6 @@ mod tests {
         );
     }
 
-    /// scRGB scales each channel by `paper_white / 80` (identity gamut).
     #[test]
     fn scrgb_scales_by_paper_white_over_80() {
         let color = LinearRgba::new(0.5, 0.25, 1.0, 1.0);
@@ -883,7 +820,6 @@ mod tests {
         assert_eq!(out.red.to_bits(), 0.625f32.to_bits());
     }
 
-    /// Alpha passes through unchanged for both transfers.
     #[test]
     fn alpha_passes_through() {
         let color = LinearRgba::new(0.3, 0.6, 0.9, 0.42);
@@ -898,29 +834,23 @@ mod tests {
         );
     }
 
-    /// Negative channels clamp to zero before the PQ transfer (a negative base
-    /// under the non-integer PQ exponent would be `NaN`); scRGB leaves them
-    /// signed (the signal is unbounded).
     #[test]
     fn negative_channels_clamp_before_pq() {
         let color = LinearRgba::new(-0.5, 0.0, 1.0, 1.0);
         let pq = encode_out_texture_clear_color(color, &encoding(DisplayTransfer::Pq), 100.0);
-        // After the 709 -> 2020 mix the red channel is still negative. It must
+        // After the 709 to 2020 mix the red channel is still negative. It must
         // clamp to the encode of zero nits, never `NaN`.
         let rec2020 = REC709_TO_REC2020 * Vec3::new(-0.5, 0.0, 1.0);
         assert!(rec2020.x < 0.0);
         assert!(pq.red.is_finite());
         assert_eq!(pq.red.to_bits(), pq_inverse_eotf_from_nits(0.0).to_bits());
 
-        // scRGB carries the negative through unclamped.
         let scrgb =
             encode_out_texture_clear_color(color, &encoding(DisplayTransfer::ScRgbLinear), 100.0);
         assert_eq!(scrgb.red.to_bits(), scrgb_encode(-0.5, 100.0).to_bits());
         assert!(scrgb.red < 0.0);
     }
 
-    /// Extended-sRGB over Rec.709 (the `ExtendedSrgb` color space): identity
-    /// gamut, then `srgb_oetf_extended(scrgb_encode(ch, pw))` per channel.
     #[test]
     fn extended_srgb_over_rec709_encodes_each_channel() {
         let color = LinearRgba::new(0.5, 0.25, 1.0, 1.0);
@@ -932,8 +862,8 @@ mod tests {
                 srgb_oetf_extended(scrgb_encode(value, 100.0)).to_bits()
             );
         }
-        // 18% gray at an 80-nit paper white round-trips SDR: scrgb_encode is
-        // identity there, so this is the plain sRGB encode (~0.4613).
+        // At an 80-nit paper white `scrgb_encode` is the identity, so 18% gray
+        // is the plain sRGB encode (~0.4613).
         let gray = encode_out_texture_clear_color(
             LinearRgba::new(0.18, 0.18, 0.18, 1.0),
             &encoding(DisplayTransfer::ExtendedSrgb),
@@ -942,9 +872,6 @@ mod tests {
         assert!((gray.red - 0.461_356).abs() < 1e-4);
     }
 
-    /// Extended-sRGB over Display-P3 (the `ExtendedDisplayP3` color space):
-    /// the authored Rec.709 clear gamut-converts through `REC709_TO_DISPLAYP3`
-    /// before the per-channel OETF (mirrors `pq_red_gamut_converts_before_encoding`).
     #[test]
     fn extended_srgb_over_displayp3_gamut_converts_before_encoding() {
         let out = encode_out_texture_clear_color(
@@ -966,14 +893,12 @@ mod tests {
             srgb_oetf_extended(scrgb_encode(p3.z, 100.0)).to_bits()
         );
         // Rec.709 red spreads into all three P3 channels, so the conversion is
-        // not the identity and the encoded green and blue are non-zero. Rec.709
-        // red sits inside the wider P3 gamut, so the expansion stays positive.
+        // not the identity. Rec.709 red sits inside the wider P3 gamut, so the
+        // expansion stays positive.
         assert!(p3.y > 0.0 && p3.z > 0.0);
         assert!(out.green > 0.0 && out.blue > 0.0);
     }
 
-    /// Extended-sRGB leaves negatives signed (the OETF is sign-preserving),
-    /// distinct from PQ's clamp.
     #[test]
     fn extended_srgb_is_sign_preserving() {
         let color = LinearRgba::new(-0.5, 0.0, 1.0, 1.0);
@@ -987,11 +912,6 @@ mod tests {
         assert!(out.red.is_finite());
     }
 
-    /// The Rec.709 gamut arm passes channels through bit-identically: a `-0.0`
-    /// clear channel keeps its sign bit through the pure-multiply scRGB encode.
-    /// An identity-matrix multiply would flip it to `+0.0`, since
-    /// `1.0 * -0.0 + 0.0 * g + 0.0 * b == +0.0`, and break bit-identity with
-    /// the encoded pixels, which never see a matrix on the identity path.
     #[test]
     fn identity_gamut_preserves_the_sign_bit_of_negative_zero() {
         let color = LinearRgba::new(-0.0, 0.5, 0.25, 1.0);
@@ -1000,9 +920,6 @@ mod tests {
         assert_eq!(scrgb.red.to_bits(), (-0.0f32).to_bits());
     }
 
-    /// An authored `paper_white_nits` of `0.0` sanitizes to 100 nits, so the
-    /// caller (which passes `sanitized_paper_white_nits()`) encodes white as
-    /// 100 nits rather than blacking out the clear.
     #[test]
     fn degenerate_paper_white_encodes_as_100_nits() {
         let sanitized = DisplayTarget {

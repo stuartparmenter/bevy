@@ -3,26 +3,17 @@
 //! result to the app's settings directory ([`SettingsPlugin`]), and reload it on
 //! later runs.
 //!
-//! Every step reuses one pattern, the way most games calibrate: a probe square
-//! on a reference card over a background field, with per-step luminances. Peak
-//! raises the card until the max-signal probe disappears into it; paper white
-//! tunes the card - and with it every white UI element - to comfortable white
-//! paper; black level lowers the probe until it disappears into the black
-//! background. Peak measures sharpest with the display in HGIG / Game mode
-//! (dynamic tone mapping off); with tone mapping on, the probe fades instead of
-//! vanishing, and the right stop is where it is faintest.
+//! Every step reuses one pattern: a probe square on a reference card over a
+//! background field. The peak step measures sharpest with the display in HGIG /
+//! Game mode, with dynamic tone mapping off. With tone mapping on, the probe
+//! fades instead of vanishing, and the right stop is where it is faintest.
 //!
-//! The calibration camera uses [`Tonemapping::Linear`] (no tone curve) with an
-//! fp16 intermediate, so the pattern reaches the display encoder unmodified.
-//! [`HdrPlugin`](hdr::HdrPlugin) picks the HDR transfer; when the surface has
-//! none there is nothing to calibrate, so a notice shows instead. The
-//! calibration itself covers only the three luminance numbers and the per-field
-//! auto/manual [`DisplayCalibrationPolicy`] - transfer and gamut stay with
-//! `HdrPlugin`.
+//! [`HdrPlugin`](hdr::HdrPlugin) picks the transfer and gamut. This example
+//! calibrates only the three luminance numbers and the per-field auto/manual
+//! [`DisplayCalibrationPolicy`].
 //!
-//! Controls: Up/Down pick a section in the left-hand menu, Left/Right adjust it,
-//! `M` flips between manual (HGIG) and trust-the-OS calibration, Enter saves,
-//! Esc cancels.
+//! Controls: Up/Down pick a section, Left/Right adjust it, `M` flips between
+//! manual (HGIG) and trust-the-OS calibration, Enter saves, Esc cancels.
 
 use bevy::{
     camera::{Hdr, ScalingMode},
@@ -38,8 +29,6 @@ use bevy::{
 #[path = "../helpers/hdr.rs"]
 mod hdr;
 
-/// The app's states: calibrate, then show a done card until a key returns to
-/// calibrating.
 #[derive(States, Default, Debug, Clone, PartialEq, Eq, Hash)]
 enum AppState {
     #[default]
@@ -50,21 +39,18 @@ enum AppState {
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(bevy::render::RenderPlugin {
-            // The calibration pattern is grayscale, so the working color space
-            // does not change it; Rec.2020 matches the PQ display target
-            // `HdrPlugin` prefers, so the renderer does not warn about rendering
-            // to a wide target from the narrow default.
+            // Rec.2020 matches the PQ display target `HdrPlugin` prefers, so the
+            // renderer does not warn about a wide target from the narrow default.
+            // The pattern is grayscale, so the choice does not change it.
             working_color_space: bevy::render::WorkingColorSpace::Rec2020,
             ..default()
         }))
         .init_state::<AppState>()
-        // The saved calibration: registered before `SettingsPlugin` so the
-        // plugin finds the group, and initialized so it exists (with defaults)
-        // even before any settings file has been written.
+        // Register before `SettingsPlugin` so the plugin finds the group, and
+        // init so defaults exist before any settings file is written.
         .register_type::<CalibrationSettings>()
         .init_resource::<CalibrationSettings>()
         .add_plugins(SettingsPlugin::new("org.bevy.examples.hdr_calibration"))
-        // Request the best HDR output the surface can present.
         .add_plugins(hdr::HdrPlugin::default())
         .insert_resource(ClearColor(Color::BLACK))
         .init_resource::<CalibrationStep>()
@@ -75,8 +61,6 @@ fn main() {
         .add_systems(
             Update,
             (
-                // The input systems run in a fixed order; the display systems
-                // after them are independent of each other.
                 (
                     change_step,
                     toggle_mode,
@@ -129,7 +113,6 @@ impl CalibrationStep {
         }
     }
 
-    /// The menu label for this step.
     fn label(self) -> &'static str {
         match self {
             Self::PeakLuminance => "Peak luminance",
@@ -142,8 +125,7 @@ impl CalibrationStep {
 /// The [`DisplayCalibrationPolicy`] for a calibration mode. Manual (HGIG) keeps
 /// every authored value; trust-OS lets the engine resolve peak, black level, and
 /// gamut from sensed display information. Paper white is a viewing preference
-/// the display cannot sense, so it is always manual. The policy component on the
-/// window is the single owner of this choice; see [`is_trust_os`].
+/// the display cannot sense, so it is always manual.
 fn policy_for(trust_os: bool) -> DisplayCalibrationPolicy {
     DisplayCalibrationPolicy {
         auto_paper_white: false,
@@ -158,13 +140,11 @@ fn is_trust_os(policy: &DisplayCalibrationPolicy) -> bool {
     policy.auto_peak_luminance
 }
 
-/// Countdown for the "window moved monitors" banner notice; raised by
-/// [`watch_monitor_changes`], read by [`update_banner`].
+/// Countdown for the "window moved monitors" banner notice.
 #[derive(Resource, Default)]
 struct MonitorChangeNotice(Timer);
 
-/// One quad of the calibration pattern; [`update_pattern`] assigns each a
-/// luminance per step.
+/// One quad of the calibration pattern; [`update_pattern`] sets its luminance.
 #[derive(Component, Clone, Copy, PartialEq, Eq)]
 enum PatternQuad {
     Background,
@@ -172,17 +152,14 @@ enum PatternQuad {
     Probe,
 }
 
-/// Elements gated on the surface's HDR state: shown when `0` matches whether an
-/// HDR transfer is active. The wizard and pattern carry `true`, the "no HDR
-/// output" notice `false`.
+/// Gates an element on the surface's HDR state: shown when `0` matches whether
+/// an HDR transfer is active.
 #[derive(Component, Clone, Copy)]
 struct VisibleWhenHdr(bool);
 
-/// Tags the banner at the top of the screen.
 #[derive(Component, Default, Clone, FromTemplate)]
 struct BannerText;
 
-/// Tags the value bar at the bottom of the screen.
 #[derive(Component, Default, Clone, FromTemplate)]
 struct ValueBarText;
 
@@ -190,7 +167,6 @@ struct ValueBarText;
 #[derive(Component, Clone, Copy)]
 struct StepMenuLabel(CalibrationStep);
 
-/// Tags the menu's manual/trust-OS mode line.
 #[derive(Component, Default, Clone, FromTemplate)]
 struct ModeText;
 
@@ -204,41 +180,35 @@ const STAGE_SHIFT: f32 = 0.8;
 /// stays at whatever the display chain clips to while the card rises.
 const MAX_SIGNAL_NITS: f32 = DisplayTarget::MAX_PAPER_WHITE_NITS;
 
-/// The probe's paper-white-relative gray on the paper-white step, like ink on
-/// the white "sheet" behind it.
+/// The probe's paper-white-relative gray on the paper-white step.
 const PAPER_PROBE_LEVEL: f32 = 0.35;
 
-/// The background's paper-white-relative gray on the paper-white step: a dim
-/// surround so the card reads as a lit sheet of paper.
+/// The background's paper-white-relative gray on the paper-white step.
 const PAPER_SURROUND_LEVEL: f32 = 0.15;
 
-/// The background field, sized to fill most of the view (the view is
-/// [`VIEW_HEIGHT`] world units tall).
+/// The background field, sized to fill most of the view.
 const BACKGROUND_SIZE: Vec2 = Vec2::new(9.0, 6.0);
 
-/// The reference card: roughly a tenth of the frame. HDR panels are brighter
-/// over small areas than over the full frame, so the peak step compares the
-/// probe against this similarly-sized card, never against the large background -
-/// a fullscreen comparison patch could not match a small one at any setting.
+/// The reference card: about a tenth of the frame. HDR panels are brighter over
+/// small areas than over the full frame, so the peak step compares the probe
+/// against this similarly-sized card, never against the large background.
 const CARD_SIZE: Vec2 = Vec2::new(4.6, 1.8);
 
 /// The probe square, small enough to sit inside the card.
 const PROBE_SIZE: Vec2 = Vec2::splat(1.2);
 
-/// Nits per second the peak adjustment moves at (before the Shift multiplier).
+/// Nits per second the peak adjustment moves, before the Shift multiplier.
 const PEAK_ADJUST_NITS_PER_SEC: f32 = 250.0;
 
-/// Nits per second the paper-white adjustment moves at.
 const PAPER_ADJUST_NITS_PER_SEC: f32 = 50.0;
 
-/// Paper-white bounds: below ~80 nits white UI reads dim even in a dark room,
-/// and above ~500 a persistent white level is fatiguing.
+/// Paper-white bounds: below 80 nits white UI reads dim even in a dark room, and
+/// above 500 a constant white level is fatiguing.
 const PAPER_WHITE_MIN_NITS: f32 = 80.0;
 const PAPER_WHITE_MAX_NITS: f32 = 500.0;
 
-/// Exponential rate of the black-level adjustment per second held:
-/// multiplicative, because equal luminance ratios look like equal steps near
-/// black.
+/// Exponential rate of the black-level adjustment per second held. It is
+/// multiplicative because equal luminance ratios look like equal steps near black.
 const BLACK_ADJUST_RATE: f32 = 1.5;
 
 /// Black-level bounds, in nits. The floor is nonzero so the multiplicative
@@ -249,16 +219,13 @@ const BLACK_LEVEL_MAX_NITS: f32 = 5.0;
 /// Adjustment speed multiplier while Shift is held.
 const FAST_MULTIPLIER: f32 = 4.0;
 
-/// How long the monitor-change notice stays in the banner.
 const MONITOR_NOTICE_SECONDS: f32 = 8.0;
 
-/// Menu text colors for the active and inactive sections.
 const MENU_ACTIVE: Color = Color::WHITE;
 const MENU_DIM: Color = Color::srgb(0.5, 0.5, 0.5);
 
-/// Seeds the primary window's calibration intent at startup from
-/// [`CalibrationSettings`]: the saved values when a settings file existed,
-/// otherwise the defaults.
+/// Seeds the primary window's calibration from [`CalibrationSettings`]: the
+/// saved values when a settings file existed, otherwise the defaults.
 fn seed_window(
     mut commands: Commands,
     primary_window: Single<Entity, With<PrimaryWindow>>,
@@ -271,10 +238,7 @@ fn seed_window(
         .insert((target, policy_for(settings.trust_os)));
 }
 
-/// Spawns the calibration camera, the pattern, and the player UI on entering the
-/// calibration state.
 fn spawn_calibration(mut commands: Commands, mut step: ResMut<CalibrationStep>) {
-    // Start a fresh wizard each entry.
     *step = CalibrationStep::PeakLuminance;
     let camera = commands
         .spawn_scene(calibration_camera())
@@ -297,7 +261,7 @@ fn spawn_calibration(mut commands: Commands, mut step: ResMut<CalibrationStep>) 
 fn spawn_done_screen(mut commands: Commands) {
     commands.spawn((
         Camera2d,
-        // Encode with no tone curve; the card is plain SDR text.
+        // No tone curve; the card is plain SDR text.
         Tonemapping::Linear,
         DespawnOnExit(AppState::Done),
     ));
@@ -323,16 +287,12 @@ fn leave_done(keys: Res<ButtonInput<KeyCode>>, mut next: ResMut<NextState<AppSta
     }
 }
 
-// --- BSN scene functions ---
-
-/// The [`Tonemapping::Linear`] fp16 orthographic camera the pattern renders
-/// through. Linear applies no tone curve, so pattern values reach the display
-/// encoder unmodified.
+/// The orthographic camera the pattern renders through. [`Tonemapping::Linear`]
+/// applies no tone curve, so pattern values reach the display encoder unmodified.
 fn calibration_camera() -> impl Scene {
     bsn! {
         Camera3d
-        // fp16 intermediate, so pattern values above paper white survive to the
-        // display-encoding pass.
+        // fp16 intermediate, so values above paper white survive to display encoding.
         Hdr
         template_value(Tonemapping::Linear)
         template_value(Projection::from(OrthographicProjection {
@@ -343,9 +303,8 @@ fn calibration_camera() -> impl Scene {
     }
 }
 
-/// The one pattern every step reuses: a probe square on a reference card over a
-/// background field. [`update_pattern`] drives the three luminances from the
-/// current step, so nothing here carries a brightness of its own.
+/// The pattern every step reuses: a probe square on a reference card over a
+/// background field. [`update_pattern`] sets the three luminances per step.
 fn calibration_pattern() -> impl Scene {
     bsn! {
         template_value(Transform::from_xyz(STAGE_SHIFT, 0.0, 0.0))
@@ -360,8 +319,7 @@ fn calibration_pattern() -> impl Scene {
 }
 
 /// One unlit pattern quad. Each gets its own material handle because
-/// [`update_pattern`] mutates `base_color` per quad; a shared handle would tie
-/// them together.
+/// [`update_pattern`] mutates `base_color` per quad.
 fn pattern_quad(quad: PatternQuad, size: Vec2, z: f32) -> impl Scene {
     bsn! {
         template_value(quad)
@@ -379,9 +337,8 @@ fn pattern_quad(quad: PatternQuad, size: Vec2, z: f32) -> impl Scene {
     }
 }
 
-/// The player UI: the left-hand step menu, a one-line banner, the value bar, and
-/// the key legend. Hidden while the surface has no HDR transfer. All plain SDR
-/// text.
+/// The player UI: step menu, banner, value bar, and key legend. Hidden while the
+/// surface has no HDR transfer.
 fn player_ui() -> impl Scene {
     bsn! {
         template_value(VisibleWhenHdr(true))
@@ -451,8 +408,7 @@ fn sdr_notice() -> impl Scene {
     }
 }
 
-/// The left-hand menu: the three calibration sections, with the active one
-/// highlighted by [`update_menu`], and the manual/trust-OS mode line.
+/// The left-hand menu: the three calibration sections and the mode line.
 fn step_menu() -> impl Scene {
     bsn! {
         Node {
@@ -491,15 +447,11 @@ fn menu_entry(step: CalibrationStep) -> impl Scene {
     }
 }
 
-// --- Per-frame systems ---
-
-/// Whether any connected gamepad just pressed `button`.
 fn any_gamepad_just_pressed(gamepads: &Query<&Gamepad>, button: GamepadButton) -> bool {
     gamepads.iter().any(|gamepad| gamepad.just_pressed(button))
 }
 
-/// Walks the menu: Down / d-pad down next section, Up / d-pad up previous.
-/// Clamped at the ends.
+/// Walks the menu with Up/Down or the d-pad, clamped at the ends.
 fn change_step(
     keys: Res<ButtonInput<KeyCode>>,
     gamepads: Query<&Gamepad>,
@@ -517,8 +469,7 @@ fn change_step(
     }
 }
 
-/// Flips between manual and trust-OS calibration with `M` (or gamepad north) by
-/// rewriting the window's [`DisplayCalibrationPolicy`].
+/// Flips the window's [`DisplayCalibrationPolicy`] between manual and trust-OS.
 fn toggle_mode(
     keys: Res<ButtonInput<KeyCode>>,
     gamepads: Query<&Gamepad>,
@@ -530,9 +481,8 @@ fn toggle_mode(
     }
 }
 
-/// Adjusts the current step's value while Left/Right (or the d-pad) is held.
-/// Under trust-OS the engine resolves peak and black level, so only paper white
-/// responds. Peak is clamped at or above paper white.
+/// Adjusts the current step's value while Left/Right or the d-pad is held. Under
+/// trust-OS only paper white responds. Peak stays at or above paper white.
 fn adjust_value(
     keys: Res<ButtonInput<KeyCode>>,
     gamepads: Query<&Gamepad>,
@@ -563,7 +513,6 @@ fn adjust_value(
             display_target.paper_white_nits = (display_target.paper_white_nits
                 + held * PAPER_ADJUST_NITS_PER_SEC)
                 .clamp(PAPER_WHITE_MIN_NITS, PAPER_WHITE_MAX_NITS);
-            // Keep peak at or above the new paper white.
             display_target.peak_luminance_nits = display_target
                 .peak_luminance_nits
                 .max(display_target.paper_white_nits);
@@ -577,9 +526,8 @@ fn adjust_value(
     }
 }
 
-/// Confirms (`Enter` / gamepad south) -> persist the calibration and show the
-/// done screen. Cancels (`Esc` / gamepad east) -> restore the last-saved (or
-/// default) calibration and stay on the wizard.
+/// Enter (gamepad south) saves the calibration and shows the done screen. Esc
+/// (gamepad east) restores the last saved or default calibration.
 fn confirm_or_cancel(
     keys: Res<ButtonInput<KeyCode>>,
     gamepads: Query<&Gamepad>,
@@ -615,15 +563,14 @@ fn confirm_or_cancel(
         );
         next.set(AppState::Done);
     } else if cancel {
-        // The settings resource only changes on confirm, so it always holds the
-        // last-saved (or default) calibration.
+        // The settings resource changes only on confirm, so it holds the last
+        // saved or default calibration.
         settings.apply(&mut display_target);
     }
 }
 
-/// Shows every [`VisibleWhenHdr`] element whose polarity matches whether an HDR
-/// transfer is active, so the wizard swaps for the "no HDR output" notice
-/// (including while the surface is still negotiating).
+/// Shows every [`VisibleWhenHdr`] element whose polarity matches the active HDR
+/// state. A surface that is still negotiating counts as not HDR.
 fn update_visibility(
     surface: Option<Single<&WindowSurfaceTransfers, With<PrimaryWindow>>>,
     mut gated: Query<(&VisibleWhenHdr, &mut Visibility)>,
@@ -638,31 +585,28 @@ fn update_visibility(
     }
 }
 
-/// The background, card, and probe luminances for one step, in
-/// paper-white-relative units, from the resolved target. Reading the resolved
-/// [`EffectiveDisplayTarget`], not the authored [`DisplayTarget`], lets a sensed
-/// peak or black level show through under trust-OS.
+/// The background, card, and probe luminances for one step, relative to paper
+/// white. The caller passes the resolved [`EffectiveDisplayTarget`], so a sensed
+/// peak or black level shows through under trust-OS.
 fn pattern_levels(step: CalibrationStep, target: &DisplayTarget) -> (f32, f32, f32) {
     let paper_white = target.sanitized_paper_white_nits();
     match step {
-        // Black screen; the card carries the candidate peak and the probe on it
-        // holds max signal. Raising the candidate to the display chain's real
-        // peak makes the two clip together and the probe vanish.
+        // The card carries the candidate peak and the probe holds max signal. At
+        // the display chain's real peak the two clip together and the probe vanishes.
         CalibrationStep::PeakLuminance => (
             0.0,
             target.peak_luminance_nits / paper_white,
             MAX_SIGNAL_NITS / paper_white,
         ),
-        // The card is the "sheet of paper" being judged, over a dim surround;
-        // the probe is dim ink on it.
+        // The card is the sheet of paper being judged; the probe is ink on it.
         CalibrationStep::PaperWhite => (PAPER_SURROUND_LEVEL, 1.0, PAPER_PROBE_LEVEL),
         // The probe carries the near-black candidate over true black.
         CalibrationStep::BlackLevel => (0.0, 0.0, target.min_luminance_nits / paper_white),
     }
 }
 
-/// Writes the current step's luminances into the three pattern materials,
-/// skipping frames where nothing changed so the material assets are not dirtied.
+/// Writes the current step's luminances into the pattern materials, skipping
+/// unchanged frames so the material assets are not dirtied.
 fn update_pattern(
     step: Res<CalibrationStep>,
     effective: Single<&EffectiveDisplayTarget, With<PrimaryWindow>>,
@@ -671,8 +615,8 @@ fn update_pattern(
     mut last_levels: Local<Option<(f32, f32, f32)>>,
 ) {
     let levels = pattern_levels(*step, &effective.target);
-    // Freshly spawned quads (state re-entry) start black and need painting even
-    // when the levels match the previous wizard's.
+    // Quads spawned on state re-entry start black and need painting even when the
+    // levels match the previous wizard's.
     let any_added = quads.iter().any(|(quad, _)| quad.is_added());
     if !any_added && *last_levels == Some(levels) {
         return;
@@ -692,8 +636,7 @@ fn update_pattern(
     }
 }
 
-/// Writes the banner: one short instruction for the current step, plus a
-/// monitor-change notice while one is active.
+/// Writes the banner: the current step's instruction, plus any monitor-change notice.
 fn update_banner(
     mut text: Single<&mut Text, With<BannerText>>,
     step: Res<CalibrationStep>,
@@ -718,8 +661,8 @@ fn update_banner(
     text.set_if_neq(Text(banner));
 }
 
-/// Writes the value bar: the single value the current step edits, reading the
-/// authored [`DisplayTarget`] (the value the keys move).
+/// Writes the value bar from the authored [`DisplayTarget`], which is the value
+/// the keys move.
 fn update_value_bar(
     mut text: Single<&mut Text, With<ValueBarText>>,
     window: Single<(&DisplayTarget, &DisplayCalibrationPolicy), With<PrimaryWindow>>,
@@ -750,8 +693,7 @@ fn update_value_bar(
     text.set_if_neq(Text(bar));
 }
 
-/// Highlights the active section in the left-hand menu and keeps the mode line
-/// current.
+/// Highlights the active section and keeps the mode line current.
 fn update_menu(
     step: Res<CalibrationStep>,
     policy: Single<&DisplayCalibrationPolicy, With<PrimaryWindow>>,
@@ -776,10 +718,9 @@ fn update_menu(
     }
 }
 
-/// Raises a recalibration notice when the window moves to a different monitor, by
-/// watching the [`OnMonitor`] relationship `bevy_winit` maintains. The first
-/// insertion per window is the monitor becoming known at startup, so it is logged
-/// rather than raised.
+/// Raises a recalibration notice when the window moves to a different monitor,
+/// watching the [`OnMonitor`] relationship. The first insertion per window is the
+/// monitor becoming known at startup, so it only logs.
 fn watch_monitor_changes(
     changed: Query<(Entity, Ref<OnMonitor>), Changed<OnMonitor>>,
     mut removed: RemovedComponents<OnMonitor>,
@@ -801,8 +742,7 @@ fn watch_monitor_changes(
             notice.0 = Timer::from_seconds(MONITOR_NOTICE_SECONDS, TimerMode::Once);
         }
     }
-    // Removal means the monitor is no longer known. Skip windows whose relationship
-    // went away because the window itself despawned.
+    // Removal means the monitor is no longer known. Skip windows that despawned.
     for window in removed.read() {
         if windows.contains(window) {
             info!("Window {window} moved to monitor <unknown>; recalibration recommended.");
@@ -814,11 +754,8 @@ fn watch_monitor_changes(
     }
 }
 
-// --- Persistence ---
-
-/// The persisted calibration, saved by [`SettingsPlugin`] to `settings.toml` in
-/// the app's settings directory. Only authored values are stored, never a sensed
-/// or effective value.
+/// The persisted calibration, saved by [`SettingsPlugin`] to `settings.toml`.
+/// Only authored values are stored, never a sensed or effective value.
 #[derive(Resource, SettingsGroup, Reflect, Clone, PartialEq)]
 #[reflect(Resource, SettingsGroup, Default)]
 #[settings_group(group = "calibration")]
@@ -830,9 +767,8 @@ struct CalibrationSettings {
 }
 
 impl Default for CalibrationSettings {
-    /// The calibration before any save exists, and what Cancel restores on a
-    /// first run. The 1000-nit peak candidate exceeds most consumer panels, so
-    /// the peak step is two-directional.
+    /// The calibration before any save exists. The 1000-nit peak candidate
+    /// exceeds most consumer panels, so the peak step can move both ways.
     fn default() -> Self {
         Self {
             trust_os: false,
@@ -844,8 +780,7 @@ impl Default for CalibrationSettings {
 }
 
 impl CalibrationSettings {
-    /// Writes the three luminance numbers onto `target`. Transfer and gamut stay
-    /// as they are.
+    /// Writes the three luminance numbers onto `target`, not transfer or gamut.
     fn apply(&self, target: &mut DisplayTarget) {
         target.paper_white_nits = self.paper_white_nits;
         target.peak_luminance_nits = self.peak_luminance_nits;

@@ -7,11 +7,11 @@ pub trait Luminance: Sized {
     /// Return the luminance of this color (0.0 - 1.0 for SDR colors, higher for HDR).
     fn luminance(&self) -> f32;
 
-    /// Return a new version of this color with the given luminance. The resulting color
-    /// will be clamped to the valid range for the color space; for some color spaces,
-    /// clamping may cause the hue or chroma to change. Colors outside `[0.0, 1.0]` and
-    /// target luminances above 1.0 are not clamped in spaces that support them, such as
-    /// [`LinearRgba`](crate::LinearRgba) and [`LinearRec2020`](crate::LinearRec2020).
+    /// Return a new version of this color with the given luminance. The resulting color will
+    /// be clamped to the valid range for the color space; for some color spaces, clamping
+    /// may cause the hue or chroma to change. Spaces that support HDR, such as
+    /// [`LinearRgba`](crate::LinearRgba) and [`LinearRec2020`](crate::LinearRec2020), do not
+    /// clamp components outside `[0.0, 1.0]` or targets above 1.0.
     fn with_luminance(&self, value: f32) -> Self;
 
     /// Return a darker version of this color. The `amount` should be between 0.0 and 1.0.
@@ -25,10 +25,9 @@ pub trait Luminance: Sized {
     /// Return a lighter version of this color. The `amount` should be between 0.0 and 1.0.
     /// The amount represents an absolute increase in luminance, and is distributive:
     /// `color.lighter(a).lighter(b) == color.lighter(a + b)`. Colors are clamped to white
-    /// if the amount would cause them to go above white. Colors already brighter than
-    /// white are lightened without an upper clamp: in [`LinearRgba`](crate::LinearRgba)
-    /// and [`LinearRec2020`](crate::LinearRec2020) that means a luminance or channel
-    /// above `1.0`, and elsewhere a luminance or lightness above `1.0`.
+    /// if the amount would cause them to go above white. Colors already above white are not
+    /// clamped; in [`LinearRgba`](crate::LinearRgba) and [`LinearRec2020`](crate::LinearRec2020)
+    /// a single channel above `1.0` counts as above white.
     ///
     /// For a relative increase in luminance, you can simply `mix()` with white.
     fn lighter(&self, amount: f32) -> Self;

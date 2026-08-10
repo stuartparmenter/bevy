@@ -31,7 +31,7 @@ mod gt7;
 mod node;
 
 /// These live in `bevy_render` so camera extraction can pick the main-texture format from
-/// the operator. The pass that uses them is here.
+/// the operator.
 pub use bevy_render::view::{DebandDither, Tonemapping};
 use bevy_utils::default;
 pub use gt7::{
@@ -103,9 +103,8 @@ impl Plugin for TonemappingPlugin {
             ExtractComponentPlugin::<Tonemapping>::default(),
             ExtractComponentPlugin::<DebandDither>::default(),
             ExtractComponentPlugin::<GranTurismo7Params>::default(),
-            // Packs the per-view `Gt7ParamsUniform`s that `queue_gt7_params_uniforms`
-            // inserts. Views without one, every view in a default SDR project, leave the
-            // buffer unallocated.
+            // Views without a `Gt7ParamsUniform`, every view in a default SDR project,
+            // leave the buffer unallocated.
             UniformComponentPlugin::<Gt7ParamsUniform>::default(),
         ));
 
@@ -118,16 +117,15 @@ impl Plugin for TonemappingPlugin {
             .add_systems(
                 Render,
                 (
-                    // Mutates `PipelineCache` through `block_on_render_pipeline`.
-                    // Ambiguities against other pipeline-cache users are ignored, the
-                    // same way the upscaling system ignores them
-                    // (https://github.com/bevyengine/bevy/issues/14770).
+                    // `block_on_render_pipeline` mutates `PipelineCache`. Ignore
+                    // ambiguities against other pipeline-cache users, like the upscaling
+                    // system does (https://github.com/bevyengine/bevy/issues/14770).
                     prepare_view_tonemapping_pipelines
                         .in_set(RenderSystems::Prepare)
                         .ambiguous_with_all(),
-                    // `prepare_view_tonemapping_pipelines`, one of the `Prepare` consumers
-                    // of what this writes, is `ambiguous_with_all`, so an ambiguity report
-                    // would not catch a missing edge here.
+                    // `prepare_view_tonemapping_pipelines` consumes this and is
+                    // `ambiguous_with_all`, so an ambiguity report cannot catch a missing
+                    // edge here.
                     queue_gt7_params_uniforms.in_set(RenderSystems::Queue),
                 ),
             );
@@ -136,13 +134,11 @@ impl Plugin for TonemappingPlugin {
 
 #[derive(Resource)]
 pub struct TonemappingPipeline {
-    /// The base tonemapping layout: view uniform, HDR source texture and sampler, and the
-    /// tonemapping LUT (bindings 0-4). Used by every view that does not run the GT7
-    /// operator.
+    /// View uniform, HDR source texture and sampler, and the tonemapping LUT
+    /// (bindings 0-4). Used by pipelines that do not bind the GT7 params uniform.
     texture_bind_group: BindGroupLayoutDescriptor,
-    /// [`Self::texture_bind_group`] plus the per-view [`Gt7ParamsUniform`] at binding 5.
-    /// Used by pipelines specialized with
-    /// [`TonemappingPipelineKeyFlags::GT7_PARAMS_UNIFORM`].
+    /// [`Self::texture_bind_group`] plus the per-view [`Gt7ParamsUniform`] at binding 5,
+    /// for pipelines with [`TonemappingPipelineKeyFlags::GT7_PARAMS_UNIFORM`].
     gt7_params_bind_group: BindGroupLayoutDescriptor,
     sampler: Sampler,
     fullscreen_shader: FullscreenShader,
@@ -150,16 +146,13 @@ pub struct TonemappingPipeline {
 }
 
 /// Render-world marker: the view's white-balance matrix
-/// ([`ColorGradingUniform::balance`](bevy_render::view::ColorGradingUniform)) is composed
-/// with an extra correction on the GPU, outside the static [`ColorGrading`] temperature
-/// and tint values.
+/// ([`ColorGradingUniform::balance`](bevy_render::view::ColorGradingUniform)) gets an extra
+/// correction on the GPU, outside the static [`ColorGrading`] temperature and tint values.
 ///
-/// The tonemapping pass normally enables its `WHITE_BALANCE` shader def only when the
-/// static temperature or tint is non-zero (see [`prepare_view_tonemapping_pipelines`]). A
-/// GPU-side producer, such as `AutoWhiteBalance` in `bevy_post_process`, must insert this
-/// marker on the render-world view entity (for example through its
-/// [`ExtractComponent::Out`](bevy_render::extract_component::ExtractComponent) bundle) so
-/// the shader path that reads the matrix stays compiled in when those values are zero.
+/// The pass enables its `WHITE_BALANCE` shader def only when the static temperature or tint
+/// is non-zero. A GPU-side producer, such as `AutoWhiteBalance` in `bevy_post_process`, must
+/// insert this marker on the render-world view entity to keep that shader path compiled in
+/// when both values are zero.
 #[derive(Component, Default, Clone, Copy, Debug)]
 pub struct ExternalWhiteBalance;
 
@@ -176,29 +169,22 @@ bitflags! {
         /// Saturation/contrast/gamma/gain/lift for one or more sections
         /// (shadows, midtones, highlights) need to be adjusted.
         const SECTIONAL_COLOR_GRADING   = 0x04;
-        /// The per-view [`Gt7ParamsUniform`] is bound at binding 5 and the
-        /// `GT7_PARAMS_UNIFORM` shader def is pushed, replacing the GT7 operator's
-        /// baked SDR defaults with prepared per-camera values.
-        ///
-        /// Set from the presence of the view's [`Gt7ParamsUniform`] component, which
-        /// [`queue_gt7_params_uniforms`] inserts on non-deferred views
-        /// [`gt7_params_uniform_active`] holds for.
+        /// Binds the per-view [`Gt7ParamsUniform`] at binding 5 and pushes the
+        /// `GT7_PARAMS_UNIFORM` shader def, replacing the GT7 operator's baked SDR
+        /// defaults with prepared per-camera values.
         const GT7_PARAMS_UNIFORM        = 0x10;
         /// Pushes the `TONEMAP_OUTPUT_REC2020` shader def. Set exactly when the view's
         /// [`ResolvedTonemapping::output_gamut`] is [`DisplayGamut::Rec2020`].
         const TONEMAP_OUTPUT_REC2020    = 0x80;
         /// The view composites in gamma-encoded sRGB space
-        /// ([`CompositingSpace::Srgb`](bevy_camera::CompositingSpace::Srgb)). Main pass
-        /// shaders write sRGB-encoded values, so this pass decodes to scene-linear
-        /// before tone mapping and re-encodes the result, keeping the convention the
-        /// upscaling blit expects (`SRGB_TO_LINEAR`). Pushes the
-        /// `COMPOSITING_SPACE_SRGB` shader def.
+        /// ([`CompositingSpace::Srgb`](bevy_camera::CompositingSpace::Srgb)). Pushes the
+        /// `COMPOSITING_SPACE_SRGB` shader def, so the pass decodes to scene-linear
+        /// before tone mapping and re-encodes the result.
         const SRGB_COMPOSITING          = 0x20;
         /// The view composites in Oklab space
         /// ([`CompositingSpace::Oklab`](bevy_camera::CompositingSpace::Oklab)). Like
-        /// [`Self::SRGB_COMPOSITING`], but with the Oklab transforms (the blit's
-        /// `OKLAB_TO_LINEAR` counterpart). Pushes the `COMPOSITING_SPACE_OKLAB` shader
-        /// def.
+        /// [`Self::SRGB_COMPOSITING`], but with the Oklab transforms. Pushes the
+        /// `COMPOSITING_SPACE_OKLAB` shader def.
         const OKLAB_COMPOSITING         = 0x40;
     }
 }
@@ -347,9 +333,8 @@ impl SpecializedRenderPipeline for TonemappingPipeline {
     }
 }
 
-/// Binding index of the per-view [`Gt7ParamsUniform`] in the tonemapping bind group. Only
-/// part of the layout when [`TonemappingPipelineKeyFlags::GT7_PARAMS_UNIFORM`] is set.
-/// Pushed into `gt7.wesl` as a shader def so another bind group can use a different index.
+/// Binding index of the per-view [`Gt7ParamsUniform`] in the tonemapping bind group. Pushed
+/// into `gt7.wesl` as a shader def so another bind group can use a different index.
 pub const GT7_PARAMS_BINDING_INDEX: u32 = 5;
 
 pub fn init_tonemapping_pipeline(
@@ -375,8 +360,7 @@ pub fn init_tonemapping_pipeline(
     let tonemap_texture_bind_group =
         BindGroupLayoutDescriptor::new("tonemapping_hdr_texture_bind_group_layout", &entries);
 
-    // The GT7 operator also binds its per-camera params uniform at binding 5. Kept
-    // separate so every non-GT7 view uses the base layout with no extra bindings.
+    // Kept separate so views without the params uniform use the base layout unchanged.
     let gt7_params_entries = entries.extend_with_indices(((
         GT7_PARAMS_BINDING_INDEX,
         uniform_buffer::<Gt7ParamsUniform>(true),
@@ -400,24 +384,18 @@ pub fn init_tonemapping_pipeline(
 /// The specialized tonemapping pipeline of a view, plus the resolved values the tonemapping
 /// node needs to run it.
 ///
-/// Only views that run the tonemapping pass carry this. `Tonemapping::None` opt-outs, views
-/// that fold tone mapping into their material shaders, and stack members whose finalizer
-/// tone-maps the composed buffer do not, so the `tonemapping` node's `ViewQuery` skips them
-/// and the pass records no GPU work.
+/// Only views that run the tonemapping pass carry this, so the `tonemapping` node's
+/// `ViewQuery` skips views that opt out and the pass records no GPU work.
 #[derive(Component)]
 pub struct ViewTonemappingPipeline {
     pipeline_id: CachedRenderPipelineId,
     /// The resolved operator ([`resolve_tonemapping`]) the pipeline runs. Selects the LUT
     /// and keys the node's bind-group cache.
     operator: Tonemapping,
-    /// Whether the pipeline's layout binds the per-view [`Gt7ParamsUniform`]
-    /// ([`TonemappingPipelineKeyFlags::GT7_PARAMS_UNIFORM`]).
     binds_gt7_params: bool,
 }
 
-/// Selects between the two tonemapping bind group layouts: the GT7 variant with the
-/// per-view params uniform at binding 5, or the base layout. Pipeline specialization and
-/// the tonemapping node both go through here.
+/// Pipeline specialization and the tonemapping node both select the layout here.
 fn gt7_layout(
     pipeline: &TonemappingPipeline,
     binds_gt7_params: bool,
@@ -438,13 +416,11 @@ pub struct ResolvedTonemapping {
     /// The color primaries of the tonemapping pass output for the view.
     ///
     /// [`DisplayGamut::Rec2020`] exactly when [`Self::operator`] is
-    /// [`Tonemapping::GranTurismo7`] and the view's resolved display target requests an
-    /// HDR transfer. The pipeline is then specialized with
+    /// [`Tonemapping::GranTurismo7`] and the view's resolved display target requests an HDR
+    /// transfer. The pipeline is then specialized with
     /// [`TonemappingPipelineKeyFlags::TONEMAP_OUTPUT_REC2020`] and GT7 emits its native
-    /// linear Rec.2020 display-referred output with no Rec.709 back-conversion (see
-    /// `gt7.wesl`). Every other configuration emits Rec.709 display-linear. Under the
-    /// Rec.2020 working space the Rec.709-fit operators get a Rec.2020 to Rec.709
-    /// conversion at the pass entry (see `tonemapping.wesl`).
+    /// linear Rec.2020 display-referred output (see `gt7.wesl`). Every other configuration
+    /// emits Rec.709 display-linear.
     pub output_gamut: DisplayGamut,
 }
 
@@ -454,16 +430,10 @@ pub struct ResolvedTonemapping {
 /// An SDR-only operator ([`Tonemapping::is_sdr_only`]) on a view whose display target
 /// requests an HDR transfer ([`ViewDisplayTarget::is_hdr_transfer`]) is substituted with
 /// [`Tonemapping::GranTurismo7`], which is fully algorithmic and so always available
-/// without the `tonemapping_luts` feature.
+/// without the `tonemapping_luts` feature. Every other configuration keeps the authored
+/// operator. A missing operator resolves as [`Tonemapping::None`].
 ///
-/// Every other configuration keeps the authored operator: SDR views (including HDR requests
-/// downgraded at surface negotiation), HDR views already using
-/// [`Tonemapping::GranTurismo7`], [`Tonemapping::Linear`] (unbounded output), and
-/// [`Tonemapping::None`] (a pass-through, not an SDR-only operator; the display encoder
-/// warns about it separately). A missing operator resolves as [`Tonemapping::None`].
-///
-/// The output gamut is derived from the substituted operator in the same evaluation, and
-/// the stack resolver derives the display encoder's source gamut
+/// The stack resolver derives the display encoder's source gamut
 /// ([`ViewStackContract::source_gamut`](crate::camera_stack::ViewStackContract)) from
 /// [`ResolvedTonemapping::output_gamut`], so the tonemapping and display-encoding pipelines
 /// cannot disagree about the post-tonemap buffer's primaries. Pass the view's authored
@@ -493,19 +463,14 @@ pub fn resolve_tonemapping(
 /// Whether a view's tonemapping pipeline binds the per-view [`Gt7ParamsUniform`]
 /// ([`TonemappingPipelineKeyFlags::GT7_PARAMS_UNIFORM`]).
 ///
-/// True when the view's resolved operator ([`resolve_tonemapping`]) is
-/// [`Tonemapping::GranTurismo7`] and either:
+/// GT7's HDR mode is selected inside the prepared uniform, with the peak taken from the
+/// display target (see [`Gt7ParamsUniform::new`]), so every GT7 view on an HDR-transfer
+/// target needs one, even without a [`GranTurismo7Params`] component.
 ///
-/// * the camera opted in with a [`GranTurismo7Params`] component, or
-/// * the view's resolved display target requests an HDR transfer
-///   ([`ViewDisplayTarget::is_hdr_transfer`]). GT7's HDR mode is selected inside the
-///   prepared uniform, with the peak taken from the display target (see
-///   [`Gt7ParamsUniform::new`]), so every GT7 view on an HDR target needs one.
-///
-/// [`queue_gt7_params_uniforms`] is the only caller. It evaluates this once per view and
-/// records the answer as the presence of the view's [`Gt7ParamsUniform`] component, which is
-/// what [`prepare_view_tonemapping_pipelines`] keys the shader def and layout selection on,
-/// so the pipeline layout and the bound buffer cannot disagree.
+/// [`queue_gt7_params_uniforms`] is the only caller. It records the answer as the presence
+/// of the view's [`Gt7ParamsUniform`] component, which is what
+/// [`prepare_view_tonemapping_pipelines`] keys the shader def and layout selection on, so
+/// the pipeline layout and the bound buffer cannot disagree.
 pub fn gt7_params_uniform_active(
     resolved: Tonemapping,
     has_params: bool,
@@ -514,9 +479,6 @@ pub fn gt7_params_uniform_active(
     resolved == Tonemapping::GranTurismo7 && (has_params || is_hdr_transfer)
 }
 
-/// Derives a view's [`TonemappingPipelineKeyFlags`] from its color grading, resolved
-/// compositing space, and resolved output gamut.
-///
 /// `compositing_space` must be the resolved space from the view's `ViewStackContract`, never
 /// the camera's raw request: stack members share one main texture, so the decode and
 /// re-encode flags have to match the one space the whole stack composites in.
@@ -538,8 +500,6 @@ fn tonemapping_key_flags(
         TonemappingPipelineKeyFlags::HUE_ROTATE,
         color_grading.global.hue != 0.0,
     );
-    // Also kept compiled in when a GPU-side producer composes into the view's balance
-    // matrix. See `ExternalWhiteBalance`.
     flags.set(
         TonemappingPipelineKeyFlags::WHITE_BALANCE,
         color_grading.global.temperature != 0.0
@@ -553,8 +513,8 @@ fn tonemapping_key_flags(
             .any(|section| *section != default()),
     );
 
-    // `CompositingSpace::Linear` and no component both set neither flag, so scene-linear
-    // views share one key. See the flag docs for what the encoded spaces need.
+    // `CompositingSpace::Linear` and no component both set neither flag, so
+    // scene-linear views share one key.
     flags.set(
         TonemappingPipelineKeyFlags::SRGB_COMPOSITING,
         compositing_space == Some(CompositingSpace::Srgb),
@@ -594,8 +554,8 @@ pub fn prepare_view_tonemapping_pipelines(
             Has<TonemapInShader>,
         ),
         // `ViewStackContract` is overwritten in place and never removed, so a view whose
-        // `ViewTarget` was dropped keeps a stale contract. This filter gates on liveness
-        // and must stay even though no `ViewTarget` field is read here.
+        // `ViewTarget` was dropped keeps a stale contract. This filter must stay even
+        // though no `ViewTarget` field is read here.
         With<ViewTarget>,
     >,
     working_color_space: Res<WorkingColorSpace>,
@@ -613,10 +573,9 @@ pub fn prepare_view_tonemapping_pipelines(
         tonemap_in_shader,
     ) in view_targets.iter()
     {
-        // Cameras stacked on a shared main texture tone-map once, on the stack's
-        // finalizer, so earlier cameras' pixels are not tone-mapped again when the
-        // finalizer's fullscreen pass runs over the composed buffer. Render-world entities
-        // are retained, so the component has to be removed when a view joins a stack.
+        // Stacked cameras share a main texture and tone-map once, on the stack's
+        // finalizer, so the finalizer's pass does not tone-map earlier cameras' pixels
+        // twice. Render-world entities are retained, so remove a stale component.
         if matches!(contract.tonemap, StackRole::Deferred(_)) {
             if has_view_tonemapping_pipeline {
                 commands.entity(entity).remove::<ViewTonemappingPipeline>();
@@ -648,10 +607,9 @@ pub fn prepare_view_tonemapping_pipelines(
         }
 
         // `Tonemapping::None` views opt out of the pass and `TonemapInShader` views fold
-        // tone mapping into their material shaders, so the node runs for neither. Don't
-        // specialize and block on compiling a pipeline it never binds. Render-world
-        // entities are retained, so a stale component has to be removed, but only if
-        // present: default SDR views then issue no command.
+        // tone mapping into their material shaders, so the node runs for neither. Do not
+        // block on compiling a pipeline it never binds. Render-world entities are
+        // retained, so remove a stale component, but only if present.
         let no_pass = resolved.operator == Tonemapping::None || tonemap_in_shader;
         if no_pass {
             if has_view_tonemapping_pipeline {
@@ -678,8 +636,7 @@ pub fn prepare_view_tonemapping_pipelines(
 
         // The upscaling blit blocks on its own pipeline and presents whatever is in the
         // main texture, so an unready tonemapping pipeline would present raw scene-linear
-        // frames at startup or after a key change. Block here too. This is O(1) once the
-        // pipeline is compiled.
+        // frames. Block here too. This is O(1) once the pipeline is compiled.
         pipeline_cache.block_on_render_pipeline(pipeline);
 
         commands.entity(entity).insert(ViewTonemappingPipeline {
@@ -812,14 +769,12 @@ mod tests {
         for operator in Tonemapping::ALL {
             let resolved = resolve_tonemapping(Some(&operator), &hdr).operator;
             if operator.is_sdr_only() {
-                // An SDR-only operator on an HDR transfer resolves to the GT7 substitute.
                 assert_eq!(
                     resolved,
                     Tonemapping::GranTurismo7,
                     "expected substitution for {operator:?} on an HDR target"
                 );
             } else {
-                // `None`, `Linear`, and GT7 itself pass through unchanged.
                 assert_eq!(resolved, operator);
             }
         }
@@ -828,14 +783,11 @@ mod tests {
     #[test]
     fn sdr_only_operator_substitution_never_fires_off_hdr_targets() {
         for operator in Tonemapping::ALL {
-            // Plain SDR target, including an HDR request downgraded at surface
-            // negotiation.
             assert_eq!(
                 resolve_tonemapping(Some(&operator), &sdr_view_display_target()).operator,
                 operator
             );
         }
-        // A missing operator is `None`, which is never substituted.
         assert_eq!(
             resolve_tonemapping(None, &hdr_view_display_target()).operator,
             Tonemapping::None
@@ -846,8 +798,6 @@ mod tests {
     fn output_gamut_matches_the_resolved_operator() {
         let hdr = hdr_view_display_target();
         for operator in Tonemapping::ALL {
-            // On HDR targets the resolved operator is GT7 for everything except `None`
-            // and `Linear`, so those two are the only Rec.709 outputs.
             let expected = if matches!(operator, Tonemapping::None | Tonemapping::Linear) {
                 DisplayGamut::Rec709
             } else {
@@ -858,7 +808,6 @@ mod tests {
                 expected,
                 "output gamut mismatch for {operator:?} on an HDR target"
             );
-            // SDR targets, downgraded requests included, are always Rec.709.
             assert_eq!(
                 resolve_tonemapping(Some(&operator), &sdr_view_display_target()).output_gamut,
                 DisplayGamut::Rec709
@@ -871,18 +820,15 @@ mod tests {
         let hdr = hdr_view_display_target();
         let gt7 = Tonemapping::GranTurismo7;
 
-        // On an SDR target, GT7 binds the uniform only if the camera opted in with
-        // params. Cameras without the component keep the baked SDR defaults.
+        // On an SDR target, GT7 binds the uniform only if the camera opted in with params.
         assert!(gt7_params_uniform_active(gt7, true, false));
         assert!(!gt7_params_uniform_active(gt7, false, false));
 
-        // On an HDR-transfer target, GT7 always binds it, with the camera's params if
-        // present and the defaults otherwise.
+        // On an HDR-transfer target, GT7 always binds it.
         assert!(gt7_params_uniform_active(gt7, false, true));
         assert!(gt7_params_uniform_active(gt7, true, true));
 
-        // Substituted views resolve to GT7 on an HDR target, so the arm above covers
-        // them.
+        // Substituted views resolve to GT7, so the arm above covers them.
         for operator in Tonemapping::ALL {
             if !operator.is_sdr_only() {
                 continue;
@@ -902,8 +848,6 @@ mod tests {
         }
     }
 
-    /// A solo default camera (default grading, no resolved compositing space, plain SDR
-    /// target) keys an empty flag set, whatever the authored operator.
     #[test]
     fn solo_sdr_default_keys_empty_flags() {
         for operator in Tonemapping::ALL {
@@ -923,8 +867,6 @@ mod tests {
         }
     }
 
-    /// The resolved compositing space sets exactly the matching decode and re-encode
-    /// flag. `Some(Linear)` keys like no space.
     #[test]
     fn resolved_compositing_space_sets_exactly_its_flag() {
         let flags_for = |space: Option<CompositingSpace>| {

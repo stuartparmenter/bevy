@@ -18,17 +18,14 @@ use {bevy_ecs::prelude::ReflectComponent, bevy_reflect::Reflect};
 /// This component is synchronized with `winit` through `bevy_winit`, but is effectively
 /// read-only as `winit` does not support changing monitor properties.
 ///
-/// # HDR capability metadata
+/// # HDR capability
 ///
 /// A display's luminance and coarse gamut bucket, where the platform reports
 /// them, live in the additive
 /// [`MonitorDisplayCapability`](crate::MonitorDisplayCapability) component on
-/// the same entity, populated by the renderer's display-sensing poll. Its
-/// absence means the platform reports nothing, never that the display is SDR.
-///
-/// Display calibration (the values the renderer encodes for) is not this
-/// component: it is the user-authoritative
-/// [`DisplayTarget`](crate::DisplayTarget) on each [`Window`](crate::Window).
+/// the same entity. The calibration the renderer encodes for is not here: it is
+/// the [`DisplayTarget`](crate::DisplayTarget) on each
+/// [`Window`](crate::Window).
 #[derive(Component, Debug, Clone)]
 #[require(HasWindows)]
 #[cfg_attr(

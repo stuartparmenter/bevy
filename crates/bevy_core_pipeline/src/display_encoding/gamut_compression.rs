@@ -1,11 +1,8 @@
 //! CPU mirror of the display-encoding pass's out-of-gamut chroma compression.
-//! Keep it in sync with `gamut_compress` in `display_encoding.wesl`. That
-//! shader documents the ACES 1.3 Reference Gamut Compression this implements
-//! (Academy S-2020-001, "RGC"; reference implementation `lib/RGC_common.ctl`
-//! in `aces-dev`), and where the thresholds, limits and power come from.
-//!
-//! The rationale for choosing the ACES RGC over an exact hue-preserving
-//! `ICtCp` compression is on [`DisplayGamutCompression`].
+//! Keep it in sync with `gamut_compress` in `display_encoding.wesl`, which
+//! documents the algorithm and where the thresholds, limits and power come
+//! from. [`DisplayGamutCompression`] holds the rationale for the ACES RGC over
+//! an exact hue-preserving `ICtCp` compression.
 //!
 //! [`DisplayGamutCompression`]: super::DisplayGamutCompression
 
@@ -154,11 +151,10 @@ mod tests {
         }
     }
 
-    /// Sweeps the Rec.2020 gamut hull (cube faces) through the Rec.2020 to
-    /// Rec.709 contraction and asserts every compressed color is inside the
-    /// Rec.709 gamut, up to f32 residue caught by the shader's final `max(0)`.
-    /// This is the property the re-derived limits exist for. The ACES
-    /// camera-gamut limits fail it in the cyan direction.
+    /// Every point on the Rec.2020 hull lands inside Rec.709 after the
+    /// contraction. The re-derived limits exist for that property: the ACES
+    /// camera-gamut limits fail it in the cyan direction. The slack below is
+    /// f32 residue, which the shader's final `max(0)` catches.
     #[test]
     fn rec2020_hull_compresses_into_gamut() {
         const N: usize = 100;
@@ -185,10 +181,9 @@ mod tests {
         assert_eq!(checked, 6 * (N + 1) * (N + 1));
     }
 
-    /// The Rec.2020 primaries and secondaries, the most saturated possible
-    /// inputs, land in gamut with bounded `ICtCp` hue drift. The bounds below
-    /// are the measured behavior of the per-channel ACES RGC formulation, not
-    /// exact hue preservation. See `DisplayGamutCompression`.
+    /// The Rec.2020 primaries and secondaries are the most saturated possible
+    /// inputs. The bounds below are the measured behavior of the per-channel
+    /// ACES RGC formulation, not exact hue preservation.
     #[test]
     fn rec2020_primaries_compress_in_gamut_with_bounded_hue_drift() {
         let cases = [
@@ -204,7 +199,6 @@ mod tests {
             assert!(rgb709.min_element() < 0.0, "{label} should be OOG in 709");
             let out = gamut_compress(rgb709);
             assert!(out.min_element() >= -1e-5, "{label}: {out} out of gamut");
-            // max(r, g, b) (the achromatic anchor) is preserved exactly.
             assert_eq!(
                 out.max_element().to_bits(),
                 rgb709.max_element().to_bits(),
@@ -218,10 +212,9 @@ mod tests {
         }
     }
 
-    /// Moderately out-of-gamut colors, the common case of slightly wide chroma
-    /// after a Rec.2020 to Rec.709 contraction, keep hue drift in the low
-    /// single digits of degrees. The per-direction bounds below are the
-    /// measured behavior of the per-channel formulation.
+    /// Moderately out-of-gamut colors are the common case after a Rec.2020 to
+    /// Rec.709 contraction. The per-direction bounds below are the measured
+    /// behavior of the per-channel formulation.
     #[test]
     fn moderate_out_of_gamut_hue_drift_is_small() {
         // The Rec.2020 color with the worst cyan-direction distance (~1.594),
@@ -248,8 +241,6 @@ mod tests {
         }
     }
 
-    /// The compression curve is monotonically increasing through the knee and
-    /// continuous at the threshold.
     #[test]
     fn compression_is_monotonic_and_continuous_at_the_knee() {
         for i in 0..3 {
@@ -263,9 +254,8 @@ mod tests {
                 (at_knee - (threshold + eps)).abs() < 1e-5,
                 "channel {i}: discontinuous at the knee ({at_knee})"
             );
-            // Monotonicity of the effective per-channel mapping across the knee
-            // and the whole compression range: identity below the threshold via
-            // the pass-through select, the curve above it.
+            // The effective mapping is the identity below the threshold, via
+            // the pass-through select, and the curve above it.
             let effective = |d: f32| {
                 if d < threshold {
                     d
@@ -302,8 +292,7 @@ mod tests {
         }
     }
 
-    /// The compression is scale-invariant (distances are ratios), so it
-    /// behaves identically across exposure: compress(k * c) == k * compress(c).
+    /// Distances are ratios, so the compression is invariant across exposure.
     #[test]
     fn compression_is_scale_invariant() {
         let rgb = REC2020_TO_REC709 * Vec3::new(0.1, 0.9, 0.2);

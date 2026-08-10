@@ -52,10 +52,9 @@ impl Sensitivity {
 /// A component for enabling Fast Approximate Anti-Aliasing (FXAA)
 /// for a [`bevy_camera::Camera`].
 ///
-/// On a view composited in [`CompositingSpace::Oklab`], edge detection uses
-/// the Oklab lightness channel as the luma. The default Rec.601 luma
-/// approximation only works for sRGB views; it would produce NaN on Oklab's
-/// signed chroma channels.
+/// On a view composited in [`CompositingSpace::Oklab`], edge detection uses the
+/// Oklab lightness channel as the luma. The Rec.601 luma approximation works
+/// only for sRGB views; it can return NaN on Oklab's signed chroma channels.
 #[derive(Reflect, Component, Clone, ExtractComponent)]
 #[reflect(Component, Default, Clone)]
 #[extract_component_filter(With<Camera>)]
@@ -167,17 +166,10 @@ pub struct FxaaPipelineKey {
     edge_threshold: Sensitivity,
     edge_threshold_min: Sensitivity,
     target_format: TextureFormat,
-    /// [`ViewStackContract::is_hdr_encode`]; selects the `HDR_DISPLAY_TARGET`
-    /// shader path.
     hdr_encode: bool,
-    /// Whether [`ViewStackContract::compositing_space`] resolved to
-    /// [`CompositingSpace::Oklab`], not what the camera requested. The shader
-    /// then compiles with the `COMPOSITING_SPACE_OKLAB` def and reads the
-    /// Oklab L channel as the edge-detection luma.
     oklab_compositing: bool,
 }
 
-/// Returns the shader defs for an [`FxaaPipelineKey`]
 fn fxaa_shader_defs(key: &FxaaPipelineKey) -> Vec<ShaderDefVal> {
     let mut shader_defs = vec![
         format!("EDGE_THRESH_{}", key.edge_threshold.get_str()).into(),
@@ -262,8 +254,6 @@ mod tests {
         }
     }
 
-    /// A key with `oklab_compositing: false` pushes no
-    /// `COMPOSITING_SPACE_OKLAB` def, for both `hdr_encode` values.
     #[test]
     fn non_oklab_def_vector_is_byte_identical() {
         let sdr = fxaa_shader_defs(&base_key(false, false));
@@ -288,8 +278,6 @@ mod tests {
         assert!(!hdr.contains(&ShaderDefVal::from("COMPOSITING_SPACE_OKLAB")));
     }
 
-    /// `oklab_compositing: true` appends the `COMPOSITING_SPACE_OKLAB` def,
-    /// for both `hdr_encode` values.
     #[test]
     fn oklab_def_present_only_when_set() {
         let sdr = fxaa_shader_defs(&base_key(false, true));

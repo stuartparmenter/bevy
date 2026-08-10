@@ -382,20 +382,16 @@ fn tone_mapping(in: vec4<f32>, in_color_grading: ColorGrading) -> vec4<f32> {
 
 @if(WORKING_COLOR_SPACE_REC2020 && !TONEMAP_METHOD_GRAN_TURISMO_7) {
     // The scene buffer holds linear Rec.2020 working-space values, but every operator
-    // below, and the grading stack (white balance, sectional grading, saturation), is fit
-    // to Rec.709 primaries. The AgX, Tony McMapface, and Blender Filmic LUTs have no
-    // algorithmic source, so they cannot be rebaked for Rec.2020. Convert at the pass
-    // entry instead. The output stays Rec.709 display-linear with 1.0 = paper white.
-    // Working-space colors outside the Rec.709 gamut are clipped here.
+    // below, and the grading stack, is fit to Rec.709 primaries. The AgX, Tony McMapface,
+    // and Blender Filmic LUTs have no algorithmic source, so they cannot be rebaked for
+    // Rec.2020. Convert at the pass entry instead. The output is Rec.709 display-linear
+    // with 1.0 = paper white. Colors outside the Rec.709 gamut are clipped here.
     //
-    // The Gran Turismo 7 operator is Rec.2020-native, so it takes the working-space
+    // Gran Turismo 7 is excluded because it is Rec.2020-native: it takes the working-space
     // values directly and skips its own Rec.709 to Rec.2020 input expansion (see
-    // gt7.wesl). The grading stack before the operator therefore runs on Rec.2020 values
-    // with Rec.709-fit constants. GT7 is also the only operator whose output can be
-    // Rec.2020: under TONEMAP_OUTPUT_REC2020, which only HDR-transfer targets set, it
-    // emits native Rec.2020 for the display encoder, so the post-tonemapping
-    // `saturation()` below, the deband dither, and the FXAA/SMAA luma weights run on
-    // Rec.2020 values with Rec.709-fit constants too.
+    // gt7.wesl). Its grading runs on Rec.2020 values with Rec.709-fit constants, as do the
+    // post-tonemapping saturation, the deband dither, and the FXAA/SMAA luma weights when
+    // TONEMAP_OUTPUT_REC2020 keeps GT7's output Rec.2020.
     color = max(rec2020_to_rec709(color), vec3(0.0));
 }
 

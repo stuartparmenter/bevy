@@ -1,15 +1,8 @@
 //! The project-global working color space of the renderer.
 //!
-//! Bevy renders scene-referred color in linear Rec.709 (the sRGB primaries).
-//! [`WorkingColorSpace`] makes that choice explicit and configurable, with
-//! [`WorkingColorSpace::Rec2020`] as the opt-in wide-gamut alternative.
-//!
-//! The working color space is set on [`RenderPlugin`](crate::RenderPlugin). The
-//! shader def is registered globally when the renderer initializes, so changing
-//! the extracted resource later does not reach the shaders.
-//!
-//! The shader side is [`WORKING_COLOR_SPACE_REC2020_SHADER_DEF`] plus the WGSL
-//! helpers importable as `bevy_render::working_color_space`.
+//! Set the working color space on [`RenderPlugin`](crate::RenderPlugin). The
+//! shader def is registered when the renderer initializes, so a later change to
+//! the extracted resource does not reach the shaders.
 
 use bevy_color::LinearRgba;
 use bevy_ecs::{reflect::ReflectResource, resource::Resource};
@@ -23,7 +16,6 @@ pub const WORKING_COLOR_SPACE_REC2020_SHADER_DEF: &str = "WORKING_COLOR_SPACE_RE
 
 /// The color primaries of the renderer's scene-referred working space.
 ///
-/// This is a project-global setting on [`RenderPlugin`](crate::RenderPlugin).
 /// All scene-referred buffers, material/light/clear colors, and lighting math
 /// share one set of primaries, because shared assets and buffers make
 /// per-camera working spaces impractical.
@@ -32,15 +24,14 @@ pub const WORKING_COLOR_SPACE_REC2020_SHADER_DEF: &str = "WORKING_COLOR_SPACE_RE
 ///
 /// * Scene-linear intermediate textures hold linear Rec.2020 values.
 /// * Colors that enter the render world without shader-side texture
-///   composition (light colors, ambient light, fog, clear colors) are
-///   converted from Rec.709 to Rec.2020 on the CPU at their extract/prepare
-///   seams, via [`linear_rgba_rec709_to_working`].
-/// * Colors composed in shaders from Rec.709 factors (material color, texture,
-///   and vertex color; environment map and skybox samples) are converted once
-///   at the end of composition, under the `WORKING_COLOR_SPACE_REC2020` shader
-///   def. All sampled color textures are assumed to be authored against
-///   Rec.709 primaries, the common case. Textures stamped with wide primaries
-///   have no per-texture escape hatch and are over-converted. See
+///   composition (light colors, ambient light, fog, clear colors) convert on
+///   the CPU at their extract/prepare seams, through
+///   [`linear_rgba_rec709_to_working`].
+/// * Colors composed in shaders from Rec.709 factors (material, texture, and
+///   vertex color; environment map and skybox samples) convert once at the end
+///   of composition, under the `WORKING_COLOR_SPACE_REC2020` shader def. The
+///   renderer assumes every sampled color texture is Rec.709. A texture with
+///   wide primaries has no escape hatch and is over-converted. See
 ///   `GpuImage::source_primaries`.
 /// * The Gran Turismo 7 tone mapping operator takes the working space
 ///   natively, so its Rec.709 to Rec.2020 input expansion is skipped. Every
@@ -49,20 +40,15 @@ pub const WORKING_COLOR_SPACE_REC2020_SHADER_DEF: &str = "WORKING_COLOR_SPACE_RE
 ///   clips colors outside the Rec.709 gamut.
 ///
 /// `LinearRgba` and the rest of `bevy_color` stay defined as linear Rec.709.
-/// The conversion to the working space happens once, at the seams above.
 #[derive(Resource, Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Reflect)]
 #[reflect(Resource, Debug, Default, Clone, PartialEq, Hash)]
 pub enum WorkingColorSpace {
-    /// Linear Rec.709 / sRGB primaries, D65 white point (the default).
-    ///
-    /// Every working-space conversion is an identity, so rendering matches a
-    /// build with no working-space support compiled in.
+    /// Linear Rec.709 / sRGB primaries, D65 white point. Every working-space
+    /// conversion is an identity.
     #[default]
     Rec709,
-    /// Linear ITU-R BT.2020 (Rec.2020) primaries, D65 white point.
-    ///
-    /// Opt-in wide working space, meant for HDR display output. See the
-    /// type-level docs for what changes.
+    /// Linear ITU-R BT.2020 (Rec.2020) primaries, D65 white point. Opt-in wide
+    /// working space for HDR display output.
     Rec2020,
 }
 
@@ -81,11 +67,8 @@ impl WorkingColorSpace {
 /// `f32` of the matching f64 literal in `working_color_space.wesl` and
 /// `gt7.wesl`. The Rust and WGSL constants must stay bit-identical so the CPU
 /// code is an exact parity reference for the shaders
-/// (`matrices_match_wgsl_f64_literals`).
-///
-/// Equal to `bevy_color::rgb_to_rgb_matrix(RgbPrimaries::BT709,
-/// RgbPrimaries::BT2020)` within a few ULP. That derivation starts from the
-/// `f32` chromaticity fields; these constants come from the same values in f64.
+/// (`matrices_match_wgsl_f64_literals`). Equal to
+/// `bevy_color::rgb_to_rgb_matrix(BT709, BT2020)` within a few ULP.
 pub const REC709_TO_REC2020: Mat3 = Mat3::from_cols(
     Vec3::new(0.627_403_9, 0.069_097_29, 0.016_391_44),
     Vec3::new(0.329_283_03, 0.919_540_4, 0.088_013_306),
@@ -95,8 +78,7 @@ pub const REC709_TO_REC2020: Mat3 = Mat3::from_cols(
 /// Linear Rec.2020 to Rec.709 conversion matrix, D65 white point. Inverse of
 /// [`REC709_TO_REC2020`].
 ///
-/// See [`REC709_TO_REC2020`] for the WGSL bit-identity contract and the
-/// `bevy_color` tolerance.
+/// See [`REC709_TO_REC2020`] for the WGSL bit-identity contract.
 pub const REC2020_TO_REC709: Mat3 = Mat3::from_cols(
     Vec3::new(1.660_491, -0.124_550_48, -0.018_150_763),
     Vec3::new(-0.587_641_1, 1.132_899_9, -0.100_578_9),
@@ -112,9 +94,7 @@ pub const REC2020_TO_REC709: Mat3 = Mat3::from_cols(
 /// The display-encoding pass uses this to carry Rec.709 tone-map output into
 /// the P3-gamut
 /// [`ExtendedDisplayP3`](bevy_window::DisplayTransfer::ExtendedSrgb) signal.
-/// Bit-identical to `REC709_TO_DISPLAYP3` in `working_color_space.wesl`, and
-/// equal to `bevy_color::rgb_to_rgb_matrix(BT709, DISPLAY_P3)` within a few
-/// ULP.
+/// Bit-identical to `REC709_TO_DISPLAYP3` in `working_color_space.wesl`.
 pub const REC709_TO_DISPLAYP3: Mat3 = Mat3::from_cols(
     Vec3::new(0.822_461_96, 0.033_194_2, 0.017_082_632),
     Vec3::new(0.177_538_04, 0.966_805_8, 0.072_397_44),
@@ -135,8 +115,8 @@ pub const DISPLAYP3_TO_REC709: Mat3 = Mat3::from_cols(
 /// `REC2020_TO_DISPLAYP3` in `working_color_space.wesl`.
 ///
 /// The display-encoding pass uses this on the GT7-on-HDR path, whose tone-map
-/// output is native Rec.2020, to reach a P3-gamut signal. Display-P3 sits
-/// inside Rec.2020, so this contracts the gamut.
+/// output is native Rec.2020. Display-P3 sits inside Rec.2020, so this
+/// contracts the gamut.
 pub const REC2020_TO_DISPLAYP3: Mat3 = Mat3::from_cols(
     Vec3::new(1.343_578_2, -0.065_297_455, 0.002_821_787_3),
     Vec3::new(-0.282_179_68, 1.075_787_9, -0.019_598_495),
@@ -154,13 +134,10 @@ pub const DISPLAYP3_TO_REC2020: Mat3 = Mat3::from_cols(
 
 /// Converts a linear Rec.709 color into the given working color space.
 ///
-/// Every extract/prepare-time working-space conversion goes through this or
-/// its [`Vec4`] variant, so the matrix and the identity guarantee stay here.
-///
 /// * [`WorkingColorSpace::Rec709`]: returns `color` unchanged, bit for bit.
 /// * [`WorkingColorSpace::Rec2020`]: applies [`REC709_TO_REC2020`] to the RGB
-///   channels and leaves alpha alone. Out-of-gamut inputs (negative or > 1
-///   components) convert linearly like any other value.
+///   channels and leaves alpha alone. Nothing is clamped, so out-of-gamut
+///   inputs convert like any other value.
 #[inline]
 pub fn linear_rgba_rec709_to_working(color: LinearRgba, working: WorkingColorSpace) -> LinearRgba {
     match working {
@@ -196,10 +173,10 @@ mod tests {
         let a = a.to_cols_array();
         let b = b.to_cols_array();
         for (index, (lhs, rhs)) in a.iter().zip(b.iter()).enumerate() {
-            // Entries that are both near zero compare by absolute error, not
-            // relative. A shared primary makes some off-diagonals exactly zero
-            // in closed form, so those literals are locked to `0.0` while the
-            // runtime derivation leaves about 1e-17 of floating-point noise.
+            // Entries that are both near zero compare by absolute error. A
+            // shared primary makes some off-diagonals exactly zero in closed
+            // form, so those literals are locked to `0.0` while the runtime
+            // derivation leaves about 1e-17 of noise.
             let scale = lhs.abs().max(rhs.abs());
             let rel = if scale < 1e-6 {
                 0.0
@@ -216,9 +193,7 @@ mod tests {
     }
 
     /// The Rust literals must round to the same `f32` as the f64 literals in
-    /// `working_color_space.wesl` and in `gt7.wesl`, which keeps its own
-    /// fixture-locked copy. Drift shows up here before it reaches a readback
-    /// comparison.
+    /// `working_color_space.wesl` and `gt7.wesl`.
     #[test]
     fn matrices_match_wgsl_f64_literals() {
         // Transcribed from the WGSL sources, one column per line.
@@ -246,10 +221,10 @@ mod tests {
         }
     }
 
-    /// The BT.2087-derived literals must agree with the `bevy_color` runtime
-    /// derivation to within a few ULP, about 1e-6 relative. They are not
-    /// bit-identical: `rgb_to_rgb_matrix` starts from the `f32` chromaticity
-    /// fields, while the BT.2087 constants come from an f64 derivation.
+    /// The literals are not bit-identical to the `bevy_color` runtime
+    /// derivation: `rgb_to_rgb_matrix` starts from the `f32` chromaticity
+    /// fields, while these constants come from an f64 derivation. They must
+    /// still agree to within a few ULP.
     #[test]
     fn matrices_match_bevy_color_primaries_within_tolerance() {
         assert_mat3_rel_eq(
@@ -264,8 +239,6 @@ mod tests {
             1e-5,
             "REC2020_TO_REC709 vs rgb_to_rgb_matrix(BT2020, BT709)",
         );
-        // The Display-P3 literals diverge from the runtime derivation for the
-        // same reason, and by the same order of magnitude.
         assert_mat3_rel_eq(
             REC709_TO_DISPLAYP3,
             rgb_to_rgb_matrix(RgbPrimaries::BT709, RgbPrimaries::DISPLAY_P3),
@@ -292,8 +265,6 @@ mod tests {
         );
     }
 
-    /// The Display-P3 matrices are gray-preserving (rows sum to 1, shared D65
-    /// white) and mutual inverses with their Rec.709 / Rec.2020 counterparts.
     #[test]
     fn display_p3_matrices_are_gray_preserving_inverses() {
         let white = Vec3::ONE;
@@ -322,7 +293,6 @@ mod tests {
         }
     }
 
-    /// Both matrices are gray-preserving (rows sum to 1) and mutual inverses.
     #[test]
     fn matrices_are_gray_preserving_inverses() {
         let white = Vec3::ONE;
@@ -359,8 +329,8 @@ mod tests {
         );
     }
 
-    /// Known-value conversion: Rec.709 red maps to the first column of the
-    /// matrix; alpha passes through.
+    /// Rec.709 red maps to the first column of the matrix; alpha passes
+    /// through.
     #[test]
     fn rec2020_conversion_known_values() {
         let red = linear_rgba_rec709_to_working(LinearRgba::RED, WorkingColorSpace::Rec2020);

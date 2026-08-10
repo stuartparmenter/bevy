@@ -45,16 +45,14 @@ pub struct AutoExposureUniform {
     pub(super) long_term_bound_up: f32,
     pub(super) long_term_bound_down: f32,
     pub(super) physiological: u32,
-    /// Auto white balance chromaticity adaptation speed, per second.
+    /// Chromaticity adaptation speed, per second.
     pub(super) awb_speed: f32,
-    /// Auto white balance virtual-light anchor luminance, scene-linear units.
+    /// Virtual-light anchor luminance, scene-linear units.
     pub(super) awb_anchor: f32,
     /// Non-zero when the camera has an `AutoWhiteBalance` component.
-    /// The shader gates all white balance work on this flag.
     pub(super) awb_enabled: u32,
-    /// Tail padding to 80 bytes. The 17 fields above take 68, and WGSL rounds
-    /// a uniform struct's size up to a multiple of 16. encase does not, so the
-    /// mirror has to pad explicitly.
+    /// Tail padding to 80 bytes. The 17 fields above take 68, and WGSL rounds a uniform
+    /// struct's size up to a multiple of 16. encase does not, so pad explicitly.
     pub(super) pad_0: u32,
     pub(super) pad_1: u32,
     pub(super) pad_2: u32,
@@ -64,16 +62,16 @@ pub struct AutoExposureUniform {
 /// Field order and types must match the WGSL struct.
 #[derive(ShaderType, Clone, Copy, Debug, PartialEq)]
 pub struct AutoExposureState {
-    /// The smoothed short-term exposure correction, in EV.
+    /// The short-term exposure correction, in EV.
     pub(super) exposure: f32,
-    /// The long-term physiological adaptation envelope, in EV.
+    /// The long-term adaptation envelope, in EV.
     pub(super) long_term: f32,
-    /// The adapted white-point chromaticity (CIE 1931 x), used by auto white balance.
+    /// The adapted white point chromaticity, CIE 1931 x.
     pub(super) chroma_x: f32,
-    /// The adapted white-point chromaticity (CIE 1931 y); see [`Self::chroma_x`].
+    /// The adapted white point chromaticity, CIE 1931 y.
     pub(super) chroma_y: f32,
-    /// Fixed-point sums for the white balance chromaticity measurement (`x*Y`,
-    /// `y*Y`, `Y`), `array<atomic<u32>, 3>` on the GPU. Drained to zero each frame.
+    /// Fixed-point sums for the white balance measurement (`x*Y`, `y*Y`, `Y`),
+    /// `array<atomic<u32>, 3>` on the GPU. Drained to zero each frame.
     pub(super) chroma_sums: [u32; 3],
 }
 

@@ -58,9 +58,6 @@ pub struct SpritePipeline {
     material_layout: BindGroupLayoutDescriptor,
     shader: Handle<Shader>,
     /// The project-global working color space, captured at `RenderStartup`.
-    /// Under `WorkingColorSpace::Rec2020` the sprite fragment shader converts
-    /// its composed color (instance tint times texture sample) into it
-    /// (`OUTPUT_GAMUT_REC2020`).
     working_color_space: WorkingColorSpace,
 }
 
@@ -581,8 +578,6 @@ pub fn queue_sprites(
             | SpritePipelineKey::from_msaa_samples(msaa.samples())
             | SpritePipelineKey::from_compositing_space(resolved_space.and_then(|space| space.0));
 
-        // Fast path: an SDR camera marked `TonemapInShader` folds tonemapping
-        // and optional debanding into the sprite shader.
         if tonemap_in_shader
             && let Some(tonemapping) = tonemapping
             && *tonemapping != Tonemapping::None

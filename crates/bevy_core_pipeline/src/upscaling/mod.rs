@@ -49,12 +49,11 @@ fn clear_view_upscaling_pipelines(
 /// The compositing space the upscaling blit decodes from, taken from the
 /// view's [`ViewStackContract`].
 ///
-/// Returns `None` when the stack resolved encode parameters. The display
+/// Returns `None` when the stack resolved encode parameters: the display
 /// encoder already did the compositing-space decode and the main texture
-/// holds encoded signal (scRGB-linear, PQ, or encoded extended-range sRGB),
-/// so the blit passes it through. A deferred encode normally skips its blit
-/// ([`BlitDisposition::SkipDeferred`]). A request downgraded to plain SDR
-/// carries no encode parameters and keeps the decode-and-hardware-encode path.
+/// holds encoded signal, so the blit passes it through. A request downgraded
+/// to plain SDR carries no encode parameters and keeps the
+/// decode-and-hardware-encode path.
 fn blit_source_space(contract: Option<&ViewStackContract>) -> Option<CompositingSpace> {
     let contract = contract?;
     if contract.encoding.is_some() {
@@ -68,10 +67,9 @@ fn blit_source_space(contract: Option<&ViewStackContract>) -> Option<Compositing
 /// (`CameraOutputMode::Write { blend_state: None }`).
 ///
 /// The first camera to render to an output (`sorted_index == 0`) replaces.
-/// Later cameras alpha-blend so they composite over earlier cameras instead
-/// of overwriting them. A [`BlitDisposition::Run`] with `force_replace`
-/// replaces too, because that blit carries the whole composition and must not
-/// blend over the cleared out texture.
+/// Later cameras alpha-blend so they do not overwrite earlier cameras'
+/// output. `force_replace` replaces too, because that blit carries the whole
+/// composition and must not blend over the cleared out texture.
 fn auto_blit_blend_state(force_replace: bool, sorted_index: usize) -> Option<BlendState> {
     if force_replace || sorted_index == 0 {
         None
@@ -94,10 +92,9 @@ fn prepare_view_upscaling_pipelines(
     )>,
 ) {
     for (entity, view_target, camera, maybe_pipeline, contract) in view_targets.iter() {
-        // A view below its stack's finalizer skips its blit, see
-        // `BlitDisposition::SkipDeferred`. Removing the pipeline keeps the
-        // node from running, since its `ViewQuery` requires the component, so
-        // the out texture stays untouched until the finalizer blits.
+        // Removing the pipeline keeps the upscaling node from running, since
+        // its `ViewQuery` requires the component, so the out texture stays
+        // untouched until the finalizer blits.
         let force_replace = match contract.map(|contract| contract.blit) {
             Some(BlitDisposition::SkipDeferred) => {
                 commands.entity(entity).remove::<ViewUpscalingPipeline>();

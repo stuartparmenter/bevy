@@ -213,8 +213,7 @@ fn compute_radiances(
     }
 
 @if(WORKING_COLOR_SPACE_REC2020) {
-    // Environment maps are assumed Rec.709-authored, so convert the sampled
-    // radiance into the working space (see `GpuImage::source_primaries`).
+    // Environment maps are assumed Rec.709-authored, so convert into the working space.
     radiances.irradiance = rec709_to_rec2020(radiances.irradiance);
     radiances.radiance = rec709_to_rec2020(radiances.radiance);
 }
@@ -286,8 +285,7 @@ fn compute_radiances(
         radiance_level).rgb * intensity;
 
 @if(WORKING_COLOR_SPACE_REC2020) {
-    // Environment maps are assumed Rec.709-authored, so convert the sampled
-    // radiance into the working space (see `GpuImage::source_primaries`).
+    // Environment maps are assumed Rec.709-authored, so convert into the working space.
     radiances.irradiance = rec709_to_rec2020(radiances.irradiance);
     radiances.radiance = rec709_to_rec2020(radiances.radiance);
 }

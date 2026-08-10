@@ -24,11 +24,10 @@
 //! Without a usable wgpu adapter, or when renderer init fails, the test prints a `SKIP`
 //! line and passes.
 //!
-//! Scene: five cameras, each with a uniform clear color, each rendering to
-//! its own offscreen `Image` target. Four targets are registered in
-//! `ManualDisplayTargets` with `DisplayTransfer::Pq` + Rec.2020. One is a plain SDR
-//! `Rgba8UnormSrgb` target with no registration. Screenshots are captured mid-run,
-//! decoded by `decode_pq_screenshot`, then compared against the CPU prediction.
+//! Scene: five cameras, each with a uniform clear color and its own offscreen
+//! `Image` target. Four targets are registered in `ManualDisplayTargets` with
+//! `DisplayTransfer::Pq` + Rec.2020. One is a plain SDR `Rgba8UnormSrgb` target
+//! with no registration.
 
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -75,9 +74,7 @@ const MUTATE_AT: u32 = 70;
 const CAPTURE_2: u32 = 110;
 const MAX_FRAMES: u32 = 2000;
 
-// --- Display targets registered in ManualDisplayTargets ---
-
-/// PQ / Rec.2020, 1000-nit peak, 203-nit paper white (targets A, B, E).
+/// The calibration registered for targets A, B, and E.
 const T_PQ_203: DisplayTarget = DisplayTarget::SDR_SRGB
     .with_transfer(DisplayTransfer::Pq)
     .with_gamut(DisplayGamut::Rec2020)
@@ -85,15 +82,13 @@ const T_PQ_203: DisplayTarget = DisplayTarget::SDR_SRGB
     .with_paper_white(203.0)
     .with_min_luminance(0.005);
 
-/// PQ / Rec.2020 for target C. A second, distinct calibration, so the display-target
-/// uniform buffer holds more than one slice and a wrong dynamic offset shows up.
+/// Target C's calibration. A second, distinct calibration makes the display-target
+/// uniform buffer hold more than one slice, so a wrong dynamic offset shows up.
 const T_PQ_100: DisplayTarget = DisplayTarget::SDR_SRGB
     .with_transfer(DisplayTransfer::Pq)
     .with_gamut(DisplayGamut::Rec2020)
     .with_peak(4000.0)
     .with_paper_white(100.0);
-
-// --- GT7 params ---
 
 /// Camera B's initial params: a full UCS blend with the chroma fade band pulled to
 /// near zero, so the output is achromatic.
@@ -119,15 +114,13 @@ fn params_b_mutated() -> GranTurismo7Params {
     }
 }
 
-// --- Clear colors (scene-linear Rec.709 working space) ---
-
+// Clear colors, in the scene-linear Rec.709 working space.
 const C_AB: Vec3 = Vec3::new(1.0, 2.0, 4.0); // spans > 1.0, hits the GT7 shoulder
 const C_C: Vec3 = Vec3::new(4.0, 1.0, 0.05); // > 1.0 red, toe-region blue
 const C_D: Vec3 = Vec3::new(0.25, 0.5, 0.75); // plain SDR
 const C_E: Vec3 = Vec3::new(0.02, 0.02, 0.02); // dark: auto exposure must brighten
 
-// --- Cross-world plumbing ---
-// Statics. The render world and observers write, the test body reads after the app exits.
+// Statics: the render world and observers write, the test body reads after the app exits.
 
 #[derive(Clone, Debug)]
 struct CapturedImage {
@@ -173,15 +166,13 @@ struct TargetHandles {
     e: Handle<Image>,
 }
 
-// --- App setup ---
-
 fn hdr_image(images: &mut Assets<Image>) -> Handle<Image> {
     let img = Image::new_target_texture(SIZE, SIZE, TextureFormat::Rgba16Float, None);
     images.add(img)
 }
 
-/// Directory for the screenshots written by `save_to_disk`: an explicit
-/// override, or cargo's per-target scratch space (never the repo tree).
+/// Directory for the screenshots `save_to_disk` writes: an explicit override, or
+/// cargo's per-target scratch space. Never the repo tree.
 fn out_dir() -> PathBuf {
     std::env::var_os("GPU_FIXTURE_OUT_DIR")
         .map(PathBuf::from)
@@ -202,8 +193,8 @@ fn capture(commands: &mut Commands, handle: &Handle<Image>, label: &'static str)
             },
         ));
     });
-    // Exercise the save-to-disk path for one target. `.exr` needs the opt-in `exr`
-    // cargo feature, `.hdr` ships by default. A missing codec only logs an error.
+    // Exercise the save-to-disk path for one target. `.hdr` is built in; `.exr`
+    // needs the opt-in `exr` feature and only logs an error when it is missing.
     if label == "gt7_default" {
         entity
             .observe(save_to_disk(out_dir().join("gt7_default.exr")))
@@ -228,8 +219,7 @@ fn driver(
             capture(&mut commands, &handles.e, "auto_exposure_t1");
         }
         MUTATE_AT => {
-            // In-place mutation (no remove/insert): the per-frame uniform
-            // refresh must pick it up.
+            // In-place mutation, no remove/insert: the uniform refresh must pick it up.
             for mut p in &mut params {
                 *p = params_b_mutated();
             }
@@ -307,7 +297,6 @@ fn observe_render_world(
     *RENDER_OBS.lock().unwrap() = Some(obs);
 }
 
-// --- CPU reference for the GT7 operator ---
 // A port of the test-only `cpu_reference` module in bevy_core_pipeline's gt7.rs, driven
 // by the same `Gt7ParamsUniform` the shader binds.
 
@@ -437,8 +426,6 @@ fn expected_decoded(clear: Vec3, uniform: &Gt7ParamsUniform, paper_white_nits: f
     REC2020_TO_REC709 * linear
 }
 
-// --- Capture inspection ---
-
 fn pixel_f32(cap: &CapturedImage, x: u32, y: u32) -> [f32; 4] {
     assert_eq!(cap.format, TextureFormat::Rgba32Float);
     let idx = ((y * cap.width + x) * 16) as usize;
@@ -458,8 +445,6 @@ fn pixel_u8(cap: &CapturedImage, x: u32, y: u32) -> [u8; 4] {
 fn close(actual: Vec3, expected: Vec3, rel: f32, abs: f32) -> bool {
     (0..3).all(|i| (actual[i] - expected[i]).abs() <= f32::max(rel * expected[i].abs(), abs))
 }
-
-// --- The test ---
 
 struct Checker {
     failed: Vec<String>,
@@ -528,9 +513,8 @@ const RUN_TIMEOUT: Duration = Duration::from_secs(480);
 
 #[test]
 fn gpu_hdr_fixture() {
-    // Build and run on a helper thread so a wedged driver cannot hang the test. The
-    // test thread only ever waits with a timeout. Winit is disabled, so nothing
-    // needs the main thread.
+    // Build and run on a helper thread so a wedged driver cannot hang the test; the
+    // test thread only waits with timeouts. Winit is off, so nothing needs the main thread.
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         // Silence the default panic hook while building. A missing adapter panics
@@ -621,7 +605,6 @@ fn gpu_hdr_fixture() {
 
     let mut c = Checker { failed: Vec::new() };
 
-    // --- Check 1: manual display targets reach the render world ---
     c.check(
         "1a extracted ManualDisplayTargets map reaches the render world",
         obs.manual_len == 4
@@ -674,7 +657,6 @@ fn gpu_hdr_fixture() {
         ),
     );
 
-    // --- Check 2: HDR-gated display-target uniform ---
     for (label, want_pw) in [
         ("gt7_default", 203.0),
         ("gt7_custom", 203.0),
@@ -700,8 +682,7 @@ fn gpu_hdr_fixture() {
             && !d.has_tonemap_pipeline,
         format!("{d:?}"),
     );
-    // The SDR camera renders fine without the uniform: Tonemapping::None +
-    // hardware sRGB encode => bytes are srgb_oetf(clear) quantized.
+    // Tonemapping::None plus hardware sRGB encode gives srgb_oetf(clear), quantized.
     {
         let sdr = cap("sdr_none");
         let px = pixel_u8(sdr, sdr.width / 2, sdr.height / 2);
@@ -719,7 +700,6 @@ fn gpu_hdr_fixture() {
         );
     }
 
-    // --- Check 3: GT7 uniform and node-side tonemapping veto ---
     let defaults = GranTurismo7Params::default();
     for (label, target, params) in [
         ("gt7_default", T_PQ_203, defaults),
@@ -740,8 +720,7 @@ fn gpu_hdr_fixture() {
             format!("has ViewTonemappingPipeline = {}", v.has_tonemap_pipeline),
         );
     }
-    // Custom params visibly affect output: A (defaults) vs B (custom), same
-    // target calibration, same clear color.
+    // A (defaults) vs B (custom): same target calibration, same clear color.
     {
         let (a, _) = decoded_px("gt7_default");
         let (b1, _) = decoded_px("gt7_custom_t1");
@@ -763,7 +742,6 @@ fn gpu_hdr_fixture() {
         );
     }
 
-    // --- Check 4: PQ encode/decode round trip vs the CPU reference chain ---
     let round_trip = |name: &str,
                       label: &str,
                       clear: Vec3,
@@ -817,7 +795,6 @@ fn gpu_hdr_fixture() {
         &mut c,
     );
 
-    // --- Check 5: auto-exposure smoke ---
     {
         let (e1, _) = decoded_px("auto_exposure_t1");
         let (e2, _) = decoded_px("auto_exposure_t2");

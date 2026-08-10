@@ -128,8 +128,6 @@ pub trait UiMaterial: AsBindGroup + Asset + Clone + Sized {
 pub struct UiMaterialKey<M: UiMaterial> {
     pub target_format: TextureFormat,
     pub bind_group_data: M::Data,
-    /// Writer-side encode of the fragment output (see
-    /// [`UiWriterEncodeKey`](crate::pipeline::UiWriterEncodeKey)).
     pub writer_encode: crate::pipeline::UiWriterEncodeKey,
 }
 

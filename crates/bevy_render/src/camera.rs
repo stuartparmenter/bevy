@@ -474,9 +474,7 @@ pub struct ExtractedCamera {
     pub exposure: f32,
     pub hdr: bool,
     /// When [`CompositingSpace::Srgb`], shaders output sRGB-encoded values for
-    /// gamma-encoded blending and the main texture uses linear storage:
-    /// `Rgba8Unorm`, or `Rgba16Float` when the camera is `Hdr`, tone-maps, or
-    /// has an HDR display target.
+    /// gamma-encoded blending and the main texture uses linear storage.
     pub compositing_space: Option<CompositingSpace>,
 }
 
@@ -524,10 +522,9 @@ pub fn extract_cameras(
     main_pass_formats.clear();
     let primary_window = primary_window.iter().next();
 
-    // The SDR in-shader tone-mapping fast path forces an 8-bit main texture,
-    // so a camera can only take it when it is the sole active camera on its
-    // target. Siblings that need the fp16 scene-linear format would land on a
-    // different main texture, splitting compositing across the two.
+    // The SDR in-shader tone-mapping fast path forces an 8-bit main texture, so a camera
+    // can only take it when it is the sole active camera on its target. A sibling that
+    // needs the fp16 format would land on a different main texture, splitting compositing.
     let mut active_cameras_per_target: HashMap<NormalizedRenderTarget, usize> = HashMap::default();
     for camera_query in query.iter() {
         let (camera, render_target) = (camera_query.2, camera_query.3);
@@ -650,9 +647,8 @@ pub fn extract_cameras(
                         .map(|format| normalize_bgra8(target, format))
                 })
                 .unwrap_or(TextureFormat::Rgba8UnormSrgb);
-            // This resolved transfer is the previous frame's negotiation
-            // result, as fresh as the swapchain format read above.
-            // `MainTextureMode` documents the format policy.
+            // This resolved transfer is the previous frame's negotiation result, as
+            // fresh as the swapchain format read above.
             let view_display_target = resolve_view_display_target(
                 target.as_ref(),
                 extracted_swap_chains.iter(),
@@ -773,50 +769,30 @@ fn normalize_bgra8(target: &NormalizedRenderTarget, format: TextureFormat) -> Te
 }
 
 /// The main-texture format policy a camera view falls under.
-///
-/// Selected by [`main_texture_mode`] and turned into a concrete format by
-/// [`MainTextureMode::format`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MainTextureMode {
     /// The high-precision `Rgba16Float` intermediate.
     ///
-    /// Taken by `Hdr` cameras, by cameras with an active tone-mapping operator
-    /// that are not eligible for [`InShaderTonemapSdr`](Self::InShaderTonemapSdr),
-    /// and by cameras whose resolved display target requests an HDR transfer.
+    /// Node-side tone mapping needs an unclipped buffer: an 8-bit intermediate clamps
+    /// scene-referred values above 1.0 before the operator sees them. This holds under an
+    /// explicit `CompositingSpace::Srgb` or `Oklab` too, because the compositing encode is
+    /// a value convention, not a storage format, and fp16 keeps values above 1.0 intact.
     ///
-    /// Node-side tone mapping needs an unclipped buffer: an 8-bit intermediate
-    /// would clamp scene-referred values above 1.0 before the operator sees
-    /// them. That holds under an explicit `CompositingSpace::Srgb`/`Oklab` too,
-    /// because the compositing encode is a value convention rather than a
-    /// storage-format requirement, and fp16 keeps encoded values above 1.0
-    /// intact for the tonemapping pass to decode.
-    ///
-    /// The HDR-transfer case covers `Tonemapping::None` views, which are warned
-    /// about when nothing in their stack tone-maps but still run the
-    /// display-encoding pass, whose input is unclamped display-linear values.
-    /// Without it such a camera on a PQ/HDR10 window would render into the
-    /// swapchain's `Rgb10a2Unorm` format, clamping at 1.0 and quantizing to
-    /// 10-bit linear before the encoder sees the values.
+    /// The display-encoding pass needs it too: a camera on a PQ/HDR10 window would
+    /// otherwise render into the swapchain's `Rgb10a2Unorm` format, which clamps at 1.0
+    /// and quantizes to 10-bit linear before the encoder reads the values.
     SceneLinear,
-    /// The output texture's view format, with tone mapping folded into the
-    /// camera's material shaders.
-    ///
-    /// Taken by a plain SDR sRGB window camera with an active operator, no
-    /// need for the scene-linear buffer, and sole ownership of its target. The
-    /// fold uses the `TONEMAP_IN_SHADER` pipeline path and keeps the 8-bit main
-    /// texture. Published to render-world consumers as [`TonemapInShader`].
+    /// The output texture's view format, with tone mapping folded into the camera's
+    /// material shaders. Published to render-world consumers as [`TonemapInShader`].
     InShaderTonemapSdr,
     /// The linear-storage `Rgba8Unorm` main texture an explicit
     /// `CompositingSpace::Srgb` camera keeps.
     CompositingSrgb8,
-    /// The output texture's view format, for everything else (e.g.
-    /// `Tonemapping::None` 2D cameras on SDR targets).
+    /// The output texture's view format, for everything else.
     FollowOutput,
 }
 
 impl MainTextureMode {
-    /// The main-texture format for this mode, given the view format of the
-    /// texture the camera ultimately writes to.
     fn format(self, output_texture_format: TextureFormat) -> TextureFormat {
         match self {
             MainTextureMode::SceneLinear => TextureFormat::Rgba16Float,
@@ -828,14 +804,10 @@ impl MainTextureMode {
     }
 }
 
-/// Render-world marker for camera views on the SDR in-shader tone-mapping
-/// fast path (`MainTextureMode::InShaderTonemapSdr`).
+/// Render-world marker for camera views on the SDR in-shader tone-mapping fast path.
 ///
-/// [`extract_cameras`] adds and removes it, so it is present exactly when the
-/// camera keeps an 8-bit main texture with an active tone-mapping operator.
-/// Pipeline specialization reads it to set the `TONEMAP_IN_SHADER` shader def,
-/// and the tonemapping pass skips those views, since the fold already
-/// tone-mapped every fragment.
+/// [`extract_cameras`] adds and removes it each frame. Pipeline specialization reads it to
+/// set the `TONEMAP_IN_SHADER` shader def, and the tonemapping pass skips these views.
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct TonemapInShader;
 
@@ -843,20 +815,18 @@ pub struct TonemapInShader;
 #[derive(Clone, Copy)]
 struct MainTextureCamera<'a> {
     hdr: bool,
-    /// [`Tonemapping::is_enabled`]; `false` when the camera has no
-    /// [`Tonemapping`] component.
+    /// [`Tonemapping::is_enabled`], or `false` with no [`Tonemapping`] component.
     tonemapping_enabled: bool,
     needs_scene_linear_target: bool,
     needs_node_tonemapping: bool,
     compositing_space: Option<CompositingSpace>,
     display_target: ViewDisplayTarget,
     target: Option<&'a NormalizedRenderTarget>,
-    /// Active cameras rendering to `target`, this one included. `None` when
-    /// the target is not a counted render target.
+    /// Active cameras rendering to `target`, this one included. `None` when the
+    /// camera has no target.
     cameras_on_target: Option<usize>,
 }
 
-/// Picks the main-texture format policy for one extracted camera view.
 fn main_texture_mode(camera: MainTextureCamera) -> MainTextureMode {
     let MainTextureCamera {
         hdr,
@@ -869,15 +839,11 @@ fn main_texture_mode(camera: MainTextureCamera) -> MainTextureMode {
         cameras_on_target,
     } = camera;
 
-    // The fast path is restricted to window targets, so the 8-bit format is
-    // always `Rgba8UnormSrgb`. Image and texture-view targets keep the
-    // node-side path. The compositing space must be the default linear one:
-    // `Srgb` routes to `Rgba8Unorm`, which has no hardware sRGB encode for the
-    // 3D fold to rely on, and `Oklab` needs signed-float storage.
-    // `TonemappingPass` excludes operators whose config the fold cannot
-    // reproduce, such as custom GT7 parameters. The display target is the
-    // post-negotiation value, so a downgraded HDR request folds like any other
-    // SDR view.
+    // Window targets only, so the 8-bit format is always `Rgba8UnormSrgb`. The compositing
+    // space must be the default linear one: `Srgb` routes to `Rgba8Unorm`, which has no
+    // hardware sRGB encode for the fold to rely on, and `Oklab` needs signed-float storage.
+    // `TonemappingPass` excludes operators whose config the fold cannot reproduce, such as
+    // custom GT7 parameters.
     let eligible_in_shader_tonemap = tonemapping_enabled
         && !hdr
         && !needs_scene_linear_target
@@ -937,9 +903,9 @@ pub fn sort_cameras(
             ambiguities.insert(new_order_target.clone());
         }
         if let Some(target) = &sorted_camera.target {
-            // Keyed by target alone, so every camera sharing a render target gets a
-            // unique index even when `hdr` differs. Downstream stack analyses and the
-            // upscaling auto-blend need that bottom-to-top order.
+            // Keyed by target alone, so every camera sharing a target gets a unique index
+            // even when `hdr` differs. Stack analysis and the upscaling auto-blend need
+            // that bottom-to-top order.
             let count = target_counts.entry(target.clone()).or_insert(0usize);
             let (_, mut camera) = cameras.get_mut(sorted_camera.entity).unwrap();
             camera.sorted_camera_index_for_target = *count;
@@ -1569,8 +1535,7 @@ mod tests {
 
         let shared = NormalizedRenderTarget::TextureView(ManualTextureViewHandle(0));
         let other = NormalizedRenderTarget::TextureView(ManualTextureViewHandle(1));
-        // The upper camera is spawned first so the assigned indices prove that
-        // camera order, not spawn order, drives the sequence.
+        // Spawn the upper camera first, so the indices prove camera order beats spawn order.
         let upper = world.spawn(extracted_camera(1, true, shared.clone())).id();
         let lower = world.spawn(extracted_camera(0, false, shared)).id();
         let solo = world.spawn(extracted_camera(0, true, other)).id();

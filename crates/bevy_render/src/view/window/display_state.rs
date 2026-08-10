@@ -1,17 +1,14 @@
-//! Render-side display sensing. [`poll_display_state`] re-reads each surface's
-//! live HDR state when it can have changed, [`DisplayStateStore`] suppresses
-//! sub-threshold jitter, and [`write_back_display_state`] mirrors the result to
-//! the main world as [`WindowDisplayState`] and [`MonitorDisplayCapability`].
+//! Render-side display sensing.
 //!
 //! The single live value the tone mapper consumes is
 //! [`DisplayHdrInfo::tone_map_headroom`], the linear multiplier of SDR white
 //! the display can drive right now. wgpu folds the platform-specific
 //! reporting into it (Apple's relative EDR headroom, Windows' absolute
 //! `max_nits / sdr_white_nits` ratio, the coarse SDR flag), so this module
-//! never reconstructs an absolute peak from platform-specific fields.
+//! never reconstructs an absolute peak.
 //!
-//! `bevy_window` stays wgpu-free and holds only the plain-data result types.
-//! Everything that touches a wgpu [`DisplayHdrInfo`] lives here.
+//! `bevy_window` stays wgpu-free, so everything that touches a wgpu
+//! [`DisplayHdrInfo`] lives here.
 
 use bevy_ecs::prelude::*;
 use bevy_platform::collections::HashMap;
@@ -26,10 +23,9 @@ use crate::MainWorld;
 
 use super::{ExtractedWindow, SurfaceData};
 
-/// Maps a wgpu coarse [`DisplayGamut`](WgpuDisplayGamut) onto the plain-data
-/// [`DisplayGamut`] the window crate carries. `Srgb` and any unrecognized future
-/// wgpu variant map to [`DisplayGamut::Rec709`], the narrowest known gamut and
-/// the conservative choice for a capability hint.
+/// `Srgb` and any unrecognized future wgpu variant map to
+/// [`DisplayGamut::Rec709`], the narrowest known gamut and the conservative
+/// choice for a capability hint.
 fn map_gamut(g: WgpuDisplayGamut) -> DisplayGamut {
     match g {
         WgpuDisplayGamut::DisplayP3 => DisplayGamut::DisplayP3,
@@ -46,8 +42,7 @@ pub(crate) fn finite_positive(v: Option<f32>) -> Option<f32> {
 
 /// Whether a [`DisplayHdrInfo`] carries any usable reporting model: absolute
 /// luminance (Windows), a relative headroom (Apple), or a coarse capability
-/// (web). `false` means this platform or this moment reports nothing. It never
-/// means "SDR".
+/// (web). `false` means the platform reports nothing. It never means "SDR".
 fn reports_anything(info: &DisplayHdrInfo) -> bool {
     info.luminance
         .is_some_and(|l| l.max_nits.is_some() || l.sdr_white_nits.is_some())
@@ -58,14 +53,9 @@ fn reports_anything(info: &DisplayHdrInfo) -> bool {
 /// Collapses a wgpu [`DisplayHdrInfo`] into the two plain-data carriers, or
 /// `None` when the platform reported nothing usable.
 ///
-/// The live half is wgpu's already-folded
-/// [`tone_map_headroom`](DisplayHdrInfo::tone_map_headroom), which reads `1.0`
-/// for a display that reports itself SDR. `sdr_white_nits` is carried alongside
-/// (Windows only) to anchor the `paper_white` auto-calibration.
-///
-/// The capability half is copied through for the [`MonitorDisplayCapability`]
-/// mirror, including the coarse gamut bucket the backend reports (a
-/// nearest-primaries match on DXGI, the CSS `color-gamut` query on web).
+/// [`tone_map_headroom`](DisplayHdrInfo::tone_map_headroom) reads `1.0` for a
+/// display that reports itself SDR. `sdr_white_nits` is Windows only, and
+/// anchors the `paper_white` auto-calibration.
 fn read_display_state(
     info: &DisplayHdrInfo,
 ) -> Option<(WindowDisplayState, MonitorDisplayCapability)> {
@@ -92,24 +82,19 @@ fn read_display_state(
 /// enough to swallow float noise.
 const EPSILON_REL: f32 = 0.01;
 
-/// Per-surface committed live state and last capability, keyed by window entity.
-/// Render-world only.
+/// Per-surface committed live state and capability, keyed by main-world window
+/// entity.
 #[derive(Resource, Default)]
 pub(crate) struct DisplayStateStore {
     /// The committed (post-epsilon) [`WindowDisplayState`] per surface. A
-    /// present-but-`None` entry marks a surface that was read on a platform that
-    /// reports nothing: it stops the per-frame re-read, and the component stays
-    /// absent until a real read lands.
+    /// present-but-`None` entry marks a surface on a platform that reports
+    /// nothing: it stops the per-frame re-read.
     states: HashMap<Entity, Option<WindowDisplayState>>,
-    /// The last committed capability per surface (so the [`Monitor`] write-back
-    /// is insert-on-change).
-    ///
-    /// [`Monitor`]: bevy_window::Monitor
+    /// The last committed capability per surface, so the monitor write-back is
+    /// insert-on-change.
     capabilities: HashMap<Entity, MonitorDisplayCapability>,
 }
 
-/// Whether two optional continuous values differ by more than the relative
-/// epsilon. A `None` to `Some` or `Some` to `None` transition always counts.
 fn rel_changed(old: Option<f32>, new: Option<f32>) -> bool {
     match (old, new) {
         (Some(a), Some(b)) => (a - b).abs() > EPSILON_REL * a.abs().max(f32::MIN_POSITIVE),
@@ -118,11 +103,10 @@ fn rel_changed(old: Option<f32>, new: Option<f32>) -> bool {
     }
 }
 
-/// Folds a fresh read into the committed live state for `entity`. A read
-/// commits only when a field moves past the relative [`EPSILON_REL`], so
+/// Folds a fresh read into the committed live state for `entity`. A read commits
+/// only when a field moves past [`EPSILON_REL`], so
 /// [`Changed<WindowDisplayState>`](bevy_ecs::prelude::Changed) signals a real
-/// transition rather than read jitter. The capability half is not smoothed;
-/// write-back handles it insert-on-change.
+/// transition rather than read jitter. The capability half is not smoothed.
 fn commit(
     store: &mut DisplayStateStore,
     entity: Entity,
@@ -147,29 +131,13 @@ fn commit(
 /// smooths it, and stores the committed result for write-back.
 ///
 /// Main-thread-pinned on Apple platforms: the relative-headroom query returns
-/// `None` off the main thread. A surface is read when:
-///
-/// - it is seen for the first time, to seed the mirror, or
-/// - its surface was just (re)configured
-///   ([`display_target_transfer_changed`](super::ExtractedWindow::display_target_transfer_changed)),
-///   or
-/// - a window event flagged it for re-query
-///   ([`request_display_requery`](super::ExtractedWindow::request_display_requery)):
-///   a move, a focus regain, a monitor change, or a surface renegotiation that
-///   changed the resolved transfer, or
-/// - it is auto-calibrating
-///   ([`display_calibration_auto`](super::ExtractedWindow::display_calibration_auto))
-///   an HDR surface on a platform whose live value drifts with no event (Apple
-///   EDR headroom), in which case it is read every frame.
-///
-/// A read on a platform that reports nothing commits nothing.
+/// `None` off the main thread.
 pub(crate) fn poll_display_state(
     #[cfg(any(target_os = "macos", target_os = "ios"))] _marker: bevy_ecs::system::NonSendMarker,
     windows: Query<(MainEntity, &ExtractedWindow, &SurfaceData)>,
     render_adapter: Res<RenderAdapter>,
     mut store: ResMut<DisplayStateStore>,
 ) {
-    // Drop bookkeeping for surfaces that went away.
     let live: bevy_ecs::entity::EntityHashSet = windows
         .iter()
         .map(|(main_entity, ..)| main_entity)
@@ -185,8 +153,7 @@ pub(crate) fn poll_display_state(
         let resolved = surface_data.resolved_transfer;
 
         // The OS gate stands in for "this surface's headroom drifts without an
-        // event" until wgpu exposes that as a surface capability. Today the
-        // Apple EDR headroom is the only such signal.
+        // event" until wgpu exposes that as a surface capability.
         let continuous = cfg!(any(target_os = "macos", target_os = "ios"))
             && resolved.is_hdr()
             && extracted.display_calibration_auto;
@@ -211,18 +178,13 @@ pub(crate) fn poll_display_state(
 }
 
 /// Mirrors what the render world learned about each window surface back to the
-/// main world: the negotiated and supported transfers
-/// ([`WindowSurfaceTransfers`], so apps can spot a downgraded request and offer
-/// only the modes that will work), the surface's committed
+/// main world: [`WindowSurfaceTransfers`], the surface's committed
 /// [`WindowDisplayState`], and its [`MonitorDisplayCapability`]. The capability
-/// goes on the [`Monitor`] entity the window is on (resolved through
-/// [`OnMonitor`]), so every window on a display shares one record.
+/// goes on the monitor entity the window is on, so every window on a display
+/// shares one record.
 ///
-/// Runs during extraction, the render world's only window into the main world,
-/// so every value lags the frame that produced it by one. Writes are
-/// insert-on-change, so [`Changed`] stays a usable signal.
-///
-/// [`Monitor`]: bevy_window::Monitor
+/// Runs during extraction, so every value lags the frame that produced it by
+/// one.
 pub(crate) fn write_back_display_state(
     mut main_world: ResMut<MainWorld>,
     windows: Query<(MainEntity, &SurfaceData)>,
@@ -305,7 +267,6 @@ mod read_tests {
         let (state, capability) = read_display_state(&info).unwrap();
         // `tone_map_headroom()` returns Apple's live `current`, not `potential`.
         assert_eq!(state.tone_map_headroom, Some(4.0));
-        // Apple reports no absolute nits.
         assert_eq!(state.sdr_white_nits, None);
         assert_eq!(capability.max_nits, None);
     }
@@ -400,11 +361,9 @@ mod read_tests {
 
     #[test]
     fn rel_changed_transitions() {
-        // Presence transitions always count. Both absent never does.
         assert!(rel_changed(Some(5.0), None));
         assert!(rel_changed(None, Some(5.0)));
         assert!(!rel_changed(None, None));
-        // Sub-epsilon vs supra-epsilon while both present.
         assert!(!rel_changed(Some(5.0), Some(5.02)));
         assert!(rel_changed(Some(5.0), Some(5.5)));
     }
@@ -433,8 +392,7 @@ mod commit_tests {
         let capability = MonitorDisplayCapability::default();
         commit(&mut store, entity, state(Some(5.0), None), capability);
 
-        // A 0.4% change is below the 1% relative epsilon, so it never commits
-        // and the insert-on-change write-back never fires.
+        // A 0.4% change is below the 1% relative epsilon, so it never commits.
         commit(&mut store, entity, state(Some(5.02), None), capability);
         assert_eq!(committed(&store, entity), Some(state(Some(5.0), None)));
     }
@@ -447,7 +405,6 @@ mod commit_tests {
         let capability = MonitorDisplayCapability::default();
         commit(&mut store, entity, state(Some(5.0), None), capability);
 
-        // A 10% change is above the epsilon: commits.
         commit(&mut store, entity, state(Some(5.5), None), capability);
         assert_eq!(committed(&store, entity), Some(state(Some(5.5), None)));
     }

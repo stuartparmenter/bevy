@@ -266,11 +266,9 @@ mod tests {
 
     #[test]
     fn hdr_lighter_darker() {
-        // SDR luminance clamps at 1.0.
         let sdr = Xyza::new(0.5, 0.9, 0.5, 1.0);
         assert_approx_eq!(sdr.lighter(0.5).y, 1.0, 1e-6);
 
-        // HDR luminance extends without clamping.
         let hdr = Xyza::new(1.0, 3.0, 1.0, 1.0);
         assert_approx_eq!(hdr.lighter(0.5).y, 3.5, 1e-6);
         assert_approx_eq!(hdr.darker(0.5).y, 2.5, 1e-6);

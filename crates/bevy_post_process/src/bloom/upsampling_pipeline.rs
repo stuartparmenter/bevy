@@ -153,8 +153,7 @@ pub fn prepare_upsampling_pipeline(
             BloomUpsamplingPipelineKeys {
                 composite_mode,
                 // The intermediate passes render into the bloom pyramid, whose
-                // format is per-view (fp16 on HDR display targets). The final
-                // pass below targets the view target.
+                // format is per-view. The final pass below uses the view target.
                 target_format: bloom_texture_format(Some(display_target)),
             },
         );

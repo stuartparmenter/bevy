@@ -3,28 +3,13 @@
 // display signal. The `display_encoding` module docs describe where the pass
 // sits in the display pipeline.
 //
-// Stages:
-//   1. optional decode of the view's compositing space back to linear
-//      (`SRGB_TO_LINEAR` / `OKLAB_TO_LINEAR`),
-//   2. gamut transform from the per-view source primaries to the display
-//      signal primaries (`DISPLAY_GAMUT_REC2020`, `GAMUT_REC2020_TO_REC709`,
-//      `DISPLAY_GAMUT_DISPLAYP3`, `GAMUT_REC2020_TO_DISPLAYP3`, or no def for
-//      an identity transform),
-//   3. out-of-gamut handling: chroma compression toward the achromatic axis
-//      (`DISPLAY_GAMUT_COMPRESSION`), then a `max(0)` safety clip for every
-//      transfer but `DISPLAY_TRANSFER_EXTENDED_SRGB`,
-//   4. transfer encoding (`DISPLAY_TRANSFER_SCRGB` / `DISPLAY_TRANSFER_PQ` /
-//      `DISPLAY_TRANSFER_EXTENDED_SRGB`).
-//
-// There is no sRGB transfer def: the hardware applies the exact sRGB OETF on
-// the upscaling blit's `*UnormSrgb` writeback, so plain SDR views never run
-// this pass.
+// There is no sRGB transfer def: the hardware applies the sRGB OETF on the
+// upscaling blit's `*UnormSrgb` writeback, so plain SDR views never run this
+// pass.
 
 import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput;
 import bevy_render::view::display_target::DisplayTargetUniform;
 import bevy_render::transfer_functions::{scrgb_encode, pq_inverse_eotf_from_nits, srgb_oetf_extended};
-// Gamut matrices for stage 2. `working_color_space` documents their derivation
-// and the bit-identity contract with the Rust constants.
 import bevy_render::working_color_space::{REC709_TO_REC2020, REC2020_TO_REC709, REC709_TO_DISPLAYP3, REC2020_TO_DISPLAYP3};
 @if(SRGB_TO_LINEAR)
 import bevy_render::color_operations::srgb_to_linear;
@@ -48,13 +33,12 @@ import bevy_render::color_operations::oklab_to_linear_rgb;
 // power curve compresses distances above the threshold so that `dist == limit`
 // lands exactly on the boundary.
 //
-// Thresholds and power are the published ACES RGC values (cyan 0.815, magenta
-// 0.803, yellow 0.880, power 1.2). The ACES limits (1.147 / 1.264 / 1.312) were
-// derived from digital-cinema camera gamuts and under-cover the Rec.2020 to
-// Rec.709 contraction this pass performs: the Rec.2020 hull reaches a distance
-// of ~1.594 in the cyan direction when expressed in Rec.709 coordinates. The
-// limits below are re-derived from the Rec.2020 hull maxima
-// (~1.594 / ~1.087 / ~1.117) plus headroom.
+// Thresholds and power are the published ACES RGC values. The ACES limits
+// (1.147 / 1.264 / 1.312) were derived from digital-cinema camera gamuts and
+// under-cover the Rec.2020 to Rec.709 contraction this pass performs: the
+// Rec.2020 hull reaches a distance of ~1.594 in the cyan direction when
+// expressed in Rec.709 coordinates. The limits below are re-derived from the
+// Rec.2020 hull maxima (~1.594 / ~1.087 / ~1.117) plus headroom.
 //
 // CPU mirror and tests: `gamut_compression.rs` next to this shader. Keep both
 // in sync.
@@ -119,22 +103,18 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
 
     // 2. Gamut transform: tone-map-output primaries to display primaries.
     //
-    // Input contract: the tone-mapping pass emits Rec.709 display-linear for
-    // every operator under every `WorkingColorSpace`. Rec.709-fit operators get
-    // a Rec.2020 to Rec.709 conversion at the pass entry. The exception is
-    // `Tonemapping::GranTurismo7` on an HDR-transfer target, which emits its
-    // native linear Rec.2020 through the `TONEMAP_OUTPUT_REC2020` path in
-    // gt7.wesl. The stack contract resolver reads the same predicate
-    // (`tonemap_output_gamut`), and prepare keys exactly one of the defs below,
-    // or none for an identity transform.
+    // Input contract: the tone-mapping pass emits Rec.709 display-linear,
+    // except `Tonemapping::GranTurismo7` on an HDR-transfer target, which emits
+    // its native linear Rec.2020 through the `TONEMAP_OUTPUT_REC2020` path in
+    // gt7.wesl. Prepare keys exactly one of the defs below, or none for an
+    // identity transform.
 @if(DISPLAY_GAMUT_REC2020) {
     rgb = REC709_TO_REC2020 * rgb;
 }
 @if(GAMUT_REC2020_TO_REC709) {
     // A contraction: GT7's Rec.2020 output onto the Rec.709-coordinate scRGB
     // or extended-sRGB signal. It can produce negative components, so prepare
-    // normally keys in `DISPLAY_GAMUT_COMPRESSION` below. See
-    // `DisplayGamutCompression` and `is_gamut_contraction` in mod.rs.
+    // normally keys in `DISPLAY_GAMUT_COMPRESSION` below.
     rgb = REC2020_TO_REC709 * rgb;
 }
 @if(DISPLAY_GAMUT_DISPLAYP3) {
@@ -157,9 +137,7 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     // Final safety clip of negative components. PQ needs non-negative input
     // before its `pow`. After compression this only catches floating-point
     // residue and scene-referred negatives that did not come from the gamut
-    // stage. With no compression active, including the
-    // `DisplayGamutCompression::Clip` debug fallback, it is the entire
-    // out-of-gamut handling.
+    // stage. With no compression active it is the whole out-of-gamut handling.
     //
     // Skipped for the encoded extended-range sRGB transfer. Its OETF is
     // odd-symmetric, and the extended signal exists to carry out-of-gamut and

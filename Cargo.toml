@@ -1454,8 +1454,7 @@ required-features = ["bevy_settings"]
 name = "HDR Calibration"
 description = "HGIG-style calibration patterns for tuning a window's DisplayTarget on an HDR display"
 category = "3D Rendering"
-# The calibration patterns need PQ or scRGB output; browser WebGPU exposes no
-# PQ canvas color space, so the example cannot do its job on wasm
+# The calibration patterns need PQ or scRGB output, which browser WebGPU cannot present
 wasm = false
 
 [[example]]

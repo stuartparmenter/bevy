@@ -1,16 +1,10 @@
 //! Render-world plumbing for [`DisplayTarget`].
 //!
-//! [`DisplayTarget`] is a required component on [`Window`] entities (see
-//! `bevy_window`). This module covers the two cases that component cannot:
-//!
-//! - non-entity render targets ([`RenderTarget::Image`] and
-//!   [`RenderTarget::TextureView`]), which the [`ManualDisplayTargets`]
-//!   resource describes, and
-//! - the render world, where [`resolve_display_target`] looks up the
-//!   [`DisplayTarget`] for any [`NormalizedRenderTarget`].
-//!
-//! [`RenderTarget::Image`]: bevy_camera::RenderTarget::Image
-//! [`RenderTarget::TextureView`]: bevy_camera::RenderTarget::TextureView
+//! [`DisplayTarget`] is a required component on [`Window`] entities. This module
+//! covers the two cases that component cannot: non-entity render targets, which
+//! [`ManualDisplayTargets`] describes, and the render world, where
+//! [`resolve_display_target`] looks up the [`DisplayTarget`] for any
+//! [`NormalizedRenderTarget`].
 
 use bevy_camera::NormalizedRenderTarget;
 use bevy_ecs::{entity::ContainsEntity, prelude::*};
@@ -26,19 +20,11 @@ use super::ExtractedWindow;
 use crate::RenderApp;
 
 /// Resource that stores the [`DisplayTarget`] for render targets that are not
-/// backed by a [`Window`] entity.
+/// backed by a [`Window`] entity, keyed by [`NormalizedRenderTarget`].
 ///
-/// Entries are keyed by [`NormalizedRenderTarget`] (the same keying
-/// `ViewTargetAttachments` uses). Targets without an entry, including
-/// [`RenderTarget::None`], use [`DisplayTarget::SDR_SRGB`].
-///
-/// Insert into it from the main world; an [`ExtractResourcePlugin`] clones it
-/// into the render world on change, where [`resolve_display_target`] reads it.
-/// The render world sees the authored value: manual targets have no surface and
-/// no monitor, so calibration has nothing to sense or merge for them.
-///
-/// [`ExtractResourcePlugin`]: crate::extract_resource::ExtractResourcePlugin
-/// [`RenderTarget::None`]: bevy_camera::RenderTarget::None
+/// Insert into it from the main world. The render world sees the authored value:
+/// manual targets have no surface and no monitor, so calibration has nothing to
+/// sense or merge for them.
 #[derive(Default, Clone, Debug, PartialEq, Resource, ExtractResource, Reflect)]
 #[reflect(Resource, Default, Debug, PartialEq, Clone)]
 #[extract_app(RenderApp)]
@@ -60,22 +46,16 @@ impl core::ops::DerefMut for ManualDisplayTargets {
 
 /// Resolves the [`DisplayTarget`] for a render target in the render world.
 ///
-/// View-preparation code calls this to set up per-display work (tone mapping,
-/// gamut mapping, transfer encoding) for a view. `target` is the view's
-/// [`NormalizedRenderTarget`], e.g. `ExtractedCamera::target`. All cameras
-/// rendering to the same target resolve to the same `DisplayTarget`.
+/// `target` is the view's [`NormalizedRenderTarget`], for example
+/// `ExtractedCamera::target`.
 ///
-/// Resolution rules:
-/// - [`NormalizedRenderTarget::Window`]: the window's extracted
-///   `DisplayTarget`. `extract_windows` feeds this from the window's resolved
-///   [`EffectiveDisplayTarget`], so it carries the calibration the renderer
-///   encodes for, not the raw authored value.
-/// - [`NormalizedRenderTarget::Image`] / [`NormalizedRenderTarget::TextureView`]:
-///   looked up in [`ManualDisplayTargets`]. The key is the whole
-///   [`NormalizedRenderTarget`], so an image entry only matches views whose
-///   target has the same image handle and `ImageRenderTarget::scale_factor`.
-/// - [`NormalizedRenderTarget::None`], `target == None`, or any missing
-///   entry: [`DisplayTarget::SDR_SRGB`].
+/// A window resolves to its extracted `DisplayTarget`, which `extract_windows`
+/// feeds from the window's resolved [`EffectiveDisplayTarget`], so it carries
+/// the calibration the renderer encodes for, not the authored value. An image or
+/// texture view resolves through [`ManualDisplayTargets`]; the key is the whole
+/// [`NormalizedRenderTarget`], so an image entry only matches views with the
+/// same image handle and `ImageRenderTarget::scale_factor`. Everything else,
+/// including a missing entry, resolves to [`DisplayTarget::SDR_SRGB`].
 pub fn resolve_display_target<'a>(
     target: Option<&NormalizedRenderTarget>,
     windows: impl IntoIterator<Item = (Entity, &'a ExtractedWindow)>,
@@ -105,7 +85,6 @@ pub(crate) mod policy {
         FieldProvenance, MonitorDisplayCapability, WindowDisplayState,
     };
 
-    /// The sensed inputs the resolver can use for one target.
     #[derive(Default, Clone, Copy)]
     pub(crate) struct SensedInputs<'a> {
         pub capability: Option<&'a MonitorDisplayCapability>,
@@ -115,30 +94,23 @@ pub(crate) mod policy {
     /// Resolves one [`EffectiveDisplayTarget`] from the authored target, its
     /// policy, and sensed inputs.
     ///
-    /// Per field, the highest applicable source wins:
-    /// 1. the authored value, when the field does not opt into auto-resolution;
-    /// 2. otherwise the OS-sensed value, else the authored value tagged
-    ///    [`FieldProvenance::Default`].
+    /// Per field: the authored value when the field is not auto, else the
+    /// OS-sensed value, else the authored value tagged
+    /// [`FieldProvenance::Default`]. wgpu and winit expose no channel for a
+    /// platform-pushed calibration override (HGIG), so there is no rung for one.
     ///
-    /// A platform that pushes calibration at the app would add two rungs
-    /// between manual and OS-sensed: an HDR-game-interface (HGIG) override,
-    /// then an engine policy. wgpu and winit expose no such channel, so those
-    /// rungs are omitted.
-    ///
-    /// The transfer is never auto-resolved. It is copied verbatim and carries
-    /// no provenance entry.
+    /// The transfer is never auto-resolved. It is copied verbatim and has no
+    /// provenance entry.
     pub(crate) fn resolve(
         target: DisplayTarget,
         policy: DisplayCalibrationPolicy,
         sensed: SensedInputs,
     ) -> EffectiveDisplayTarget {
         let mut out = target;
-        // Defaults to all `User`.
         let mut prov = DisplayProvenance::default();
 
-        // Paper white resolves first. On platforms with no absolute nits (Apple)
-        // the OS-sensed peak is `paper_white * headroom`, so peak needs the
-        // resolved paper white.
+        // Paper white resolves first: on platforms with no absolute nits (Apple)
+        // the OS-sensed peak is `paper_white * headroom`.
         resolve_f32(
             policy.auto_paper_white,
             &mut out.paper_white_nits,
@@ -151,7 +123,6 @@ pub(crate) mod policy {
             &mut out.peak_luminance_nits,
             &mut prov.peak_luminance,
             target.peak_luminance_nits,
-            // `out.transfer` is still the authored request.
             os_peak(&sensed, out.paper_white_nits, out.transfer.is_hdr()),
         );
         resolve_f32(
@@ -178,18 +149,14 @@ pub(crate) mod policy {
 
     /// The OS-sensed peak luminance in nits, for an HDR target.
     ///
-    /// `surface_is_hdr` is the transfer's
-    /// [`is_hdr`](bevy_window::DisplayTransfer::is_hdr), a capability question
-    /// kept separate from the live headroom value. An SDR target has no HDR peak
-    /// to auto-resolve, so peak falls through the ladder to the authored value.
+    /// An SDR target has no HDR peak to auto-resolve, so peak falls through to
+    /// the authored value.
     ///
-    /// For an HDR target the absolute peak is the platform's measured
-    /// small-patch peak where it reports one (Windows DXGI `max_nits`), else the
-    /// resolved paper white times the live
+    /// For an HDR target the peak is the platform's measured small-patch peak
+    /// where it reports one (Windows DXGI `max_nits`), else the resolved paper
+    /// white times the live
     /// [`tone_map_headroom`](WindowDisplayState::tone_map_headroom) (the Apple
-    /// EDR path, which reports no absolute nits). That multiplier is 1.0 with
-    /// macOS at full brightness, leaving peak at the paper white. Either way
-    /// GT7's `peak / paper_white` ceiling resolves to the live headroom.
+    /// EDR path, which reports no absolute nits).
     fn os_peak(sensed: &SensedInputs, paper_white_nits: f32, surface_is_hdr: bool) -> Option<f32> {
         use crate::view::window::display_state::finite_positive;
         if !surface_is_hdr {
@@ -204,8 +171,6 @@ pub(crate) mod policy {
         })
     }
 
-    /// Resolves one `f32` field through the precedence ladder, writing the
-    /// resolved value and its provenance.
     fn resolve_f32(
         auto: bool,
         out: &mut f32,
@@ -229,14 +194,6 @@ pub(crate) mod policy {
 /// Resolves every window's [`EffectiveDisplayTarget`] in the main world, before
 /// extraction, so a window that authored HDR shows HDR on its first frame, with
 /// no SDR pop.
-///
-/// For each window it merges the authored [`DisplayTarget`] with its
-/// [`DisplayCalibrationPolicy`] (defaulting to all-manual), the
-/// [`MonitorDisplayCapability`] of the monitor it is on (resolved through
-/// [`OnMonitor`]), and its live [`WindowDisplayState`]. The write is
-/// [`set_if_neq`](bevy_ecs::change_detection::DetectChangesMut::set_if_neq), so
-/// [`Changed<EffectiveDisplayTarget>`](bevy_ecs::prelude::Changed) only fires on
-/// a real change.
 pub fn resolve_calibration(
     mut windows: Query<
         (
@@ -278,8 +235,6 @@ mod resolve_display_target_tests {
         })
     }
 
-    /// There is no policy merge on the manual path: the authored value comes
-    /// back field for field.
     #[test]
     fn registered_manual_targets_resolve_to_the_authored_value() {
         let pq = DisplayTarget::SDR_SRGB
@@ -306,9 +261,6 @@ mod resolve_display_target_tests {
         );
     }
 
-    /// Every miss falls back to the SDR default: an unregistered key, a key
-    /// that differs only in `scale_factor`, a `None` target, and no target at
-    /// all.
     #[test]
     fn misses_fall_back_to_sdr_srgb() {
         let mut manual = ManualDisplayTargets::default();
@@ -317,8 +269,7 @@ mod resolve_display_target_tests {
             DisplayTarget::SDR_SRGB.with_transfer(DisplayTransfer::Pq),
         );
 
-        // Same image handle, different scale factor: the key is the whole
-        // `NormalizedRenderTarget`, so this misses.
+        // Same image handle, different scale factor: the whole key must match.
         assert_eq!(
             resolve_display_target(Some(&image_target(2.0)), no_windows(), &manual),
             DisplayTarget::SDR_SRGB
@@ -383,7 +334,6 @@ mod policy_tests {
                 ..Default::default()
             },
         );
-        // Every field is unchanged and provenance is all-User.
         assert_eq!(e.target, target);
         assert_eq!(e.provenance, DisplayProvenance::default());
     }
@@ -415,8 +365,7 @@ mod policy_tests {
     #[test]
     fn auto_peak_skipped_on_sdr_target() {
         // On an SDR target a reported capability peak (the EDID panel peak) must
-        // NOT surface as a phantom HDR peak. Peak falls through to the authored
-        // value.
+        // NOT surface as a phantom HDR peak.
         let target = DisplayTarget::SDR_SRGB.with_peak(1000.0); // Srgb transfer
         let policy = DisplayCalibrationPolicy {
             auto_peak_luminance: true,
@@ -450,7 +399,6 @@ mod policy_tests {
     #[test]
     fn transfer_is_never_resolved() {
         let target = DisplayTarget::SDR_SRGB.with_transfer(DisplayTransfer::Pq);
-        // Every field auto.
         let policy = DisplayCalibrationPolicy {
             auto_paper_white: true,
             auto_peak_luminance: true,
@@ -466,7 +414,6 @@ mod policy_tests {
                 ..Default::default()
             },
         );
-        // The transfer is unchanged.
         assert_eq!(e.target.transfer, DisplayTransfer::Pq);
     }
 
@@ -524,9 +471,8 @@ mod policy_tests {
 
     #[test]
     fn auto_peak_and_paper_white_together_on_apple_path() {
-        // Both auto on the Apple path. Apple reports no absolute SDR white, so
-        // paper white falls back to the authored default (100, tagged Default)
-        // and peak comes out as 100 * 4 = 400.
+        // Apple reports no absolute SDR white, so paper white falls back to the
+        // authored default, tagged Default, and anchors the peak.
         let target = DisplayTarget::SDR_SRGB.with_transfer(DisplayTransfer::ScRgbLinear);
         let policy = DisplayCalibrationPolicy {
             auto_paper_white: true,

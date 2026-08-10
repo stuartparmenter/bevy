@@ -8,21 +8,14 @@
 //! composites on top with [`ClearColorConfig::None`]. Running the pass per
 //! camera would apply it twice to the earlier camera's pixels: tone mapping
 //! the lower camera's output a second time, or alpha-blending PQ-encoded
-//! signal. The pass is deferred instead to the last enabled camera in the
-//! stack, which processes the composed buffer once.
-//!
-//! [`resolve_camera_stack_contracts`] runs that deferral once per pass (tone
-//! mapping and display encoding), reconciles the two, resolves the display
-//! encoder's parameters once per stack, and publishes one
-//! [`ViewStackContract`] component per view.
+//! signal. The pass defers to the last enabled camera in the stack, which
+//! processes the composed buffer once.
 //!
 //! The main-texture ping-pong persists across frames, so a stack whose first
 //! camera uses [`ClearColorConfig::None`] starts each frame from last frame's
-//! already-processed output and reprocesses it. Feedback and trail effects
-//! built that way drift over time. The resolver reports this as a diagnostic
-//! and leaves the behavior alone. Stable accumulation needs
-//! [`Tonemapping::None`] on an SDR target, which keeps the main buffer
-//! scene-referred.
+//! processed output and reprocesses it. Feedback and trail effects built that
+//! way drift over time. Stable accumulation needs [`Tonemapping::None`] on an
+//! SDR target, which keeps the main buffer scene-referred.
 //!
 //! [`ClearColorConfig::None`]: bevy_camera::ClearColorConfig
 //! [`Tonemapping::None`]: crate::tonemapping::Tonemapping::None
@@ -74,11 +67,10 @@ impl Plugin for CameraStackPlugin {
 /// A view's role for one deferrable fullscreen pass within its camera stack.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum StackRole {
-    /// The view runs its own pass (if enabled). Solo views, members of
-    /// non-deferring stack shapes, and pass-disabled views all carry this.
+    /// The view runs its own pass, if the pass is enabled.
     Solo,
-    /// The pass is deferred to the named finalizing view. This view must not
-    /// run the pass.
+    /// The pass defers to the named finalizing view. This view must not run
+    /// the pass.
     Deferred(Entity),
     /// The view runs the pass once for the whole stack.
     Finalizer,
@@ -87,7 +79,6 @@ pub enum StackRole {
 /// Whether a view's upscaling blit runs, and with which auto-detected blend.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BlitDisposition {
-    /// The blit runs.
     Run {
         /// Whether the auto-detected `ALPHA_BLENDING` (sorted index > 0) is
         /// upgraded to replace. Set on the first surviving blit of a stack
@@ -95,10 +86,10 @@ pub enum BlitDisposition {
         /// user `blend_state`.
         force_replace: bool,
     },
-    /// The view sits below its stack's finalizer, either deferring a pass to
-    /// it or pass-disabled mid-stack. Presenting the not-yet-finalized buffer
-    /// would show un-tonemapped or un-encoded pixels, so the blit is skipped
-    /// and the finalizer's blit carries the composition.
+    /// The view sits below its stack's finalizer. Presenting the
+    /// not-yet-finalized buffer would show un-tonemapped or un-encoded
+    /// pixels, so the blit is skipped and the finalizer's blit carries the
+    /// composition.
     SkipDeferred,
 }
 
@@ -106,21 +97,20 @@ pub enum BlitDisposition {
 /// transfer and gamut coercion chain (see `coerce_display_encode`).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct ResolvedEncoding {
-    /// The resolved display transfer function.
     pub transfer: DisplayTransfer,
-    /// The resolved display gamut the encoder transforms to.
+    /// The gamut the encoder transforms to.
     pub gamut: DisplayGamut,
 }
 
 /// Per-view resolved composition state.
 ///
-/// Overwritten in place by [`resolve_camera_stack_contracts`] every frame and
-/// never removed, so a view whose `ViewTarget` was dropped keeps a stale
-/// contract. Consumers must keep a `ViewTarget` term (or a component gated on
-/// it) in their queries as the liveness gate.
+/// Overwritten in place every frame and never removed, so a view whose
+/// `ViewTarget` was dropped keeps a stale contract. Consumers must keep a
+/// `ViewTarget` term (or a component gated on it) in their queries as the
+/// liveness gate.
 ///
 /// Not registered for reflection: the component is render-world internal, and
-/// [`StackRole`] and [`BlitDisposition`] do not implement `Reflect`.
+/// [`StackRole`] and [`BlitDisposition`] are not `Reflect`.
 #[derive(Component, Clone, Copy, PartialEq, Debug)]
 pub struct ViewStackContract {
     /// Role of this view's tonemapping pass.
@@ -138,8 +128,7 @@ pub struct ViewStackContract {
     /// per-camera encode keys for its own region.
     pub source_gamut: DisplayGamut,
     /// Resolved encode parameters. `Some` exactly when the view's resolved
-    /// display target requests an HDR transfer, which
-    /// [`resolve_camera_stack_contracts`] asserts per view.
+    /// display target requests an HDR transfer.
     pub encoding: Option<ResolvedEncoding>,
 }
 
@@ -151,8 +140,7 @@ impl ViewStackContract {
     /// buffer's primaries.
     ///
     /// A solo `Tonemapping::None` view under a Rec.2020 working space returns
-    /// `false`: no pass marks the buffer Rec.2020, so its `source_gamut`
-    /// stays Rec.709 and no post-tonemap conversion runs.
+    /// `false`: no pass marks the buffer Rec.2020.
     pub fn source_gamut_is_rec2020(&self) -> bool {
         matches!(self.source_gamut, DisplayGamut::Rec2020)
     }
@@ -196,9 +184,7 @@ pub(crate) struct ContractInput<K> {
     pub loads_previous: bool,
     /// The view's resolved tone-mapping operator
     /// (`resolve_tonemapping(..).operator`).
-    /// [`Tonemapping::is_enabled`] gates the view's tonemapping pass. The
-    /// operator is compared against the finalizer's for the operator-mismatch
-    /// diagnostic.
+    /// [`Tonemapping::is_enabled`] gates the view's tonemapping pass.
     pub operator: Tonemapping,
 }
 
@@ -272,8 +258,7 @@ pub(crate) fn resolve_contracts<K: Copy + Eq + Hash>(
 ///
 /// The pass defers to the last enabled member exactly when there are at least
 /// two enabled members and every enabled member after the first composites
-/// fullscreen: it loads the previous content and covers the whole target with
-/// its output. Any other arrangement (clearing cameras, viewport-scoped
+/// fullscreen. Any other arrangement (clearing cameras, viewport-scoped
 /// cameras) keeps the per-camera behavior, where each camera's pass feeds
 /// only its own region of the final image.
 fn pass_finalizer<K>(
@@ -308,16 +293,15 @@ fn resolve_group<K>(members: &[ContractInput<K>], outputs: &mut EntityHashMap<Co
     // not-yet-tonemapped buffer. Each deferral test looks only at enabled
     // views, so a pass-disabled viewport member is invisible to the tonemap
     // test but breaks the shape for the encode test. Tonemap deferral is then
-    // cancelled and every member tone-maps per camera. SDR groups have no
-    // encode pass and always keep tonemap deferral.
+    // cancelled and every member tone-maps per camera.
     let coherence_cancelled =
         encode_enabled_group && tonemap_finalizer.is_some() && encode_finalizer.is_none();
     if coherence_cancelled {
         tonemap_finalizer = None;
     }
 
-    // The finalizer is by construction the last enabled member, so an
-    // enabled member below it defers to it and every other member runs solo.
+    // The finalizer is by construction the last enabled member, so an enabled
+    // member below it defers to it.
     let role = |index: usize, enabled: bool, finalizer: Option<usize>| match finalizer {
         Some(f) if index == f => StackRole::Finalizer,
         Some(f) if enabled && index < f => StackRole::Deferred(members[f].entity),
@@ -325,9 +309,8 @@ fn resolve_group<K>(members: &[ContractInput<K>], outputs: &mut EntityHashMap<Co
     };
 
     // The gamut of the composed buffer a deferred encode reads: whatever the
-    // last tonemap-enabled member in sorted order produced, or Rec.709 when
-    // nothing in the group tone-maps. Not the tonemap finalizer, which does
-    // not exist when the tonemap pass runs per camera.
+    // last tonemap-enabled member in sorted order produced. Not the tonemap
+    // finalizer, which does not exist when the tonemap pass runs per camera.
     let group_gamut = members
         .iter()
         .rev()
@@ -336,8 +319,7 @@ fn resolve_group<K>(members: &[ContractInput<K>], outputs: &mut EntityHashMap<Co
         .unwrap_or(DisplayGamut::Rec709);
 
     // The finalizer whose blit presents the whole composition: the
-    // highest-index finalizer of either pass. Every member below it skips its
-    // blit, see `BlitDisposition::SkipDeferred`. A `CameraOutputMode::Skip`
+    // highest-index finalizer of either pass. A `CameraOutputMode::Skip`
     // finalizer never blits, so skipping for it would leave the target
     // unpresented and members keep their blits instead.
     let presenting_finalizer = tonemap_finalizer
@@ -346,18 +328,17 @@ fn resolve_group<K>(members: &[ContractInput<K>], outputs: &mut EntityHashMap<Co
 
     let encode_without_tonemap = encode_enabled_group && !stack_tonemaps;
 
-    // See the module docs for the drift this reports. The diagnostic only
-    // fires when a pass runs over the group: a stack that neither tone-maps
-    // nor encodes leaves the buffer scene-referred and accumulates stably.
+    // The diagnostic only fires when a pass runs over the group: a stack that
+    // neither tone-maps nor encodes leaves the buffer scene-referred and
+    // accumulates stably.
     let frame_start_loads_processed_output =
         members.first().is_some_and(|first| first.loads_previous)
             && (stack_tonemaps || encode_enabled_group);
 
     // A member is shape-breaking when its output does not composite over the
     // whole target: any viewport member, or a clearing member that is not the
-    // group's first. The first member is expected to clear. Viewport-ness is
-    // "loads previous content but does not composite fullscreen", so a
-    // clearing viewport as the first member counts as a normal root.
+    // group's first. The first member is expected to clear, so a clearing
+    // viewport as the first member counts as a normal root.
     let shape_breaking = |index: usize, member: &ContractInput<K>| {
         if index == 0 {
             !member.composites_fullscreen && member.loads_previous
@@ -376,8 +357,7 @@ fn resolve_group<K>(members: &[ContractInput<K>], outputs: &mut EntityHashMap<Co
     // member blits the whole target, re-presenting regions whose passes ran
     // per camera below it. The mirror case, a viewport member above
     // per-camera members, stays silent: any trigger for it would also fire on
-    // every ordinary splitscreen, because a non-first member's clear is inert
-    // on the shared attachment.
+    // every ordinary splitscreen.
     let fullscreen_blit_over_per_camera_passes =
         members.iter().enumerate().any(|(index, overlay)| {
             overlay.composites_fullscreen
@@ -397,8 +377,8 @@ fn resolve_group<K>(members: &[ContractInput<K>], outputs: &mut EntityHashMap<Co
             Some(finalizer) if index == finalizer => BlitDisposition::Run {
                 force_replace: !member.explicit_blend,
             },
-            // No finalizer, or a member above it: the blit runs with its
-            // auto-detected blend and composites over any earlier present.
+            // No finalizer, or a member above it: the blit composites over
+            // any earlier present.
             _ => BlitDisposition::Run {
                 force_replace: false,
             },
@@ -440,18 +420,15 @@ fn resolve_group<K>(members: &[ContractInput<K>], outputs: &mut EntityHashMap<Co
 
 /// Resolves every camera view's stack into a [`ViewStackContract`].
 ///
-/// Groups views by `ViewTarget::main_texture().id()` and orders each group by
-/// `sorted_camera_index_for_target`. It runs in
-/// [`RenderSystems::PrepareViews`] after `prepare_view_targets`, which
-/// supplies the `ViewTarget`, and `prepare_view_display_targets`, which
+/// Runs in [`RenderSystems::PrepareViews`] after `prepare_view_targets`,
+/// which supplies the `ViewTarget`, and `prepare_view_display_targets`, which
 /// supplies the `ViewDisplayTarget`.
 ///
 /// A texture group never spans two [`ResolvedCompositingSpace`] groups: equal
 /// main-texture ids imply equal main-texture keys, and `prepare_view_targets`
 /// dedups allocations on exactly that key.
 ///
-/// The stack rules live in `resolve_contracts`. This system feeds it and
-/// reports the diagnostics as `warn_once`s.
+/// The stack rules live in `resolve_contracts`.
 pub fn resolve_camera_stack_contracts(
     mut commands: Commands,
     views: Query<(
@@ -469,11 +446,10 @@ pub fn resolve_camera_stack_contracts(
     // part of the texture grouping key, so transfer and gamut are uniform
     // across a group. Resolving from the first-iterated member therefore
     // agrees with every member's `encode_enabled`, since both read
-    // `is_hdr_transfer()` off that shared target. The invariant can only break
-    // in a pathological plugin order where a camera view still holds its
-    // default (plain SDR) `ViewDisplayTarget`, which is out of scope. The
-    // `debug_assert_eq!` makes that divergence loud in debug builds instead of
-    // silently mixing an encoded group with an unencoded out-texture clear.
+    // `is_hdr_transfer()` off that shared target. The `debug_assert_eq!`
+    // catches a pathological plugin order that leaves a view holding its
+    // default SDR `ViewDisplayTarget`, which would mix an encoded group with
+    // an unencoded out-texture clear.
     let mut group_encodings: HashMap<TextureId, Option<ResolvedEncoding>> = HashMap::default();
     let mut inputs = Vec::new();
     for (entity, camera, view_target, view_display_target, tonemapping, resolved_space) in &views {
@@ -549,8 +525,7 @@ fn resolve_group_encode_parameters(
     // Only manual Image/TextureView targets can hit this. Window surfaces
     // negotiate HDR transfers onto formats without a hardware sRGB encode,
     // while a `ManualDisplayTargets` entry resolves verbatim because the user
-    // owns the texture. Writing the encoded signal through an sRGB view would
-    // encode it a second time.
+    // owns the texture.
     if view_target
         .out_texture_view_format()
         .is_some_and(|format| format.is_srgb())
@@ -580,13 +555,10 @@ fn resolve_group_encode_parameters(
 }
 
 /// The prepare-time display-encode coercion chain over the resolved transfer
-/// and gamut: `DisplayP3` -> Rec709 for every transfer except `ExtendedSrgb`,
-/// then scRGB forces Rec709, then `ExtendedSrgb` forces Rec2020 -> Rec709,
-/// then PQ forces Rec2020.
+/// and gamut.
 ///
 /// The order is load bearing: the P3 -> Rec709 arm runs before the
-/// transfer-specific gamut arms. Each arm reports the coercion it applies as
-/// a `warn_once` or `info_once`.
+/// transfer-specific gamut arms.
 pub(crate) fn coerce_display_encode(
     transfer: DisplayTransfer,
     gamut: DisplayGamut,
@@ -603,9 +575,8 @@ pub(crate) fn coerce_display_encode(
     }
     if transfer == DisplayTransfer::ScRgbLinear && gamut != DisplayGamut::Rec709 {
         // scRGB-linear (IEC 61966-2-2) gets wide gamut from out-of-range and
-        // negative component values, not from a change of primaries.
-        // Re-coordinatizing into Rec.2020 here would still be read as Rec.709
-        // by the compositor and would desaturate every pixel.
+        // negative components, not from a change of primaries. Rec.2020
+        // coordinates would still be read as Rec.709 and desaturate every pixel.
         info_once!(
             "scRGB-linear signals are always expressed in (extended) Rec.709/sRGB \
             coordinates (the OS compositor performs the mapping to the panel's gamut); \
@@ -697,8 +668,7 @@ mod contract_tests {
         Entity::from_raw_u32(raw).unwrap()
     }
 
-    /// An SDR member with an active operator that clears its target. Tests
-    /// override the fields each case exercises.
+    /// An SDR member with an active operator that clears its target.
     fn clearing(raw: u32, index: usize) -> ContractInput<u32> {
         ContractInput {
             entity: entity(raw),
@@ -763,7 +733,6 @@ mod contract_tests {
         assert_eq!(output.diagnostics, ContractDiagnostics::default());
     }
 
-    // E1: a solo camera runs everything itself with no diagnostics.
     #[test]
     fn solo_camera_is_solo_everywhere() {
         let outputs = resolve_contracts(vec![clearing(1, 0)]);
@@ -777,9 +746,8 @@ mod contract_tests {
         assert_silent(&solo);
     }
 
-    // E3 (canonical S1): a GT7 base with a pass-through HDR overlay defers
-    // only the encode. The deferred encode's source gamut is the last
-    // tonemap-enabled member's (the base), not the finalizer's own.
+    // The deferred encode's source gamut is the last tonemap-enabled member's
+    // (the base), not the finalizer's own.
     #[test]
     fn gt7_base_with_passthrough_overlay_defers_encode_only() {
         let outputs = resolve_contracts(vec![
@@ -801,8 +769,6 @@ mod contract_tests {
         assert_silent(&overlay);
     }
 
-    // E4: an all-pass-through stack on an HDR target defers the encode with
-    // the Rec.709 fallback gamut and flags the missing tone mapping.
     #[test]
     fn all_passthrough_hdr_stack_flags_encode_without_tonemap() {
         let outputs = resolve_contracts(vec![
@@ -823,8 +789,6 @@ mod contract_tests {
         assert!(!base.diagnostics.coherence_cancelled);
     }
 
-    // E5: a pass-disabled viewport member cancels tonemap deferral for the
-    // whole group, so every member runs its passes per camera.
     #[test]
     fn viewport_member_cancels_tonemap_deferral() {
         let outputs = resolve_contracts(vec![
@@ -846,8 +810,6 @@ mod contract_tests {
         assert_eq!(output(&outputs, 3).source_gamut, DisplayGamut::Rec709);
     }
 
-    // Coherence negative control: when both passes can defer, both do, and
-    // nothing is cancelled.
     #[test]
     fn coherent_hdr_stack_defers_both_passes() {
         let outputs = resolve_contracts(vec![gt7_hdr(clearing(1, 0)), gt7_hdr(compositing(2, 1))]);
@@ -863,8 +825,7 @@ mod contract_tests {
         assert_silent(&overlay);
     }
 
-    // E6: an SDR stack keeps tonemap deferral (no encode pass exists to
-    // cohere with) and the finalizer's blit carries the composition.
+    // An SDR stack has no encode pass to cohere with.
     #[test]
     fn sdr_stack_keeps_tonemap_deferral_and_skips_deferred_blit() {
         let outputs = resolve_contracts(vec![clearing(1, 0), compositing(2, 1)]);
@@ -881,7 +842,6 @@ mod contract_tests {
         assert_silent(&overlay);
     }
 
-    // Three enabled members over one texture defer to the last.
     #[test]
     fn three_member_stack_defers_to_the_last() {
         let outputs = resolve_contracts(vec![clearing(1, 0), compositing(2, 1), compositing(3, 2)]);
@@ -890,9 +850,8 @@ mod contract_tests {
         assert_eq!(output(&outputs, 3).tonemap, StackRole::Finalizer);
     }
 
-    // A shape-breaking member in the middle of the enabled set suppresses
-    // deferral for the whole group: the predicate scans every enabled member
-    // after the first, not just the last.
+    // The deferral test scans every enabled member after the first, not just
+    // the last.
     #[test]
     fn shape_breaking_middle_member_suppresses_deferral() {
         let outputs = resolve_contracts(vec![compositing(1, 0), viewport(2, 1), compositing(3, 2)]);
@@ -901,13 +860,11 @@ mod contract_tests {
         }
     }
 
-    // E7: viewport splitscreen keeps per-camera passes and per-view source
-    // gamuts, silently.
     #[test]
     fn viewport_splitscreen_keeps_per_camera_passes() {
         // The first split-screen camera clears its target. A
-        // `ClearColorConfig::None` first member would instead load last
-        // frame's processed output and trip the frame-start diagnostic.
+        // `ClearColorConfig::None` first member would trip the frame-start
+        // diagnostic.
         let mut left = viewport(1, 0);
         left.loads_previous = false;
         left.tonemap_output_gamut = DisplayGamut::Rec709;
@@ -926,9 +883,6 @@ mod contract_tests {
         assert_silent(&right);
     }
 
-    // E8: the sorted index orders the stack, not the input order, so a stack
-    // with deterministic per-target indices defers and blits the same way
-    // every frame.
     #[test]
     fn sorted_index_orders_roles_not_insertion_order() {
         let outputs = resolve_contracts(vec![compositing(2, 1), clearing(1, 0)]);
@@ -938,9 +892,8 @@ mod contract_tests {
         assert_eq!(output(&outputs, 2).blit, RUN_REPLACE);
     }
 
-    // E12: a pass-disabled member below the finalizer is Solo, never deferred
-    // and never a finalizer, but its blit would present the un-finalized
-    // buffer, so it skips too.
+    // A pass-disabled member below the finalizer is Solo, but its blit would
+    // present the un-finalized buffer, so it skips too.
     #[test]
     fn disabled_member_below_finalizer_skips_blit() {
         let outputs = resolve_contracts(vec![
@@ -959,8 +912,7 @@ mod contract_tests {
         assert_eq!(finalizer.blit, RUN_REPLACE);
     }
 
-    // A pass-disabled overlay above the finalizer keeps its auto
-    // alpha-blended blit and composites over the finalizer's present.
+    // The overlay composites over the finalizer's present.
     #[test]
     fn disabled_member_above_finalizer_keeps_alpha_blit() {
         let outputs = resolve_contracts(vec![
@@ -979,8 +931,8 @@ mod contract_tests {
         assert_eq!(overlay.blit, RUN);
     }
 
-    // E13: a `CameraOutputMode::Skip` finalizer never blits, so nobody
-    // skips for it; deferral roles are unaffected.
+    // A `CameraOutputMode::Skip` finalizer never blits, so nobody skips for
+    // it. Deferral roles are unaffected.
     #[test]
     fn skip_finalizer_cancels_blit_skipping() {
         let mut finalizer = compositing(2, 1);
@@ -992,8 +944,7 @@ mod contract_tests {
         assert_eq!(output(&outputs, 2).blit, RUN);
     }
 
-    // An explicit user blend_state is never overridden by force_replace;
-    // members below the finalizer still skip.
+    // Members below the finalizer still skip.
     #[test]
     fn explicit_blend_is_never_overridden() {
         let mut finalizer = compositing(2, 1);
@@ -1003,9 +954,8 @@ mod contract_tests {
         assert_eq!(output(&outputs, 2).blit, RUN);
     }
 
-    // E15: a fullscreen None-clear overlay above viewport cameras with
-    // enabled per-camera passes re-presents their processed regions. The
-    // configuration is diagnosed and the roles are unchanged (all Solo).
+    // The overlay's full-target blit re-presents regions already processed
+    // per camera. The roles stay Solo.
     #[test]
     fn fullscreen_overlay_above_viewport_cameras_is_flagged() {
         let outputs = resolve_contracts(vec![
@@ -1021,8 +971,8 @@ mod contract_tests {
         }
     }
 
-    // E17: the symmetric arrangement (an enabled viewport member above
-    // enabled members) is a silent documented limitation.
+    // An enabled viewport member above enabled members is a documented
+    // limitation, so the silence is deliberate.
     #[test]
     fn viewport_above_enabled_members_is_silent() {
         let outputs = resolve_contracts(vec![clearing(1, 0), viewport(2, 1)]);
@@ -1034,9 +984,8 @@ mod contract_tests {
         assert_silent(&pip);
     }
 
-    // E18: a disabled clearing member mid-stack breaks the phase-1 stack
-    // shape but not the enabled-only deferral, because its clear is inert.
-    // The blits below the finalizer skip, and the overlay-over-per-camera
+    // A disabled clearing member mid-stack does not break the enabled-only
+    // deferral, because its clear is inert. The overlay-over-per-camera
     // diagnostic stays quiet since nothing below the finalizer runs a
     // per-camera pass.
     #[test]
@@ -1053,7 +1002,7 @@ mod contract_tests {
         assert_eq!(base.blit, BlitDisposition::SkipDeferred);
         assert_eq!(middle.blit, BlitDisposition::SkipDeferred);
         assert_eq!(finalizer.blit, RUN_REPLACE);
-        // The phase-1 resolution passes through per view.
+        // The compositing space passes through per view.
         assert_eq!(base.compositing_space, None);
         assert_eq!(finalizer.compositing_space, Some(CompositingSpace::Oklab));
         assert_silent(&base);
@@ -1061,8 +1010,6 @@ mod contract_tests {
         assert_silent(&finalizer);
     }
 
-    // W13: a deferred member whose operator differs from its finalizer's is
-    // flagged with both operators; the finalizer itself is not.
     #[test]
     fn operator_mismatch_is_flagged_on_the_deferred_member() {
         let mut base = clearing(1, 0);
@@ -1075,8 +1022,7 @@ mod contract_tests {
         assert_eq!(output(&outputs, 2).diagnostics.operator_mismatch, None);
     }
 
-    // The deferred encode keys on the last tonemap-enabled member's gamut in
-    // sorted order, not the first's and not the encode finalizer's own.
+    // Not the first member's gamut and not the encode finalizer's own.
     #[test]
     fn last_tonemap_enabled_member_sets_the_deferred_source_gamut() {
         let mut base = gt7_hdr(clearing(1, 0));
@@ -1092,9 +1038,6 @@ mod contract_tests {
         assert_eq!(output(&outputs, 3).encode, StackRole::Finalizer);
     }
 
-    // E14: a solo camera that loads the previous buffer
-    // (`ClearColorConfig::None`) while running a tone-mapping pass reprocesses
-    // last frame's output every frame; the diagnostic fires.
     #[test]
     fn frame_start_load_with_tonemapping_is_flagged() {
         let outputs = resolve_contracts(vec![compositing(1, 0)]);
@@ -1102,8 +1045,6 @@ mod contract_tests {
         assert!(solo.diagnostics.frame_start_loads_processed_output);
     }
 
-    // The same load-previous solo camera with display encoding (HDR target)
-    // but no tone-mapping pass still reprocesses last frame's encoded output.
     #[test]
     fn frame_start_load_with_encode_only_is_flagged() {
         let outputs = resolve_contracts(vec![passthrough_hdr(compositing(1, 0))]);
@@ -1111,9 +1052,8 @@ mod contract_tests {
         assert!(solo.diagnostics.frame_start_loads_processed_output);
     }
 
-    // A load-previous stack that neither tone-maps nor encodes leaves the
-    // buffer scene-referred, so feedback accumulates stably and the
-    // diagnostic stays quiet.
+    // With no pass over it the buffer stays scene-referred, so feedback
+    // accumulates stably.
     #[test]
     fn frame_start_load_without_passes_is_silent() {
         let outputs = resolve_contracts(vec![disabled(compositing(1, 0))]);
@@ -1121,7 +1061,6 @@ mod contract_tests {
         assert!(!solo.diagnostics.frame_start_loads_processed_output);
     }
 
-    // Views on different textures resolve independently.
     #[test]
     fn separate_textures_resolve_independently() {
         let mut other = compositing(2, 0);
@@ -1178,8 +1117,8 @@ mod coercion_tests {
         );
     }
 
-    // The sRGB transfer never reaches the chain via an HDR target, but the
-    // pure coercion leaves a non-HDR transfer untouched.
+    // The sRGB transfer never reaches the chain from an HDR target, but the
+    // coercion still leaves a non-HDR transfer untouched.
     #[test]
     fn srgb_is_unchanged() {
         assert_eq!(

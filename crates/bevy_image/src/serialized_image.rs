@@ -171,7 +171,6 @@ mod tests {
             TextureFormat::Rgba8UnormSrgb,
             RenderAssetUsages::RENDER_WORLD,
         );
-        // A non-default value, to check that it survives the round trip.
         image.source_primaries = SourceColorPrimaries::Bt2020;
 
         let serialized_image = SerializedImage::from_image(image.clone());

@@ -34,15 +34,13 @@ const peakC = vec2<f32>(10.0, -40.0);
 
 // range compression following AMD's HDR guidance for RCAS
 fn rcas_range_compress(c: vec3<f32>) -> vec3<f32> {
-    // Negative inputs are not expected post-tonemap. Clamp them so the
-    // compression stays monotonic and invertible.
+    // Negative inputs are not expected; clamping keeps this monotonic and invertible.
     let v = max(c, vec3<f32>(0.0));
     return v / (1.0 + v);
 }
 
 fn rcas_range_decompress(c: vec3<f32>) -> vec3<f32> {
-    // The denominator floor of `1 / 65504` (the f16 maximum an Rgba16Float
-    // target can store) keeps the inverse finite for inputs at or above 1.0.
+    // The denominator floor of 1 / 65504 (the f16 maximum) keeps the inverse finite at 1.0.
     let v = clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
     return v / max(1.0 - v, vec3<f32>(1.0 / 65504.0));
 }
@@ -70,8 +68,7 @@ fn rcas_range_decompress(c: vec3<f32>) -> vec3<f32> {
 //  0.25  -1  0.25
 //       0.25
 // This is used as a noise detection filter, to reduce the effect of RCAS on grain, and focus on real edges.
-// The CAS node runs after tonemapping. On SDR display targets the input is in
-// the range of 0 to 1.
+// The CAS node runs after tonemapping. On SDR display targets the input is 0 to 1.
 @fragment
 fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     // Algorithm uses minimal 3x3 pixel neighborhood.
@@ -101,7 +98,6 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
 } @else {
     b = textureSample(screenTexture, samp, in.uv, vec2<i32>(0, -1)).rgb;
     d = textureSample(screenTexture, samp, in.uv, vec2<i32>(-1, 0)).rgb;
-    // We need the alpha value of the pixel we're working on for the output
     e = textureSample(screenTexture, samp, in.uv).rgba;
     f = textureSample(screenTexture, samp, in.uv, vec2<i32>(1, 0)).rgb;
     h = textureSample(screenTexture, samp, in.uv, vec2<i32>(0, 1)).rgb;
@@ -131,7 +127,7 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
 }
 @if(HDR_DISPLAY_TARGET) {
     let sharpened = rcas_range_decompress((lobe * b + lobe * d + lobe * f + lobe * h + e.rgb) / (4.0 * lobe + 1.0));
-    // ensure clamp RCAS limiter output to paper white for HDR values
+    // Bound overshoot by local_max, or by paper white (1.0) if that is larger.
     return vec4<f32>(min(sharpened, max(local_max, vec3<f32>(1.0))), e.w);
 } @else {
     return vec4<f32>((lobe * b + lobe * d + lobe * f + lobe * h + e.rgb) / (4.0 * lobe + 1.0), e.w);

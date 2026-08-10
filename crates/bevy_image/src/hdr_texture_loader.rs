@@ -21,8 +21,8 @@ pub struct HdrTextureLoaderSettings {
     /// The color primaries the image data is expressed in, stamped on
     /// [`Image::source_primaries`].
     ///
-    /// `None` (the default) uses the file's `PRIMARIES=` header line, falling back to
-    /// [`SourceColorPrimaries::Bt709`]. `Some` overrides the file.
+    /// `None` (the default) reads the file's `PRIMARIES=` header line, then falls back
+    /// to [`SourceColorPrimaries::Bt709`].
     #[serde(default)]
     pub source_primaries: Option<SourceColorPrimaries>,
 }
@@ -97,11 +97,10 @@ impl AssetLoader for HdrTextureLoader {
 }
 
 /// Parses a Radiance `PRIMARIES=` header line (eight CIE 1931 xy coordinates: red,
-/// green, blue, white) from the decoder's custom attributes and matches it against the
-/// supported [`SourceColorPrimaries`].
+/// green, blue, white) and matches it against the supported [`SourceColorPrimaries`].
 ///
 /// Returns `None` when the line is absent, malformed, or names primaries Bevy does not
-/// support. Unsupported primaries also warn once.
+/// support. Unsupported primaries warn once.
 fn parse_radiance_primaries(
     custom_attributes: &[(String, String)],
 ) -> Option<SourceColorPrimaries> {
@@ -164,18 +163,15 @@ mod tests {
 
     #[test]
     fn radiance_primaries_reject_unknown_or_malformed() {
-        // No PRIMARIES attribute at all.
         assert_eq!(parse_radiance_primaries(&[]), None);
-        // Radiance's own default primaries are not quite BT.709 (green = 0.290, 0.600).
+        // Radiance's own default primaries are not BT.709 (green = 0.290, 0.600).
         assert_eq!(
             parse_radiance_primaries(&attributes(
                 "0.640 0.330 0.290 0.600 0.150 0.060 0.333 0.333"
             )),
             None
         );
-        // Malformed: too few coordinates.
         assert_eq!(parse_radiance_primaries(&attributes("0.640 0.330")), None);
-        // Malformed: not numbers.
         assert_eq!(
             parse_radiance_primaries(&attributes("a b c d e f g h")),
             None

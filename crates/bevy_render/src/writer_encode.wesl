@@ -11,9 +11,6 @@
 //   2. `COMPOSITING_SPACE_SRGB` or `COMPOSITING_SPACE_OKLAB`: the view
 //      composites in an encoded space, so the output is encoded to match and
 //      blending happens in that space. The terminal decode reverses it.
-//
-// Default Rec.709 linear views push no defs and compile a pass-through. Alpha
-// is untouched.
 
 @if(OUTPUT_GAMUT_REC2020)
 import bevy_render::working_color_space::rec709_to_rec2020;

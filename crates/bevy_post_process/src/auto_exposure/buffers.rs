@@ -13,21 +13,18 @@ use super::{
     AutoExposure, AutoWhiteBalance,
 };
 
-/// The CIE 1931 xy chromaticity of the D65 white point. Must stay in sync with
-/// `D65_XY` in `bevy_render::view` and `AWB_D65_XY` in `auto_exposure.wesl`.
+/// CIE 1931 xy of the D65 white point. Keep in sync with `D65_XY` in `bevy_render::view`
+/// and `AWB_D65_XY` in `auto_exposure.wesl`.
 const D65_XY: (f32, f32) = (0.31272, 0.32903);
 
-/// The per-view GPU adaptation state, keyed by render-world view entity.
+/// Per-view GPU adaptation state, keyed by render-world view entity.
 #[derive(Resource, Default)]
 pub(super) struct AutoExposureBuffers {
     pub(super) buffers: EntityHashMap<StorageBuffer<AutoExposureState>>,
 }
 
-/// Creates the adaptation state buffer for views that started metering and
-/// drops it for views that stopped.
-///
-/// An existing buffer is never rewritten, so the adaptation stays continuous
-/// across settings changes. Removing and re-adding [`AutoExposure`] resets it.
+/// An existing buffer is never rewritten, so the adaptation stays continuous across
+/// settings changes. Removing and re-adding [`AutoExposure`] resets it.
 pub(super) fn prepare_buffers(
     device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
@@ -41,19 +38,16 @@ pub(super) fn prepare_buffers(
         }
     }
 
-    // Dropping the buffer is enough to stop the metering pass: the render node
-    // bails out when the view has no entry here, so the stale
-    // `ViewAutoExposurePipeline` left behind is inert. That component is never
-    // removed, so keying on it would leak the buffer. `AutoExposureUniform` is
-    // the liveness anchor: the sync machinery removes it when the main-world
-    // camera stops metering, and a despawned view fails this query too.
+    // The render node bails out when the view has no entry here, so dropping the buffer
+    // stops the metering pass. `ViewAutoExposurePipeline` is never removed, so keying on
+    // it would leak the buffer. `AutoExposureUniform` is the liveness anchor: the sync
+    // machinery removes it when the main-world camera stops metering.
     buffers.buffers.retain(|&entity, _| views.contains(entity));
 }
 
-/// Builds the settings uniform for one view, sanitizing invalid values.
-///
-/// The long-term envelope parameters are filled in even when
-/// [`AutoExposure::physiological`] is `None`. See [`PhysiologicalAdaptation`].
+/// Builds the settings uniform for one view, sanitizing invalid values. The long-term
+/// envelope parameters are filled in even when [`AutoExposure::physiological`] is `None`;
+/// see [`PhysiologicalAdaptation`].
 pub(super) fn build_uniform(
     settings: &AutoExposure,
     white_balance: Option<&AutoWhiteBalance>,
@@ -102,10 +96,6 @@ pub(super) fn build_uniform(
     }
 }
 
-/// Builds the initial per-view adaptation state.
-///
-/// The short-term exposure and the long-term envelope both start at 0 EV, clamped into
-/// [`AutoExposure::range`]. The adapted chromaticity starts at the D65 white point.
 pub(super) fn initial_state(settings: &AutoExposure) -> AutoExposureState {
     let (min_log_lum, max_log_lum) = settings.range.clone().into_inner();
     let exposure = 0.0f32.clamp(min_log_lum, max_log_lum);
@@ -115,7 +105,7 @@ pub(super) fn initial_state(settings: &AutoExposure) -> AutoExposureState {
         long_term: exposure,
         chroma_x: D65_XY.0,
         chroma_y: D65_XY.1,
-        // The shader drains these back to zero every frame; this is the only CPU write.
+        // The shader drains these to zero every frame; this is the only CPU write.
         chroma_sums: [0; 3],
     }
 }

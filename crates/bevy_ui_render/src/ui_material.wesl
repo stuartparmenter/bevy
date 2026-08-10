@@ -33,7 +33,6 @@ fn vertex(
 fn fragment(in: UiVertexOutput) -> @location(0) vec4<f32> {
     let color = vec4<f32>(1.0);
 
-    // Custom UI materials that supply their own fragment shader have to import
-    // and call `encode_output` themselves.
+    // A custom UI material fragment shader must import and call `encode_output` itself.
     return encode_output(color);
 }

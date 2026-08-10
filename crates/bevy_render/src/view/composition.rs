@@ -2,18 +2,15 @@
 //!
 //! [`CompositingSpace`] is a per-camera request, and absent means linear.
 //! Cameras rendering to the same target share one main-texture ping-pong (see
-//! [`prepare_view_targets`](super::prepare_view_targets)), and that buffer can
-//! only hold one space at a time when its cameras composite over each other.
+//! [`prepare_view_targets`](super::prepare_view_targets)), and that buffer
+//! holds one space at a time when its cameras composite over each other.
 //! [`resolve_composition_spaces`] groups views by the shared-main-texture key
 //! and resolves one space per compositing stack into each view's
 //! [`ResolvedCompositingSpace`].
 //!
 //! These phase-1 groups are a superset of the phase-2 texture groups in
 //! `bevy_core_pipeline`. `prepare_view_targets` dedups allocations on the
-//! main-texture key, so equal main-texture ids imply equal `MainTextureKey`s
-//! and a phase-2 group never spans two phase-1 groups. If the phases disagree
-//! on shape, the views resolve per view and warn rather than mismatching
-//! across groups.
+//! main-texture key, so a phase-2 group never spans two phase-1 groups.
 
 use bevy_camera::{Camera2d, CameraMainTextureUsages, ClearColorConfig, CompositingSpace};
 use bevy_ecs::{
@@ -34,19 +31,16 @@ use crate::camera::ExtractedCamera;
 /// A camera view's per-frame resolved compositing space.
 ///
 /// Camera extraction seeds this with the camera's raw request.
-/// [`resolve_composition_spaces`] then overwrites it in
-/// [`RenderSystems::CreateViews`](crate::RenderSystems::CreateViews), after
-/// `sort_cameras`. Views that share a main-texture ping-pong and form a
-/// compositing stack (every later member uses `ClearColorConfig::None` with no
-/// viewport) resolve to one shared space. Solo views and other group shapes
-/// keep their own request.
+/// [`resolve_composition_spaces`] then overwrites it. Views that share a
+/// main-texture ping-pong and form a compositing stack resolve to one shared
+/// space. Solo views and other group shapes keep their own request.
 ///
 /// Read this component, or the downstream `ViewStackContract`, rather than
 /// [`ExtractedCamera::compositing_space`]. The raw request only feeds the
 /// extract-time main-texture format choice.
 ///
 /// Spawning or despawning an overlay camera can flip the base view's space.
-/// That dirties its 2d specializations and rebuilds its tonemapping pipeline
+/// That rebuilds the base view's 2d specializations and tonemapping pipeline
 /// for one frame, and only for stacks that request a non-default space.
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResolvedCompositingSpace(pub Option<CompositingSpace>);
@@ -68,9 +62,7 @@ struct SpaceInput<K> {
     texture: K,
     /// The camera's position in its render target's sorted camera order.
     sorted_index: usize,
-    /// The camera's own [`CompositingSpace`] request.
     request: Option<CompositingSpace>,
-    /// See [`composites_fullscreen`].
     composites_fullscreen: bool,
     is_camera_2d: bool,
     /// Whether the main-texture format stores signed floats
@@ -210,12 +202,12 @@ fn resolve_stack<K>(
 /// Resolves solo views and non-stack groups, meaning groups with a clearing or
 /// viewport-scoped member after the first.
 ///
-/// Each view keeps its own request verbatim, including `Some(Linear)`, so
-/// untouched configurations stay byte-identical. The `resolve_stack` overrides
-/// then apply in order per view instead of per group: a non-`Camera2d` view
-/// loses only its own `Srgb`/`Oklab` request, so a `Camera2d` member of a
-/// mixed-type group keeps its request and its splitscreen blend semantics.
-/// A kept `Oklab` degrades to linear without signed-float storage.
+/// Each view keeps its own request verbatim, including `Some(Linear)`. The
+/// `resolve_stack` overrides then apply in order per view instead of per group:
+/// a non-`Camera2d` view loses only its own `Srgb`/`Oklab` request, so a
+/// `Camera2d` member of a mixed-type group keeps its request and its
+/// splitscreen blend semantics. A kept `Oklab` degrades to linear without
+/// signed-float storage.
 fn resolve_per_view<K>(
     members: &[SpaceInput<K>],
     resolved: &mut EntityHashMap<Option<CompositingSpace>>,
@@ -270,7 +262,6 @@ fn resolve_per_view<K>(
 /// this runs after `sort_cameras`, in
 /// [`RenderSystems::CreateViews`](crate::RenderSystems::CreateViews).
 /// The rules live on `resolve_spaces`, `resolve_stack`, and `resolve_per_view`.
-/// This system feeds them and reports their diagnostics as `warn_once`s.
 ///
 /// `Has<Camera2d>` reads the render-world marker that `bevy_core_pipeline`
 /// extracts with its `ExtractComponentPlugin::<Camera2d>`. Without that plugin
@@ -351,8 +342,7 @@ mod tests {
         Entity::from_raw_u32(raw).unwrap()
     }
 
-    /// A `Camera2d` view on signed-float storage. Tests override the fields
-    /// each case exercises.
+    /// A `Camera2d` view on signed-float storage. Cases override what they need.
     fn view(
         raw: u32,
         texture: u32,
@@ -424,7 +414,6 @@ mod tests {
         assert!(diagnostics.is_empty());
     }
 
-    // Two members asking for the same space is still one distinct request.
     #[test]
     fn stack_with_one_distinct_space_resolves_every_member_to_it() {
         let (resolved, diagnostics) = resolve_spaces([
@@ -480,7 +469,6 @@ mod tests {
         assert!(diagnostics.is_empty());
     }
 
-    // `Some(Linear)` normalizes to no-request, so this mixture is not mixed.
     #[test]
     fn linear_vs_no_request_non_stack_does_not_warn() {
         let mut upper = view(2, 0, 1, None);
@@ -509,7 +497,6 @@ mod tests {
         assert!(diagnostics.is_empty());
     }
 
-    // The stack warns only because one of its members requested a space.
     #[test]
     fn stack_with_non_camera_2d_member_resolves_to_none() {
         let mut base = view(1, 0, 0, None);
@@ -532,8 +519,7 @@ mod tests {
         assert!(diagnostics.is_empty());
     }
 
-    // The non-`Camera2d` member has no request of its own, so it draws no
-    // non-2d warning.
+    // The non-`Camera2d` member has no request, so it draws no non-2d warning.
     #[test]
     fn camera_2d_member_of_mixed_non_stack_group_keeps_request() {
         let mut camera_2d = view(1, 0, 0, SRGB);
@@ -595,7 +581,7 @@ mod tests {
         let mut base = view(1, 0, 0, None);
         base.composites_fullscreen = false;
         // Insert the overlay first. The group is still a stack because the
-        // clearing member, the only one allowed to clear, sorts to the front.
+        // clearing member sorts to the front.
         let (resolved, diagnostics) = resolve_spaces([view(2, 0, 1, SRGB), base]);
         assert_eq!(resolved_for(&resolved, 1), SRGB);
         assert_eq!(resolved_for(&resolved, 2), SRGB);

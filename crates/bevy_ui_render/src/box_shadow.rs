@@ -130,8 +130,6 @@ pub struct BoxShadowPipelineKey {
     pub target_format: TextureFormat,
     /// Number of samples, a higher value results in better quality shadows.
     pub samples: u32,
-    /// Writer-side encode of the fragment output (see
-    /// [`UiWriterEncodeKey`](crate::pipeline::UiWriterEncodeKey)).
     pub writer_encode: crate::pipeline::UiWriterEncodeKey,
 }
 

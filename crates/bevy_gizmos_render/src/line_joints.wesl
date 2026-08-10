@@ -245,7 +245,6 @@ struct FragmentOutput {
     @location(0) color: vec4<f32>,
 };
 
-// See lines.wesl for the writer-side encode.
 @fragment
 fn fragment(in: FragmentInput) -> FragmentOutput {
     return FragmentOutput(writer_encode(in.color));

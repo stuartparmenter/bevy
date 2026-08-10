@@ -30,8 +30,7 @@ pub struct RenderAppChannels {
 impl RenderAppChannels {
     /// Create a `RenderAppChannels` from a [`async_channel::Receiver`] and [`async_channel::Sender`].
     ///
-    /// [`Drop`] pumps `main_thread_executor` so a final main-thread-pinned
-    /// render system can finish and teardown does not deadlock.
+    /// [`Drop`] pumps `main_thread_executor` so teardown does not deadlock.
     pub fn new(
         app_to_render_sender: Sender<SubApp>,
         render_to_app_receiver: Receiver<SubApp>,
@@ -68,9 +67,9 @@ impl Drop for RenderAppChannels {
             //
             // `recv_blocking()` can deadlock: the final frame may still have a
             // main-thread-pinned (`NonSend`) system queued on the `MainThreadExecutor`,
-            // such as macOS surface creation or display sensing. The render thread can't
-            // send the world back until the main thread ticks that executor, so pump it
-            // here as `renderer_extract` does each frame.
+            // such as macOS surface creation. The render thread cannot send the world
+            // back until the main thread ticks that executor, so pump it here as
+            // `renderer_extract` does each frame.
             let receiver = self.render_to_app_receiver.clone();
             let _recovered_render_app = ComputeTaskPool::get().scope_with_executor(
                 true,

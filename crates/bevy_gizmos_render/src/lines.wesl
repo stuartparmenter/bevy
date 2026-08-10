@@ -161,8 +161,7 @@ struct FragmentOutput {
     @location(0) color: vec4<f32>,
 };
 
-// Gizmos render pre-tonemap in the working space and, in 2D, blend into the
-// camera's compositing-space buffer, so each fragment writer-encodes its color.
+// Gizmos render pre-tonemap, so each fragment writer-encodes its color.
 @fragment
 fn fragment_solid(in: FragmentInput) -> FragmentOutput {
     return FragmentOutput(writer_encode(in.color));

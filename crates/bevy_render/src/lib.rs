@@ -134,10 +134,6 @@ use std::sync::Mutex;
 #[derive(Default)]
 pub struct RenderPlugin {
     pub render_creation: RenderCreation,
-    /// The color primaries of the renderer's scene-referred working space.
-    ///
-    /// Defaults to [`WorkingColorSpace::Rec709`]. See [`working_color_space`]
-    /// for what [`WorkingColorSpace::Rec2020`] changes.
     pub working_color_space: WorkingColorSpace,
     /// If `true`, disables asynchronous pipeline compilation.
     /// This has no effect on macOS, Wasm, iOS, or without the `multi_threaded` feature.
@@ -415,8 +411,6 @@ impl Plugin for RenderPlugin {
         app.init_resource::<RenderAssetBytesPerFrame>()
             .init_resource::<RenderErrorHandler>();
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
-            // Copy for `RenderStartup` pipeline initialization and the
-            // render-world prepare and extract systems.
             render_app.insert_resource(self.working_color_space);
             render_app.init_resource::<RenderScheduleOrder>();
             render_app.init_resource::<RenderAssetBytesPerFrameLimiter>();

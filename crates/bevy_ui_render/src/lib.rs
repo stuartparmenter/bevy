@@ -289,8 +289,7 @@ impl Plugin for UiRenderPlugin {
             )
             .add_systems(
                 Core2d,
-                // UI composites in display-linear, paper-white-relative space:
-                // after tone mapping, before the display-encoding pass.
+                // UI composites in display-linear, paper-white-relative space.
                 ui_pass
                     .after(Core2dSystems::PostProcess)
                     .before(display_encoding)
@@ -298,7 +297,6 @@ impl Plugin for UiRenderPlugin {
             )
             .add_systems(
                 Core3d,
-                // See the Core2d registration above for the ordering rationale.
                 ui_pass
                     .after(Core3dSystems::PostProcess)
                     .before(display_encoding)

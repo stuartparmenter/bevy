@@ -192,8 +192,6 @@ pub fn init_cas_pipeline(
 pub struct CasPipelineKey {
     target_format: TextureFormat,
     denoise: bool,
-    /// [`ViewStackContract::is_hdr_encode`]; selects the `HDR_DISPLAY_TARGET`
-    /// shader path.
     hdr_encode: bool,
 }
 
@@ -269,14 +267,12 @@ pub struct ViewCasPipeline(CachedRenderPipelineId);
 
 #[cfg(test)]
 mod tests {
-    //! Single-channel CPU mirrors of the RCAS math in
-    //! `robust_contrast_adaptive_sharpening.wesl`, exact for grayscale
-    //! neighborhoods, where the per-channel WGSL vector math collapses to the
-    //! same scalars.
+    //! CPU mirrors of the RCAS math in
+    //! `robust_contrast_adaptive_sharpening.wesl`. Exact for grayscale
+    //! neighborhoods, where the per-channel vector math collapses to scalars.
 
     const FSR_RCAS_LIMIT: f32 = 0.1875;
     const PEAK_C: (f32, f32) = (10.0, -40.0);
-    /// The largest value an `Rgba16Float` target can store.
     const F16_MAX: f32 = 65504.0;
 
     fn compress(c: f32) -> f32 {
@@ -289,8 +285,7 @@ mod tests {
         v / (1.0 - v).max(1.0 / F16_MAX)
     }
 
-    /// The "Limiters" block of the fragment shader, for a grayscale cross
-    /// neighborhood.
+    /// The "Limiters" block of the fragment shader.
     fn rcas_lobe(b: f32, d: f32, f: f32, h: f32, sharpness: f32) -> f32 {
         let mn4 = b.min(d).min(f.min(h));
         let mx4 = b.max(d).max(f.max(h));
@@ -300,14 +295,13 @@ mod tests {
         (-FSR_RCAS_LIMIT).max(lobe_rgb.min(0.0)) * sharpness
     }
 
-    /// The full grayscale RCAS filter (def-less / SDR shape).
+    /// The full RCAS filter, without the `HDR_DISPLAY_TARGET` def.
     fn rcas(b: f32, d: f32, e: f32, f: f32, h: f32, sharpness: f32) -> f32 {
         let lobe = rcas_lobe(b, d, f, h, sharpness);
         (lobe * b + lobe * d + lobe * f + lobe * h + e) / (4.0 * lobe + 1.0)
     }
 
-    /// The `HDR_DISPLAY_TARGET` path: compress, RCAS, decompress, then bound
-    /// overshoot by `max(local_max, 1.0)`.
+    /// The `HDR_DISPLAY_TARGET` path.
     fn rcas_hdr(b: f32, d: f32, e: f32, f: f32, h: f32, sharpness: f32) -> f32 {
         let sharpened = decompress(rcas(
             compress(b),
@@ -325,7 +319,7 @@ mod tests {
     fn range_compression_round_trips() {
         for x in [0.0_f32, 0.001, 0.18, 0.5, 1.0, 2.5, 10.0, 100.0, 10000.0] {
             let round_tripped = decompress(compress(x));
-            // scale tolerance quadratically with x because of precision limits
+            // Precision loss grows quadratically with x.
             let tolerance = (x * x * f32::EPSILON * 4.0).max(1e-7);
             assert!(
                 (round_tripped - x).abs() <= tolerance,
@@ -336,19 +330,16 @@ mod tests {
 
     #[test]
     fn range_compression_edge_cases() {
-        // Negative inputs clamp to zero (monotonic, invertible domain).
         assert_eq!(compress(-5.0), 0.0);
         assert!(compress(F16_MAX) < 1.0);
-        // Decompression saturates at the f16 maximum instead of infinity,
-        // even for an out-of-contract input of exactly 1.0.
+        // Decompression saturates at the f16 maximum instead of infinity.
         assert_eq!(decompress(1.0), F16_MAX);
         assert!(decompress(2.0).is_finite());
     }
 
     #[test]
     fn hdr_path_is_bounded_and_finite_on_hdr_input() {
-        // Neighborhoods that break the SDR math: flat and edged regions up to
-        // 100x paper white.
+        // Flat and edged neighborhoods up to 100x paper white break the SDR math.
         for peak in [2.5_f32, 4.0, 10.0, 16.0, 100.0] {
             for (b, d, e, f, h) in [
                 (peak, peak, peak, peak, peak),
@@ -362,9 +353,8 @@ mod tests {
                 );
                 let out = rcas_hdr(b, d, e, f, h, 1.0);
                 assert!(out.is_finite(), "HDR RCAS produced a non-finite value");
-                // RCAS limits its output to the neighborhood range. The
-                // compression is monotonic, so that bound survives
-                // decompression, modulo f32 rounding.
+                // RCAS limits its output to the neighborhood range. Compression
+                // is monotonic, so the bound survives decompression, within f32 rounding.
                 let neighborhood_max = b.max(d).max(e).max(f).max(h);
                 assert!(
                     (0.0..=neighborhood_max * (1.0 + 1e-4) + 1e-6).contains(&out),
@@ -376,8 +366,6 @@ mod tests {
 
     #[test]
     fn hdr_path_sharpens_sdr_range_edges() {
-        // On an in-range edge the HDR path still sharpens: it darkens a dark
-        // center pixel surrounded by bright ones, like the SDR path does.
         let sdr = rcas(1.0, 1.0, 0.2, 1.0, 1.0, 1.0);
         let hdr = rcas_hdr(1.0, 1.0, 0.2, 1.0, 1.0, 1.0);
         assert!(sdr < 0.2);

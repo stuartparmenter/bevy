@@ -81,24 +81,21 @@ impl From<Camera3dDepthLoadOp> for LoadOp<f32> {
 }
 
 /// If this component is added to a camera, the camera will use an intermediate "high dynamic range" render texture.
-/// This allows rendering with a wider range of lighting values. It only affects the
-/// intermediate render texture, not the signal sent to the display. For that, request an
-/// HDR transfer on the window's [`DisplayTarget`](bevy_window::DisplayTarget); cameras
-/// rendering to such a target get the high-precision intermediate automatically.
+/// This allows rendering with a wider range of lighting values. It only affects the intermediate
+/// render texture, not the display signal. To send an HDR signal, request an HDR transfer on the
+/// window's [`DisplayTarget`](bevy_window::DisplayTarget); that also selects this render texture.
 #[derive(Component, Default, Copy, Clone, Reflect, PartialEq, Eq, Hash, Debug)]
 #[reflect(Component, Default, PartialEq, Hash, Debug)]
 pub struct Hdr;
 
-/// Marker that forces a camera's tone mapping to run in the node-side pass
-/// instead of folding it into the material shaders. Camera extraction treats
-/// it like `NeedsSceneLinearTarget` and skips the in-shader fast path.
+/// Marker that forces a camera's tone mapping to run in the node-side pass instead of
+/// folding it into the material shaders.
 ///
-/// `GranTurismo7Params` pulls this in as a required component. The in-shader
-/// fold has no way to bind the per-view GT7 params uniform, so it would fall
-/// back to the baked SDR defaults and drop the camera's parameters.
+/// `GranTurismo7Params` pulls this in as a required component. The in-shader fold has no
+/// way to bind the per-view GT7 params uniform, so it would fall back to the baked SDR
+/// defaults and drop the camera's parameters.
 ///
-/// Being a required component, it outlives the params that pulled it in and
-/// also applies under a non-GT7 operator. Both cases only cost the camera an
+/// As a required component it can outlive the params that added it. The cost is an
 /// `Rgba16Float` intermediate and one fullscreen pass; the pixels match.
 #[derive(Component, Default, Copy, Clone, Reflect, PartialEq, Eq, Hash, Debug)]
 #[reflect(Component, Default, PartialEq, Hash, Debug)]

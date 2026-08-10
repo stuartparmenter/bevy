@@ -12,7 +12,6 @@ use bevy_render::{
 
 use super::{DisplayEncodingPipeline, ViewDisplayEncodingPipeline};
 
-/// Cached bind group state for the display-encoding pass.
 #[derive(Default)]
 pub struct DisplayEncodingBindGroupCache {
     cached: Option<CachedBindGroup>,
@@ -30,8 +29,7 @@ struct CachedBindGroup {
 ///
 /// Runs after the UI pass, which composites in the paper-white-relative
 /// display-linear space this pass consumes, and before the upscaling blit,
-/// which passes the encoded signal through unchanged (see
-/// `prepare_view_upscaling_pipelines`).
+/// which passes the encoded signal through unchanged.
 ///
 /// Views without a [`ViewDisplayEncodingPipeline`] get no ping-pong flip.
 pub fn display_encoding(

@@ -107,11 +107,8 @@ impl Plugin for Mesh2dRenderPlugin {
                     Render,
                     (
                         prepare_pending_mesh_material2d_queues.in_set(RenderSystems::Specialize),
-                        // Reads the resolved compositing spaces, so it runs
-                        // after the resolver. The `ViewKeyCache` consumers
-                        // `specialize_material2d_meshes` and
-                        // `specialize_wireframes` run in `Specialize`, after
-                        // this set.
+                        // The `ViewKeyCache` consumers `specialize_material2d_meshes`
+                        // and `specialize_wireframes` run in `Specialize`, after this set.
                         check_views_need_specialization
                             .in_set(RenderSystems::CreateViews)
                             .after(resolve_composition_spaces),
@@ -160,8 +157,6 @@ pub fn check_views_need_specialization(
             | Mesh2dPipelineKey::from_target_format(view.target_format)
             | Mesh2dPipelineKey::from_compositing_space(resolved_space.and_then(|space| space.0));
 
-        // Fast path: an SDR camera marked `TonemapInShader` folds tonemapping
-        // and optional debanding into the fragment shaders.
         if tonemap_in_shader
             && let Some(tonemapping) = tonemapping
             && *tonemapping != Tonemapping::None
@@ -345,8 +340,6 @@ pub struct Mesh2dPipeline {
     pub shader: Handle<Shader>,
     pub per_object_buffer_batch_size: Option<u32>,
     /// The project-global working color space, captured at `RenderStartup`.
-    /// Under `WorkingColorSpace::Rec2020` the 2D mesh and material fragment
-    /// shaders convert their composed colors into it (`OUTPUT_GAMUT_REC2020`).
     pub working_color_space: WorkingColorSpace,
 }
 

@@ -369,7 +369,6 @@ mod tests {
 
     #[test]
     fn wide_gamut_chroma_preserved() {
-        // A saturated wide-gamut color's chroma must survive `Laba` -> `Lcha`.
         let laba = Laba::new(0.8, 1.5, -1.2, 1.0);
         let lcha: Lcha = laba.into();
         assert!(lcha.chroma > 1.9, "chroma was clamped: {:?}", lcha);

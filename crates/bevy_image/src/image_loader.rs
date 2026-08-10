@@ -159,9 +159,8 @@ pub struct ImageLoaderSettings {
     /// The color primaries the image data is expressed in, stamped on
     /// [`Image::source_primaries`].
     ///
-    /// `None` (the default) uses color metadata from the file itself (currently only
-    /// the KTX2 data format descriptor), falling back to
-    /// [`SourceColorPrimaries::Bt709`]. `Some` overrides the file.
+    /// `None` (the default) reads color metadata from the file (only the KTX2 data
+    /// format descriptor), then falls back to [`SourceColorPrimaries::Bt709`].
     #[serde(default)]
     pub source_primaries: Option<SourceColorPrimaries>,
 }
@@ -301,7 +300,6 @@ mod tests {
 
     #[test]
     fn settings_metadata_without_source_primaries_still_deserializes() {
-        // `.meta` files written before `source_primaries` existed must keep loading.
         let mut serialized = serde_json::to_value(ImageLoaderSettings::default()).unwrap();
         assert!(serialized
             .as_object_mut()

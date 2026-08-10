@@ -569,22 +569,16 @@ fn neighborhood_blending_vertex_main(@builtin(vertex_index) vertex_index: u32)
  * IMPORTANT NOTICE: luma edge detection requires gamma-corrected colors, and
  * thus 'color_texture' should be a non-sRGB texture.
  *
- * Bevy note: this pass reads display-linear values, not the gamma-corrected
- * ones the reference shader was tuned for. The view target is either an sRGB
- * texture (hardware-decoded to linear on sample) or, for tone-mapped cameras,
- * an Rgba16Float texture holding display-linear values. This is a
- * long-standing, deliberate deviation: SMAA_THRESHOLD operates on linear luma
- * here, which is slightly more sensitive in shadows and less in highlights
+ * Bevy deviates: this pass reads display-linear values, not gamma-corrected
+ * ones, so SMAA_THRESHOLD is more sensitive in shadows and less in highlights
  * than the reference tuning.
  *
- * On HDR display targets the input is also paper-white-relative and exceeds
- * 1.0 (up to peak / paper white), which shifts SMAA_THRESHOLD's effective
- * sensitivity, so the luma used for edge detection is saturated to [0, 1].
- * Blending (pass 3) still reads the unmodified HDR texels.
+ * On an HDR display target the input is paper-white-relative and can exceed
+ * 1.0, which shifts that sensitivity further, so the edge-detection luma is
+ * saturated to [0, 1]. Blending (pass 3) still reads the unmodified texels.
  */
-// The edge-detection luma for one texel. Takes the sampled rgb rather than a
-// uv, because an implicit-derivative textureSample inside a user function has
-// a uniformity requirement the post-discard call sites below cannot meet.
+// Edge-detection luma for one texel. Takes rgb, not a uv: a textureSample with
+// implicit derivatives cannot meet its uniformity requirement after a discard.
 fn edge_luma(rgb: vec3<f32>) -> f32 {
     let weights = vec3(0.2126, 0.7152, 0.0722);
     @if(HDR_DISPLAY_TARGET)

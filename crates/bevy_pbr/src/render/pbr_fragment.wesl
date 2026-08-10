@@ -687,13 +687,11 @@ pbr_input.material.uv_transform = uv_transform;
 
 @if(WORKING_COLOR_SPACE_REC2020) {
     // Base color, emissive, and the sampled lightmap radiance are all
-    // Rec.709-authored. Convert them into the Rec.2020 working space once,
-    // after composition, so per-channel tinting keeps its sRGB-relative
-    // appearance and every texture path is covered by one site. Textures
-    // stamped with wide source primaries have no per-texture escape hatch
-    // and are over-converted (see `GpuImage::source_primaries`). Data inputs
-    // (normal, metallic/roughness, occlusion, clearcoat, anisotropy) and the
-    // specular tint / reflectance inputs are not converted.
+    // Rec.709-authored. Convert them after composition, so per-channel tinting
+    // keeps its sRGB-relative appearance. Textures stamped with wide source
+    // primaries are over-converted (see `GpuImage::source_primaries`). Data
+    // inputs (normal, metallic/roughness, occlusion, clearcoat, anisotropy)
+    // and the specular tint / reflectance inputs are not converted.
     pbr_input.material.base_color = vec4(
         rec709_to_rec2020(pbr_input.material.base_color.rgb),
         pbr_input.material.base_color.a,
@@ -702,9 +700,8 @@ pbr_input.material.uv_transform = uv_transform;
         rec709_to_rec2020(pbr_input.material.emissive.rgb),
         pbr_input.material.emissive.a,
     );
-    // `attenuation_color` is a uniform-only Rec.709 color that tints the
-    // working-space transmitted background through a per-channel
-    // Beer-Lambert term. It converts here because `AsBindGroupShaderType`
+    // `attenuation_color` is a Rec.709 uniform that tints the working-space
+    // transmitted background. It converts here because `AsBindGroupShaderType`
     // has no `World` access to do it on the CPU.
     pbr_input.material.attenuation_color = vec4(
         rec709_to_rec2020(pbr_input.material.attenuation_color.rgb),

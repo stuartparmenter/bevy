@@ -207,9 +207,9 @@ impl RenderResources {
         }
 
         render_world.insert_resource(instance);
-        // Read from the render world, where `RenderPlugin::build` inserted it,
-        // rather than passed in, so the device-loss reinit path rebuilds the
-        // cache with the same working color space.
+        // Read from the render world, where `RenderPlugin::build` inserted it, not a
+        // parameter, so the device-loss reinit path rebuilds the cache with the same
+        // working color space.
         let working_color_space = *render_world.resource::<WorkingColorSpace>();
         render_world.insert_resource(PipelineCache::new(
             device.clone(),

@@ -141,10 +141,8 @@ impl LinearRgba {
         Self { blue, ..self }
     }
 
-    /// Make the color lighter or darker by some amount. SDR colors keep the
-    /// clamp-to-black / clamp-to-white behavior of [`Luminance::darker`] and
-    /// [`Luminance::lighter`]. HDR colors are adjusted without an upper clamp,
-    /// scaling the color and preserving their chromaticity.
+    /// Make the color lighter or darker by some amount. SDR colors clamp to black and
+    /// white. HDR colors have no upper clamp: they scale and keep their chromaticity.
     fn adjust_lightness(&mut self, amount: f32) {
         let luminance = self.luminance();
         // A saturated color can have channels above 1.0 while its luminance stays below 1.0.
@@ -499,19 +497,17 @@ mod tests {
 
     #[test]
     fn hdr_clamp_relaxation() {
-        // An SDR input with an SDR target keeps the clamped behavior.
+        // An SDR input with an SDR target stays clamped.
         let sdr = LinearRgba::new(0.0, 0.0, 1.0, 1.0);
         let adjusted = sdr.with_luminance(0.5);
         assert_eq!(adjusted.blue, 1.0);
 
-        // HDR input passes through `with_luminance` unclamped.
         let hdr = LinearRgba::new(2.0, 4.0, 8.0, 1.0);
         let adjusted = hdr.with_luminance(2.0 * hdr.luminance());
         assert!((adjusted.red - 4.0).abs() < 1e-4);
         assert!((adjusted.green - 8.0).abs() < 1e-4);
         assert!((adjusted.blue - 16.0).abs() < 1e-4);
 
-        // An HDR target luminance on an SDR color extends past 1.0.
         let gray = LinearRgba::new(0.5, 0.5, 0.5, 1.0);
         let bright = gray.with_luminance(2.0);
         assert!((bright.red - 2.0).abs() < 1e-4);
@@ -524,12 +520,10 @@ mod tests {
         assert_eq!(crushed.green, 0.0);
         assert_eq!(crushed.blue, 0.0);
 
-        // `lighter` on an SDR color still clamps at white...
         let almost_white = LinearRgba::new(0.9, 0.9, 0.9, 1.0);
         let lighter = almost_white.lighter(0.5);
         assert!((lighter.luminance() - 1.0).abs() < 1e-4);
 
-        // ...but an HDR color keeps getting brighter (and darker works above 1.0).
         let hdr_gray = LinearRgba::new(2.0, 2.0, 2.0, 1.0);
         let lighter = hdr_gray.lighter(0.5);
         assert!((lighter.luminance() - 2.5).abs() < 1e-4);
@@ -546,10 +540,8 @@ mod tests {
         assert!(lighter.red > 4.0);
         assert_eq!(lighter.green, 0.0);
         assert_eq!(lighter.blue, 0.0);
-        // ... and it matches `with_luminance` for the same target.
         let via_with_luminance = saturated_hdr.with_luminance(luminance + 0.3);
         assert!((lighter.red - via_with_luminance.red).abs() < 1e-4);
-        // `darker` keeps its chromaticity-preserving scale on the same input.
         let darker = saturated_hdr.darker(0.3);
         assert!((darker.luminance() - (luminance - 0.3)).abs() < 1e-4);
         assert!(darker.red < 4.0 && darker.red > 0.0);

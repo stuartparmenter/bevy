@@ -187,9 +187,8 @@ pub struct SmaaNeighborhoodBlendingPipelineKey {
 pub struct SmaaEdgeDetectionPipelineKey {
     /// The quality preset.
     preset: SmaaPreset,
-    /// [`ViewStackContract::is_hdr_encode`]; selects the `HDR_DISPLAY_TARGET`
-    /// shader path. Only phase 1 reads luma, so phases 2 and 3 need no such
-    /// key.
+    /// Selects the `HDR_DISPLAY_TARGET` shader path. Only phase 1 reads luma,
+    /// so phases 2 and 3 do not key on this.
     hdr_encode: bool,
 }
 

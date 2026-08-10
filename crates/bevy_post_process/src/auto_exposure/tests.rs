@@ -1,7 +1,7 @@
 //! CPU-side tests for the auto exposure and auto white balance adaptation math.
 //!
-//! The functions marked as mirrors below copy `auto_exposure.wesl` operation for
-//! operation. If the shader math changes, they must be updated to match.
+//! The functions marked as mirrors copy `auto_exposure.wesl` operation for operation.
+//! Update them when the shader math changes.
 
 use super::{
     buffers::{build_uniform, initial_state},
@@ -62,8 +62,8 @@ fn adaptation_step(
     exposure
 }
 
-/// The single-stage smoothing, without the two-stage model. Reference for the tests
-/// that pin the disabled path to numerically identical output.
+/// The single-stage smoothing, without the two-stage model. The tests use it to pin the
+/// disabled path to numerically identical output.
 fn legacy_single_stage_step(
     exposure: f32,
     target_exposure: f32,
@@ -94,8 +94,7 @@ fn enabled_settings(adaptation: PhysiologicalAdaptation) -> AutoExposureUniform 
     )
 }
 
-/// An [`AutoExposureState`] with the given exposure values and the neutral (D65) white
-/// balance chromaticity.
+/// An [`AutoExposureState`] with the given exposures and the neutral (D65) chromaticity.
 fn ae_state(exposure: f32, long_term: f32) -> AutoExposureState {
     AutoExposureState {
         exposure,
@@ -106,8 +105,8 @@ fn ae_state(exposure: f32, long_term: f32) -> AutoExposureState {
     }
 }
 
-/// A deterministic, wandering target sequence exercising both adaptation directions and
-/// both the linear and exponential smoothing regions.
+/// A deterministic target sequence covering both adaptation directions and both the
+/// linear and exponential smoothing regions.
 fn target_sequence(step: usize) -> f32 {
     match (step / 120) % 4 {
         0 => 6.0,
@@ -121,10 +120,9 @@ fn target_sequence(step: usize) -> f32 {
 fn gpu_struct_layouts_match_the_wgsl_structs() {
     use bevy_render::render_resource::ShaderType;
 
-    // naga computes span=80 for the WGSL `AutoExposure` uniform (17 4-byte scalars
-    // plus three words of tail padding) and span=28 for `AutoExposureState` (four
-    // scalars plus a stride-4 array of three atomic words; storage structs are not
-    // rounded to 16). The encase layouts must agree.
+    // naga computes span=80 for the WGSL `AutoExposure` uniform (17 4-byte scalars plus
+    // three words of tail padding) and span=28 for `AutoExposureState` (four scalars plus
+    // a stride-4 array of three atomic words; storage structs are not rounded to 16).
     assert_eq!(AutoExposureUniform::min_size().get(), 80);
     assert_eq!(AutoExposureState::min_size().get(), 28);
 }
@@ -133,14 +131,11 @@ fn gpu_struct_layouts_match_the_wgsl_structs() {
 fn default_component_is_configuration_identical_to_legacy() {
     let settings = AutoExposure::default();
 
-    // The fields that predate the two-stage model keep their documented defaults.
     assert_eq!(settings.range, -8.0..=8.0);
     assert_eq!(settings.filter, 0.10..=0.90);
     assert_eq!(settings.speed_brighten, 3.0);
     assert_eq!(settings.speed_darken, 1.0);
     assert_eq!(settings.exponential_transition_distance, 1.5);
-
-    // The two-stage and bias fields default to neutral.
     assert_eq!(settings.metering_bias, 0.0);
     assert!(settings.physiological.is_none());
 }
@@ -149,7 +144,6 @@ fn default_component_is_configuration_identical_to_legacy() {
 fn default_uniform_is_neutral() {
     let uniform = build_uniform(&AutoExposure::default(), None);
 
-    // The metering values the single-stage implementation uploaded, unchanged.
     assert_eq!(uniform.min_log_lum, -8.0);
     assert_eq!(uniform.inv_log_lum_range, 1.0 / 16.0);
     assert_eq!(uniform.log_lum_range, 16.0);
@@ -158,12 +152,9 @@ fn default_uniform_is_neutral() {
     assert_eq!(uniform.speed_up, 3.0);
     assert_eq!(uniform.speed_down, 1.0);
     assert_eq!(uniform.exponential_transition_distance, 1.5);
-
-    // Neutral, so the shader skips both the metering bias and the two-stage clamp.
     assert_eq!(uniform.metering_bias, 0.0);
     assert_eq!(uniform.physiological, 0);
 
-    // The initial GPU state: exposure 0 clamped into range, envelope at the same value.
     let state = initial_state(&AutoExposure::default());
     assert_eq!(state.exposure, 0.0);
     assert_eq!(state.long_term, 0.0);
@@ -248,7 +239,6 @@ fn bounded_exposure_converges_once_the_envelope_catches_up() {
 
 #[test]
 fn convergence_within_bounds_is_unaffected_by_the_envelope() {
-    // A target inside the envelope's bounds adapts as fast as the single-stage path.
     let settings = enabled_settings(PhysiologicalAdaptation::default());
     let mut state = ae_state(0.0, 0.0);
     let mut legacy_exposure = 0.0;
@@ -324,12 +314,10 @@ fn long_term_envelope_is_rate_limited() {
 
 #[test]
 fn metering_bias_math() {
-    // At the neutral bias, the metered value passes through bit-identically.
     let neutral = build_uniform(&AutoExposure::default(), None);
     let avg = -3.7f32;
     assert_eq!(apply_metering_bias(avg, &neutral).to_bits(), avg.to_bits());
 
-    // A positive bias meters the scene as brighter than it measured.
     let settings = build_uniform(
         &AutoExposure {
             metering_bias: 1.0,
@@ -342,7 +330,6 @@ fn metering_bias_math() {
 
 #[test]
 fn invalid_inputs_are_sanitized() {
-    // A non-finite metering bias is ignored.
     let settings = build_uniform(
         &AutoExposure {
             metering_bias: f32::NAN,
@@ -352,7 +339,6 @@ fn invalid_inputs_are_sanitized() {
     );
     assert_eq!(settings.metering_bias, 0.0);
 
-    // Invalid physiological fields are reset to their defaults; valid ones are kept.
     let defaults = PhysiologicalAdaptation::default();
     let settings = enabled_settings(PhysiologicalAdaptation {
         speed_brighten: f32::NAN,
@@ -369,7 +355,6 @@ fn invalid_inputs_are_sanitized() {
 
 #[test]
 fn initial_state_starts_neutral_inside_the_metering_range() {
-    // The envelope starts at the same neutral exposure as the short-term stage.
     let state = initial_state(&AutoExposure::default());
     assert_eq!(state.exposure, 0.0);
     assert_eq!(state.long_term, state.exposure);
@@ -383,7 +368,7 @@ fn initial_state_starts_neutral_inside_the_metering_range() {
     assert_eq!(state.long_term, 2.0);
 }
 
-// Auto white balance mirrors. Matrices are stored column-major, like WGSL `mat3x3<f32>`.
+// Matrices are stored column-major, like WGSL `mat3x3<f32>`.
 
 /// Mirror of `AWB_D65_XY`.
 const AWB_D65_XY: [f32; 2] = [0.31272, 0.32903];
@@ -607,9 +592,9 @@ fn mccamy_matches_known_illuminants() {
 
 #[test]
 fn deep_blue_scenes_read_as_cool_not_warm() {
-    // A saturated blue scene adapts below McCamy's y = 0.1858 epicenter (this fixture
-    // is Rec.709 blue blended with the default D65 anchor). The CCT must stay at the
-    // cool end; a denominator sign flip would read it as ~1632 K and boost blue.
+    // A saturated blue scene adapts below McCamy's y = 0.1858 epicenter (this fixture is
+    // Rec.709 blue blended with the default D65 anchor). A denominator sign flip would
+    // read it as ~1632 K and boost blue.
     let adapted_xy = [0.1853, 0.1184];
     let cct = awb_cct(adapted_xy);
     assert!(
@@ -657,7 +642,6 @@ fn planckian_locus_round_trips_through_mccamy() {
 
 #[test]
 fn cct_output_is_clamped_to_the_camera_range() {
-    // A 2000 K scene is clamped to the 2500 K lower bound.
     let white = awb_white_point(awb_planckian_xy(2000.0));
     let clamped = awb_cct(white);
     assert!(
@@ -665,7 +649,6 @@ fn cct_output_is_clamped_to_the_camera_range() {
         "2000 K clamped to {clamped}, expected ~2500 K"
     );
 
-    // A 10000 K scene is clamped to the 7000 K upper bound.
     let white = awb_white_point(awb_planckian_xy(10000.0));
     let clamped = awb_cct(white);
     assert!(
@@ -762,14 +745,13 @@ fn chromaticity_adaptation_is_rate_limited_and_convergent() {
     awb_adaptation_step(&mut state, sums, 1.0, DT, &settings);
     assert!((state.chroma_x - expected).abs() < 1e-7);
 
-    // It converges over time...
     for _ in 0..3600 {
         awb_adaptation_step(&mut state, sums, 1.0, DT, &settings);
     }
     assert!((state.chroma_x - measured[0]).abs() < 1e-4);
     assert!((state.chroma_y - measured[1]).abs() < 1e-4);
 
-    // ...and a huge speed * delta_time never overshoots: it lands exactly on target.
+    // A huge speed * delta_time never overshoots: it lands exactly on target.
     let settings = awb_settings(AutoWhiteBalance {
         speed: 1000.0,
         virtual_light_anchor: 0.0,
@@ -801,7 +783,6 @@ fn balance_matrix_neutralizes_a_warm_illuminant() {
     let illuminant = awb_xy_to_rec709([0.44757, 0.40745]);
     let ([x, y], luminance) = rec709_to_xy_lum(illuminant);
 
-    // Let the adaptation converge onto the measured chromaticity.
     let settings = awb_settings(AutoWhiteBalance {
         speed: 4.0,
         virtual_light_anchor: 0.001,
@@ -812,7 +793,6 @@ fn balance_matrix_neutralizes_a_warm_illuminant() {
         awb_adaptation_step(&mut state, sums, 1.0, DT, &settings);
     }
 
-    // The correction must push the illuminant towards neutral and reduce the spread.
     let m = awb_balance_matrix([state.chroma_x, state.chroma_y]);
     let corrected = mat3_mul_vec3(&m, illuminant);
     let spread_before = illuminant[0] / illuminant[2];
@@ -821,9 +801,9 @@ fn balance_matrix_neutralizes_a_warm_illuminant() {
         spread_after < spread_before,
         "correction did not reduce the warm cast: {spread_before} -> {spread_after}"
     );
-    // Deriving the gains in the same LMS basis they are applied in leaves a residual
-    // R/B ratio of ~1.0003 (D65_XY's 5-digit rounding) plus ~0.1% of anchor pull.
-    // Deriving them in raw CAM16 LMS would leave ~1.54 instead.
+    // Deriving the gains in the same LMS basis they are applied in leaves a residual R/B
+    // ratio of ~1.0003 (D65_XY's 5-digit rounding) plus ~0.1% of anchor pull. Raw CAM16
+    // LMS would leave ~1.54 instead.
     assert!(
         (spread_after - 1.0).abs() < 0.01,
         "corrected illuminant {corrected:?} is not neutral (R/B {spread_after})"
@@ -834,7 +814,6 @@ fn balance_matrix_neutralizes_a_warm_illuminant() {
         max / min < 1.01,
         "corrected illuminant {corrected:?} has a residual channel spread"
     );
-    // The correction preserves the white point's luminance.
     let (_, corrected_luminance) = rec709_to_xy_lum(corrected);
     assert!(
         (corrected_luminance - luminance).abs() < 0.01,
@@ -844,13 +823,11 @@ fn balance_matrix_neutralizes_a_warm_illuminant() {
 
 #[test]
 fn awb_uniform_defaults_and_sanitization() {
-    // Without the component, every auto white balance field is neutral.
     let uniform = build_uniform(&AutoExposure::default(), None);
     assert_eq!(uniform.awb_enabled, 0);
     assert_eq!(uniform.awb_speed, 0.0);
     assert_eq!(uniform.awb_anchor, 0.0);
 
-    // With the component, the sanitized values are uploaded.
     let uniform = build_uniform(&AutoExposure::default(), Some(&AutoWhiteBalance::default()));
     assert_eq!(uniform.awb_enabled, 1);
     assert_eq!(uniform.awb_speed, AutoWhiteBalance::default().speed);
@@ -859,7 +836,6 @@ fn awb_uniform_defaults_and_sanitization() {
         AutoWhiteBalance::default().virtual_light_anchor
     );
 
-    // Invalid fields are reset to their defaults.
     let uniform = build_uniform(
         &AutoExposure::default(),
         Some(&AutoWhiteBalance {

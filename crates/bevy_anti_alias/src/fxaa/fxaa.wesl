@@ -59,12 +59,12 @@ fn QUALITY(q: i32) -> f32 {
 
 fn rgb2luma(rgb: vec3<f32>) -> f32 {
 @if(COMPOSITING_SPACE_OKLAB) {
-    // rgb.x is already the Oklab perceptual lightness L, simply return it
+    // rgb.x is the Oklab lightness L.
     return saturate(rgb.x);
 } @else {
     let luma = dot(rgb, vec3<f32>(0.299, 0.587, 0.114));
     @if(HDR_DISPLAY_TARGET) {
-        // saturate HDR display target to keep it in the valid domain
+        // Saturate to keep the luma in the 0 to 1 domain FXAA expects.
         return sqrt(saturate(luma));
     } @else {
         return sqrt(luma);

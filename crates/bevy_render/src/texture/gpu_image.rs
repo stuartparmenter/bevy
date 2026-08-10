@@ -21,15 +21,12 @@ pub struct GpuImage {
     pub texture_descriptor: TextureDescriptor<Option<&'static str>, &'static [TextureFormat]>,
     pub texture_view_descriptor: Option<TextureViewDescriptor<Option<&'static str>>>,
     pub had_data: bool,
-    /// The color primaries the source [`Image`]'s pixel data was authored
-    /// against, copied from [`Image::source_primaries`].
+    /// The color primaries the source [`Image`] was authored against, copied from
+    /// [`Image::source_primaries`].
     ///
-    /// Metadata only: nothing is converted at upload time. Under
-    /// `WorkingColorSpace::Rec2020` the shader sampling seams assume every
-    /// color texture is Rec.709-authored. This field is here so a
-    /// working-space-aware consumer can add a per-texture escape hatch, such
-    /// as skipping the conversion for [`SourceColorPrimaries::Bt2020`],
-    /// without re-plumbing the asset pipeline.
+    /// Nothing converts the data at upload time. The field is here so a
+    /// working-space-aware consumer can add a per-texture escape hatch. See
+    /// [`WorkingColorSpace`](crate::WorkingColorSpace).
     pub source_primaries: SourceColorPrimaries,
 }
 

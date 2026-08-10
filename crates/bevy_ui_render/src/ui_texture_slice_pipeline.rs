@@ -140,7 +140,6 @@ pub fn init_ui_texture_slice_pipeline(mut commands: Commands, asset_server: Res<
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
 pub struct UiTextureSlicePipelineKey {
     pub target_format: TextureFormat,
-    /// Writer-side encode of the fragment output (see [`UiWriterEncodeKey`]).
     pub writer_encode: UiWriterEncodeKey,
 }
 

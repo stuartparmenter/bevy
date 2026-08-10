@@ -7,16 +7,16 @@ use serde::{Deserialize, Serialize};
 
 /// The color primaries that an [`Image`](crate::Image)'s RGB data is expressed in.
 ///
-/// This is metadata only: it records the gamut the pixel values were authored in,
-/// so a wide working color space can convert them at sample or upload time.
+/// Metadata only: it records the gamut the pixel values were authored in. Nothing
+/// converts the pixel data.
 ///
 /// Loaders resolve the stamped value in this order:
 /// 1. An explicit `source_primaries` loader setting, for example on
 ///    [`ImageLoaderSettings`](crate::ImageLoaderSettings).
-/// 2. Color-primary metadata in the file itself: the KTX2 data format descriptor, a
-///    Radiance HDR `PRIMARIES=` header line, or `OpenEXR` `chromaticities`.
-/// 3. The [`SourceColorPrimaries::Bt709`] default, because most assets are authored
-///    against the sRGB / Rec. 709 primaries.
+/// 2. Color-primary metadata in the file: the KTX2 data format descriptor, a Radiance
+///    HDR `PRIMARIES=` header line, or `OpenEXR` `chromaticities`.
+/// 3. The [`SourceColorPrimaries::Bt709`] default, because most assets use the sRGB /
+///    Rec. 709 primaries.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "bevy_reflect",
@@ -30,17 +30,16 @@ pub enum SourceColorPrimaries {
     Bt709,
     /// The ITU-R BT.2020 (Rec. 2020) wide-gamut primaries, D65 white point.
     Bt2020,
-    /// The Display P3 primaries (DCI-P3 primaries with a D65 white point), used by
-    /// most wide-gamut consumer displays.
+    /// The Display P3 primaries (DCI-P3 primaries with a D65 white point).
     DisplayP3,
 }
 
 impl SourceColorPrimaries {
     /// The per-coordinate tolerance used by [`SourceColorPrimaries::from_chromaticities`].
     ///
-    /// Files typically write primaries with three or four decimal places, so `2e-3`
-    /// absorbs the rounding. BT.709 and Display P3, the closest pair of supported sets,
-    /// differ by `0.04` in the red x coordinate.
+    /// Files write primaries with three or four decimal places, so `2e-3` absorbs the
+    /// rounding. BT.709 and Display P3 are the closest supported pair, and differ by
+    /// `0.04` in the red x coordinate.
     pub const CHROMATICITY_MATCH_TOLERANCE: f32 = 2e-3;
 
     /// Returns the [`RgbPrimaries`] chromaticities of this primary set, for use with
@@ -57,7 +56,6 @@ impl SourceColorPrimaries {
     ///
     /// Returns the matching variant when every coordinate of `red`, `green`, `blue`, and
     /// `white` is within [`CHROMATICITY_MATCH_TOLERANCE`] of one of them, `None` otherwise.
-    /// Callers fall back to [`SourceColorPrimaries::Bt709`] on `None`.
     ///
     /// [`CHROMATICITY_MATCH_TOLERANCE`]: SourceColorPrimaries::CHROMATICITY_MATCH_TOLERANCE
     pub fn from_chromaticities(
@@ -100,7 +98,6 @@ mod tests {
             SourceColorPrimaries::DisplayP3,
         ] {
             let reference = source.to_rgb_primaries();
-            // Exact chromaticities match.
             assert_eq!(
                 SourceColorPrimaries::from_chromaticities(
                     reference.red,
@@ -110,7 +107,6 @@ mod tests {
                 ),
                 Some(source)
             );
-            // Chromaticities perturbed by less than the tolerance still match.
             let nudge = SourceColorPrimaries::CHROMATICITY_MATCH_TOLERANCE * 0.5;
             assert_eq!(
                 SourceColorPrimaries::from_chromaticities(
@@ -126,7 +122,7 @@ mod tests {
 
     #[test]
     fn from_chromaticities_rejects_unknown_primaries() {
-        // ACEScg (AP1) primaries: a supported file value, but not a supported variant.
+        // ACEScg (AP1) primaries: a valid file value, but not a supported variant.
         assert_eq!(
             SourceColorPrimaries::from_chromaticities(
                 Chromaticity::new(0.713, 0.293),

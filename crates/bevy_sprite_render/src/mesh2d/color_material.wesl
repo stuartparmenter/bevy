@@ -86,7 +86,6 @@ fn fragment(
 @if(TONEMAP_IN_SHADER)
     output_color = tonemapping::tone_mapping(output_color, view.color_grading);
 
-    // Writer-side encode; see bevy_render::writer_encode.
     return writer_encode(output_color);
 }
 

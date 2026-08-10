@@ -59,7 +59,7 @@ pub struct BloomUniforms {
 
 impl BloomUniforms {
     /// Packs the soft-knee threshold curve parameters that `soft_threshold` in
-    /// `bloom.wesl` consumes. This is the single source of the packing math.
+    /// `bloom.wesl` consumes.
     ///
     /// `threshold` is in scene-linear framebuffer units. `threshold_softness` is
     /// clamped to `[0, 1]`.

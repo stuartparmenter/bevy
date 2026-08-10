@@ -10,20 +10,9 @@ use bevy_reflect::prelude::*;
 /// Linear RGB color with [ITU-R BT.2020](https://www.itu.int/rec/R-REC-BT.2020)
 /// (Rec. 2020) wide-gamut primaries, a D65 white point, and an alpha channel.
 ///
-/// Rec. 2020 covers roughly 76% of the CIE 1931 chromaticity diagram (compared to
-/// roughly 36% for the Rec. 709 primaries used by [`LinearRgba`]), which makes it
-/// the standard container gamut for HDR and wide-gamut content. All Rec. 709 colors
-/// and almost all Display P3 colors fit inside it with non-negative components.
-///
-/// Component values are linear. `(1.0, 1.0, 1.0)` is the D65 reference white at SDR
-/// paper-white intensity, the same white as [`LinearRgba::WHITE`]. Values above
-/// `1.0` are HDR intensities.
-///
-/// Conversions to and from other color spaces go through [`Xyza`], using matrices
-/// derived from the BT.2020 primary chromaticities (R `(0.708, 0.292)`,
-/// G `(0.170, 0.797)`, B `(0.131, 0.046)`) and the crate's D65 reference white
-/// ([`Xyza::D65_WHITE`]), so white round-trips exactly between [`LinearRec2020`],
-/// [`Xyza`], and [`LinearRgba`].
+/// All Rec. 709 colors and almost all Display P3 colors fit inside this gamut with
+/// non-negative components. `(1.0, 1.0, 1.0)` is the D65 reference white, the same
+/// white as [`LinearRgba::WHITE`]. Values above `1.0` are HDR intensities.
 #[doc = include_str!("../docs/conversion.md")]
 /// <div>
 #[doc = include_str!("../docs/diagrams/model_graph.svg")]
@@ -60,9 +49,8 @@ impl LinearRec2020 {
     /// [Lindbloom method](http://www.brucelindbloom.com/index.html?Eqn_RGB_XYZ_Matrix.html)
     /// and reference white as the crate's sRGB to XYZ matrices.
     ///
-    /// Row-major rows: X, Y, Z. The first entry of the Z row is exactly zero because
-    /// the BT.2020 red primary lies on the `x + y = 1` line of the chromaticity
-    /// diagram.
+    /// Row-major rows: X, Y, Z. The first entry of the Z row is zero because the
+    /// BT.2020 red primary lies on the `x + y = 1` line.
     const RGB_TO_XYZ: [[f32; 3]; 3] = [
         [0.637_010_2, 0.144_615_02, 0.168_844_77],
         [0.262_721_72, 0.677_989_3, 0.059_289_01],
@@ -143,10 +131,8 @@ impl LinearRec2020 {
         Self { blue, ..self }
     }
 
-    /// Make the color lighter or darker by some amount. SDR colors keep the
-    /// clamp-to-black / clamp-to-white behavior of [`Luminance::darker`] and
-    /// [`Luminance::lighter`]. HDR colors are adjusted without an upper clamp,
-    /// scaling the color and preserving their chromaticity.
+    /// Make the color lighter or darker by some amount. SDR colors clamp to black and
+    /// white. HDR colors have no upper clamp: they scale and keep their chromaticity.
     fn adjust_lightness(&mut self, amount: f32) {
         let luminance = self.luminance();
         // A saturated color can have channels above 1.0 while its luminance stays below 1.0.
@@ -174,8 +160,7 @@ impl LinearRec2020 {
 }
 
 impl Default for LinearRec2020 {
-    /// Construct a new [`LinearRec2020`] color with the default values (white with
-    /// full alpha).
+    /// Construct a new [`LinearRec2020`] color with the default values (white with full alpha).
     fn default() -> Self {
         Self::WHITE
     }
@@ -525,7 +510,6 @@ mod tests {
             LinearRec2020::new(1.0, 0.0, 0.0, 1.0),
             LinearRec2020::new(0.0, 1.0, 0.0, 1.0),
             LinearRec2020::new(0.0, 0.0, 1.0, 1.0),
-            // HDR / out-of-gamut values must survive too.
             LinearRec2020::new(4.5, -0.2, 1.5, 1.0),
         ];
         for color in colors {
@@ -578,7 +562,7 @@ mod tests {
         assert_approx_eq!(white.y, Xyza::D65_WHITE.y, 1e-5);
         assert_approx_eq!(white.z, Xyza::D65_WHITE.z, 1e-5);
 
-        // ... and therefore to linear sRGB white, since both spaces share D65.
+        // Both spaces share D65, so white is also linear sRGB white.
         let srgb_white: LinearRgba = LinearRec2020::WHITE.into();
         assert_approx_eq!(srgb_white.red, 1.0, 1e-5);
         assert_approx_eq!(srgb_white.green, 1.0, 1e-5);
@@ -606,12 +590,10 @@ mod tests {
 
     #[test]
     fn hdr_lighter_darker() {
-        // SDR colors keep the clamp-to-white behavior.
         let sdr = LinearRec2020::rgb(0.9, 0.9, 0.9);
         let lighter = sdr.lighter(0.5);
         assert_approx_eq!(lighter.luminance(), 1.0, 1e-5);
 
-        // HDR colors extend instead of clamping.
         let hdr = LinearRec2020::rgb(2.0, 2.0, 2.0);
         let lighter = hdr.lighter(0.5);
         assert_approx_eq!(lighter.luminance(), 2.5, 1e-4);
@@ -628,7 +610,6 @@ mod tests {
         assert!(lighter.red > 3.0);
         assert_approx_eq!(lighter.green, 0.0, 1e-6);
         assert_approx_eq!(lighter.blue, 0.0, 1e-6);
-        // ... and it matches `with_luminance` for the same target.
         let via_with_luminance = saturated_hdr.with_luminance(luminance + 0.3);
         assert_approx_eq!(lighter.red, via_with_luminance.red, 1e-4);
     }

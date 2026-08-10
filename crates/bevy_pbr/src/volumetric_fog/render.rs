@@ -660,8 +660,7 @@ pub fn prepare_volumetric_fog_uniforms(
                 clip_from_local: hull_clip_from_local,
                 uvw_from_world: UVW_FROM_LOCAL * *local_from_world,
                 far_planes: get_far_planes(&view_from_local),
-                // These are composed in-shader with light colors already in
-                // the working color space, so they convert here too.
+                // These compose in-shader with light colors already in the working space.
                 fog_color: linear_rgba_rec709_to_working(
                     fog_volume.fog_color.to_linear(),
                     *working_color_space,

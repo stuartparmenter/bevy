@@ -1,19 +1,17 @@
 //! Physically derived veiling-glare weights for the bloom pyramid
 //! ([`BloomScatterModel::Gt7Glare`](super::BloomScatterModel::Gt7Glare)).
 //!
-//! Gran Turismo 7 has no separate bloom pass. Its glare fills that role,
-//! approximating the camera's far-field (Fraunhofer) diffraction point-spread
-//! function by a weighted sum of progressively blurred buffers, with per-level
-//! composite weights that depend on the aperture F-number (SIGGRAPH 2025 PBS
-//! course, "Physically Based Tone Mapping and Glare in Gran Turismo 7",
-//! Polyphony Digital, slides 177-187). Polyphony's 240 hand-calibrated weights
-//! (per-level x per-channel x 10 F-numbers) are not published, so this module
-//! derives its own from the same physical model.
+//! Gran Turismo 7 replaces bloom with a glare that approximates the camera's
+//! far-field (Fraunhofer) diffraction point-spread function as a weighted sum
+//! of progressively blurred buffers, with per-level weights that depend on the
+//! aperture F-number (SIGGRAPH 2025 PBS course, "Physically Based Tone Mapping
+//! and Glare in Gran Turismo 7", Polyphony Digital, slides 177-187). Polyphony's
+//! 240 hand-calibrated weights are not published, so this module derives its own
+//! from the same physical model.
 //!
-//! The Fraunhofer diffraction pattern of an ideal circular aperture is the Airy
-//! pattern. Its encircled energy, the fraction of the PSF's total energy within
-//! radius `r` of the center, has the closed form (Rayleigh; see Born & Wolf,
-//! *Principles of Optics*, section 8.5.2)
+//! The Fraunhofer pattern of an ideal circular aperture is the Airy pattern. Its
+//! encircled energy, the fraction of the PSF energy within radius `r` of the
+//! center, is (Rayleigh; Born & Wolf, *Principles of Optics*, section 8.5.2)
 //!
 //! ```text
 //! E(v) = 1 - J0(v)^2 - J1(v)^2,     v = pi*r / (lambda*N)
@@ -21,53 +19,45 @@
 //!
 //! where `J0`/`J1` are Bessel functions of the first kind, `lambda` is the
 //! wavelength and `N` the F-number. Pyramid level `k` reproduces scattering
-//! radii of roughly `[t*2^k, t*2^(k+1))` around a bright source, where `t` is
-//! the size of a level-0 texel, so the energy for level `k` is the
-//! encircled-energy difference over that annulus. Level 0 also absorbs the
-//! central core, `r < t`. The weights are integrated over the visible band,
-//! weighting each wavelength by a single-Gaussian approximation of the CIE 1924
-//! photopic luminosity function
-//! `V(lambda) ~= 1.019*exp(-285.4*(lambda - 0.559)^2)` (lambda in microns),
-//! which also smooths out the monochromatic Airy rings the way a real
-//! polychromatic PSF does.
+//! radii of `[t*2^k, t*2^(k+1))` around a bright source, where `t` is the size
+//! of a level-0 texel, so its energy is the encircled-energy difference over
+//! that annulus. Level 0 also absorbs the core, `r < t`. Each band is integrated
+//! over the visible range, weighting each wavelength by a single-Gaussian
+//! approximation of the CIE 1924 photopic luminosity function
+//! `V(lambda) ~= 1.019*exp(-285.4*(lambda - 0.559)^2)` (lambda in microns). That
+//! also smooths the monochromatic Airy rings, as a polychromatic PSF does.
 //!
-//! The Airy pattern scales linearly with `lambda*N`, so a large F-number (small
-//! aperture, f/22) pushes energy into wide pyramid levels, while a small
-//! F-number (f/1.0) keeps the PSF sub-texel and the glare nearly invisible.
 //! Asymptotically `J0(v)^2 + J1(v)^2 -> 2/(pi*v)` (Abramowitz & Stegun 9.2.1),
-//! so far from the core each successive octave-spaced level receives half the
-//! energy of the previous one, a heavier tail than a Gaussian blur has.
+//! so far from the core each octave-spaced level receives half the energy of the
+//! previous one.
 //!
-//! The bands cover the full PSF (the residual beyond the widest band is < 0.5%
-//! even at f/22) and the table is normalized per F-number, so
-//! [`Bloom::intensity`](super::Bloom::intensity) keeps its meaning as the total
-//! fraction of energy scattered out of the sharp image, and the F-number
-//! controls only how that energy is spread across the pyramid levels.
+//! The bands cover the full PSF and the table is normalized per F-number, so
+//! [`Bloom::intensity`](super::Bloom::intensity) stays the fraction of energy
+//! scattered out of the sharp image, and the F-number controls only how that
+//! energy spreads across the pyramid levels.
 //!
 //! Mapping image-plane microns to pyramid texels needs a virtual sensor scale:
-//! one pyramid level-0 texel is 2 microns across. That is the one perceptual
-//! tuning constant of the derivation, chosen so the f/1 to f/22 ladder sweeps
-//! the Airy core from well below one texel to a few texels at the pyramid's
-//! reference resolution of 512 rows.
+//! one level-0 texel is 2 microns across. That is the one tuning constant of the
+//! derivation, chosen so the f/1 to f/22 ladder sweeps the Airy core from well
+//! below one texel to a few texels at the pyramid's reference resolution of 512
+//! rows.
 //!
 //! The weights are achromatic, one per level rather than one per channel.
-//! Chromatic dispersion like GT7's would triple the upsample cost for
-//! per-channel blur radii and is left as a follow-up.
+//! GT7-style chromatic dispersion would triple the upsample cost.
 //!
-//! [`GLARE_WEIGHT_TABLE`] holds the finished weights as literals. The Bessel
-//! quadrature behind them costs a few milliseconds, too much to spend at every
-//! app's startup for a scatter model most apps never enable, so the derivation
-//! lives in this module's tests. `tests::table_matches_derivation` compares the
-//! two bit for bit, so changing the model fails until the literals are
+//! [`GLARE_WEIGHT_TABLE`] holds the finished weights as literals: the Bessel
+//! quadrature behind them costs a few milliseconds, too much to spend at startup
+//! for a model most apps never enable. The derivation lives in this module's
+//! tests, and `tests::table_matches_derivation` fails until changed literals are
 //! regenerated.
 
 use bevy_math::ops;
 use bevy_utils::once;
 use tracing::warn;
 
-/// The number of pyramid levels (octave-spaced annular bands) the weight table
-/// covers. Matches the default bloom chain depth (`max_mip_dimension = 512`,
-/// 8 mips). See [`blend_factor`] for deeper and shallower chains.
+/// Pyramid levels (octave-spaced annular bands) the weight table covers. Matches
+/// the default chain depth (`max_mip_dimension = 512`, 8 mips); [`blend_factor`]
+/// handles other depths.
 pub(crate) const GLARE_BANDS: usize = 8;
 
 /// The standard full-stop aperture ladder the weight table is precomputed for.
@@ -192,8 +182,6 @@ static GLARE_WEIGHT_TABLE: [[f32; GLARE_BANDS]; F_NUMBER_LADDER.len()] = [
     ],
 ];
 
-/// Replaces a non-finite or non-positive F-number with
-/// [`DEFAULT_F_NUMBER`], warning once.
 fn sanitize_f_number(f_number: f32) -> f32 {
     if f_number.is_finite() && f_number > 0.0 {
         f_number
@@ -207,9 +195,9 @@ fn sanitize_f_number(f_number: f32) -> f32 {
 }
 
 /// Normalized per-level glare weights for an arbitrary F-number. Interpolates
-/// [`GLARE_WEIGHT_TABLE`] linearly in `log2(N)`, matching the ladder's
-/// geometric spacing, and clamps to the ladder ends. Linear interpolation of
-/// normalized weight vectors stays normalized.
+/// [`GLARE_WEIGHT_TABLE`] linearly in `log2(N)` to match the ladder's geometric
+/// spacing, and clamps to the ladder ends. Linear interpolation of normalized
+/// weight vectors stays normalized.
 pub(crate) fn mip_weights(f_number: f32) -> [f32; GLARE_BANDS] {
     let table = &GLARE_WEIGHT_TABLE;
     let n = sanitize_f_number(f_number).clamp(
@@ -234,10 +222,9 @@ pub(crate) fn mip_weights(f_number: f32) -> [f32; GLARE_BANDS] {
     weights
 }
 
-/// The upsample blend constant for the glare model, used in place of the
-/// parametric curve of
-/// [`BloomScatterModel::Aesthetic`](super::BloomScatterModel::Aesthetic) in
-/// `compute_blend_factor`.
+/// The upsample blend constant for the glare model, used in
+/// `compute_blend_factor` in place of the
+/// [`Aesthetic`](super::BloomScatterModel::Aesthetic) curve.
 ///
 /// The bloom node composites the pyramid bottom-up through chained
 /// energy-conserving lerps (`out = lerp(dst, src, blend)`), so the final image
@@ -247,8 +234,8 @@ pub(crate) fn mip_weights(f_number: f32) -> [f32; GLARE_BANDS] {
 /// (1 - b0)*image + sum_k b0*...*bk*(1 - b[k+1])*level_k
 /// ```
 ///
-/// Solving for the per-pass constants that realize the target per-level weights
-/// `intensity*w_k` (and `1 - intensity` for the sharp image) gives tail-sum
+/// Solving for the constants that realize the target per-level weights
+/// `intensity*w_k`, and `1 - intensity` for the sharp image, gives tail-sum
 /// ratios: with `T_j = sum of w_k over k >= j`,
 ///
 /// ```text
@@ -256,10 +243,10 @@ pub(crate) fn mip_weights(f_number: f32) -> [f32; GLARE_BANDS] {
 /// b_j = T_j / T_(j-1)               (level j blended into level j-1)
 /// ```
 ///
-/// Chains shallower than [`GLARE_BANDS`] therefore fold the wide-band tail into
-/// their deepest level, and deeper chains blend the extra levels with weight
-/// zero. `mip` follows `compute_blend_factor`'s convention: 0 is the final
-/// composite onto the view target.
+/// Chains shallower than [`GLARE_BANDS`] fold the wide-band tail into their
+/// deepest level; deeper chains blend the extra levels with weight zero. `mip`
+/// follows `compute_blend_factor`'s convention: 0 is the final composite onto
+/// the view target.
 pub(crate) fn blend_factor(f_number: f32, intensity: f32, mip: u32) -> f32 {
     let intensity = if intensity.is_finite() {
         intensity.clamp(0.0, 1.0)
@@ -290,10 +277,7 @@ mod tests {
     use core::f64::consts::PI;
 
     /// Virtual sensor pitch of one pyramid level-0 texel, in micrometers.
-    ///
-    /// See the module docs. At 2 microns the Airy core radius
-    /// (`1.22*lambda*N`) spans ~0.3 texels at f/1.0 and ~7 texels at f/22 for
-    /// lambda = 555 nm.
+    /// See the module docs.
     const TEXEL_PITCH_MICRONS: f64 = 2.0;
 
     /// Wavelength integration range (microns) and sample count for the
@@ -336,9 +320,8 @@ mod tests {
     ///
     /// For `v >=` [`AIRY_ASYMPTOTIC_SEAM`] this uses the ring-averaged
     /// asymptotic `J0^2 + J1^2 -> 2/(pi*v)` (relative error `O(v^-2)`), with its
-    /// constant calibrated so the two branches meet exactly at the seam. That
-    /// keeps `E` continuous and monotonic, which the band-energy differences
-    /// rely on.
+    /// constant calibrated so the two branches meet at the seam. That keeps `E`
+    /// continuous and monotonic, which the band-energy differences rely on.
     fn airy_encircled_energy(v: f64) -> f64 {
         // seam * (J0(seam)^2 + J1(seam)^2), ~= 2/pi up to the ring residual.
         static TAIL_CONSTANT: LazyLock<f64> = LazyLock::new(|| {
@@ -363,9 +346,8 @@ mod tests {
     /// `r` in `[t*2^k, t*2^(k+1))`, `t =` [`TEXEL_PITCH_MICRONS`].
     ///
     /// Level 0's band extends down to the center (`[0, 2t)`), so the core is
-    /// part of the finest level. Excluding a sub-texel core region instead
-    /// makes the normalized shape non-monotonic in N as the Airy bulk crosses
-    /// the cutoff: tested and rejected.
+    /// part of the finest level. Excluding a sub-texel core instead makes the
+    /// normalized shape non-monotonic in N as the Airy bulk crosses the cutoff.
     fn raw_band_energies(f_number: f64) -> [f64; GLARE_BANDS] {
         let mut bands = [0.0; GLARE_BANDS];
         let mut total_weight = 0.0;
@@ -375,7 +357,6 @@ mod tests {
                     / (WAVELENGTH_SAMPLES - 1) as f64;
             let weight = photopic_weight(lambda);
             total_weight += weight;
-            // v = pi*r/(lambda*N)
             let v_per_micron = PI / (lambda * f_number);
             for (k, band) in bands.iter_mut().enumerate() {
                 let r_inner = if k == 0 {
@@ -406,8 +387,7 @@ mod tests {
         weights
     }
 
-    /// `J0`/`J1` against standard reference values (Abramowitz & Stegun,
-    /// table 9.1) and the first zeros.
+    /// `J0`/`J1` against reference values (Abramowitz & Stegun, table 9.1).
     #[test]
     fn bessel_reference_values() {
         let cases = [
@@ -432,8 +412,6 @@ mod tests {
         assert!(bessel_j(1, 3.831_705_970_2).abs() < 1e-9);
     }
 
-    /// The encircled energy is a CDF: 0 at the center, increasing, approaching
-    /// 1. The first dark ring encloses the textbook 83.8% of the energy.
     #[test]
     fn encircled_energy_is_a_cdf() {
         assert_eq!(airy_encircled_energy(0.0), 0.0);
@@ -453,10 +431,6 @@ mod tests {
         assert!((airy_encircled_energy(3.831_705_970_2) - 0.8378).abs() < 1e-3);
     }
 
-    /// Raw band energies are physical fractions of the PSF's total energy:
-    /// non-negative, summing to at most 1, and covering >= 99% at every ladder
-    /// entry. The residual beyond the widest band grows as the pattern widens,
-    /// and the finest level's share drains outward as the aperture stops down.
     #[test]
     fn raw_energies_conserve_and_cover_the_psf() {
         let mut previous_total = f64::INFINITY;
@@ -480,8 +454,7 @@ mod tests {
         }
     }
 
-    /// Every table entry reproduces, bit for bit, the weights the derivation
-    /// produces for its F-number. Regenerate the literals if this fails.
+    /// Regenerate the baked literals if this fails.
     #[test]
     fn table_matches_derivation() {
         for (i, n) in F_NUMBER_LADDER.into_iter().enumerate() {
@@ -493,10 +466,8 @@ mod tests {
         }
     }
 
-    /// Each table entry is normalized, and through f/11 the level weights decay
-    /// strictly monotonically. At f/16 and up the core's bulk ring crosses into
-    /// level 1 and the peak moves off the finest level, so monotonicity is not
-    /// asserted there.
+    /// At f/16 and up the core's bulk ring crosses into level 1 and the peak
+    /// moves off the finest level, so falloff is not asserted there.
     #[test]
     fn table_normalized_and_monotonic_falloff_through_f11() {
         for (i, n) in F_NUMBER_LADDER.into_iter().enumerate() {
@@ -517,8 +488,6 @@ mod tests {
         }
     }
 
-    /// The energy-weighted mean level index strictly increases along the whole
-    /// ladder, by more than a full pyramid level end to end.
     #[test]
     fn spread_increases_with_f_number() {
         let mean_level = |weights: &[f32; GLARE_BANDS]| -> f32 {
@@ -538,8 +507,6 @@ mod tests {
         assert!(last - first > 1.0, "f/1 {first} -> f/22 {last}");
     }
 
-    /// F-number interpolation: exact at ladder entries, clamped outside,
-    /// continuous and normalized in between.
     #[test]
     fn f_number_interpolation() {
         for (i, n) in F_NUMBER_LADDER.into_iter().enumerate() {
@@ -565,7 +532,6 @@ mod tests {
         }
     }
 
-    /// Invalid F-numbers degrade to the default.
     #[test]
     fn invalid_f_number_degrades_to_default() {
         for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0, -2.8] {
@@ -574,9 +540,8 @@ mod tests {
     }
 
     /// Reconstructs the per-level contributions from the chained lerp blend
-    /// constants and checks they reproduce `intensity*w_k`, with `1 - intensity`
-    /// left for the sharp image. Covers the full 8-level chain, a shallower
-    /// chain, and a deeper chain.
+    /// constants and checks they reproduce `intensity*w_k`. The mip counts cover
+    /// the full 8-level chain, a shallower chain, and a deeper one.
     #[test]
     fn blend_constants_reproduce_weights() {
         let f_number = 4.0;
@@ -589,7 +554,6 @@ mod tests {
                 .map(|mip| blend_factor(f_number, intensity, mip as u32))
                 .collect();
 
-            // contribution(level k) = b0*...*bk*(1 - b[k+1]).
             let mut product = 1.0f32;
             let mut contributions = Vec::new();
             for k in 0..levels {
@@ -613,7 +577,6 @@ mod tests {
                     // Deepest represented level: the folded tail.
                     intensity * weights[k..].iter().sum::<f32>()
                 } else {
-                    // Levels past the table get nothing.
                     0.0
                 };
                 assert!(
@@ -624,14 +587,12 @@ mod tests {
         }
     }
 
-    /// Degenerate inputs to the blend factor are safe.
     #[test]
     fn blend_factor_degenerate_inputs() {
         assert_eq!(blend_factor(5.6, f32::NAN, 0), 0.0);
         assert_eq!(blend_factor(5.6, 2.0, 0), 1.0);
         assert_eq!(blend_factor(5.6, -1.0, 0), 0.0);
         assert_eq!(blend_factor(5.6, 0.5, GLARE_BANDS as u32 + 5), 0.0);
-        // All pass constants are valid lerp factors.
         for n in F_NUMBER_LADDER {
             for mip in 0..12 {
                 let b = blend_factor(n, 0.7, mip);
