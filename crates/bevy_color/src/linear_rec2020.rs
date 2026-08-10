@@ -101,12 +101,6 @@ impl LinearRec2020 {
 
     /// Construct a new [`LinearRec2020`] color from (r, g, b) components, with the
     /// default alpha (1.0).
-    ///
-    /// # Arguments
-    ///
-    /// * `red` - Red channel. [0.0, 1.0] for SDR colors
-    /// * `green` - Green channel. [0.0, 1.0] for SDR colors
-    /// * `blue` - Blue channel. [0.0, 1.0] for SDR colors
     pub const fn rgb(red: f32, green: f32, blue: f32) -> Self {
         Self {
             red,
