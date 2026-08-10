@@ -31,28 +31,31 @@ Output is display-linear: `1.0` is `paper_white_nits`, and highlights run up to
 `peak_luminance_nits`. `DisplayTarget::transfer` picks the swapchain:
 
 - `DisplayTransfer::ScRgbLinear` gives an `Rgba16Float` swapchain in the
-  `ExtendedSrgbLinear` color space (1.0 = 80 nits). Native only: macOS/iOS
-  (Metal), Windows (Vulkan/DX12), Wayland (Vulkan, Mesa 25.1+).
+  `ExtendedSrgbLinear` color space. Native only: macOS and iOS 16+ (Metal),
+  Windows (Vulkan/DX12), Wayland (Vulkan, KDE).
 - `DisplayTransfer::ExtendedSrgb` is the encoded (gamma) form of scRGB-linear,
-  and the only HDR path browser WebGPU can present. Metal and Vulkan advertise
-  it too. It is the one transfer that reads `DisplayTarget::gamut`:
-  `DisplayGamut::Rec709` gives `ExtendedSrgb`, `DisplayGamut::DisplayP3` gives
-  `ExtendedDisplayP3` (Metal and browser WebGPU).
+  and the only HDR path browser WebGPU can present. Metal advertises it too. It
+  is the one transfer that reads `DisplayTarget::gamut`: `DisplayGamut::Rec709`
+  gives `ExtendedSrgb`, `DisplayGamut::DisplayP3` gives `ExtendedDisplayP3`
+  (Metal and browser WebGPU).
 - `DisplayTransfer::Pq` gives an HDR10 swapchain: the PQ (SMPTE ST 2084) signal
   in Rec.2020 primaries, preferring `Rgb10a2Unorm` and taking `Rgba16Float`
-  where the backend offers that instead. Vulkan, DX12, and Metal, when the OS
-  has HDR output enabled.
+  where the backend offers that instead. Vulkan, DX12, and Metal.
 
 Press `O` in the `tonemapping` example to cycle sRGB, scRGB, extended-range
 sRGB 709/P3, and PQ.
 
 A request the surface cannot fulfill is downgraded, with a warning. PQ falls
 back to scRGB-linear, and any HDR request falls back to plain SDR sRGB,
-identical to a default window, when the surface offers nothing better: SDR
-displays, OS HDR disabled, X11, GLES. A cross-HDR downgrade keeps your
+identical to a default window, when the surface offers nothing better: X11,
+GLES, or Wayland without color management. A cross-HDR downgrade keeps your
 calibration and swaps only the transfer. Read the outcome from the window's
 `WindowSurfaceTransfers` component, not from the request; see the release note
 "`DisplayTarget`: per-display calibration for windows".
+
+Windows and macOS advertise HDR color spaces even on an SDR display, so the
+request succeeds there and the compositor clips. `WindowDisplayState` carries
+the live tone-map headroom when you need to tell.
 
 Changing `DisplayTarget::transfer` at runtime reconfigures the surface and
 renegotiates, as does a `DisplayTarget::gamut` change under `ExtendedSrgb`.
