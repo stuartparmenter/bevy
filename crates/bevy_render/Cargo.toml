@@ -26,8 +26,8 @@ statically-linked-dxc = ["wgpu/static-dxc"]
 raw_vulkan_init = ["wgpu/vulkan"]
 
 # Driver-metered presentation of multiple textures per rendered frame, used by frame
-# generation (e.g. DLSS Frame Generation). Requires VK_NV_present_metering at runtime.
-paced_present = ["wgpu/vulkan"]
+# generation such as DLSS Frame Generation. Requires VK_NV_present_metering at runtime.
+paced_present = ["raw_vulkan_init"]
 
 trace = ["profiling"]
 tracing-tracy = ["dep:tracy-client"]

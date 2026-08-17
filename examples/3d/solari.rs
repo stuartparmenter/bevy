@@ -519,7 +519,7 @@ fn toggle_dlss_frame_generation(
     };
     if key_input.just_pressed(KeyCode::Digit4) {
         let (entity, frame_generation) = *camera;
-        // Cycle Off -> 2x -> 3x -> 4x -> Off, skipping unsupported modes
+        // Cycle from off through 2x, 3x, and 4x, then back to off, skipping unsupported modes
         let next_mode = match frame_generation.map(|frame_generation| frame_generation.mode) {
             None => Some(DlssFrameGenerationMode::X2),
             Some(DlssFrameGenerationMode::X2) => Some(DlssFrameGenerationMode::X3),
@@ -634,15 +634,14 @@ fn update_control_text(
         Res<DlssRayReconstructionSupported>,
     >,
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))] dlss_camera: Query<
-        Has<Dlss<DlssRayReconstructionFeature>>,
+        (
+            Has<Dlss<DlssRayReconstructionFeature>>,
+            Option<&DlssFrameGeneration>,
+        ),
         With<SolariLighting>,
     >,
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))] dlss_fg_supported: Option<
         Res<DlssFrameGenerationSupported>,
-    >,
-    #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))] dlss_fg_camera: Query<
-        Option<&DlssFrameGeneration>,
-        With<SolariLighting>,
     >,
 ) {
     text.0.clear();
@@ -671,8 +670,16 @@ fn update_control_text(
     }
 
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
+    let (dlss_rr_active, dlss_fg_mode) = match dlss_camera.single() {
+        Ok((rr_active, frame_generation)) => {
+            (rr_active, frame_generation.map(|settings| settings.mode))
+        }
+        Err(_) => (false, None),
+    };
+
+    #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
     if dlss_rr_supported.is_some() {
-        if matches!(dlss_camera.single(), Ok(true)) {
+        if dlss_rr_active {
             text.0.push_str("\n(3): Disable DLSS Ray Reconstruction");
         } else {
             text.0.push_str("\n(3): Enable DLSS Ray Reconstruction");
@@ -685,9 +692,9 @@ fn update_control_text(
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
     if let Some(dlss_fg_supported) = dlss_fg_supported.as_deref() {
         let max_multiplier = dlss_fg_supported.max_mode().multiplier();
-        let mode = match dlss_fg_camera.single() {
-            Ok(Some(frame_generation)) => format!("{}x", frame_generation.mode.multiplier()),
-            _ => "Off".to_string(),
+        let mode = match dlss_fg_mode {
+            Some(mode) => format!("{}x", mode.multiplier()),
+            None => "Off".to_string(),
         };
         text.0.push_str(&format!(
             "\n(4): DLSS Frame Generation: {mode} (up to {max_multiplier}x supported)"
@@ -709,22 +716,22 @@ fn update_performance_text(
     mut text: Single<&mut Text, With<PerformanceText>>,
     diagnostics: Res<DiagnosticsStore>,
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))] dlss_camera: Query<
-        Has<Dlss<DlssRayReconstructionFeature>>,
-        With<SolariLighting>,
-    >,
-    #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))] dlss_fg_camera: Query<
-        Option<&DlssFrameGeneration>,
+        (
+            Has<Dlss<DlssRayReconstructionFeature>>,
+            Option<&DlssFrameGeneration>,
+        ),
         With<SolariLighting>,
     >,
 ) {
     text.0.clear();
 
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
-    let frame_generation_mode = dlss_fg_camera
-        .single()
-        .ok()
-        .flatten()
-        .map(|frame_generation| frame_generation.mode);
+    let (dlss_rr_active, frame_generation_mode) = match dlss_camera.single() {
+        Ok((rr_active, frame_generation)) => {
+            (rr_active, frame_generation.map(|settings| settings.mode))
+        }
+        Err(_) => (false, None),
+    };
 
     let mut total = 0.0;
     let mut add_diagnostic = |name: &str, path: &'static str| {
@@ -745,7 +752,7 @@ fn update_performance_text(
     );
     (add_diagnostic)("Lighting", "render/solari_lighting/lighting/elapsed_gpu");
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
-    if matches!(dlss_camera.single(), Ok(true)) {
+    if dlss_rr_active {
         (add_diagnostic)("DLSS-RR", "render/dlss_ray_reconstruction/elapsed_gpu");
     }
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]

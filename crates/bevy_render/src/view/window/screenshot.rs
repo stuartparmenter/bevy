@@ -624,27 +624,47 @@ fn render_screenshot(
         );
 
         if let Some(pipeline) = pipelines.get_render_pipeline(prepared_state.pipeline_id) {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("screenshot_to_screen_pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: texture_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &prepared_state.bind_group, &[]);
-            pass.draw(0..3, 0..1);
+            fullscreen_blit_pass(
+                encoder,
+                "screenshot_to_screen_pass",
+                texture_view,
+                wgpu::LoadOp::Load,
+                pipeline,
+                &prepared_state.bind_group,
+            );
         }
     }
+}
+
+/// Records a fullscreen triangle pass that blits a bound texture to `view` with the
+/// [`ScreenshotToScreenPipeline`] pass shape.
+pub(crate) fn fullscreen_blit_pass(
+    encoder: &mut CommandEncoder,
+    label: &str,
+    view: &wgpu::TextureView,
+    load: wgpu::LoadOp<wgpu::Color>,
+    pipeline: &wgpu::RenderPipeline,
+    bind_group: &wgpu::BindGroup,
+) {
+    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some(label),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load,
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, bind_group, &[]);
+    pass.draw(0..3, 0..1);
 }
 
 pub(crate) fn collect_screenshots(world: &mut World) {

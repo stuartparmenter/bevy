@@ -70,7 +70,9 @@ impl Plugin for WindowRenderPlugin {
                 .init_resource::<paced_present::PacedPresentPlans>()
                 .add_systems(
                     ExtractSchedule,
-                    paced_present::reset_paced_windows.before(extract_windows),
+                    paced_present::reset_paced_windows
+                        .in_set(paced_present::PacedWindowReset)
+                        .before(extract_windows),
                 );
         }
     }

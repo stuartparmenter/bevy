@@ -1,11 +1,11 @@
 //! Driver-metered presentation of multiple textures per rendered frame.
 //!
-//! Frame generation features (e.g. DLSS Frame Generation) produce one or more generated
+//! Frame generation features such as DLSS Frame Generation produce one or more generated
 //! frames alongside each real rendered frame, and need to present them evenly spaced in
 //! time. The [VK_NV_present_metering] Vulkan extension lets the driver meter the display
 //! timing of the batch, so the frames are presented back to back.
 //!
-//! A producer marks a window as paced by inserting its (main world) window entity into
+//! A producer marks a window as paced by inserting its main world window entity into
 //! [`PacedWindows`] during extract, which suppresses the render thread's normal swapchain
 //! acquisition, and then submits a [`PacedPresentPlan`] for the window before the end of
 //! the [`RenderGraph`](crate::renderer::RenderGraph) schedule. During presentation each
@@ -14,9 +14,9 @@
 //!
 //! Driver metering is used when [`PresentMeteringSupported`] is present in
 //! [`AdditionalVulkanFeatures`](crate::renderer::raw_vulkan_init::AdditionalVulkanFeatures).
-//! Whoever enables VK_NV_present_metering during raw Vulkan device creation (e.g. the DLSS
-//! plugin, via `dlss_wgpu::present_metering`) must insert the marker. Without it the
-//! frames are presented unmetered, so producers should gate their support on it too.
+//! Whoever enables VK_NV_present_metering during raw Vulkan device creation, for example
+//! the DLSS plugin through `dlss_wgpu::present_metering`, must insert the marker. Without
+//! it the frames are presented unmetered, so producers should gate their support on it too.
 //!
 //! [VK_NV_present_metering]: https://registry.khronos.org/vulkan/specs/latest/man/html/VK_NV_present_metering.html
 
@@ -44,11 +44,11 @@ pub struct PresentMeteringSupported;
 
 /// `VkSetPresentConfigNV` from VK_NV_present_metering, chained onto the `VkPresentInfoKHR`
 /// of the first present of a batch to have the driver meter the batch's display timing.
-/// Defined locally: `bevy_render` depends on neither ash (which also lacks the extension)
-/// nor `dlss_wgpu`, which carry the canonical definitions.
+/// Defined locally because `bevy_render` depends on neither `dlss_wgpu` nor ash, and ash
+/// does not have the extension yet either.
 #[repr(C)]
 struct SetPresentConfigNV {
-    /// `VkStructureType`: `VK_STRUCTURE_TYPE_SET_PRESENT_CONFIG_NV`
+    /// `VK_STRUCTURE_TYPE_SET_PRESENT_CONFIG_NV`
     s_type: i32,
     p_next: *const core::ffi::c_void,
     num_frames_per_batch: u32,
@@ -68,8 +68,12 @@ const STRUCTURE_TYPE_SET_PRESENT_CONFIG_NV: i32 = 1000613000;
 #[derive(Resource, Default)]
 pub struct PacedWindows(pub EntityHashSet);
 
-/// Clears [`PacedWindows`] each frame. Producers writing [`PacedWindows`] during extract
-/// must order themselves after this system.
+/// System set containing [`reset_paced_windows`]. Producers writing [`PacedWindows`]
+/// during extract must order themselves after this set.
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PacedWindowReset;
+
+/// Clears [`PacedWindows`] each frame, in [`PacedWindowReset`].
 pub fn reset_paced_windows(mut paced_windows: ResMut<PacedWindows>) {
     paced_windows.0.clear();
 }
@@ -77,8 +81,8 @@ pub fn reset_paced_windows(mut paced_windows: ResMut<PacedWindows>) {
 /// An ordered list of textures to present to a window, ending with the real rendered
 /// frame, displayed at an even cadence by driver present metering.
 pub struct PacedPresentPlan {
-    /// Frames in presentation order. Must match the window surface size; sRGB views
-    /// should be used for correct encoding.
+    /// Frames in presentation order. They must match the window surface size, and sRGB
+    /// views should be used for correct encoding.
     pub frames: Vec<TextureView>,
 }
 
@@ -89,7 +93,7 @@ pub struct PacedPresentPlans {
 }
 
 impl PacedPresentPlans {
-    /// Queues `plan` for `window` (main world entity), replacing any plan already queued.
+    /// Queues `plan` for the main world `window` entity, replacing any plan already queued.
     pub fn insert(&mut self, window: Entity, plan: PacedPresentPlan) {
         self.plans.insert(window, plan);
     }
@@ -118,12 +122,9 @@ pub(crate) fn present_paced_plans(
         _ => return presented,
     };
 
-    #[cfg(feature = "raw_vulkan_init")]
     let metering_supported = world
         .get_resource::<crate::renderer::raw_vulkan_init::AdditionalVulkanFeatures>()
         .is_some_and(|features| features.has::<PresentMeteringSupported>());
-    #[cfg(not(feature = "raw_vulkan_init"))]
-    let metering_supported = false;
 
     let Ok((
         mut pipelines,
@@ -178,9 +179,10 @@ pub(crate) fn present_paced_plans(
             let Some(surface_texture) = acquire(surface_data, &render_device) else {
                 break;
             };
-            // The driver meters the whole batch starting at the next present. Armed only
-            // after a successful acquire, when a present is guaranteed to follow in this
-            // scope, so the stashed pointer is consumed before `present_config` drops.
+            // The driver meters the whole batch starting at the next present. This is
+            // armed only after a successful acquire, when a present is guaranteed to
+            // follow in this scope, so the stashed pointer is consumed before
+            // `present_config` drops.
             if frame_index == 0
                 && metering_supported
                 && let Some(hal_surface) =
@@ -226,6 +228,8 @@ fn acquire(
     match status {
         wgpu::CurrentSurfaceTexture::Success(surface_texture)
         | wgpu::CurrentSurfaceTexture::Suboptimal(surface_texture) => Some(surface_texture),
+        // The window is not visible, there is nothing to present to
+        wgpu::CurrentSurfaceTexture::Occluded => None,
         status => {
             warn!("Couldn't acquire paced swap chain texture: {status:?}");
             None
@@ -250,26 +254,13 @@ fn blit(
     let mut encoder = render_device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("paced_present_blit"),
     });
-    {
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("paced_present_blit"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &texture_view,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
-        pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, bind_group, &[]);
-        pass.draw(0..3, 0..1);
-    }
+    super::screenshot::fullscreen_blit_pass(
+        &mut encoder,
+        "paced_present_blit",
+        &texture_view,
+        wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+        pipeline,
+        bind_group,
+    );
     render_queue.submit([encoder.finish()]);
 }

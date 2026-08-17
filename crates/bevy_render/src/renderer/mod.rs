@@ -114,7 +114,7 @@ pub fn render_system(
         #[cfg(feature = "trace")]
         let _span = info_span!("present_frames").entered();
 
-        // Windows presented by driver-metered paced presentation this frame; skipped below.
+        // Windows presented by paced presentation this frame, skipped by the loop below
         #[cfg(feature = "paced_present")]
         let paced_windows =
             crate::view::window::paced_present::present_paced_plans(world, paced_present_state);

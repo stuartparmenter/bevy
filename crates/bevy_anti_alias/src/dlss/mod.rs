@@ -187,24 +187,16 @@ impl Plugin for DlssPlugin {
             info!("DLSS is not supported on this system");
             return;
         };
-        let (
-            super_resolution_supported,
-            ray_reconstruction_supported,
-            frame_generation_supported,
-            max_frames_to_generate,
-        ) = {
-            let sdk = dlss_sdk.lock().unwrap();
-            (
-                super_resolution_supported
-                    && sdk.feature_supported(dlss_wgpu::DlssFeature::SuperResolution),
-                ray_reconstruction_supported
-                    && sdk.feature_supported(dlss_wgpu::DlssFeature::RayReconstruction),
-                frame_generation_supported
-                    && sdk.feature_supported(dlss_wgpu::DlssFeature::FrameGeneration)
-                    && present_metering_supported,
-                sdk.multi_frame_count_max(),
-            )
-        };
+        let sdk = dlss_sdk.lock().unwrap();
+        let super_resolution_supported = super_resolution_supported
+            && sdk.feature_supported(dlss_wgpu::DlssFeature::SuperResolution);
+        let ray_reconstruction_supported = ray_reconstruction_supported
+            && sdk.feature_supported(dlss_wgpu::DlssFeature::RayReconstruction);
+        let frame_generation_supported = frame_generation_supported
+            && sdk.feature_supported(dlss_wgpu::DlssFeature::FrameGeneration)
+            && present_metering_supported;
+        let max_frames_to_generate = sdk.multi_frame_count_max();
+        drop(sdk);
 
         if super_resolution_supported {
             app.insert_resource(DlssSuperResolutionSupported);
@@ -244,7 +236,7 @@ impl Plugin for DlssPlugin {
                 .add_systems(
                     ExtractSchedule,
                     frame_generation::extract_frame_generation
-                        .after(paced_present::reset_paced_windows)
+                        .after(paced_present::PacedWindowReset)
                         // Reads the normalized render target off ExtractedCamera
                         .after(bevy_render::camera::extract_cameras),
                 )
@@ -253,9 +245,9 @@ impl Plugin for DlssPlugin {
                     frame_generation::prepare_frame_generation
                         .in_set(RenderSystems::PrepareViews)
                         .after(prepare_view_attachments)
-                        // Window screenshots also override the target attachment; frame
-                        // generation deterministically wins (screenshots of paced windows
-                        // are unsupported)
+                        // Window screenshots also override the target attachment. Frame
+                        // generation wins, since screenshots of paced windows are
+                        // unsupported.
                         .after(bevy_render::view::window::screenshot::ScreenshotPreparation)
                         .after(prepare::prepare_dlss::<DlssSuperResolutionFeature>)
                         .after(prepare::prepare_dlss::<DlssRayReconstructionFeature>)
@@ -490,8 +482,8 @@ pub struct DlssRayReconstructionSupported;
 pub struct DlssFrameGeneration {
     /// Presented frame rate multiplier.
     ///
-    /// Modes above what the current machine supports (see [`DlssFrameGenerationSupported::max_mode`])
-    /// fall back to the highest supported mode, with a warning.
+    /// Modes above what the current machine supports fall back to the highest supported
+    /// mode, with a warning. See [`DlssFrameGenerationSupported::max_mode`].
     pub mode: DlssFrameGenerationMode,
     /// Set to true after a camera cut or other discontinuity.
     ///
@@ -504,16 +496,16 @@ pub struct DlssFrameGeneration {
 pub enum DlssFrameGenerationMode {
     /// One generated frame per rendered frame, doubling the presented frame rate.
     ///
-    /// Supported by all frame generation capable GPUs (RTX 40 series and newer).
+    /// Supported by all frame generation capable GPUs, RTX 40 series and newer.
     #[default]
     X2,
     /// Two generated frames per rendered frame, tripling the presented frame rate.
     ///
-    /// Requires multi frame generation support (RTX 50 series and newer).
+    /// Requires multi frame generation support, RTX 50 series and newer.
     X3,
     /// Three generated frames per rendered frame, quadrupling the presented frame rate.
     ///
-    /// Requires multi frame generation support (RTX 50 series and newer).
+    /// Requires multi frame generation support, RTX 50 series and newer.
     X4,
 }
 

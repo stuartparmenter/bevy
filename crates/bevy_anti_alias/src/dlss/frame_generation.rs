@@ -1,6 +1,4 @@
 use super::{DlssFrameGeneration, DlssFrameGenerationSupported, DlssSdk};
-extern crate alloc;
-use alloc::sync::Arc;
 use bevy_camera::{Camera, MainPassResolutionOverride, NormalizedRenderTarget, Projection};
 use bevy_core_pipeline::prepass::ViewPrepassTextures;
 use bevy_ecs::{prelude::*, query::Has};
@@ -29,6 +27,7 @@ use dlss_wgpu::frame_generation::{
     DlssFrameGeneration as WgpuDlssFrameGeneration, DlssFrameGenerationCamera,
     DlssFrameGenerationRenderParameters,
 };
+use std::sync::Arc;
 use tracing::warn;
 
 pub(super) fn extract_frame_generation(
@@ -52,8 +51,7 @@ pub(super) fn extract_frame_generation(
         let mut entity_commands = commands
             .get_entity(entity)
             .expect("Camera entity wasn't synced.");
-        let (had_frame_generation, prepared, extracted_camera) =
-            render_state.get(entity).unwrap_or((false, false, None));
+        let (had_frame_generation, prepared, extracted_camera) = render_state.get(entity).unwrap();
         // `extract_cameras` ran earlier this frame, so the render target is already normalized
         let window = match extracted_camera.and_then(|camera| camera.target.as_ref()) {
             Some(NormalizedRenderTarget::Window(window_ref)) => Some(window_ref.entity()),
@@ -67,8 +65,8 @@ pub(super) fn extract_frame_generation(
             entity_commands.insert(frame_generation.clone());
             frame_generation.reset = false;
             // Only pace the window once a prior prepare succeeded, so that the first frame
-            // after enabling (and any prepare failure) presents normally instead of
-            // suppressing swapchain acquisition with nothing to present.
+            // after enabling, or any frame after a prepare failure, presents normally
+            // instead of suppressing swapchain acquisition with nothing to present.
             if prepared {
                 paced_windows.0.insert(window);
             }
@@ -103,8 +101,8 @@ pub(super) struct FrameGenerationRenderContext {
 
 #[derive(Component)]
 pub(super) struct ViewFrameGenerationTextures {
-    /// The camera's redirected final output. Its default (non-sRGB) view is the NGX
-    /// backbuffer input; it is retained and presented as the real frame.
+    /// The camera's redirected final output. Its default non-sRGB view is the NGX
+    /// backbuffer input, and it is retained and presented as the real frame.
     input: CachedTexture,
     /// sRGB view of [`Self::input`], rendered to by the camera and blitted by the pacer.
     input_srgb_view: TextureView,
@@ -112,7 +110,7 @@ pub(super) struct ViewFrameGenerationTextures {
 }
 
 struct InterpolatedTexture {
-    /// NGX interpolated output. The default (non-sRGB) view is written by NGX.
+    /// NGX interpolated output. NGX writes the default non-sRGB view.
     texture: CachedTexture,
     /// sRGB view blitted to the surface by the pacer.
     srgb_view: TextureView,
@@ -129,6 +127,7 @@ pub(super) fn prepare_frame_generation(
         Option<&Msaa>,
         Option<&MainPassResolutionOverride>,
         Option<&FrameGenerationRenderContext>,
+        Option<&ViewFrameGenerationTextures>,
     )>,
     windows: Query<(MainEntity, &ExtractedWindow)>,
     paced_windows: Res<PacedWindows>,
@@ -140,7 +139,9 @@ pub(super) fn prepare_frame_generation(
     mut texture_cache: ResMut<TextureCache>,
     mut attachments: ResMut<ViewTargetAttachments>,
 ) {
-    for (entity, camera, view, settings, msaa, resolution_override, context) in &cameras {
+    for (entity, camera, view, settings, msaa, resolution_override, context, existing_textures) in
+        &cameras
+    {
         let Some(target @ NormalizedRenderTarget::Window(window_ref)) = camera.target.as_ref()
         else {
             continue;
@@ -243,54 +244,76 @@ pub(super) fn prepare_frame_generation(
                 ..descriptor
             },
         );
-        let input_srgb_view = input.texture.create_view(&TextureViewDescriptor {
-            label: Some("dlss_frame_generation_input_srgb_view"),
-            format: Some(view_format),
-            usage: Some(TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING),
-            ..Default::default()
-        });
-        let interpolated = (0..frames_to_generate)
+        let interpolated_textures = (0..frames_to_generate)
             .map(|_| {
-                let texture = texture_cache.get(
+                texture_cache.get(
                     &render_device,
                     TextureDescriptor {
                         label: Some("dlss_frame_generation_interpolated"),
                         ..descriptor.clone()
                     },
-                );
-                let srgb_view = texture.texture.create_view(&TextureViewDescriptor {
-                    label: Some("dlss_frame_generation_interpolated_srgb_view"),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        // Views are only recreated when the cached textures change, so view identity
+        // stays stable across frames
+        let unchanged = existing_textures.filter(|textures| {
+            textures.input.texture.id() == input.texture.id()
+                && textures.interpolated.len() == interpolated_textures.len()
+                && textures
+                    .interpolated
+                    .iter()
+                    .zip(&interpolated_textures)
+                    .all(|(old, new)| old.texture.texture.id() == new.texture.id())
+        });
+        let input_srgb_view = match unchanged {
+            Some(textures) => textures.input_srgb_view.clone(),
+            None => {
+                let input_srgb_view = input.texture.create_view(&TextureViewDescriptor {
+                    label: Some("dlss_frame_generation_input_srgb_view"),
                     format: Some(view_format),
-                    usage: Some(TextureUsages::TEXTURE_BINDING),
+                    usage: Some(TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING),
                     ..Default::default()
                 });
-                InterpolatedTexture { texture, srgb_view }
-            })
-            .collect();
+                let interpolated = interpolated_textures
+                    .into_iter()
+                    .map(|texture| {
+                        let srgb_view = texture.texture.create_view(&TextureViewDescriptor {
+                            label: Some("dlss_frame_generation_interpolated_srgb_view"),
+                            format: Some(view_format),
+                            usage: Some(TextureUsages::TEXTURE_BINDING),
+                            ..Default::default()
+                        });
+                        InterpolatedTexture { texture, srgb_view }
+                    })
+                    .collect();
+                commands.entity(entity).insert(ViewFrameGenerationTextures {
+                    input,
+                    input_srgb_view: input_srgb_view.clone(),
+                    interpolated,
+                });
+                input_srgb_view
+            }
+        };
 
         // Redirect the camera's final output into the input texture only while the window
-        // is actually paced; during warm-up the camera renders to the swapchain as normal.
+        // is actually paced. During warm-up the camera renders to the swapchain as normal.
         if paced_windows.0.contains(&window_entity) {
             attachments.insert(
                 target.clone(),
-                OutputColorAttachment::new(input_srgb_view.clone(), view_format),
+                OutputColorAttachment::new(input_srgb_view, view_format),
             );
         }
-        commands.entity(entity).insert(ViewFrameGenerationTextures {
-            input,
-            input_srgb_view,
-            interpolated,
-        });
     }
 }
 
-/// Returns the NGX storage format, sRGB view format, and texture view formats to use for a
-/// given window surface format.
+/// Returns the NGX storage format and the texture view formats to use for a given window
+/// surface format.
 ///
-/// NGX consumes and produces non-sRGB UNORM textures holding display-ready (sRGB encoded)
-/// values; the camera renders and the pacer blits through sRGB views. The sRGB view format
-/// always matches the surface view format the pacer presents with
-/// (`surface_format.add_srgb_suffix()`).
+/// NGX consumes and produces non-sRGB UNORM textures that hold display-ready sRGB encoded
+/// values. The camera renders and the pacer blits through sRGB views, and the sRGB view
+/// format always matches `surface_format.add_srgb_suffix()`, which the pacer presents with.
 fn frame_generation_formats(
     surface_format: TextureFormat,
 ) -> Option<(TextureFormat, &'static [TextureFormat])> {
@@ -318,7 +341,6 @@ pub(super) fn frame_generation(
         &ViewPrepassTextures,
         Option<&TemporalJitter>,
     )>,
-    windows: Query<MainEntity, With<ExtractedWindow>>,
     paced_windows: Res<PacedWindows>,
     adapter: Res<RenderAdapter>,
     mut plans: ResMut<PacedPresentPlans>,
@@ -339,9 +361,6 @@ pub(super) fn frame_generation(
             continue;
         };
         let window_entity = window_ref.entity();
-        if !windows.iter().any(|window| window == window_entity) {
-            continue;
-        }
         let Projection::Perspective(projection) = projection else {
             continue;
         };
