@@ -1,7 +1,7 @@
 use super::{DlssFrameGeneration, DlssFrameGenerationSupported, DlssSdk};
 use bevy_camera::{Camera, MainPassResolutionOverride, NormalizedRenderTarget, Projection};
 use bevy_core_pipeline::prepass::ViewPrepassTextures;
-use bevy_ecs::{prelude::*, query::Has};
+use bevy_ecs::{entity::EntityHashMap, prelude::*, query::Has};
 use bevy_log::warn_once;
 use bevy_math::{Mat4, UVec2, Vec2, Vec4Swizzles};
 use bevy_render::{
@@ -16,17 +16,22 @@ use bevy_render::{
     texture::{CachedTexture, OutputColorAttachment, TextureCache},
     view::{
         window::{
-            paced_present::{PacedPresentPlan, PacedPresentPlans, PacedWindows},
+            paced_present::{
+                PacedPresentPlan, PacedPresentPlans, PacedSwapchainDepths, PacedWindows,
+                PlannedFrame, PresentChainLink,
+            },
             ExtractedWindow,
         },
         ExtractedView, Msaa, ViewTargetAttachments,
     },
     MainWorld,
 };
+use bevy_window::{Monitor, OnMonitor};
 use dlss_wgpu::frame_generation::{
     DlssFrameGeneration as WgpuDlssFrameGeneration, DlssFrameGenerationCamera,
     DlssFrameGenerationRenderParameters,
 };
+use dlss_wgpu::present_metering::SetPresentConfigNV;
 use std::sync::Arc;
 use tracing::warn;
 
@@ -34,12 +39,30 @@ pub(super) fn extract_frame_generation(
     mut commands: Commands,
     mut main_world: ResMut<MainWorld>,
     mut paced_windows: ResMut<PacedWindows>,
+    supported: Res<DlssFrameGenerationSupported>,
+    mut paced_depths: ResMut<PacedSwapchainDepths>,
     render_state: Query<(
         Has<DlssFrameGeneration>,
         Has<ViewFrameGenerationTextures>,
         Option<&ExtractedCamera>,
     )>,
 ) {
+    // Collected up front because the camera query below borrows the main world mutably.
+    let mut monitor_links = main_world.query::<(Entity, &OnMonitor)>();
+    let window_monitors: Vec<(Entity, Entity)> = monitor_links
+        .iter(&main_world)
+        .map(|(window, on_monitor)| (window, on_monitor.0))
+        .collect();
+    let mut monitors = main_world.query::<&Monitor>();
+    let mut window_refresh_rates = EntityHashMap::default();
+    for (window, monitor) in window_monitors {
+        let refresh_rate = monitors
+            .get(&main_world, monitor)
+            .ok()
+            .and_then(|monitor| monitor.refresh_rate_millihertz);
+        window_refresh_rates.insert(window, refresh_rate);
+    }
+
     let mut cameras = main_world.query::<(
         RenderEntity,
         &Camera,
@@ -62,8 +85,26 @@ pub(super) fn extract_frame_generation(
             (frame_generation.as_deref_mut(), projection, window)
             && camera.is_active
         {
-            entity_commands.insert(frame_generation.clone());
+            let max_frames_for_display =
+                max_frames_for_refresh(window_refresh_rates.get(&window).copied().flatten());
+            if frame_generation.mode.frames_to_generate() > max_frames_for_display {
+                warn_once!(
+                    "DlssFrameGenerationMode::{:?} is unsafe at the display refresh rate, clamping to {} generated frames",
+                    frame_generation.mode,
+                    max_frames_for_display,
+                );
+            }
+            entity_commands.insert((
+                frame_generation.clone(),
+                FrameGenerationRefreshLimit {
+                    max_frames_to_generate: max_frames_for_display,
+                },
+            ));
             frame_generation.reset = false;
+            // Sized once from the SDK maximum, never from a plan's length. Declaring during
+            // warm-up gives surface sizing and the blit pipeline pre-warm at least one frame
+            // of lead time before the first plan.
+            paced_depths.declare(window, supported.max_frames_to_generate() + 1);
             // Only pace the window once a prior prepare succeeded, so that the first frame
             // after enabling, or any frame after a prepare failure, presents normally
             // instead of suppressing swapchain acquisition with nothing to present.
@@ -83,8 +124,33 @@ pub(super) fn extract_frame_generation(
                 DlssFrameGeneration,
                 FrameGenerationRenderContext,
                 ViewFrameGenerationTextures,
+                FrameGenerationRefreshLimit,
             )>();
         }
+    }
+}
+
+/// Refresh rate clamp for a frame generation camera, computed during extract because
+/// `Monitor` is a main world component that is never extracted.
+#[derive(Component, Clone, Copy)]
+pub(super) struct FrameGenerationRefreshLimit {
+    /// Largest generated frame count the window's display supports.
+    max_frames_to_generate: u32,
+}
+
+/// The largest generated frame count that is safe at a display refresh rate.
+///
+/// NVIDIA documents 4x frame generation as safe only at 60 Hz output and above, and 5x
+/// only at 75 Hz and above, one multiplier step per 15 Hz. Thresholds carry 1 Hz of
+/// slack so fractional rates such as 59.94 Hz count as 60 Hz. An unknown rate is not
+/// clamped, 3 is the engine maximum. Reported rates can be stale or wrong, see
+/// `Monitor::refresh_rate_millihertz`, so the clamp is best effort.
+fn max_frames_for_refresh(refresh_rate_millihertz: Option<u32>) -> u32 {
+    match refresh_rate_millihertz {
+        None => 3,
+        Some(millihertz) if millihertz >= 59_000 => 3,
+        Some(millihertz) if millihertz >= 44_000 => 2,
+        Some(_) => 1,
     }
 }
 
@@ -128,6 +194,7 @@ pub(super) fn prepare_frame_generation(
         Option<&MainPassResolutionOverride>,
         Option<&FrameGenerationRenderContext>,
         Option<&ViewFrameGenerationTextures>,
+        Option<&FrameGenerationRefreshLimit>,
     )>,
     windows: Query<(MainEntity, &ExtractedWindow)>,
     paced_windows: Res<PacedWindows>,
@@ -139,8 +206,17 @@ pub(super) fn prepare_frame_generation(
     mut texture_cache: ResMut<TextureCache>,
     mut attachments: ResMut<ViewTargetAttachments>,
 ) {
-    for (entity, camera, view, settings, msaa, resolution_override, context, existing_textures) in
-        &cameras
+    for (
+        entity,
+        camera,
+        view,
+        settings,
+        msaa,
+        resolution_override,
+        context,
+        existing_textures,
+        refresh_limit,
+    ) in &cameras
     {
         let Some(target @ NormalizedRenderTarget::Window(window_ref)) = camera.target.as_ref()
         else {
@@ -179,7 +255,9 @@ pub(super) fn prepare_frame_generation(
         let frames_to_generate = settings
             .mode
             .frames_to_generate()
-            .min(supported.max_frames_to_generate());
+            .min(supported.max_frames_to_generate())
+            // The engine maximum is 3, so an absent limit does not clamp
+            .min(refresh_limit.map_or(3, |limit| limit.max_frames_to_generate));
 
         let recreate_context = context.is_none_or(|context| {
             context.output_resolution != output_resolution
@@ -333,6 +411,29 @@ fn frame_generation_formats(
     }
 }
 
+/// Builds a plan whose first present carries a `VkSetPresentConfigNV` covering the whole
+/// batch, so the driver meters the display timing of all of its frames.
+#[expect(
+    unsafe_code,
+    reason = "Installing the metering chain link requires the unsafe chain link API."
+)]
+fn metered_plan(frames: Vec<PlannedFrame>) -> PacedPresentPlan {
+    let mut plan = PacedPresentPlan::new(frames);
+    // Boxed fresh for every plan, because wgpu writes into the tail of the chain
+    let config = Box::new(SetPresentConfigNV {
+        num_frames_per_batch: plan.frames.len() as u32,
+        ..Default::default()
+    });
+    // SAFETY: The payload is a single valid VkSetPresentConfigNV with a null pNext,
+    // freshly boxed for this plan.
+    let link = unsafe { PresentChainLink::new(config) };
+    // SAFETY: VK_NV_present_metering was enabled at device creation. Frame generation
+    // systems only run when DlssPlugin::finish saw the PresentMeteringSupported marker
+    // set by the DLSS device creation callback.
+    unsafe { plan.set_present_chain_link(link) };
+    plan
+}
+
 pub(super) fn frame_generation(
     mut views: Query<(
         &DlssFrameGeneration,
@@ -386,12 +487,12 @@ pub(super) fn frame_generation(
         let (Some(depth), Some(motion_vectors)) =
             (&prepass_textures.depth, &prepass_textures.motion_vectors)
         else {
-            // A paced window must always receive a plan, or nothing is presented
+            // A claimed window with no plan presents nothing this frame. The real frame
+            // is fully rendered into the redirected input, so present it alone instead
+            // of dropping it.
             plans.insert(
                 window_entity,
-                PacedPresentPlan {
-                    frames: vec![textures.input_srgb_view.clone()],
-                },
+                metered_plan(vec![PlannedFrame::new(textures.input_srgb_view.clone())]),
             );
             continue;
         };
@@ -463,7 +564,7 @@ pub(super) fn frame_generation(
                         textures
                             .interpolated
                             .iter()
-                            .map(|interpolated| interpolated.srgb_view.clone()),
+                            .map(|interpolated| PlannedFrame::new(interpolated.srgb_view.clone())),
                     );
                 }
             }
@@ -473,8 +574,8 @@ pub(super) fn frame_generation(
             }
         }
         // The real frame is always presented last, after any generated frames
-        frames.push(textures.input_srgb_view.clone());
+        frames.push(PlannedFrame::new(textures.input_srgb_view.clone()));
         time_span.end(ctx.command_encoder());
-        plans.insert(window_entity, PacedPresentPlan { frames });
+        plans.insert(window_entity, metered_plan(frames));
     }
 }

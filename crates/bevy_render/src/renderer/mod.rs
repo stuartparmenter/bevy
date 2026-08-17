@@ -114,7 +114,8 @@ pub fn render_system(
         #[cfg(feature = "trace")]
         let _span = info_span!("present_frames").entered();
 
-        // Windows presented by paced presentation this frame, skipped by the loop below
+        // Windows owned by paced presentation this frame, skipped by the loop below. A
+        // claimed window is skipped even when the pacer presented nothing for it.
         #[cfg(feature = "paced_present")]
         let paced_windows =
             crate::view::window::paced_present::present_paced_plans(world, paced_present_state);

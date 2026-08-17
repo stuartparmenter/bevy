@@ -133,8 +133,7 @@ impl Plugin for DlssInitPlugin {
                     // Paced presentation of generated frames relies on driver present
                     // metering
                     if dlss_wgpu::present_metering::register_present_metering(&mut args, adapter) {
-                        additional_vulkan_features
-                            .insert::<paced_present::PresentMeteringSupported>();
+                        additional_vulkan_features.insert::<PresentMeteringSupported>();
                     }
                 },
             )
@@ -169,7 +168,7 @@ impl Plugin for DlssPlugin {
                 features.has::<DlssSuperResolutionSupported>(),
                 features.has::<DlssRayReconstructionSupported>(),
                 features.has::<DlssFrameGenerationSupported>(),
-                features.has::<paced_present::PresentMeteringSupported>(),
+                features.has::<PresentMeteringSupported>(),
             )
         };
         if !super_resolution_supported && !frame_generation_supported {
@@ -468,6 +467,12 @@ pub struct DlssSuperResolutionSupported;
 /// Otherwise this resource will be absent.
 #[derive(Resource, Clone, Copy)]
 pub struct DlssRayReconstructionSupported;
+
+/// Marker for [`AdditionalVulkanFeatures`], inserted when the DLSS device creation
+/// callback enables the `VK_NV_present_metering` device extension. Frame generation support
+/// requires it, because the paced present plans it submits are driver-metered only when
+/// they carry the extension's chain link.
+struct PresentMeteringSupported;
 
 /// Camera component that enables DLSS Frame Generation.
 ///
