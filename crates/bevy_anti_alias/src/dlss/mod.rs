@@ -21,7 +21,7 @@ mod prepare;
 
 pub use dlss_wgpu::DlssPerfQualityMode;
 
-use bevy_app::{App, Plugin};
+use bevy_app::{App, Plugin, PostUpdate};
 use bevy_camera::Hdr;
 use bevy_core_pipeline::{
     prepass::{DepthPrepass, MotionVectorPrepass},
@@ -231,6 +231,7 @@ impl Plugin for DlssPlugin {
             );
 
         if frame_generation_supported {
+            app.add_systems(PostUpdate, frame_generation::update_refresh_limits);
             app.sub_app_mut(RenderApp)
                 .add_systems(
                     ExtractSchedule,

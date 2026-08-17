@@ -1,7 +1,9 @@
 use super::{DlssFrameGeneration, DlssFrameGenerationSupported, DlssSdk};
-use bevy_camera::{Camera, MainPassResolutionOverride, NormalizedRenderTarget, Projection};
+use bevy_camera::{
+    Camera, MainPassResolutionOverride, NormalizedRenderTarget, Projection, RenderTarget,
+};
 use bevy_core_pipeline::prepass::ViewPrepassTextures;
-use bevy_ecs::{entity::EntityHashMap, prelude::*, query::Has};
+use bevy_ecs::{prelude::*, query::Has};
 use bevy_log::warn_once;
 use bevy_math::{Mat4, UVec2, Vec2, Vec4Swizzles};
 use bevy_render::{
@@ -26,7 +28,7 @@ use bevy_render::{
     },
     MainWorld,
 };
-use bevy_window::{Monitor, OnMonitor};
+use bevy_window::{Monitor, OnMonitor, PrimaryWindow};
 use dlss_wgpu::frame_generation::{
     DlssFrameGeneration as WgpuDlssFrameGeneration, DlssFrameGenerationCamera,
     DlssFrameGenerationRenderParameters,
@@ -47,30 +49,17 @@ pub(super) fn extract_frame_generation(
         Option<&ExtractedCamera>,
     )>,
 ) {
-    // Collected up front because the camera query below borrows the main world mutably.
-    let mut monitor_links = main_world.query::<(Entity, &OnMonitor)>();
-    let window_monitors: Vec<(Entity, Entity)> = monitor_links
-        .iter(&main_world)
-        .map(|(window, on_monitor)| (window, on_monitor.0))
-        .collect();
-    let mut monitors = main_world.query::<&Monitor>();
-    let mut window_refresh_rates = EntityHashMap::default();
-    for (window, monitor) in window_monitors {
-        let refresh_rate = monitors
-            .get(&main_world, monitor)
-            .ok()
-            .and_then(|monitor| monitor.refresh_rate_millihertz);
-        window_refresh_rates.insert(window, refresh_rate);
-    }
-
     let mut cameras = main_world.query::<(
         RenderEntity,
         &Camera,
         &Projection,
         Option<&mut DlssFrameGeneration>,
+        Option<&FrameGenerationRefreshLimit>,
     )>();
 
-    for (entity, camera, projection, mut frame_generation) in cameras.iter_mut(&mut main_world) {
+    for (entity, camera, projection, mut frame_generation, refresh_limit) in
+        cameras.iter_mut(&mut main_world)
+    {
         let mut entity_commands = commands
             .get_entity(entity)
             .expect("Camera entity wasn't synced.");
@@ -85,21 +74,15 @@ pub(super) fn extract_frame_generation(
             (frame_generation.as_deref_mut(), projection, window)
             && camera.is_active
         {
-            let max_frames_for_display =
-                max_frames_for_refresh(window_refresh_rates.get(&window).copied().flatten());
-            if frame_generation.mode.frames_to_generate() > max_frames_for_display {
-                warn_once!(
-                    "DlssFrameGenerationMode::{:?} is unsafe at the display refresh rate, clamping to {} generated frames",
-                    frame_generation.mode,
-                    max_frames_for_display,
-                );
+            entity_commands.insert(frame_generation.clone());
+            match refresh_limit {
+                Some(limit) => {
+                    entity_commands.insert(*limit);
+                }
+                None => {
+                    entity_commands.remove::<FrameGenerationRefreshLimit>();
+                }
             }
-            entity_commands.insert((
-                frame_generation.clone(),
-                FrameGenerationRefreshLimit {
-                    max_frames_to_generate: max_frames_for_display,
-                },
-            ));
             frame_generation.reset = false;
             // Sized once from the SDK maximum, never from a plan's length. Declaring during
             // warm-up gives surface sizing and the blit pipeline pre-warm at least one frame
@@ -130,27 +113,75 @@ pub(super) fn extract_frame_generation(
     }
 }
 
-/// Refresh rate clamp for a frame generation camera, computed during extract because
-/// `Monitor` is a main world component that is never extracted.
+/// Refresh rate clamp for a frame generation camera. Computed in the main world by
+/// [`update_refresh_limits`] because `Monitor` is never extracted, and copied to the
+/// render world during extract. Present only when the display clamps the frame count.
 #[derive(Component, Clone, Copy)]
 pub(super) struct FrameGenerationRefreshLimit {
     /// Largest generated frame count the window's display supports.
     max_frames_to_generate: u32,
 }
 
-/// The largest generated frame count that is safe at a display refresh rate.
+/// Computes [`FrameGenerationRefreshLimit`] for every frame generation camera from its
+/// window's monitor refresh rate.
+pub(super) fn update_refresh_limits(
+    mut commands: Commands,
+    cameras: Query<(Entity, &RenderTarget, &DlssFrameGeneration)>,
+    primary_window: Query<Entity, With<PrimaryWindow>>,
+    monitor_links: Query<&OnMonitor>,
+    monitors: Query<&Monitor>,
+    mut removed: RemovedComponents<DlssFrameGeneration>,
+) {
+    for entity in removed.read() {
+        if let Ok(mut removed_camera) = commands.get_entity(entity) {
+            removed_camera.remove::<FrameGenerationRefreshLimit>();
+        }
+    }
+    let primary_window = primary_window.single().ok();
+    for (entity, render_target, settings) in &cameras {
+        let refresh_rate = render_target
+            .normalize(primary_window)
+            .and_then(|target| match target {
+                NormalizedRenderTarget::Window(window_ref) => Some(window_ref.entity()),
+                _ => None,
+            })
+            .and_then(|window| monitor_links.get(window).ok())
+            .and_then(|on_monitor| monitors.get(on_monitor.0).ok())
+            .and_then(|monitor| monitor.refresh_rate_millihertz);
+        match refresh_rate.and_then(max_frames_for_refresh) {
+            Some(max_frames_to_generate) => {
+                if settings.mode.frames_to_generate() > max_frames_to_generate {
+                    warn_once!(
+                        "DlssFrameGenerationMode::{:?} is unsafe at the display refresh rate, clamping to {} generated frames",
+                        settings.mode,
+                        max_frames_to_generate,
+                    );
+                }
+                commands.entity(entity).insert(FrameGenerationRefreshLimit {
+                    max_frames_to_generate,
+                });
+            }
+            None => {
+                commands
+                    .entity(entity)
+                    .remove::<FrameGenerationRefreshLimit>();
+            }
+        }
+    }
+}
+
+/// The largest generated frame count that is safe at a display refresh rate, or None
+/// when the rate imposes no clamp of its own.
 ///
-/// NVIDIA documents 4x frame generation as safe only at 60 Hz output and above, and 5x
-/// only at 75 Hz and above, one multiplier step per 15 Hz. Thresholds carry 1 Hz of
-/// slack so fractional rates such as 59.94 Hz count as 60 Hz. An unknown rate is not
-/// clamped, 3 is the engine maximum. Reported rates can be stale or wrong, see
-/// `Monitor::refresh_rate_millihertz`, so the clamp is best effort.
-fn max_frames_for_refresh(refresh_rate_millihertz: Option<u32>) -> u32 {
+/// NVIDIA documents one multiplier step per 15 Hz of output, with 4x safe at 60 Hz and
+/// above. Thresholds carry 1 Hz of slack so fractional rates such as 59.94 Hz count as
+/// 60 Hz. Reported rates can be stale or wrong, see `Monitor::refresh_rate_millihertz`,
+/// so the clamp is best effort.
+fn max_frames_for_refresh(refresh_rate_millihertz: u32) -> Option<u32> {
     match refresh_rate_millihertz {
-        None => 3,
-        Some(millihertz) if millihertz >= 59_000 => 3,
-        Some(millihertz) if millihertz >= 44_000 => 2,
-        Some(_) => 1,
+        millihertz if millihertz >= 59_000 => None,
+        millihertz if millihertz >= 44_000 => Some(2),
+        _ => Some(1),
     }
 }
 
@@ -257,7 +288,7 @@ pub(super) fn prepare_frame_generation(
             .frames_to_generate()
             .min(supported.max_frames_to_generate())
             // The engine maximum is 3, so an absent limit does not clamp
-            .min(refresh_limit.map_or(3, |limit| limit.max_frames_to_generate));
+            .min(refresh_limit.map_or(u32::MAX, |limit| limit.max_frames_to_generate));
 
         let recreate_context = context.is_none_or(|context| {
             context.output_resolution != output_resolution

@@ -7,6 +7,7 @@ use crate::{
     Extract, ExtractSchedule, Render, RenderApp, RenderSystems,
 };
 use bevy_app::{App, Plugin};
+use bevy_ecs::entity::EntityHashMap;
 use bevy_ecs::prelude::*;
 use bevy_ecs::system::RunSystemOnce;
 use bevy_log::{debug, info, warn};
@@ -16,7 +17,7 @@ use bevy_window::{
 };
 use core::num::NonZero;
 #[cfg(feature = "paced_present")]
-use paced_present::{PacedSwapchainDepths, PacedWindows};
+use paced_present::PacedWindows;
 use wgpu::{
     SurfaceConfiguration, SurfaceTargetUnsafe, TextureFormat, TextureUsages, TextureViewDescriptor,
 };
@@ -55,6 +56,7 @@ impl Plugin for WindowRenderPlugin {
 
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
             render_app
+                .init_resource::<PacedSwapchainDepths>()
                 .add_systems(ExtractSchedule, extract_windows.before(extract_cameras))
                 .add_systems(
                     Render,
@@ -68,7 +70,7 @@ impl Plugin for WindowRenderPlugin {
             render_app
                 .init_resource::<PacedWindows>()
                 .init_resource::<paced_present::PacedPresentPlans>()
-                .init_resource::<PacedSwapchainDepths>()
+                .init_resource::<paced_present::PacedPresentedFrames>()
                 .add_systems(
                     ExtractSchedule,
                     paced_present::reset_paced_windows
@@ -79,9 +81,55 @@ impl Plugin for WindowRenderPlugin {
                     Render,
                     paced_present::prewarm_paced_blit_pipelines
                         .in_set(RenderSystems::PrepareViews)
-                        .after(create_surfaces),
+                        .after(prepare_windows)
+                        .run_if(|depths: Res<PacedSwapchainDepths>| !depths.is_empty()),
                 );
         }
+    }
+}
+
+/// Swapchain depth declared per window, keyed by main world window entity.
+///
+/// A paced presentation producer declares the largest batch it will ever present,
+/// generated frames plus the real frame. Surface configuration then sizes the swapchain
+/// so a full batch can queue while one image is still on display. A smaller swapchain
+/// does not deadlock, but FIFO acquire serializes the batch across vblanks and defeats
+/// present metering, which is armed on the first present of a batch only.
+///
+/// The depth comes from the producer's maximum, never from a plan's length. Plan length
+/// drops to one on reset and fallback frames, and reconfiguring the surface drains the
+/// device.
+///
+/// Unlike the per-frame pacing claim in `PacedWindows`, this is not cleared between
+/// frames. Entries persist until the window closes, so toggling a producer off does not
+/// reconfigure the surface. The cost is a deeper swapchain, and more permitted frame
+/// latency, while no producer paces the window.
+///
+/// The resource exists even without the `paced_present` feature, so surface sizing has
+/// one code path. Without the feature nothing declares a depth.
+#[derive(Resource, Default)]
+pub struct PacedSwapchainDepths(EntityHashMap<u32>);
+
+impl PacedSwapchainDepths {
+    /// Declares that plans for `window` can hold up to `frames_per_batch` frames.
+    /// Keeps the largest value ever declared.
+    pub fn declare(&mut self, window: Entity, frames_per_batch: u32) {
+        let depth = self.0.entry(window).or_default();
+        *depth = (*depth).max(frames_per_batch);
+    }
+
+    /// The declared depth for `window`, or zero when none was declared.
+    pub fn get(&self, window: Entity) -> u32 {
+        self.0.get(&window).copied().unwrap_or(0)
+    }
+
+    /// Whether any window has a declared depth.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub(crate) fn remove(&mut self, window: Entity) {
+        self.0.remove(&window);
     }
 }
 
@@ -141,7 +189,7 @@ impl ExtractedWindow {
 fn extract_windows(
     mut commands: Commands,
     mut extracted_windows: Query<&mut ExtractedWindow>,
-    #[cfg(feature = "paced_present")] mut paced_depths: ResMut<PacedSwapchainDepths>,
+    mut paced_depths: ResMut<PacedSwapchainDepths>,
     mut closing: Extract<MessageReader<WindowClosing>>,
     windows: Extract<Query<(RenderEntity, &Window, &RawHandleWrapper, Has<PrimaryWindow>)>>,
     mut removed: Extract<RemovedComponents<RawHandleWrapper>>,
@@ -214,14 +262,12 @@ fn extract_windows(
     }
 
     for closing_window in closing.read() {
-        #[cfg(feature = "paced_present")]
         paced_depths.remove(closing_window.window);
         if let Ok(render_entity) = mapper.get(closing_window.window) {
             commands.entity(render_entity.entity()).despawn();
         }
     }
     for removed_window in removed.read() {
-        #[cfg(feature = "paced_present")]
         paced_depths.remove(removed_window);
         if let Ok(render_entity) = mapper.get(removed_window) {
             commands.entity(render_entity.entity()).despawn();
@@ -370,21 +416,17 @@ pub fn prepare_windows(
 
 pub fn need_surface_configuration(
     windows: Query<(MainEntity, &ExtractedWindow, Option<&SurfaceData>)>,
-    #[cfg(feature = "paced_present")] paced_depths: Res<PacedSwapchainDepths>,
+    paced_depths: Res<PacedSwapchainDepths>,
 ) -> bool {
-    for (_main_entity, window, surface_data) in &windows {
+    for (main_entity, window, surface_data) in &windows {
         let Some(surface_data) = surface_data else {
             return true;
         };
         if window.size_changed || window.present_mode_changed {
             return true;
         }
-        #[cfg(feature = "paced_present")]
-        let paced_depth = paced_depths.get(_main_entity);
-        #[cfg(not(feature = "paced_present"))]
-        let paced_depth = 0;
         if surface_data.configuration.desired_maximum_frame_latency
-            != desired_frame_latency(window, paced_depth)
+            != desired_frame_latency(window, paced_depths.get(main_entity))
         {
             return true;
         }
@@ -427,14 +469,10 @@ pub fn create_surfaces(
     render_instance: Res<RenderInstance>,
     render_adapter: Res<RenderAdapter>,
     render_device: Res<RenderDevice>,
-    #[cfg(feature = "paced_present")] paced_depths: Res<PacedSwapchainDepths>,
+    paced_depths: Res<PacedSwapchainDepths>,
 ) {
-    for (entity, _main_entity, mut window, handle, mut maybe_surface_data) in &mut windows {
-        #[cfg(feature = "paced_present")]
-        let paced_depth = paced_depths.get(_main_entity);
-        #[cfg(not(feature = "paced_present"))]
-        let paced_depth = 0;
-        let target_latency = desired_frame_latency(&window, paced_depth);
+    for (entity, main_entity, mut window, handle, mut maybe_surface_data) in &mut windows {
+        let target_latency = desired_frame_latency(&window, paced_depths.get(main_entity));
         let Some(data) = maybe_surface_data.as_mut() else {
             let surface_target = SurfaceTargetUnsafe::RawHandle {
                 raw_display_handle: Some(handle.get_display_handle()),

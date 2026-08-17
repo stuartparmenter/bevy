@@ -132,54 +132,20 @@ pub fn reset_paced_windows(mut paced_windows: ResMut<PacedWindows>) {
     paced_windows.0.clear();
 }
 
-/// Swapchain depth declared per window, keyed by main world window entity.
-///
-/// A producer declares the largest batch it will ever present, generated frames plus the
-/// real frame. Surface configuration then sizes the swapchain so a full batch can queue
-/// while one image is still on display. A smaller swapchain does not deadlock, but FIFO
-/// acquire serializes the batch across vblanks and defeats present metering, which is
-/// armed on the first present of a batch only.
-///
-/// The depth comes from the producer's maximum, never from a plan's length. Plan length
-/// drops to one on reset and fallback frames, and reconfiguring the surface drains the
-/// device.
-///
-/// Unlike [`PacedWindows`] this is not a per-frame ownership claim and is not cleared
-/// between frames. Entries persist until the window closes, so toggling a producer off
-/// does not reconfigure the surface. The cost is a deeper swapchain, and more permitted
-/// frame latency, while no producer paces the window.
-#[derive(Resource, Default)]
-pub struct PacedSwapchainDepths(EntityHashMap<u32>);
-
-impl PacedSwapchainDepths {
-    /// Declares that plans for `window` can hold up to `frames_per_batch` frames.
-    /// Keeps the largest value ever declared.
-    pub fn declare(&mut self, window: Entity, frames_per_batch: u32) {
-        let depth = self.0.entry(window).or_default();
-        *depth = (*depth).max(frames_per_batch);
-    }
-
-    /// The declared depth for `window`, or zero when none was declared.
-    pub fn get(&self, window: Entity) -> u32 {
-        self.0.get(&window).copied().unwrap_or(0)
-    }
-
-    pub(crate) fn remove(&mut self, window: Entity) {
-        self.0.remove(&window);
-    }
-}
+pub use super::PacedSwapchainDepths;
 
 /// One frame of a [`PacedPresentPlan`].
 ///
 /// # Texture ownership
 ///
 /// The texture is owned by the pacer from plan submission until an explicit release
-/// signal. The release signal is the window's entry in [`PacedPresentedFrames`] for the
-/// frame the plan was submitted in. Today the pacer presents and releases synchronously,
-/// at the end of the present step of the same render frame. The contract permits the
-/// pacer to hold the texture past `render_system`, so a producer must not reuse or free
-/// a submitted texture before it observes the release signal. A producer that waits for
-/// the release signal stays correct if the pacer later presents on another thread.
+/// signal. The release signal is the window's entry in [`PacedPresentedFrames`], written
+/// at the end of the present step. Today the pacer presents and releases synchronously
+/// within the same render frame. The contract permits the pacer to hold the texture past
+/// `render_system`, so a producer must not reuse or free a submitted texture before it
+/// observes the release signal. The signal carries no plan identity yet, so it is only
+/// meaningful while presentation is synchronous. Presentation from another thread will
+/// extend the signal with plan identity.
 #[non_exhaustive]
 pub struct PlannedFrame {
     /// The texture to blit to the surface. It must match the window surface size, and an
@@ -252,9 +218,8 @@ impl PacedPresentPlans {
 /// fails. The count is also one when the blit pipeline was not ready, because only the
 /// real frame is presented then. A claimed window with no plan gets an entry of zero.
 ///
-/// This resource does not exist before the first frame in which paced presentation
-/// handles a window, so read it with `Option<Res<PacedPresentedFrames>>`. Producers read
-/// it during extract of the next frame. This is safe under pipelined rendering because
+/// The map is empty until paced presentation first handles a window. Producers read it
+/// during extract of the next frame. This is safe under pipelined rendering because
 /// extract of the next frame runs after the previous render frame has finished.
 ///
 /// An entry is also the texture release signal under the [`PlannedFrame`] ownership
@@ -273,16 +238,20 @@ pub struct PacedPresentedFrames(pub(crate) EntityHashMap<u32>);
 /// path falls back to presenting only the real frame when it has not.
 pub(crate) fn prewarm_paced_blit_pipelines(
     paced_depths: Res<PacedSwapchainDepths>,
-    windows: Query<(MainEntity, &SurfaceData)>,
+    windows: Query<(MainEntity, &ExtractedWindow)>,
     mut pipelines: ResMut<SpecializedRenderPipelines<ScreenshotToScreenPipeline>>,
     pipeline_cache: Res<PipelineCache>,
     blit_pipeline: Res<ScreenshotToScreenPipeline>,
 ) {
-    for (main_entity, surface_data) in &windows {
+    for (main_entity, window) in &windows {
         if paced_depths.get(main_entity) == 0 {
             continue;
         }
-        let view_format = surface_data.configuration.format.add_srgb_suffix();
+        // The same field the present path reads, so the pre-warmed pipeline always
+        // matches the present time format
+        let Some(view_format) = window.swap_chain_texture_view_format else {
+            continue;
+        };
         pipelines.specialize(&pipeline_cache, &blit_pipeline, view_format);
     }
 }
@@ -306,9 +275,11 @@ pub(crate) fn present_paced_plans(
     world: &mut World,
     state: &mut SystemState<PacedPresentState>,
 ) -> EntityHashSet {
+    // Taken rather than cloned. Nothing reads the claims after presentation, and the
+    // reset system clears them at the start of the next extract.
     let claimed = world
-        .get_resource::<PacedWindows>()
-        .map(|paced| paced.0.clone())
+        .get_resource_mut::<PacedWindows>()
+        .map(|mut paced| mem::take(&mut paced.0))
         .unwrap_or_default();
     let mut plans = world
         .get_resource_mut::<PacedPresentPlans>()
@@ -330,6 +301,9 @@ pub(crate) fn present_paced_plans(
             if !claimed.contains(&window_entity) {
                 continue;
             }
+            // Every claimed window gets an entry. Overwritten with the real count after
+            // the present loop below.
+            presented_counts.insert(window_entity, 0);
 
             // Release any swapchain texture still held from a frame before the window
             // became paced. Extraction keeps unpresented textures alive across frames,
@@ -337,16 +311,15 @@ pub(crate) fn present_paced_plans(
             drop(window.swap_chain_texture.take());
             window.swap_chain_texture_view = None;
 
-            let plan = plans
+            let Some(plan) = plans
                 .remove(&window_entity)
-                .filter(|plan| !plan.frames.is_empty());
-            let Some(plan) = plan else {
+                .filter(|plan| !plan.frames.is_empty())
+            else {
                 // The claim stands without a plan. The window stays owned by the pacer
-                // and nothing is presented for it this frame.
+                // and nothing is presented for it this frame. needs_initial_present
+                // stays set. A Wayland window is invisible until its first present,
+                // which now must come from a later frame.
                 warn_once!("Paced window {window_entity} was claimed but has no frames to present");
-                // needs_initial_present stays set. A Wayland window is invisible until
-                // its first present, which now must come from a later frame.
-                presented_counts.insert(window_entity, 0);
                 continue;
             };
 
@@ -354,7 +327,6 @@ pub(crate) fn present_paced_plans(
                 (surface_data, window.swap_chain_texture_view_format)
             else {
                 warn!("No surface for paced window {window_entity}");
-                presented_counts.insert(window_entity, 0);
                 continue;
             };
 
@@ -369,7 +341,6 @@ pub(crate) fn present_paced_plans(
             }
             let Some(pipeline) = pipeline_cache.get_render_pipeline(pipeline_id).cloned() else {
                 warn!("Failed to compile paced present blit pipeline");
-                presented_counts.insert(window_entity, 0);
                 continue;
             };
             let frames = if pipeline_ready {
@@ -444,10 +415,13 @@ pub(crate) fn present_paced_plans(
         }
     }
 
-    // Rewritten even when empty once it exists, so stale counts never survive a frame
-    // where a window stopped being paced
-    if !presented_counts.is_empty() || world.contains_resource::<PacedPresentedFrames>() {
-        world.insert_resource(PacedPresentedFrames(presented_counts));
+    // Rewritten in place every present step, so stale counts never survive a frame
+    // where a window stopped being paced. The idle check avoids flagging the resource
+    // changed while nothing is paced.
+    let mut presented = world.resource_mut::<PacedPresentedFrames>();
+    if !presented.is_empty() || !presented_counts.is_empty() {
+        presented.0.clear();
+        presented.0.extend(presented_counts);
     }
 
     claimed
