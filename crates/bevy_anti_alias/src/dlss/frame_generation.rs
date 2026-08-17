@@ -191,6 +191,9 @@ pub(super) fn prepare_frame_generation(
                 output_resolution.to_array(),
                 render_resolution.to_array(),
                 storage_format,
+                // HDR10 backbuffers are not supported yet, frame_generation_formats only
+                // admits 8-bit UNORM surfaces
+                false,
                 false,
                 Arc::clone(&sdk.0),
                 &adapter,
