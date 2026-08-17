@@ -126,14 +126,15 @@ impl Plugin for DlssInitPlugin {
                             } else {
                                 additional_vulkan_features.remove::<DlssFrameGenerationSupported>();
                             }
+                            // register_device_extensions registers present metering
+                            // itself. Paced presentation of generated frames relies on it.
+                            if feature_support.present_metering_supported {
+                                additional_vulkan_features.insert::<PresentMeteringSupported>();
+                            } else {
+                                additional_vulkan_features.remove::<PresentMeteringSupported>();
+                            }
                         }
                         Err(_) => {}
-                    }
-
-                    // Paced presentation of generated frames relies on driver present
-                    // metering
-                    if dlss_wgpu::present_metering::register_present_metering(&mut args, adapter) {
-                        additional_vulkan_features.insert::<PresentMeteringSupported>();
                     }
                 },
             )
