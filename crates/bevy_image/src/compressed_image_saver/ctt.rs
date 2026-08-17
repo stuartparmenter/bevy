@@ -37,7 +37,7 @@ impl CompressedImageSaverCtt {
         let output_format =
             choose_ctt_compressed_format(image.texture_descriptor.format, settings.is_normal_map)?;
 
-        let is_srgb = image.texture_descriptor.format.is_srgb();
+        let is_srgb = image.texture_descriptor.format.has_srgb_suffix();
         let color_space = if is_srgb {
             ColorSpace::Srgb
         } else {

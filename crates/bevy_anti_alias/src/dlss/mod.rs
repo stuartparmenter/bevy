@@ -187,12 +187,20 @@ impl Plugin for DlssPlugin {
             info!("DLSS is not supported on this system");
             return;
         };
-        let (super_resolution_supported, frame_generation_supported, max_frames_to_generate) = {
+        let (
+            super_resolution_supported,
+            ray_reconstruction_supported,
+            frame_generation_supported,
+            max_frames_to_generate,
+        ) = {
             let sdk = dlss_sdk.lock().unwrap();
             (
-                super_resolution_supported && sdk.super_resolution_supported(),
+                super_resolution_supported
+                    && sdk.feature_supported(dlss_wgpu::DlssFeature::SuperResolution),
+                ray_reconstruction_supported
+                    && sdk.feature_supported(dlss_wgpu::DlssFeature::RayReconstruction),
                 frame_generation_supported
-                    && sdk.frame_generation_supported()
+                    && sdk.feature_supported(dlss_wgpu::DlssFeature::FrameGeneration)
                     && present_metering_supported,
                 sdk.multi_frame_count_max(),
             )

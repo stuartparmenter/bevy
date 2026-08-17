@@ -741,15 +741,14 @@ tracing = { version = "0.1", default-features = false, optional = true }
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 bevy_dylib = { path = "crates/bevy_dylib", version = "0.20.0-dev", default-features = false, optional = true }
 
-# wgpu with `Surface::set_next_present_chain` (gfx-rs/wgpu#9847), and a naga_oil built
-# against that fork's naga (released naga_oil does not accept its boxed `WithSpan`).
-# TODO: Point back at crates.io once these release.
+# wgpu trunk for `Surface::set_next_present_chain` (gfx-rs/wgpu#9847), which releases in
+# wgpu 31.
+# TODO: Point back at crates.io once wgpu 31 releases.
 [patch.crates-io]
-wgpu = { git = "https://github.com/stuartparmenter/wgpu", rev = "5430e2d2f" }
-wgpu-types = { git = "https://github.com/stuartparmenter/wgpu", rev = "5430e2d2f" }
-wgpu-naga-bridge = { git = "https://github.com/stuartparmenter/wgpu", rev = "5430e2d2f" }
-naga = { git = "https://github.com/stuartparmenter/wgpu", rev = "5430e2d2f" }
-naga_oil = { git = "https://github.com/stuartparmenter/naga_oil", branch = "wgpu-30" }
+wgpu = { git = "https://github.com/gfx-rs/wgpu", branch = "trunk" }
+wgpu-types = { git = "https://github.com/gfx-rs/wgpu", branch = "trunk" }
+wgpu-naga-bridge = { git = "https://github.com/gfx-rs/wgpu", branch = "trunk" }
+naga = { git = "https://github.com/gfx-rs/wgpu", branch = "trunk" }
 
 [dev-dependencies]
 rand = "0.10.0"
