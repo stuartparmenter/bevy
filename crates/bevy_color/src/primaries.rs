@@ -100,8 +100,6 @@ impl RgbPrimaries {
 
     /// The [ITU-R BT.2020](https://www.itu.int/rec/R-REC-BT.2020) (Rec. 2020)
     /// wide-gamut primaries with a D65 white point.
-    ///
-    /// [`LinearRec2020`](crate::LinearRec2020) uses these primaries.
     pub const BT2020: Self = Self {
         red: Chromaticity::new(0.708, 0.292),
         green: Chromaticity::new(0.170, 0.797),

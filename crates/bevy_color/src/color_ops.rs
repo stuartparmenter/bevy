@@ -10,8 +10,8 @@ pub trait Luminance: Sized {
     /// Return a new version of this color with the given luminance. The resulting color will
     /// be clamped to the valid range for the color space; for some color spaces, clamping
     /// may cause the hue or chroma to change. Spaces that support HDR, such as
-    /// [`LinearRgba`](crate::LinearRgba) and [`LinearRec2020`](crate::LinearRec2020), do not
-    /// clamp components outside `[0.0, 1.0]` or targets above 1.0.
+    /// [`LinearRgba`](crate::LinearRgba), do not clamp components outside `[0.0, 1.0]` or
+    /// targets above 1.0.
     fn with_luminance(&self, value: f32) -> Self;
 
     /// Return a darker version of this color. The `amount` should be between 0.0 and 1.0.
@@ -26,8 +26,8 @@ pub trait Luminance: Sized {
     /// The amount represents an absolute increase in luminance, and is distributive:
     /// `color.lighter(a).lighter(b) == color.lighter(a + b)`. Colors are clamped to white
     /// if the amount would cause them to go above white. Colors already above white are not
-    /// clamped; in [`LinearRgba`](crate::LinearRgba) and [`LinearRec2020`](crate::LinearRec2020)
-    /// a single channel above `1.0` counts as above white.
+    /// clamped; in [`LinearRgba`](crate::LinearRgba) a single channel above `1.0` counts as
+    /// above white.
     ///
     /// For a relative increase in luminance, you can simply `mix()` with white.
     fn lighter(&self, amount: f32) -> Self;
@@ -231,7 +231,6 @@ mod tests {
         verify_gray::<crate::Hwba>();
         verify_gray::<crate::Laba>();
         verify_gray::<crate::Lcha>();
-        verify_gray::<crate::LinearRec2020>();
         verify_gray::<crate::LinearRgba>();
         verify_gray::<crate::Oklaba>();
         verify_gray::<crate::Oklcha>();
