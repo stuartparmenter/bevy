@@ -217,7 +217,7 @@ pub enum DisplayGamut {
 ///
 /// Backend support follows wgpu's surface color-space API:
 ///
-/// - [`Srgb`]: everywhere.
+/// - [`Srgb`][]: everywhere.
 /// - [`ScRgbLinear`] (linear scRGB): macOS/iOS (Metal), Windows (Vulkan/DX12),
 ///   Wayland (Vulkan). Native-only, since browser WebGPU cannot express a
 ///   linear-transfer canvas.
