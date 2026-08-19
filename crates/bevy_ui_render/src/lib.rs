@@ -42,6 +42,8 @@ use bevy_ui::{
 use bevy_app::prelude::*;
 use bevy_asset::{AssetEvent, AssetEventSystems, AssetId, Assets};
 use bevy_color::{Alpha, ColorToComponents, LinearRgba};
+use bevy_core_pipeline::camera_stack::ViewStackContract;
+use bevy_core_pipeline::display_encoding::display_encoding;
 use bevy_core_pipeline::schedule::{Core2d, Core2dSystems, Core3d, Core3dSystems};
 use bevy_core_pipeline::upscaling::upscaling;
 use bevy_ecs::prelude::*;
@@ -59,7 +61,7 @@ use bevy_render::{
     renderer::{RenderDevice, RenderQueue},
     sync_world::{MainEntity, RenderEntity},
     texture::GpuImage,
-    view::{ExtractedView, RetainedViewEntity, ViewUniforms},
+    view::{ExtractedView, RetainedViewEntity, ViewTarget, ViewUniforms},
     Extract, ExtractSchedule, GpuResourceAppExt, Render, RenderApp, RenderStartup, RenderSystems,
 };
 use bevy_sprite::BorderRect;
@@ -289,11 +291,18 @@ impl Plugin for UiRenderPlugin {
             )
             .add_systems(
                 Core2d,
-                ui_pass.after(Core2dSystems::PostProcess).before(upscaling),
+                // UI composites in display-linear, paper-white-relative space.
+                ui_pass
+                    .after(Core2dSystems::PostProcess)
+                    .before(display_encoding)
+                    .before(upscaling),
             )
             .add_systems(
                 Core3d,
-                ui_pass.after(Core3dSystems::PostProcess).before(upscaling),
+                ui_pass
+                    .after(Core3dSystems::PostProcess)
+                    .before(display_encoding)
+                    .before(upscaling),
             );
 
         app.add_plugins(UiTextureSlicerPlugin);
@@ -1957,7 +1966,10 @@ pub fn queue_uinodes(
     ui_pipeline: Res<UiPipeline>,
     mut pipelines: ResMut<SpecializedRenderPipelines<UiPipeline>>,
     mut transparent_render_phases: ResMut<ViewSortedRenderPhases<TransparentUi>>,
-    render_views: Query<(&UiCameraView, Option<&UiAntiAlias>), With<ExtractedView>>,
+    render_views: Query<
+        (&UiCameraView, Option<&UiAntiAlias>, &ViewStackContract),
+        (With<ExtractedView>, With<ViewTarget>),
+    >,
     camera_views: Query<&ExtractedView>,
     pipeline_cache: Res<PipelineCache>,
     draw_functions: Res<DrawFunctions<TransparentUi>>,
@@ -1971,7 +1983,7 @@ pub fn queue_uinodes(
     {
         if current_camera_entity != *extracted_camera_entity {
             current_phase = render_views.get(*extracted_camera_entity).ok().and_then(
-                |(default_camera_view, ui_anti_alias)| {
+                |(default_camera_view, ui_anti_alias, contract)| {
                     camera_views
                         .get(default_camera_view.0)
                         .ok()
@@ -1988,6 +2000,7 @@ pub fn queue_uinodes(
                                                 ui_anti_alias,
                                                 None | Some(UiAntiAlias::On)
                                             ),
+                                            writer_encode: UiWriterEncodeKey::from(contract),
                                         },
                                     );
                                     (pipeline, transparent_phase)

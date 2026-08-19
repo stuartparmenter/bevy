@@ -27,7 +27,9 @@ pub struct ViewAutoExposurePipeline {
     pub metering_mask: Handle<Image>,
 }
 
-#[derive(ShaderType, Clone, Copy)]
+/// CPU mirror of the `AutoExposure` uniform in `auto_exposure.wesl`.
+/// Field order and types must match the WGSL struct.
+#[derive(Component, ShaderType, Clone, Copy)]
 pub struct AutoExposureUniform {
     pub(super) min_log_lum: f32,
     pub(super) inv_log_lum_range: f32,
@@ -37,6 +39,40 @@ pub struct AutoExposureUniform {
     pub(super) speed_up: f32,
     pub(super) speed_down: f32,
     pub(super) exponential_transition_distance: f32,
+    pub(super) metering_bias: f32,
+    pub(super) long_term_speed_up: f32,
+    pub(super) long_term_speed_down: f32,
+    pub(super) long_term_bound_up: f32,
+    pub(super) long_term_bound_down: f32,
+    pub(super) physiological: u32,
+    /// Chromaticity adaptation speed, per second.
+    pub(super) awb_speed: f32,
+    /// Virtual-light anchor luminance, scene-linear units.
+    pub(super) awb_anchor: f32,
+    /// Non-zero when the camera has an `AutoWhiteBalance` component.
+    pub(super) awb_enabled: u32,
+    /// Tail padding to 80 bytes. The 17 fields above take 68, and WGSL rounds a uniform
+    /// struct's size up to a multiple of 16. encase does not, so pad explicitly.
+    pub(super) pad_0: u32,
+    pub(super) pad_1: u32,
+    pub(super) pad_2: u32,
+}
+
+/// CPU mirror of the per-view `AutoExposureState` buffer in `auto_exposure.wesl`.
+/// Field order and types must match the WGSL struct.
+#[derive(ShaderType, Clone, Copy, Debug, PartialEq)]
+pub struct AutoExposureState {
+    /// The short-term exposure correction, in EV.
+    pub(super) exposure: f32,
+    /// The long-term adaptation envelope, in EV.
+    pub(super) long_term: f32,
+    /// The adapted white point chromaticity, CIE 1931 x.
+    pub(super) chroma_x: f32,
+    /// The adapted white point chromaticity, CIE 1931 y.
+    pub(super) chroma_y: f32,
+    /// Fixed-point sums for the white balance measurement (`x*Y`, `y*Y`, `Y`),
+    /// `array<atomic<u32>, 3>` on the GPU. Drained to zero each frame.
+    pub(super) chroma_sums: [u32; 3],
 }
 
 #[derive(PartialEq, Eq, Hash, Clone)]
@@ -55,13 +91,13 @@ pub fn init_auto_exposure_pipeline(mut commands: Commands, asset_server: Res<Ass
                 ShaderStages::COMPUTE,
                 (
                     uniform_buffer::<GlobalsUniform>(false),
-                    uniform_buffer::<AutoExposureUniform>(false),
+                    uniform_buffer::<AutoExposureUniform>(true),
                     texture_2d(TextureSampleType::Float { filterable: false }),
                     texture_2d(TextureSampleType::Float { filterable: false }),
                     texture_1d(TextureSampleType::Float { filterable: false }),
                     uniform_buffer::<AutoExposureCompensationCurveUniform>(false),
                     storage_buffer_sized(false, NonZero::<u64>::new(HISTOGRAM_BIN_COUNT * 4)),
-                    storage_buffer_sized(false, NonZero::<u64>::new(4)),
+                    storage_buffer::<AutoExposureState>(false),
                     storage_buffer::<ViewUniform>(true),
                 ),
             ),
@@ -78,7 +114,6 @@ impl SpecializedComputePipeline for AutoExposurePipeline {
             label: Some("luminance compute pipeline".into()),
             layout: vec![self.histogram_layout.clone()],
             shader: self.histogram_shader.clone(),
-            shader_defs: vec![],
             entry_point: Some(match pass {
                 AutoExposurePass::Histogram => "compute_histogram".into(),
                 AutoExposurePass::Average => "compute_average".into(),

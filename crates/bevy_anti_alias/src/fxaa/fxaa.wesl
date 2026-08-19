@@ -58,7 +58,18 @@ fn QUALITY(q: i32) -> f32 {
 }
 
 fn rgb2luma(rgb: vec3<f32>) -> f32 {
-    return sqrt(dot(rgb, vec3<f32>(0.299, 0.587, 0.114)));
+@if(COMPOSITING_SPACE_OKLAB) {
+    // rgb.x is the Oklab lightness L.
+    return saturate(rgb.x);
+} @else {
+    let luma = dot(rgb, vec3<f32>(0.299, 0.587, 0.114));
+    @if(HDR_DISPLAY_TARGET) {
+        // Saturate to keep the luma in the 0 to 1 domain FXAA expects.
+        return sqrt(saturate(luma));
+    } @else {
+        return sqrt(luma);
+    }
+}
 }
 
 // Performs FXAA post-process anti-aliasing as described in the Nvidia FXAA white paper and the associated shader code.

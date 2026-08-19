@@ -5,13 +5,14 @@ use bevy_asset::{embedded_asset, load_embedded_asset, AssetId, AssetServer, Hand
 use bevy_camera::{visibility::ViewVisibility, Camera2d, CompositingSpace};
 use bevy_platform::collections::HashMap;
 use bevy_render::{
-    camera::{DirtySpecializations, ExtractedCamera},
+    camera::{DirtySpecializations, ExtractedCamera, TonemapInShader},
     material_bind_groups::{
         MaterialBindGroupIndex, MaterialBindGroupSlot, MaterialBindingId, RenderMaterialBindings,
     },
     mesh::{allocator::MeshSlabId, MeshMetadata, MeshMetadataFallbackBuffer},
     render_resource::binding_types::{storage_buffer_read_only, uniform_buffer_sized},
     sync_world::MainEntityHashSet,
+    working_color_space::WorkingColorSpace,
     RenderStartup,
 };
 use bevy_shader::{load_shader_library, Shader, ShaderDefVal, ShaderSettings};
@@ -39,7 +40,6 @@ use bevy_mesh::{
     MeshVertexBufferLayoutRef,
 };
 use bevy_render::prelude::Msaa;
-use bevy_render::RenderSystems::PrepareAssets;
 use bevy_render::{
     batching::{
         gpu_preprocessing::IndirectParametersMetadata,
@@ -60,8 +60,8 @@ use bevy_render::{
     sync_world::{MainEntity, MainEntityHashMap},
     texture::{FallbackImage, GpuImage},
     view::{
-        texture_format_from_code, texture_format_to_code, ExtractedView, ViewUniform,
-        ViewUniformOffset, ViewUniforms,
+        resolve_composition_spaces, texture_format_from_code, texture_format_to_code,
+        ExtractedView, ResolvedCompositingSpace, ViewUniform, ViewUniformOffset, ViewUniforms,
     },
     Extract, ExtractSchedule, GpuResourceAppExt, Render, RenderApp, RenderSystems,
 };
@@ -110,7 +110,11 @@ impl Plugin for Mesh2dRenderPlugin {
                     Render,
                     (
                         prepare_pending_mesh_material2d_queues.in_set(RenderSystems::Specialize),
-                        check_views_need_specialization.in_set(PrepareAssets),
+                        // The `ViewKeyCache` consumers `specialize_material2d_meshes`
+                        // and `specialize_wireframes` run in `Specialize`, after this set.
+                        check_views_need_specialization
+                            .in_set(RenderSystems::CreateViews)
+                            .after(resolve_composition_spaces),
                         batch_and_prepare_binned_render_phase::<Opaque2d, Mesh2dPipeline>
                             .in_set(RenderSystems::PrepareResources),
                         batch_and_prepare_binned_render_phase::<AlphaMask2d, Mesh2dPipeline>
@@ -136,37 +140,32 @@ pub struct ViewKeyCache(MainEntityHashMap<Mesh2dPipelineKey>);
 pub fn check_views_need_specialization(
     mut view_key_cache: ResMut<ViewKeyCache>,
     mut dirty_specializations: ResMut<DirtySpecializations>,
-    cameras: Query<(
-        &MainEntity,
-        &ExtractedView,
-        &ExtractedCamera,
-        &Msaa,
-        Option<&Tonemapping>,
-        Option<&DebandDither>,
-    )>,
+    cameras: Query<
+        (
+            &MainEntity,
+            &ExtractedView,
+            &Msaa,
+            Option<&Tonemapping>,
+            Option<&DebandDither>,
+            Has<TonemapInShader>,
+            Option<&ResolvedCompositingSpace>,
+        ),
+        With<ExtractedCamera>,
+    >,
 ) {
-    for (view_entity, view, camera, msaa, tonemapping, dither) in &cameras {
+    for (view_entity, view, msaa, tonemapping, dither, tonemap_in_shader, resolved_space) in
+        &cameras
+    {
         let mut view_key = Mesh2dPipelineKey::from_msaa_samples(msaa.samples())
-            | Mesh2dPipelineKey::from_target_format(view.target_format);
+            | Mesh2dPipelineKey::from_target_format(view.target_format)
+            | Mesh2dPipelineKey::from_compositing_space(resolved_space.and_then(|space| space.0));
 
-        if camera
-            .compositing_space
-            .is_some_and(|s| s == CompositingSpace::Srgb)
+        if tonemap_in_shader
+            && let Some(tonemapping) = tonemapping
+            && *tonemapping != Tonemapping::None
         {
-            view_key |= Mesh2dPipelineKey::SRGB_COMPOSITING;
-        }
-        if camera
-            .compositing_space
-            .is_some_and(|s| s == CompositingSpace::Oklab)
-        {
-            view_key |= Mesh2dPipelineKey::OKLAB_COMPOSITING;
-        }
-
-        if !camera.hdr {
-            if let Some(tonemapping) = tonemapping {
-                view_key |= Mesh2dPipelineKey::TONEMAP_IN_SHADER;
-                view_key |= tonemapping_pipeline_key(*tonemapping);
-            }
+            view_key |= Mesh2dPipelineKey::TONEMAP_IN_SHADER;
+            view_key |= tonemapping_pipeline_key(*tonemapping);
             if let Some(DebandDither::Enabled) = dither {
                 view_key |= Mesh2dPipelineKey::DEBAND_DITHER;
             }
@@ -451,12 +450,15 @@ pub struct Mesh2dPipeline {
     pub mesh_layout: BindGroupLayoutDescriptor,
     pub shader: Handle<Shader>,
     pub per_object_buffer_batch_size: Option<u32>,
+    /// The project-global working color space, captured at `RenderStartup`.
+    pub working_color_space: WorkingColorSpace,
 }
 
 pub fn init_mesh_2d_pipeline(
     mut commands: Commands,
     render_device: Res<RenderDevice>,
     asset_server: Res<AssetServer>,
+    working_color_space: Res<WorkingColorSpace>,
 ) {
     let tonemapping_lut_entries = get_lut_bind_group_layout_entries();
     let view_layout = BindGroupLayoutDescriptor::new(
@@ -495,6 +497,7 @@ pub fn init_mesh_2d_pipeline(
             &render_device.limits(),
         ),
         shader: load_embedded_asset!(asset_server.as_ref(), "mesh2d.wesl"),
+        working_color_space: *working_color_space,
     });
 }
 
@@ -636,6 +639,7 @@ bitflags::bitflags! {
         const TONEMAP_METHOD_TONY_MC_MAPFACE    = 6 << Self::TONEMAP_METHOD_SHIFT_BITS;
         const TONEMAP_METHOD_BLENDER_FILMIC     = 7 << Self::TONEMAP_METHOD_SHIFT_BITS;
         const TONEMAP_METHOD_PBR_NEUTRAL        = 8 << Self::TONEMAP_METHOD_SHIFT_BITS;
+        const TONEMAP_METHOD_GRAN_TURISMO_7     = 10 << Self::TONEMAP_METHOD_SHIFT_BITS;
     }
 }
 
@@ -685,6 +689,17 @@ impl Mesh2dPipelineKey {
             .expect("Unknown bits in `COLOR_TARGET_FORMAT_MASK_BITS` of the pipeline key")
     }
 
+    /// Key bits for a view's resolved [`CompositingSpace`], taken from
+    /// `ResolvedCompositingSpace` and never from the camera's raw request.
+    #[inline]
+    pub fn from_compositing_space(space: Option<CompositingSpace>) -> Self {
+        match space {
+            Some(CompositingSpace::Srgb) => Self::SRGB_COMPOSITING,
+            Some(CompositingSpace::Oklab) => Self::OKLAB_COMPOSITING,
+            Some(CompositingSpace::Linear) | None => Self::NONE,
+        }
+    }
+
     pub fn msaa_samples(&self) -> u32 {
         1 << ((self.bits() >> Self::MSAA_SHIFT_BITS) & Self::MSAA_MASK_BITS)
     }
@@ -716,6 +731,10 @@ impl SpecializedMeshPipeline for Mesh2dPipeline {
     ) -> Result<RenderPipelineDescriptor, SpecializedMeshPipelineError> {
         let mut shader_defs = Vec::new();
         let mut vertex_attributes = Vec::new();
+
+        if self.working_color_space.is_rec2020() {
+            shader_defs.push("OUTPUT_GAMUT_REC2020".into());
+        }
 
         if layout.0.contains(Mesh::ATTRIBUTE_POSITION) {
             shader_defs.push("VERTEX_POSITIONS".into());
@@ -811,6 +830,9 @@ impl SpecializedMeshPipeline for Mesh2dPipeline {
                 Mesh2dPipelineKey::TONEMAP_METHOD_PBR_NEUTRAL => {
                     shader_defs.push("TONEMAP_METHOD_PBR_NEUTRAL".into());
                 }
+                Mesh2dPipelineKey::TONEMAP_METHOD_GRAN_TURISMO_7 => {
+                    shader_defs.push("TONEMAP_METHOD_GRAN_TURISMO_7".into());
+                }
                 _ => {}
             }
             // Debanding is tied to tonemapping in the shader, cannot run without it.
@@ -823,10 +845,10 @@ impl SpecializedMeshPipeline for Mesh2dPipeline {
             shader_defs.push("MAY_DISCARD".into());
         }
         if key.contains(Mesh2dPipelineKey::SRGB_COMPOSITING) {
-            shader_defs.push("SRGB_OUTPUT".into());
+            shader_defs.push("COMPOSITING_SPACE_SRGB".into());
         }
         if key.contains(Mesh2dPipelineKey::OKLAB_COMPOSITING) {
-            shader_defs.push("OKLAB_OUTPUT".into());
+            shader_defs.push("COMPOSITING_SPACE_OKLAB".into());
         }
 
         let vertex_buffer_layout = layout.0.get_layout(&vertex_attributes)?;
@@ -1124,5 +1146,41 @@ impl<P: PhaseItem> RenderCommand<P> for DrawMesh2d {
             }
         }
         RenderCommandResult::Success
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolved_space_selects_exactly_its_bit() {
+        assert_eq!(
+            Mesh2dPipelineKey::from_compositing_space(Some(CompositingSpace::Srgb)),
+            Mesh2dPipelineKey::SRGB_COMPOSITING
+        );
+        assert_eq!(
+            Mesh2dPipelineKey::from_compositing_space(Some(CompositingSpace::Oklab)),
+            Mesh2dPipelineKey::OKLAB_COMPOSITING
+        );
+        assert_eq!(
+            Mesh2dPipelineKey::from_compositing_space(Some(CompositingSpace::Linear)),
+            Mesh2dPipelineKey::NONE
+        );
+        assert_eq!(
+            Mesh2dPipelineKey::from_compositing_space(None),
+            Mesh2dPipelineKey::NONE
+        );
+    }
+
+    #[test]
+    fn oklab_solo_view_key_sets_the_oklab_bit() {
+        let view_key = Mesh2dPipelineKey::from_msaa_samples(4)
+            | Mesh2dPipelineKey::from_target_format(TextureFormat::Rgba16Float)
+            | Mesh2dPipelineKey::from_compositing_space(Some(CompositingSpace::Oklab));
+        assert!(view_key.contains(Mesh2dPipelineKey::OKLAB_COMPOSITING));
+        assert!(!view_key.contains(Mesh2dPipelineKey::SRGB_COMPOSITING));
+        assert_eq!(view_key.target_format(), TextureFormat::Rgba16Float);
+        assert_eq!(view_key.msaa_samples(), 4);
     }
 }

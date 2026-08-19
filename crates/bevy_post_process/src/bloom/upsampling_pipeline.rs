@@ -1,23 +1,25 @@
 use bevy_core_pipeline::FullscreenShader;
 
 use super::{
-    downsampling_pipeline::BloomUniforms, Bloom, BloomCompositeMode, BLOOM_TEXTURE_FORMAT,
+    bloom_texture_format, downsampling_pipeline::BloomUniforms, Bloom, BloomCompositeMode,
 };
 use bevy_asset::{load_embedded_asset, AssetServer, Handle};
 use bevy_ecs::{
-    prelude::{Component, Entity},
+    prelude::{Component, Entity, With},
     resource::Resource,
     system::{Commands, Query, Res, ResMut},
 };
 use bevy_render::{
+    camera::ExtractedCamera,
     render_resource::{
         binding_types::{sampler, texture_2d, uniform_buffer},
         *,
     },
-    view::ExtractedView,
+    view::{ExtractedView, ViewDisplayTarget},
 };
 use bevy_shader::Shader;
-use bevy_utils::default;
+use bevy_utils::{default, once};
+use tracing::warn;
 
 #[derive(Component)]
 pub struct UpsamplingPipelineIds {
@@ -134,15 +136,25 @@ pub fn prepare_upsampling_pipeline(
     pipeline_cache: Res<PipelineCache>,
     mut pipelines: ResMut<SpecializedRenderPipelines<BloomUpsamplingPipeline>>,
     pipeline: Res<BloomUpsamplingPipeline>,
-    views: Query<(&ExtractedView, Entity, &Bloom)>,
+    views: Query<(&ExtractedView, Entity, &Bloom, &ViewDisplayTarget), With<ExtractedCamera>>,
 ) {
-    for (view, entity, bloom) in &views {
+    for (view, entity, bloom, display_target) in &views {
+        let composite_mode = bloom.effective_composite_mode();
+        if composite_mode != bloom.composite_mode {
+            once!(warn!(
+                "Bloom composite_mode Additive is ignored under BloomScatterModel::Gt7Glare: \
+                the glare blend constants are solved as an energy-conserving lerp chain"
+            ));
+        }
+
         let pipeline_id = pipelines.specialize(
             &pipeline_cache,
             &pipeline,
             BloomUpsamplingPipelineKeys {
-                composite_mode: bloom.composite_mode,
-                target_format: BLOOM_TEXTURE_FORMAT,
+                composite_mode,
+                // The intermediate passes render into the bloom pyramid, whose
+                // format is per-view. The final pass below uses the view target.
+                target_format: bloom_texture_format(Some(display_target)),
             },
         );
 
@@ -150,7 +162,7 @@ pub fn prepare_upsampling_pipeline(
             &pipeline_cache,
             &pipeline,
             BloomUpsamplingPipelineKeys {
-                composite_mode: bloom.composite_mode,
+                composite_mode,
                 target_format: view.target_format,
             },
         );

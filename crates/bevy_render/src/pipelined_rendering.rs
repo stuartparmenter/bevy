@@ -24,18 +24,23 @@ pub struct RenderAppChannels {
     app_to_render_sender: Sender<SubApp>,
     render_to_app_receiver: Receiver<SubApp>,
     render_app_in_render_thread: bool,
+    main_thread_executor: MainThreadExecutor,
 }
 
 impl RenderAppChannels {
-    /// Create a `RenderAppChannels` from a [`async_channel::Receiver`] and [`async_channel::Sender`]
+    /// Create a `RenderAppChannels` from a [`async_channel::Receiver`] and [`async_channel::Sender`].
+    ///
+    /// [`Drop`] pumps `main_thread_executor` so teardown does not deadlock.
     pub fn new(
         app_to_render_sender: Sender<SubApp>,
         render_to_app_receiver: Receiver<SubApp>,
+        main_thread_executor: MainThreadExecutor,
     ) -> Self {
         Self {
             app_to_render_sender,
             render_to_app_receiver,
             render_app_in_render_thread: false,
+            main_thread_executor,
         }
     }
 
@@ -57,11 +62,22 @@ impl RenderAppChannels {
 impl Drop for RenderAppChannels {
     fn drop(&mut self) {
         if self.render_app_in_render_thread {
-            // Any non-send data in the render world was initialized on the main thread.
-            // So on dropping the main world and ending the app, we block and wait for
-            // the render world to return to drop it. Which allows the non-send data
-            // drop methods to run on the correct thread.
-            self.render_to_app_receiver.recv_blocking().ok();
+            // The render world's non-send data was initialized on the main thread, so we
+            // wait for the world to come back and drop it here.
+            //
+            // `recv_blocking()` can deadlock: the final frame may still have a
+            // main-thread-pinned (`NonSend`) system queued on the `MainThreadExecutor`,
+            // such as macOS surface creation. The render thread cannot send the world
+            // back until the main thread ticks that executor, so pump it here as
+            // `renderer_extract` does each frame.
+            let receiver = self.render_to_app_receiver.clone();
+            let _recovered_render_app = ComputeTaskPool::get().scope_with_executor(
+                true,
+                Some(&*self.main_thread_executor.0),
+                |scope| {
+                    scope.spawn(async move { receiver.recv().await.ok() });
+                },
+            );
         }
     }
 }
@@ -137,7 +153,11 @@ impl Plugin for PipelinedRenderingPlugin {
             .expect("Unable to get RenderApp. Another plugin may have removed the RenderApp before PipelinedRenderingPlugin");
 
         // clone main thread executor to render world
-        let executor = app.world().get_resource::<MainThreadExecutor>().unwrap();
+        let executor = app
+            .world()
+            .get_resource::<MainThreadExecutor>()
+            .unwrap()
+            .clone();
         render_app.world_mut().insert_resource(executor.clone());
 
         render_to_app_sender.send_blocking(render_app).unwrap();
@@ -145,6 +165,7 @@ impl Plugin for PipelinedRenderingPlugin {
         app.insert_resource(RenderAppChannels::new(
             app_to_render_sender,
             render_to_app_receiver,
+            executor,
         ));
 
         std::thread::Builder::new()

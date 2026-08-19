@@ -18,6 +18,7 @@ use indexmap::IndexMap;
 pub use main_opaque_pass_2d_node::*;
 pub use main_transparent_pass_2d_node::*;
 
+use crate::display_encoding::display_encoding;
 use crate::schedule::Core2d;
 use crate::tonemapping::{tonemapping, DebandDither, Tonemapping};
 use crate::upscaling::upscaling;
@@ -85,6 +86,10 @@ impl Plugin for Core2dPlugin {
                         .chain()
                         .in_set(Core2dSystems::MainPass),
                     tonemapping.in_set(Core2dSystems::PostProcess),
+                    // The UI pass orders itself before this, see `bevy_ui_render`.
+                    display_encoding
+                        .after(Core2dSystems::PostProcess)
+                        .before(upscaling),
                     upscaling.after(Core2dSystems::PostProcess),
                 ),
             );

@@ -10,12 +10,16 @@
 //! | `C`                | Toggle Compensation Curve              |
 //! | `M`                | Toggle Metering Mask                   |
 //! | `V`                | Visualize Metering Mask                |
+//! | `P`                | Toggle Physiological Adaptation        |
+//! | `B`                | Toggle Auto White Balance              |
+//! | `L`                | Toggle Warm (Tungsten) Light           |
 
 use bevy::{
     light::Skybox,
     math::{cubic_splines::LinearSpline, primitives::Plane3d, vec2},
     post_process::auto_exposure::{
-        AutoExposure, AutoExposureCompensationCurve, AutoExposurePlugin,
+        AutoExposure, AutoExposureCompensationCurve, AutoExposurePlugin, AutoWhiteBalance,
+        PhysiologicalAdaptation,
     },
     prelude::*,
 };
@@ -109,6 +113,7 @@ fn setup(
             ..default()
         },
         Transform::from_xyz(0.0, 0.0, 0.0),
+        ExampleLight,
     ));
 
     commands.spawn((
@@ -125,7 +130,7 @@ fn setup(
 
     let text_font = TextFont::default();
 
-    commands.spawn((Text::new("Left / Right - Rotate Camera\nC - Toggle Compensation Curve\nM - Toggle Metering Mask\nV - Visualize Metering Mask"),
+    commands.spawn((Text::new("Left / Right - Rotate Camera\nC - Toggle Compensation Curve\nM - Toggle Metering Mask\nV - Visualize Metering Mask\nP - Toggle Physiological Adaptation\nB - Toggle Auto White Balance\nL - Toggle Warm (Tungsten) Light"),
             text_font.clone(), Node {
             position_type: PositionType::Absolute,
             top: px(12),
@@ -150,6 +155,9 @@ fn setup(
 #[derive(Component)]
 struct ExampleDisplay;
 
+#[derive(Component)]
+struct ExampleLight;
+
 #[derive(Resource)]
 struct ExampleResources {
     basic_compensation_curve: Handle<AutoExposureCompensationCurve>,
@@ -157,14 +165,25 @@ struct ExampleResources {
 }
 
 fn example_control_system(
-    camera: Single<(&mut Transform, &mut AutoExposure), With<Camera3d>>,
+    mut commands: Commands,
+    camera: Single<
+        (
+            Entity,
+            &mut Transform,
+            &mut AutoExposure,
+            Option<&AutoWhiteBalance>,
+        ),
+        With<Camera3d>,
+    >,
+    mut light: Single<&mut PointLight, With<ExampleLight>>,
     mut display: Single<&mut Text, With<ExampleDisplay>>,
     mut mask_image: Single<&mut Node, With<ImageNode>>,
     time: Res<Time>,
     input: Res<ButtonInput<KeyCode>>,
     resources: Res<ExampleResources>,
 ) {
-    let (mut camera_transform, mut auto_exposure) = camera.into_inner();
+    let (camera_entity, mut camera_transform, mut auto_exposure, auto_white_balance) =
+        camera.into_inner();
 
     let rotation = if input.pressed(KeyCode::ArrowLeft) {
         time.delta_secs()
@@ -194,6 +213,45 @@ fn example_control_system(
             };
     }
 
+    if input.just_pressed(KeyCode::KeyP) {
+        auto_exposure.physiological = match auto_exposure.physiological {
+            Some(_) => None,
+            // The defaults model human eyes, where full dark adaptation takes tens of
+            // minutes. These speeds are faster and the bounds tighter, so turning the
+            // camera hits the bound within a second.
+            None => Some(PhysiologicalAdaptation {
+                speed_brighten: 0.4,
+                speed_darken: 0.1,
+                bound_brighten: 2.0,
+                bound_darken: 1.0,
+            }),
+        };
+    }
+
+    if input.just_pressed(KeyCode::KeyB) {
+        if auto_white_balance.is_some() {
+            commands.entity(camera_entity).remove::<AutoWhiteBalance>();
+        } else {
+            commands.entity(camera_entity).insert(AutoWhiteBalance {
+                // The default of 0.5/s settles over a few seconds, like a real camera.
+                // This is faster so toggling the warm light (L) is easy to see.
+                speed: 2.0,
+                ..default()
+            });
+        }
+    }
+
+    // A tungsten-tinted light. With auto white balance on, the camera pulls the orange
+    // cast back out, limited by the 2500 K - 7000 K clamp on the estimated temperature.
+    let warm_light = Color::srgb(1.0, 0.6, 0.3);
+    if input.just_pressed(KeyCode::KeyL) {
+        light.color = if light.color == warm_light {
+            Color::WHITE
+        } else {
+            warm_light
+        };
+    }
+
     mask_image.display = if input.pressed(KeyCode::KeyV) {
         Display::Flex
     } else {
@@ -201,7 +259,7 @@ fn example_control_system(
     };
 
     display.0 = format!(
-        "Compensation Curve: {}\nMetering Mask: {}",
+        "Compensation Curve: {}\nMetering Mask: {}\nPhysiological Adaptation: {}\nAuto White Balance: {}\nLight: {}",
         if auto_exposure.compensation_curve == resources.basic_compensation_curve {
             "Enabled"
         } else {
@@ -211,6 +269,21 @@ fn example_control_system(
             "Enabled"
         } else {
             "Disabled"
+        },
+        if auto_exposure.physiological.is_some() {
+            "Enabled"
+        } else {
+            "Disabled"
+        },
+        if auto_white_balance.is_some() {
+            "Enabled"
+        } else {
+            "Disabled"
+        },
+        if light.color == warm_light {
+            "Warm (Tungsten)"
+        } else {
+            "White"
         },
     );
 }

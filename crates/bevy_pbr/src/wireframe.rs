@@ -19,6 +19,7 @@ use bevy_ecs::{
     query::ROQueryItem,
     system::{lifetimeless::SRes, SystemParamItem},
 };
+use bevy_math::Vec4;
 use bevy_mesh::{Mesh, Mesh3d, MeshVertexBufferLayoutRef};
 use bevy_platform::{
     collections::{HashMap, HashSet},
@@ -55,6 +56,7 @@ use bevy_render::{
         ExtractedView, NoIndirectDrawing, RenderVisibilityRanges, RenderVisibleEntities,
         RetainedViewEntity, ViewDepthStencilTexture, ViewTarget,
     },
+    working_color_space::{vec4_rec709_to_working, WorkingColorSpace},
     Extract, GpuResourceAppExt, Render, RenderApp, RenderDebugFlags, RenderStartup, RenderSystems,
 };
 use bevy_shader::Shader;
@@ -948,16 +950,22 @@ impl AsAssetId for Mesh3dWireframe {
 
 impl RenderAsset for RenderWireframeMaterial {
     type SourceAsset = WireframeMaterial;
-    type Param = ();
+    type Param = SRes<WorkingColorSpace>;
 
     fn prepare_asset(
         source_asset: Self::SourceAsset,
         _asset_id: AssetId<Self::SourceAsset>,
-        _param: &mut SystemParamItem<Self::Param>,
+        working_color_space: &mut SystemParamItem<Self::Param>,
         _previous_asset: Option<&Self>,
     ) -> Result<Self, PrepareAssetError<Self::SourceAsset>> {
+        // The wireframe color reaches the framebuffer with no texture
+        // composition, so it converts to the working space here on the CPU.
         Ok(RenderWireframeMaterial {
-            color: source_asset.color.to_linear().to_f32_array(),
+            color: vec4_rec709_to_working(
+                Vec4::from_array(source_asset.color.to_linear().to_f32_array()),
+                **working_color_space,
+            )
+            .to_array(),
             line_width: source_asset.line_width,
             topology: source_asset.topology,
         })

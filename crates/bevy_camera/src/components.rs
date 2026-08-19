@@ -81,12 +81,25 @@ impl From<Camera3dDepthLoadOp> for LoadOp<f32> {
 }
 
 /// If this component is added to a camera, the camera will use an intermediate "high dynamic range" render texture.
-/// This allows rendering with a wider range of lighting values. However, this does *not* affect
-/// whether the camera will render with hdr display output (which bevy does not support currently)
-/// and only affects the intermediate render texture.
+/// This allows rendering with a wider range of lighting values. It only affects the intermediate
+/// render texture, not the display signal. To send an HDR signal, request an HDR transfer on the
+/// window's [`DisplayTarget`](bevy_window::DisplayTarget); that also selects this render texture.
 #[derive(Component, Default, Copy, Clone, Reflect, PartialEq, Eq, Hash, Debug)]
 #[reflect(Component, Default, PartialEq, Hash, Debug)]
 pub struct Hdr;
+
+/// Marker that forces a camera's tone mapping to run in the node-side pass instead of
+/// folding it into the material shaders.
+///
+/// `GranTurismo7Params` pulls this in as a required component. The in-shader fold has no
+/// way to bind the per-view GT7 params uniform, so it would fall back to the baked SDR
+/// defaults and drop the camera's parameters.
+///
+/// As a required component it can outlive the params that added it. The cost is an
+/// `Rgba16Float` intermediate and one fullscreen pass; the pixels match.
+#[derive(Component, Default, Copy, Clone, Reflect, PartialEq, Eq, Hash, Debug)]
+#[reflect(Component, Default, PartialEq, Hash, Debug)]
+pub struct TonemappingPass;
 
 /// Color space for alpha compositing. Affects how overlapping semi-transparent layers blend.
 #[derive(Component, Copy, Clone, Reflect, PartialEq, Eq, Hash, Debug, Default)]

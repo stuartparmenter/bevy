@@ -1,13 +1,20 @@
 use core::ops::RangeInclusive;
 
-use super::compensation_curve::AutoExposureCompensationCurve;
+use super::{
+    buffers::build_uniform, compensation_curve::AutoExposureCompensationCurve,
+    pipeline::AutoExposureUniform, white_balance::AutoWhiteBalance,
+};
 use bevy_asset::Handle;
 use bevy_camera::Hdr;
-use bevy_ecs::{prelude::Component, reflect::ReflectComponent};
+use bevy_ecs::{prelude::Component, query::QueryItem, reflect::ReflectComponent};
 use bevy_image::Image;
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
-use bevy_render::{extract_component::ExtractComponent, RenderApp};
-use bevy_utils::default;
+use bevy_render::{
+    extract_component::ExtractComponent, sync_component::SyncComponent,
+    view::NeedsSceneLinearTarget, RenderApp,
+};
+use bevy_utils::{default, once};
+use tracing::warn;
 
 /// Component that enables auto exposure for an HDR-enabled 2d or 3d camera.
 ///
@@ -24,10 +31,9 @@ use bevy_utils::default;
 /// # Usage Notes
 ///
 /// **Auto Exposure requires compute shaders and is not compatible with WebGL2.**
-#[derive(Component, Clone, Reflect, ExtractComponent)]
+#[derive(Component, Clone, Reflect)]
 #[reflect(Component, Default, Clone)]
-#[require(Hdr)]
-#[extract_app(RenderApp)]
+#[require(Hdr, NeedsSceneLinearTarget)]
 pub struct AutoExposure {
     /// The range of exposure values for the histogram.
     ///
@@ -89,6 +95,20 @@ pub struct AutoExposure {
     /// The default value is a flat line at 0.0.
     /// For more information, see [`AutoExposureCompensationCurve`].
     pub compensation_curve: Handle<AutoExposureCompensationCurve>,
+
+    /// A constant bias, in exposure values (EV), added to the metered scene luminance.
+    ///
+    /// A positive bias meters the scene as brighter than it is, so the image gets darker.
+    /// The offset applies before the [`compensation_curve`](Self::compensation_curve).
+    ///
+    /// The default value is 0.0.
+    pub metering_bias: f32,
+
+    /// Two-stage adaptation, layering a slow long-term envelope on the short-term
+    /// smoothing. See [`PhysiologicalAdaptation`].
+    ///
+    /// The default value is `None`, which uses only the short-term smoothing.
+    pub physiological: Option<PhysiologicalAdaptation>,
 }
 
 impl Default for AutoExposure {
@@ -101,6 +121,114 @@ impl Default for AutoExposure {
             exponential_transition_distance: 1.5,
             metering_mask: default(),
             compensation_curve: default(),
+            metering_bias: 0.0,
+            physiological: None,
         }
+    }
+}
+
+impl SyncComponent<RenderApp> for AutoExposure {
+    type Target = (AutoExposure, AutoExposureUniform);
+}
+
+impl ExtractComponent<RenderApp> for AutoExposure {
+    type QueryData = (&'static AutoExposure, Option<&'static AutoWhiteBalance>);
+    type QueryFilter = ();
+    // The uniform folds in the optional `AutoWhiteBalance`, so extraction builds it here.
+    // It runs every frame without change detection, which also covers `AutoWhiteBalance`
+    // being removed on its own. The sanitization warnings in `build_uniform` stay once-only.
+    type Out = (AutoExposure, AutoExposureUniform);
+
+    fn extract_component(
+        (settings, white_balance): QueryItem<'_, '_, Self::QueryData>,
+    ) -> Option<Self::Out> {
+        Some((settings.clone(), build_uniform(settings, white_balance)))
+    }
+}
+
+/// Settings for two-stage physiological exposure adaptation, enabled through
+/// [`AutoExposure::physiological`]. The model is the one Gran Turismo 7 presented at
+/// SIGGRAPH 2025 ("Physically Based Tone Mapping in Gran Turismo 7").
+///
+/// Human vision adapts to brightness on two time scales:
+///
+/// * A short-term stage (pupil constriction and neural gain) covers a few EV and reacts
+///   within seconds. This is the regular [`AutoExposure`] smoothing, driven by
+///   [`AutoExposure::speed_brighten`] and [`AutoExposure::speed_darken`].
+/// * A long-term stage (receptor sensitivity and photopigment bleaching) covers the
+///   remaining range, about 12 EV, over minutes to tens of minutes. Adapting to light is
+///   much faster than adapting to darkness.
+///
+/// The long-term envelope clamps the short-term exposure to
+/// `[envelope - bound_brighten, envelope + bound_darken]`. The envelope keeps tracking the
+/// short-term exposure while this setting is `None`, so enabling it at runtime is smooth.
+///
+/// All speeds and bounds must be finite and non-negative. Invalid values are reset to their
+/// defaults when the settings are uploaded to the GPU.
+#[derive(Clone, Copy, Debug, PartialEq, Reflect)]
+#[reflect(Default, Clone, PartialEq)]
+pub struct PhysiologicalAdaptation {
+    /// Speed of the long-term envelope when the scene gets brighter, in F-stops per second.
+    ///
+    /// The default value is 0.05, which covers 12 EV in about 4 minutes.
+    pub speed_brighten: f32,
+
+    /// Speed of the long-term envelope when the scene gets darker, in F-stops per second.
+    ///
+    /// The default value is 0.01, which covers 12 EV in about 20 minutes.
+    pub speed_darken: f32,
+
+    /// How far below the long-term envelope the short-term exposure may drop, in EV,
+    /// when the scene gets brighter.
+    ///
+    /// The default value is 3.0.
+    pub bound_brighten: f32,
+
+    /// How far above the long-term envelope the short-term exposure may rise, in EV,
+    /// when the scene gets darker.
+    ///
+    /// The default value is 2.0.
+    pub bound_darken: f32,
+}
+
+impl Default for PhysiologicalAdaptation {
+    fn default() -> Self {
+        Self {
+            speed_brighten: 0.05,
+            speed_darken: 0.01,
+            bound_brighten: 3.0,
+            bound_darken: 2.0,
+        }
+    }
+}
+
+impl PhysiologicalAdaptation {
+    pub(super) fn sanitized(&self) -> Self {
+        let defaults = Self::default();
+        let mut invalid = false;
+        let mut sanitize = |value: f32, default: f32| -> f32 {
+            if value.is_finite() && value >= 0.0 {
+                value
+            } else {
+                invalid = true;
+                default
+            }
+        };
+
+        let sanitized = Self {
+            speed_brighten: sanitize(self.speed_brighten, defaults.speed_brighten),
+            speed_darken: sanitize(self.speed_darken, defaults.speed_darken),
+            bound_brighten: sanitize(self.bound_brighten, defaults.bound_brighten),
+            bound_darken: sanitize(self.bound_darken, defaults.bound_darken),
+        };
+
+        if invalid {
+            once!(warn!(
+                "PhysiologicalAdaptation speeds and bounds must be finite and non-negative; \
+                invalid fields were reset to their defaults"
+            ));
+        }
+
+        sanitized
     }
 }

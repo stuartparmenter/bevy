@@ -13,6 +13,7 @@ use bevy::{
         view::{ColorGrading, ColorGradingGlobal, ColorGradingSection},
     },
     shader::ShaderRef,
+    window::PrimaryWindow,
 };
 use std::f32::consts::PI;
 
@@ -20,14 +21,27 @@ use std::f32::consts::PI;
 const SHADER_ASSET_PATH: &str = "shaders/tonemapping_test_patterns.wesl";
 
 fn main() {
+    // Pass `--rec2020` to render in the Rec.2020 working color space, a startup-time
+    // `RenderPlugin` setting and the native input space of `Tonemapping::GranTurismo7`.
+    let working_color_space = if std::env::args().any(|arg| arg == "--rec2020") {
+        bevy::render::WorkingColorSpace::Rec2020
+    } else {
+        bevy::render::WorkingColorSpace::Rec709
+    };
+
     App::new()
         .add_plugins((
-            DefaultPlugins.set(AssetPlugin {
-                // We enable loading assets from arbitrary filesystem paths as this example allows
-                // drag and dropping a local image for color grading
-                unapproved_path_mode: UnapprovedPathMode::Allow,
-                ..default()
-            }),
+            DefaultPlugins
+                .set(AssetPlugin {
+                    // We enable loading assets from arbitrary filesystem paths as this example allows
+                    // drag and dropping a local image for color grading
+                    unapproved_path_mode: UnapprovedPathMode::Allow,
+                    ..default()
+                })
+                .set(bevy::render::RenderPlugin {
+                    working_color_space,
+                    ..default()
+                }),
             MaterialPlugin::<ColorGradientMaterial>::default(),
         ))
         .insert_resource(CameraTransform(
@@ -52,6 +66,7 @@ fn main() {
                 resize_image,
                 toggle_scene,
                 toggle_tonemapping_method,
+                toggle_hdr_output,
                 update_color_grading_settings,
                 update_ui,
             ),
@@ -312,6 +327,8 @@ fn toggle_tonemapping_method(
         **tonemapping = Tonemapping::BlenderFilmic;
     } else if keys.just_pressed(KeyCode::Digit9) {
         **tonemapping = Tonemapping::KhronosPbrNeutral;
+    } else if keys.just_pressed(KeyCode::Digit0) {
+        **tonemapping = Tonemapping::GranTurismo7;
     }
 
     **color_grading = (*per_method_settings
@@ -320,6 +337,51 @@ fn toggle_tonemapping_method(
         .as_ref()
         .unwrap())
     .clone();
+}
+
+/// Cycles the primary window's HDR output: SDR sRGB, scRGB-linear, extended-sRGB at
+/// Rec.709, extended-sRGB at Display-P3, PQ (HDR10), then back to SDR. Leaving SDR also
+/// switches to `GranTurismo7`, the only HDR-aware operator. GT7 reads the peak luminance
+/// off the display target, so this example never inserts `GranTurismo7Params`.
+///
+/// Real HDR output needs an HDR-capable display and a backend that supports the requested
+/// transfer (see [`DisplayTransfer`]). If the surface cannot carry it, Bevy logs a warning
+/// and falls back; `WindowSurfaceTransfers::resolved` on the window says what it got.
+fn toggle_hdr_output(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut display_target: Single<&mut DisplayTarget, With<PrimaryWindow>>,
+    mut tonemapping: Single<&mut Tonemapping>,
+) {
+    if keys.just_pressed(KeyCode::KeyO) {
+        match display_target.transfer {
+            DisplayTransfer::Srgb => {
+                **display_target = DisplayTarget {
+                    paper_white_nits: 200.0,
+                    peak_luminance_nits: 1000.0,
+                    transfer: DisplayTransfer::ScRgbLinear,
+                    ..DisplayTarget::SDR_SRGB
+                };
+                **tonemapping = Tonemapping::GranTurismo7;
+            }
+            // The web HDR path (wgpu's `ExtendedSrgb` color space).
+            DisplayTransfer::ScRgbLinear => {
+                display_target.transfer = DisplayTransfer::ExtendedSrgb;
+                display_target.gamut = DisplayGamut::Rec709;
+            }
+            // Same transfer, wider gamut (wgpu's `ExtendedDisplayP3` color space).
+            DisplayTransfer::ExtendedSrgb if display_target.gamut != DisplayGamut::DisplayP3 => {
+                display_target.gamut = DisplayGamut::DisplayP3;
+            }
+            DisplayTransfer::ExtendedSrgb => {
+                // The encoder coerces PQ targets to Rec.2020, so set the gamut to match.
+                display_target.transfer = DisplayTransfer::Pq;
+                display_target.gamut = DisplayGamut::Rec2020;
+            }
+            _ => {
+                **display_target = DisplayTarget::SDR_SRGB;
+            }
+        }
+    }
 }
 
 #[derive(Resource)]
@@ -395,6 +457,7 @@ fn update_color_grading_settings(
 fn update_ui(
     mut text_query: Single<&mut Text, Without<SceneNumber>>,
     settings: Single<(&Tonemapping, &ColorGrading)>,
+    display_target: Single<&DisplayTarget, With<PrimaryWindow>>,
     current_scene: Res<CurrentScene>,
     selected_parameter: Res<SelectedParameter>,
     mut hide_ui: Local<bool>,
@@ -419,7 +482,13 @@ fn update_ui(
     let mut text = String::with_capacity(text_query.len());
 
     let scn = current_scene.0;
-    text.push_str("(H) Hide UI\n\n");
+    text.push_str("(H) Hide UI\n");
+    text.push_str(&format!(
+        "(O) Cycle HDR output: sRGB -> scRGB -> extended-sRGB (709/P3) -> PQ/HDR10 \
+        (requested: {:?} {:?}; requires an HDR-capable display, falls back with a log \
+        warning)\n\n",
+        display_target.transfer, display_target.gamut
+    ));
     text.push_str("Test Scene: \n");
     text.push_str(&format!(
         "(Q) {} Basic Scene\n",
@@ -502,6 +571,14 @@ fn update_ui(
     text.push_str(&format!(
         "(9) {} Khronos PBR Neutral\n",
         if tonemapping == Tonemapping::KhronosPbrNeutral {
+            ">"
+        } else {
+            ""
+        }
+    ));
+    text.push_str(&format!(
+        "(0) {} Gran Turismo 7\n",
+        if tonemapping == Tonemapping::GranTurismo7 {
             ">"
         } else {
             ""
@@ -599,6 +676,7 @@ impl Default for PerMethodSettings {
             Tonemapping::TonyMcMapface,
             Tonemapping::BlenderFilmic,
             Tonemapping::KhronosPbrNeutral,
+            Tonemapping::GranTurismo7,
         ] {
             settings.insert(
                 method,

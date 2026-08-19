@@ -32,6 +32,7 @@
 use bevy_app::{App, Plugin};
 use bevy_asset::{embedded_asset, load_embedded_asset, AssetServer, Handle};
 use bevy_core_pipeline::{
+    camera_stack::ViewStackContract,
     schedule::{Core2d, Core2dSystems, Core3d, Core3dSystems},
     tonemapping::tonemapping,
 };
@@ -179,6 +180,16 @@ pub struct SmaaNeighborhoodBlendingPipelineKey {
     target_format: TextureFormat,
     /// The quality preset.
     preset: SmaaPreset,
+}
+
+/// A unique identifier for phase 1 of SMAA: edge detection.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SmaaEdgeDetectionPipelineKey {
+    /// The quality preset.
+    preset: SmaaPreset,
+    /// Selects the `HDR_DISPLAY_TARGET` shader path. Only phase 1 reads luma,
+    /// so phases 2 and 3 do not key on this.
+    hdr_encode: bool,
 }
 
 /// A render world component that holds the pipeline IDs for the SMAA passes.
@@ -346,6 +357,7 @@ impl Plugin for SmaaPlugin {
                 texture_view_descriptor: None,
                 asset_usage: RenderAssetUsages::RENDER_WORLD,
                 copy_on_resize: false,
+                source_primaries: Default::default(),
             });
 
             SmaaLuts {
@@ -456,11 +468,14 @@ pub fn init_smaa_pipelines(mut commands: Commands, asset_server: Res<AssetServer
 
 // Phase 1: edge detection.
 impl SpecializedRenderPipeline for SmaaEdgeDetectionPipeline {
-    type Key = SmaaPreset;
+    type Key = SmaaEdgeDetectionPipelineKey;
 
-    fn specialize(&self, preset: Self::Key) -> RenderPipelineDescriptor {
+    fn specialize(&self, key: Self::Key) -> RenderPipelineDescriptor {
         let mut shader_defs = vec!["SMAA_EDGE_DETECTION".into()];
-        shader_defs.extend(preset.shader_defs());
+        shader_defs.extend(key.preset.shader_defs());
+        if key.hdr_encode {
+            shader_defs.push("HDR_DISPLAY_TARGET".into());
+        }
 
         // We mark the pixels that we touched with a 1 so that the blending
         // weight calculation (phase 2) will only consider those. This reduces
@@ -613,13 +628,19 @@ fn prepare_smaa_pipelines(
     pipeline_cache: Res<PipelineCache>,
     mut specialized_render_pipelines: ResMut<SmaaSpecializedRenderPipelines>,
     smaa_pipelines: Res<SmaaPipelines>,
-    cameras: Query<(Entity, &ExtractedView, &Smaa), With<ExtractedCamera>>,
+    cameras: Query<
+        (Entity, &ExtractedView, &Smaa, &ViewStackContract),
+        (With<ExtractedCamera>, With<ViewTarget>),
+    >,
 ) {
-    for (entity, view, smaa) in &cameras {
+    for (entity, view, smaa, contract) in &cameras {
         let edge_detection_pipeline_id = specialized_render_pipelines.edge_detection.specialize(
             &pipeline_cache,
             &smaa_pipelines.edge_detection,
-            smaa.preset,
+            SmaaEdgeDetectionPipelineKey {
+                preset: smaa.preset,
+                hdr_encode: contract.is_hdr_encode(),
+            },
         );
 
         let blending_weight_calculation_pipeline_id = specialized_render_pipelines

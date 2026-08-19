@@ -1,9 +1,10 @@
 mod downsampling_pipeline;
+mod glare;
 mod settings;
 mod upsampling_pipeline;
 
 use bevy_image::ToExtents;
-pub use settings::{Bloom, BloomCompositeMode, BloomPrefilter};
+pub use settings::{Bloom, BloomCompositeMode, BloomPrefilter, BloomScatterModel};
 
 use crate::bloom::{
     downsampling_pipeline::init_bloom_downsampling_pipeline,
@@ -17,7 +18,7 @@ use bevy_core_pipeline::{
     tonemapping::tonemapping,
 };
 use bevy_ecs::prelude::*;
-use bevy_math::{ops, UVec2};
+use bevy_math::{ops, AspectRatio, UVec2, UVec4};
 use bevy_render::{
     camera::ExtractedCamera,
     diagnostic::RecordDiagnostics,
@@ -27,7 +28,7 @@ use bevy_render::{
     render_resource::*,
     renderer::{RenderContext, RenderDevice, ViewQuery},
     texture::{CachedTexture, TextureCache},
-    view::ViewTarget,
+    view::{ExtractedView, ViewDisplayTarget, ViewTarget},
     GpuResourceAppExt, Render, RenderApp, RenderStartup, RenderSystems,
 };
 use downsampling_pipeline::{
@@ -38,7 +39,30 @@ use upsampling_pipeline::{
     prepare_upsampling_pipeline, BloomUpsamplingPipeline, UpsamplingPipelineIds,
 };
 
+/// The bloom pyramid format for views on SDR display targets. `Rg11b10Ufloat`
+/// halves the memory and bandwidth of `Rgba16Float`, and its range
+/// (~`[6.1e-5, 65024]`, no sign bit, no alpha) covers scene-linear input.
 const BLOOM_TEXTURE_FORMAT: TextureFormat = TextureFormat::Rg11b10Ufloat;
+
+/// The bloom pyramid format for views whose display target has an HDR transfer.
+///
+/// Above-paper-white content reaches an HDR display, where `Rg11b10Ufloat`'s
+/// coarse mantissa above 1.0 bands visibly in the Karis-averaged downsample
+/// sums. `Rgba16Float` has uniform precision there at twice the memory cost:
+/// ~5 MB/frame vs ~2.5 MB/frame at 4K with the default 8-level chain.
+const BLOOM_TEXTURE_FORMAT_HDR: TextureFormat = TextureFormat::Rgba16Float;
+
+/// Returns the bloom pyramid texture format for a view, keyed on its display
+/// target transfer. Used by [`prepare_bloom_textures`] and both pipeline
+/// specializations so they cannot disagree about the format. A missing
+/// [`ViewDisplayTarget`] (a view never extracted as a camera) means SDR.
+pub(crate) fn bloom_texture_format(display_target: Option<&ViewDisplayTarget>) -> TextureFormat {
+    if display_target.is_some_and(ViewDisplayTarget::is_hdr_transfer) {
+        BLOOM_TEXTURE_FORMAT_HDR
+    } else {
+        BLOOM_TEXTURE_FORMAT
+    }
+}
 
 #[derive(Default)]
 pub struct BloomPlugin;
@@ -55,6 +79,7 @@ impl Plugin for BloomPlugin {
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
         };
+
         render_app
             .init_gpu_resource::<SpecializedRenderPipelines<BloomDownsamplingPipeline>>()
             .init_gpu_resource::<SpecializedRenderPipelines<BloomUpsamplingPipeline>>()
@@ -68,6 +93,9 @@ impl Plugin for BloomPlugin {
             .add_systems(
                 Render,
                 (
+                    prepare_bloom_uniforms
+                        .in_set(RenderSystems::Prepare)
+                        .before(RenderSystems::PrepareResources),
                     prepare_downsampling_pipeline.in_set(RenderSystems::Prepare),
                     prepare_upsampling_pipeline.in_set(RenderSystems::Prepare),
                     prepare_bloom_textures.in_set(RenderSystems::PrepareResources),
@@ -314,13 +342,57 @@ impl BloomTexture {
     }
 }
 
+/// Builds each bloom view's [`BloomUniforms`] from the extracted view geometry
+/// and the paper white of the view's resolved display target.
+///
+/// Runs after `RenderSystems::PrepareViews` has resolved [`ViewDisplayTarget`]
+/// and before `RenderSystems::PrepareResources`, where `UniformComponentPlugin`
+/// uploads the components.
+fn prepare_bloom_uniforms(
+    mut commands: Commands,
+    views: Query<(
+        Entity,
+        &Bloom,
+        &ExtractedCamera,
+        &ExtractedView,
+        &ViewDisplayTarget,
+    )>,
+) {
+    let uniforms = views
+        .iter()
+        .filter_map(|(entity, bloom, camera, view, display_target)| {
+            let target_size = camera.physical_target_size?;
+            // `UVec4(origin.x, origin.y, size.x, size.y)` in physical pixels. The
+            // size is non-zero: `Bloom` is only extracted for drawable viewports.
+            let viewport = view.viewport;
+            let uniform = BloomUniforms {
+                threshold_precomputations: BloomUniforms::threshold_precomputations(
+                    bloom
+                        .prefilter
+                        .resolve_threshold(display_target.sanitized_paper_white_nits()),
+                    bloom.prefilter.threshold_softness,
+                ),
+                viewport: viewport.as_vec4()
+                    / UVec4::new(target_size.x, target_size.y, target_size.x, target_size.y)
+                        .as_vec4(),
+                aspect: AspectRatio::try_from_pixels(viewport.z, viewport.w)
+                    .expect("Valid screen size values for Bloom settings")
+                    .ratio(),
+                scale: bloom.scale,
+            };
+            Some((entity, uniform))
+        })
+        .collect::<Vec<_>>();
+    commands.try_insert_batch(uniforms);
+}
+
 fn prepare_bloom_textures(
     mut commands: Commands,
     mut texture_cache: ResMut<TextureCache>,
     render_device: Res<RenderDevice>,
-    views: Query<(Entity, &ExtractedCamera, &Bloom)>,
+    views: Query<(Entity, &ExtractedCamera, &Bloom, &ViewDisplayTarget)>,
 ) {
-    for (entity, camera, bloom) in &views {
+    for (entity, camera, bloom, display_target) in &views {
         if let Some(viewport) = camera.physical_viewport_size {
             // How many times we can halve the resolution minus one so we don't go unnecessarily low
             let mip_count = bloom.max_mip_dimension.ilog2().max(2) - 1;
@@ -340,7 +412,7 @@ fn prepare_bloom_textures(
                 mip_level_count: mip_count,
                 sample_count: 1,
                 dimension: TextureDimension::D2,
-                format: BLOOM_TEXTURE_FORMAT,
+                format: bloom_texture_format(Some(display_target)),
                 usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             };
@@ -483,19 +555,201 @@ fn prepare_bloom_bind_groups(
 ///
 /// This function can be visually previewed for all values of *mip* (normalized) with tweakable
 /// [`Bloom`] parameters on [Desmos graphing calculator](https://www.desmos.com/calculator/ncc8xbhzzl).
+///
+/// [`BloomScatterModel::Gt7Glare`] instead uses the diffraction weights of
+/// [`glare::blend_factor`]. Those are tied to the absolute texel scale of the
+/// pyramid levels, not to the chain depth, so that branch ignores `max_mip`.
 fn compute_blend_factor(bloom: &Bloom, mip: f32, max_mip: f32) -> f32 {
-    let mut lf_boost =
-        (1.0 - ops::powf(
-            1.0 - (mip / max_mip),
-            1.0 / (1.0 - bloom.low_frequency_boost_curvature),
-        )) * bloom.low_frequency_boost;
-    let high_pass_lq = 1.0
-        - (((mip / max_mip) - bloom.high_pass_frequency) / bloom.high_pass_frequency)
-            .clamp(0.0, 1.0);
-    lf_boost *= match bloom.composite_mode {
-        BloomCompositeMode::EnergyConserving => 1.0 - bloom.intensity,
-        BloomCompositeMode::Additive => 1.0,
-    };
+    match bloom.scatter {
+        BloomScatterModel::Aesthetic => {
+            let mut lf_boost =
+                (1.0 - ops::powf(
+                    1.0 - (mip / max_mip),
+                    1.0 / (1.0 - bloom.low_frequency_boost_curvature),
+                )) * bloom.low_frequency_boost;
+            let high_pass_lq = 1.0
+                - (((mip / max_mip) - bloom.high_pass_frequency) / bloom.high_pass_frequency)
+                    .clamp(0.0, 1.0);
+            lf_boost *= match bloom.composite_mode {
+                BloomCompositeMode::EnergyConserving => 1.0 - bloom.intensity,
+                BloomCompositeMode::Additive => 1.0,
+            };
 
-    (bloom.intensity + lf_boost) * high_pass_lq
+            (bloom.intensity + lf_boost) * high_pass_lq
+        }
+        BloomScatterModel::Gt7Glare { f_number } => {
+            glare::blend_factor(f_number, bloom.intensity, mip as u32)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_ecs::{schedule::ScheduleLabel, system::RunSystemOnce};
+    use bevy_math::{Mat4, Vec2};
+    use bevy_render::view::RetainedViewEntity;
+
+    #[test]
+    fn prepare_bloom_uniforms_packs_reference_uniform() {
+        let mut world = World::new();
+
+        let bloom = Bloom {
+            prefilter: BloomPrefilter {
+                threshold: 0.0,
+                threshold_nits: Some(406.0),
+                threshold_softness: 0.25,
+            },
+            scale: Vec2::new(2.0, 1.0),
+            ..Bloom::NATURAL
+        };
+        let mut display_target = ViewDisplayTarget::default();
+        display_target.0.paper_white_nits = 203.0;
+
+        let entity = world
+            .spawn((
+                bloom,
+                ExtractedCamera {
+                    target: None,
+                    physical_viewport_size: Some(UVec2::new(320, 240)),
+                    physical_target_size: Some(UVec2::new(640, 480)),
+                    viewport: None,
+                    schedule: Core3d.intern(),
+                    order: 0,
+                    output_mode: Default::default(),
+                    msaa_writeback: Default::default(),
+                    clear_color: Default::default(),
+                    sorted_camera_index_for_target: 0,
+                    exposure: 1.0,
+                    hdr: true,
+                    compositing_space: None,
+                },
+                ExtractedView {
+                    retained_view_entity: RetainedViewEntity::new(
+                        Entity::PLACEHOLDER.into(),
+                        None,
+                        0,
+                    ),
+                    clip_from_view: Mat4::IDENTITY,
+                    world_from_view: Default::default(),
+                    clip_from_world: None,
+                    target_format: TextureFormat::Rgba16Float,
+                    viewport: UVec4::new(8, 16, 320, 240),
+                    color_grading: Default::default(),
+                    invert_culling: false,
+                },
+                display_target,
+            ))
+            .id();
+
+        world.run_system_once(prepare_bloom_uniforms).unwrap();
+
+        let uniforms = world.get::<BloomUniforms>(entity).unwrap();
+        assert_eq!(
+            uniforms.threshold_precomputations,
+            // 406 nits against a 203-nit paper white is 2.0 in framebuffer units.
+            BloomUniforms::threshold_precomputations(2.0, 0.25)
+        );
+        assert_eq!(
+            uniforms.viewport,
+            bevy_math::Vec4::new(8.0 / 640.0, 16.0 / 480.0, 320.0 / 640.0, 240.0 / 480.0)
+        );
+        assert_eq!(
+            uniforms.aspect,
+            AspectRatio::try_from_pixels(320, 240).unwrap().ratio()
+        );
+        assert_eq!(uniforms.scale, Vec2::new(2.0, 1.0));
+    }
+
+    /// An independent copy of the parametric curve, to lock the
+    /// [`BloomScatterModel::Aesthetic`] path bit for bit.
+    fn legacy_compute_blend_factor(bloom: &Bloom, mip: f32, max_mip: f32) -> f32 {
+        let mut lf_boost =
+            (1.0 - ops::powf(
+                1.0 - (mip / max_mip),
+                1.0 / (1.0 - bloom.low_frequency_boost_curvature),
+            )) * bloom.low_frequency_boost;
+        let high_pass_lq = 1.0
+            - (((mip / max_mip) - bloom.high_pass_frequency) / bloom.high_pass_frequency)
+                .clamp(0.0, 1.0);
+        lf_boost *= match bloom.composite_mode {
+            BloomCompositeMode::EnergyConserving => 1.0 - bloom.intensity,
+            BloomCompositeMode::Additive => 1.0,
+        };
+
+        (bloom.intensity + lf_boost) * high_pass_lq
+    }
+
+    #[test]
+    fn aesthetic_blend_factors_match_dedicated_implementation() {
+        let presets = [
+            Bloom::NATURAL,
+            Bloom::ANAMORPHIC,
+            Bloom::OLD_SCHOOL,
+            Bloom::SCREEN_BLUR,
+            Bloom {
+                intensity: 0.37,
+                low_frequency_boost: 0.21,
+                low_frequency_boost_curvature: 0.5,
+                high_pass_frequency: 0.66,
+                composite_mode: BloomCompositeMode::Additive,
+                scale: Vec2::new(2.0, 1.0),
+                ..Bloom::NATURAL
+            },
+        ];
+        for bloom in &presets {
+            for max_mip in [3.0f32, 7.0, 9.0] {
+                for mip in 0..=(max_mip as u32) {
+                    let mip = mip as f32;
+                    assert_eq!(
+                        compute_blend_factor(bloom, mip, max_mip).to_bits(),
+                        legacy_compute_blend_factor(bloom, mip, max_mip).to_bits(),
+                        "mismatch at mip {mip}/{max_mip}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn glare_overrides_threshold_and_composite_mode() {
+        let mut bloom = Bloom {
+            composite_mode: BloomCompositeMode::Additive,
+            ..Bloom::OLD_SCHOOL
+        };
+        assert!(bloom.thresholding_active());
+        assert_eq!(
+            bloom.effective_composite_mode(),
+            BloomCompositeMode::Additive
+        );
+
+        bloom.scatter = BloomScatterModel::Gt7Glare { f_number: 8.0 };
+        assert!(!bloom.thresholding_active());
+        assert_eq!(
+            bloom.effective_composite_mode(),
+            BloomCompositeMode::EnergyConserving
+        );
+    }
+
+    #[test]
+    fn glare_blend_factor_uses_psf_not_parametric_curve() {
+        let glare = Bloom {
+            scatter: BloomScatterModel::Gt7Glare { f_number: 5.6 },
+            ..Bloom::NATURAL
+        };
+        assert_eq!(compute_blend_factor(&glare, 0.0, 7.0), glare.intensity);
+
+        let tweaked = Bloom {
+            low_frequency_boost: 0.0,
+            low_frequency_boost_curvature: 0.1,
+            high_pass_frequency: 0.5,
+            ..glare.clone()
+        };
+        for mip in 0..8 {
+            assert_eq!(
+                compute_blend_factor(&glare, mip as f32, 7.0).to_bits(),
+                compute_blend_factor(&tweaked, mip as f32, 7.0).to_bits()
+            );
+        }
+    }
 }

@@ -7,6 +7,7 @@ use smallvec::SmallVec;
 use crate::{
     render_resource::*,
     renderer::{RenderDevice, WgpuWrapper},
+    working_color_space::{WorkingColorSpace, WORKING_COLOR_SPACE_REC2020_SHADER_DEF},
     Extract,
 };
 use alloc::{borrow::Cow, sync::Arc};
@@ -236,7 +237,11 @@ impl PipelineCache {
     }
 
     /// Create a new pipeline cache associated with the given render device.
-    pub fn new(device: RenderDevice, synchronous_pipeline_compilation: bool) -> Self {
+    pub fn new(
+        device: RenderDevice,
+        working_color_space: WorkingColorSpace,
+        synchronous_pipeline_compilation: bool,
+    ) -> Self {
         let mut global_shader_defs = Vec::new();
         #[cfg(all(feature = "webgl", target_arch = "wasm32", not(feature = "webgpu")))]
         {
@@ -264,6 +269,10 @@ impl PipelineCache {
             "AVAILABLE_STORAGE_BUFFER_BINDINGS__GE_6".into(),
             available_storage_buffer_bindings >= 6,
         ));
+
+        if working_color_space.is_rec2020() {
+            global_shader_defs.push(WORKING_COLOR_SPACE_REC2020_SHADER_DEF.into());
+        }
 
         Self {
             shader_cache: Arc::new(Mutex::new(ShaderCache::new(device.clone(), load_module))),

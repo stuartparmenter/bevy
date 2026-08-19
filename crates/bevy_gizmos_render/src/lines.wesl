@@ -1,5 +1,6 @@
 // TODO use common view binding
 import bevy_render::{view::View, maths::affine3_to_square};
+import bevy_render::writer_encode::writer_encode;
 
 @group(0) @binding(0) var<uniform> view: View;
 
@@ -160,9 +161,10 @@ struct FragmentOutput {
     @location(0) color: vec4<f32>,
 };
 
+// Gizmos render pre-tonemap, so each fragment writer-encodes its color.
 @fragment
 fn fragment_solid(in: FragmentInput) -> FragmentOutput {
-    return FragmentOutput(in.color);
+    return FragmentOutput(writer_encode(in.color));
 }
 @fragment
 fn fragment_dotted(in: FragmentInput) -> FragmentOutput {
@@ -171,8 +173,8 @@ fn fragment_dotted(in: FragmentInput) -> FragmentOutput {
     alpha = 1 - floor(in.uv % 2.0);
     @else
     alpha = 1 - floor((in.uv * in.position.w) % 2.0);
-    
-    return FragmentOutput(vec4(in.color.xyz, in.color.w * alpha));
+
+    return FragmentOutput(writer_encode(vec4(in.color.xyz, in.color.w * alpha)));
 }
 
 @fragment
@@ -182,6 +184,6 @@ fn fragment_dashed(in: FragmentInput) -> FragmentOutput {
     @else
     let uv = in.uv * in.position.w;
     let alpha = 1.0 - floor(min((uv % 2.0) / in.line_fraction, 1.0));
-    
-    return FragmentOutput(vec4(in.color.xyz, in.color.w * alpha));
+
+    return FragmentOutput(writer_encode(vec4(in.color.xyz, in.color.w * alpha)));
 }

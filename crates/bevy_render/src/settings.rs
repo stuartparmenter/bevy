@@ -2,6 +2,7 @@ use crate::{
     error_handler::DeviceErrorHandler,
     render_resource::PipelineCache,
     renderer::{self, RenderAdapter, RenderAdapterInfo, RenderDevice, RenderInstance, RenderQueue},
+    working_color_space::WorkingColorSpace,
     FutureRenderResources,
 };
 use alloc::borrow::Cow;
@@ -206,8 +207,13 @@ impl RenderResources {
         }
 
         render_world.insert_resource(instance);
+        // Read from the render world, where `RenderPlugin::build` inserted it, not a
+        // parameter, so the device-loss reinit path rebuilds the cache with the same
+        // working color space.
+        let working_color_space = *render_world.resource::<WorkingColorSpace>();
         render_world.insert_resource(PipelineCache::new(
             device.clone(),
+            working_color_space,
             synchronous_pipeline_compilation,
         ));
         render_world.insert_resource(DeviceErrorHandler::new(&device));

@@ -98,7 +98,7 @@ use crate::{
 use bevy_core_pipeline::oit::OrderIndependentTransparencySettings;
 use bevy_core_pipeline::prepass::{DeferredPrepass, DepthPrepass, NormalPrepass};
 use bevy_core_pipeline::tonemapping::{DebandDither, Tonemapping};
-use bevy_render::camera::{DirtySpecializations, ExtractedCamera, TemporalJitter};
+use bevy_render::camera::{DirtySpecializations, TemporalJitter, TonemapInShader};
 use bevy_render::prelude::Msaa;
 use bevy_render::sync_world::{MainEntity, MainEntityHashMap};
 use bevy_render::view::{
@@ -362,9 +362,12 @@ pub fn check_views_need_specialization(
     mut dirty_specializations: ResMut<DirtySpecializations>,
     mut views: Query<(
         &ExtractedView,
-        Option<&ExtractedCamera>,
         &Msaa,
-        (Option<&Tonemapping>, Option<&DebandDither>),
+        (
+            Option<&Tonemapping>,
+            Option<&DebandDither>,
+            Has<TonemapInShader>,
+        ),
         Option<&ShadowFilteringMethod>,
         Has<ScreenSpaceAmbientOcclusion>,
         (
@@ -391,9 +394,8 @@ pub fn check_views_need_specialization(
 ) {
     for (
         view,
-        camera,
         msaa,
-        (tonemapping, dither),
+        (tonemapping, dither, tonemap_in_shader),
         shadow_filter_method,
         ssao,
         (normal_prepass, depth_prepass, motion_vector_prepass, deferred_prepass),
@@ -476,11 +478,12 @@ pub fn check_views_need_specialization(
             }
         }
 
-        if !camera.is_some_and(|camera| camera.hdr) {
-            if let Some(tonemapping) = tonemapping {
-                view_key |= MeshPipelineKey::TONEMAP_IN_SHADER;
-                view_key |= tonemapping_pipeline_key(*tonemapping);
-            }
+        if tonemap_in_shader
+            && let Some(tonemapping) = tonemapping
+            && *tonemapping != Tonemapping::None
+        {
+            view_key |= MeshPipelineKey::TONEMAP_IN_SHADER;
+            view_key |= tonemapping_pipeline_key(*tonemapping);
             if let Some(DebandDither::Enabled) = dither {
                 view_key |= MeshPipelineKey::DEBAND_DITHER;
             }
@@ -2811,6 +2814,7 @@ pub fn build_dummy_white_gpu_image(
         texture_descriptor: image.texture_descriptor,
         texture_view_descriptor: image.texture_view_descriptor,
         had_data: true,
+        source_primaries: image.source_primaries,
     }
 }
 
@@ -3103,6 +3107,7 @@ bitflags::bitflags! {
         const TONEMAP_METHOD_TONY_MC_MAPFACE    = 6 << Self::TONEMAP_METHOD_SHIFT_BITS;
         const TONEMAP_METHOD_BLENDER_FILMIC     = 7 << Self::TONEMAP_METHOD_SHIFT_BITS;
         const TONEMAP_METHOD_PBR_NEUTRAL        = 8 << Self::TONEMAP_METHOD_SHIFT_BITS;
+        const TONEMAP_METHOD_GRAN_TURISMO_7     = 10 << Self::TONEMAP_METHOD_SHIFT_BITS;
         const SHADOW_FILTER_METHOD_RESERVED_BITS = Self::SHADOW_FILTER_METHOD_MASK_BITS << Self::SHADOW_FILTER_METHOD_SHIFT_BITS;
         const SHADOW_FILTER_METHOD_HARDWARE_2X2  = 0 << Self::SHADOW_FILTER_METHOD_SHIFT_BITS;
         const SHADOW_FILTER_METHOD_GAUSSIAN      = 1 << Self::SHADOW_FILTER_METHOD_SHIFT_BITS;
@@ -3603,6 +3608,8 @@ impl SpecializedMeshPipeline for MeshPipeline {
                 shader_defs.push("TONEMAP_METHOD_TONY_MC_MAPFACE".into());
             } else if method == MeshPipelineKey::TONEMAP_METHOD_PBR_NEUTRAL {
                 shader_defs.push("TONEMAP_METHOD_PBR_NEUTRAL".into());
+            } else if method == MeshPipelineKey::TONEMAP_METHOD_GRAN_TURISMO_7 {
+                shader_defs.push("TONEMAP_METHOD_GRAN_TURISMO_7".into());
             }
 
             // Debanding is tied to tonemapping in the shader, cannot run without it.

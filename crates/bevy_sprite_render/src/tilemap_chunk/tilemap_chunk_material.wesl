@@ -4,6 +4,8 @@ import package::mesh2d::{
     vertex_output::VertexOutput,
 };
 
+import bevy_render::writer_encode::writer_encode;
+
 @group(constants::MATERIAL_BIND_GROUP) @binding(0) var tileset: texture_2d_array<f32>;
 @group(constants::MATERIAL_BIND_GROUP) @binding(1) var tileset_sampler: sampler;
 @group(constants::MATERIAL_BIND_GROUP) @binding(2) var tile_data: texture_2d<u32>;
@@ -65,11 +67,11 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     let tex_color = textureSample(tileset, tileset_sampler, local_uv, tile.tileset_index);
-    let final_color = tex_color * tile.color;
+    let composed_color = tex_color * tile.color;
 
-    if (final_color.a < 0.001) {
+    if (composed_color.a < 0.001) {
         discard;
     }
 
-    return final_color;
+    return writer_encode(composed_color);
 }

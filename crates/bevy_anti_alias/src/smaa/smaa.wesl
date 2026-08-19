@@ -568,7 +568,25 @@ fn neighborhood_blending_vertex_main(@builtin(vertex_index) vertex_index: u32)
  *
  * IMPORTANT NOTICE: luma edge detection requires gamma-corrected colors, and
  * thus 'color_texture' should be a non-sRGB texture.
+ *
+ * Bevy deviates: this pass reads display-linear values, not gamma-corrected
+ * ones, so SMAA_THRESHOLD is more sensitive in shadows and less in highlights
+ * than the reference tuning.
+ *
+ * On an HDR display target the input is paper-white-relative and can exceed
+ * 1.0, which shifts that sensitivity further, so the edge-detection luma is
+ * saturated to [0, 1]. Blending (pass 3) still reads the unmodified texels.
  */
+// Edge-detection luma for one texel. Takes rgb, not a uv: a textureSample with
+// implicit derivatives cannot meet its uniformity requirement after a discard.
+fn edge_luma(rgb: vec3<f32>) -> f32 {
+    let weights = vec3(0.2126, 0.7152, 0.0722);
+    @if(HDR_DISPLAY_TARGET)
+    return saturate(dot(rgb, weights));
+    @else
+    return dot(rgb, weights);
+}
+
 @fragment
 fn luma_edge_detection_fragment_main(in: EdgeDetectionVaryings) -> @location(0) vec4<f32> {
     // Calculate the threshold:
@@ -576,11 +594,10 @@ fn luma_edge_detection_fragment_main(in: EdgeDetectionVaryings) -> @location(0) 
     let threshold = vec2(SMAA_THRESHOLD);
 
     // Calculate luma:
-    let weights = vec3(0.2126, 0.7152, 0.0722);
-    let L = dot(textureSample(color_texture, color_sampler, in.tex_coord).rgb, weights);
+    let L = edge_luma(textureSample(color_texture, color_sampler, in.tex_coord).rgb);
 
-    let Lleft = dot(textureSample(color_texture, color_sampler, in.offset_0.xy).rgb, weights);
-    let Ltop  = dot(textureSample(color_texture, color_sampler, in.offset_0.zw).rgb, weights);
+    let Lleft = edge_luma(textureSample(color_texture, color_sampler, in.offset_0.xy).rgb);
+    let Ltop  = edge_luma(textureSample(color_texture, color_sampler, in.offset_0.zw).rgb);
 
     // We do the usual threshold:
     var delta: vec4<f32> = vec4(abs(L - vec2(Lleft, Ltop)), 0.0, 0.0);
@@ -592,16 +609,16 @@ fn luma_edge_detection_fragment_main(in: EdgeDetectionVaryings) -> @location(0) 
     }
 
     // Calculate right and bottom deltas:
-    let Lright  = dot(textureSample(color_texture, color_sampler, in.offset_1.xy).rgb, weights);
-    let Lbottom = dot(textureSample(color_texture, color_sampler, in.offset_1.zw).rgb, weights);
+    let Lright  = edge_luma(textureSample(color_texture, color_sampler, in.offset_1.xy).rgb);
+    let Lbottom = edge_luma(textureSample(color_texture, color_sampler, in.offset_1.zw).rgb);
     delta = vec4(delta.xy, abs(L - vec2(Lright, Lbottom)));
 
     // Calculate the maximum delta in the direct neighborhood:
     var max_delta = max(delta.xy, delta.zw);
 
     // Calculate left-left and top-top deltas:
-    let Lleftleft = dot(textureSample(color_texture, color_sampler, in.offset_2.xy).rgb, weights);
-    let Ltoptop   = dot(textureSample(color_texture, color_sampler, in.offset_2.zw).rgb, weights);
+    let Lleftleft = edge_luma(textureSample(color_texture, color_sampler, in.offset_2.xy).rgb);
+    let Ltoptop   = edge_luma(textureSample(color_texture, color_sampler, in.offset_2.zw).rgb);
     delta = vec4(delta.xy, abs(vec2(Lleft, Ltop) - vec2(Lleftleft, Ltoptop)));
 
     // Calculate the final maximum delta:

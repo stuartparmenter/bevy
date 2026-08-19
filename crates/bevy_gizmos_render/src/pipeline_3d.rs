@@ -27,6 +27,7 @@ use bevy_render::{
     },
     render_resource::*,
     view::ExtractedView,
+    working_color_space::WorkingColorSpace,
     Render, RenderApp, RenderSystems,
 };
 use bevy_render::{sync_world::MainEntity, GpuResourceAppExt, RenderStartup};
@@ -75,11 +76,13 @@ fn init_line_gizmo_pipelines(
     mesh_pipeline: Res<MeshPipeline>,
     uniform_bind_group_layout: Res<LineGizmoUniformBindgroupLayout>,
     asset_server: Res<AssetServer>,
+    working_color_space: Res<WorkingColorSpace>,
 ) {
     let line_shader = load_embedded_asset!(asset_server.as_ref(), "lines.wesl");
     let variants_line = Variants::new(
         LineGizmoPipelineSpecializer {
             mesh_pipeline: mesh_pipeline.clone(),
+            working_color_space: *working_color_space,
         },
         RenderPipelineDescriptor {
             label: Some("LineGizmo 3d Pipeline".into()),
@@ -113,11 +116,13 @@ fn init_line_gizmo_pipelines(
         mesh_pipeline: mesh_pipeline.clone(),
         uniform_layout: uniform_bind_group_layout.layout.clone(),
         shader: load_embedded_asset!(asset_server.as_ref(), "line_joints.wesl"),
+        working_color_space: *working_color_space,
     });
 }
 
 struct LineGizmoPipelineSpecializer {
     mesh_pipeline: MeshPipeline,
+    working_color_space: WorkingColorSpace,
 }
 
 #[derive(PartialEq, Eq, Hash, Clone, SpecializerKey)]
@@ -151,6 +156,8 @@ impl Specializer<RenderPipeline> for LineGizmoPipelineSpecializer {
             fragment.shader_defs.push("PERSPECTIVE".into());
         }
 
+        crate::push_gizmo_3d_color_space_defs(&mut fragment.shader_defs, self.working_color_space);
+
         let format = key.view_key.target_format();
 
         let fragment_entry_point = match key.line_style {
@@ -180,6 +187,7 @@ struct LineJointGizmoPipeline {
     mesh_pipeline: MeshPipeline,
     uniform_layout: BindGroupLayoutDescriptor,
     shader: Handle<Shader>,
+    working_color_space: WorkingColorSpace,
 }
 
 #[derive(PartialEq, Eq, Hash, Clone)]
@@ -201,6 +209,8 @@ impl SpecializedRenderPipeline for LineJointGizmoPipeline {
         if key.perspective {
             shader_defs.push("PERSPECTIVE".into());
         }
+
+        crate::push_gizmo_3d_color_space_defs(&mut shader_defs, self.working_color_space);
 
         let format = key.view_key.target_format();
 

@@ -52,6 +52,7 @@ git checkout v0.4.0
   - [Embedded](#embedded)
   - [Games](#games)
   - [Gizmos](#gizmos)
+  - [Helpers](#helpers)
   - [Input](#input)
   - [Math](#math)
   - [Movement](#movement)
@@ -163,6 +164,7 @@ Example | Description
 [Fog](../examples/3d/fog.rs) | A scene showcasing the distance fog effect
 [Fog volumes](../examples/3d/fog_volumes.rs) | Demonstrates fog volumes
 [Generate Custom Mesh](../examples/3d/generate_custom_mesh.rs) | Simple showcase of how to generate a custom mesh with a custom texture
+[HDR Calibration](../examples/3d/hdr_calibration.rs) | HGIG-style calibration patterns for tuning a window's DisplayTarget on an HDR display
 [Irradiance Volumes](../examples/3d/irradiance_volumes.rs) | Demonstrates irradiance volumes
 [Light Probe Blending](../examples/3d/light_probe_blending.rs) | Demonstrates blending between multiple reflection probes
 [Light Textures](../examples/3d/light_textures.rs) | Demonstrates light textures
@@ -397,6 +399,12 @@ Example | Description
 [Text Gizmos 3d](../examples/gizmos/3d_text_gizmos.rs) | A scene showcasing 3d text gizmos
 [Text Gizmos Font](../examples/gizmos/text_gizmos_font.rs) | Example displaying the font used by text gizmos
 [Transform Gizmo](../examples/gizmos/transform_gizmo.rs) | Interactive transform gizmo for translating, rotating, and scaling entities
+
+### Helpers
+
+Example | Description
+--- | ---
+[HDR Helper](../examples/helpers/hdr.rs) | Reusable plugin that requests the best supported HDR output, falling back to SDR
 
 ### Input
 

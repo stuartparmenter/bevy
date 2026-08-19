@@ -77,6 +77,7 @@ use nonmax::NonMaxU32;
 
 use crate::deferred::copy_lighting_id::copy_deferred_lighting_id;
 use crate::deferred::node::{early_deferred_prepass, late_deferred_prepass};
+use crate::display_encoding::display_encoding;
 use crate::prepass::node::{early_prepass, late_prepass};
 use crate::tonemapping::tonemapping;
 use crate::upscaling::upscaling;
@@ -158,6 +159,10 @@ impl Plugin for Core3dPlugin {
                         .chain()
                         .in_set(Core3dSystems::MainPass),
                     tonemapping.in_set(Core3dSystems::PostProcess),
+                    // The UI pass orders itself before this, see `bevy_ui_render`.
+                    display_encoding
+                        .after(Core3dSystems::PostProcess)
+                        .before(upscaling),
                     upscaling.after(Core3dSystems::PostProcess),
                 ),
             );

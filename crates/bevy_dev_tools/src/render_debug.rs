@@ -3,6 +3,7 @@
 use bevy_app::{App, Plugin};
 use bevy_asset::{embedded_asset, AssetServer, Handle};
 use bevy_core_pipeline::{
+    display_encoding::display_encoding,
     mip_generation::experimental::depth::ViewDepthPyramid,
     schedule::{Core3d, Core3dSystems},
     upscaling::upscaling,
@@ -94,6 +95,10 @@ impl Plugin for RenderDebugOverlayPlugin {
                 render_debug_overlay
                     .after(Core3dSystems::PostProcess)
                     .before(ui_pass)
+                    // The overlay writes display-linear values, so it has to run
+                    // before the encoder. `.before(ui_pass)` alone is not enough:
+                    // that edge is dropped when `UiRenderPlugin` is not installed.
+                    .before(display_encoding)
                     .before(upscaling),
             );
     }

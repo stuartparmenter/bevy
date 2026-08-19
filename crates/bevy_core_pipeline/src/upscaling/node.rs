@@ -1,4 +1,7 @@
-use crate::{blit::BlitPipeline, upscaling::ViewUpscalingPipeline};
+use crate::{
+    blit::BlitPipeline, display_encoding::encode_out_texture_clear_color,
+    upscaling::ViewUpscalingPipeline,
+};
 use bevy_camera::{CameraOutputMode, ClearColor, ClearColorConfig};
 use bevy_ecs::prelude::*;
 use bevy_render::{
@@ -6,8 +9,10 @@ use bevy_render::{
     diagnostic::RecordDiagnostics,
     render_resource::{BindGroup, PipelineCache, RenderPassDescriptor, TextureViewId},
     renderer::{RenderContext, ViewQuery},
-    view::ViewTarget,
+    view::{ViewDisplayTarget, ViewTarget},
 };
+
+use crate::camera_stack::ViewStackContract;
 
 #[derive(Default)]
 pub struct UpscalingBindGroupCache {
@@ -19,6 +24,8 @@ pub fn upscaling(
         &ViewTarget,
         &ViewUpscalingPipeline,
         Option<&ExtractedCamera>,
+        Option<&ViewStackContract>,
+        Option<&ViewDisplayTarget>,
     )>,
     pipeline_cache: Res<PipelineCache>,
     blit_pipeline: Res<BlitPipeline>,
@@ -26,7 +33,7 @@ pub fn upscaling(
     mut cache: Local<UpscalingBindGroupCache>,
     mut ctx: RenderContext,
 ) {
-    let (target, upscaling_target, camera) = view.into_inner();
+    let (target, upscaling_target, camera, contract, view_display_target) = view.into_inner();
 
     let clear_color = if let Some(camera) = camera {
         match camera.output_mode {
@@ -41,7 +48,27 @@ pub fn upscaling(
         ClearColorConfig::Custom(color) => Some(color),
         ClearColorConfig::None => None,
     };
-    let converted_clear_color = clear_color.map(Into::into);
+    // On an HDR-transfer target the out texture stores encoded signal, so the
+    // `LoadOp::Clear` value has to be encoded on the CPU. Regions no blit
+    // covers would otherwise present raw display-linear values as HDR signal.
+    // On an SDR target the hardware sRGB view encodes the linear clear on
+    // store. The paper white must be the sanitized value the GPU encoder
+    // folds in, so the clear and the rendered pixels agree for degenerate
+    // authored paper whites. `encoding` is `Some` only on an HDR-transfer
+    // group, which always carries a `ViewDisplayTarget`.
+    let converted_clear_color = clear_color.map(|color| {
+        match contract
+            .and_then(|contract| contract.encoding)
+            .zip(view_display_target)
+        {
+            Some((encoding, view_display_target)) => encode_out_texture_clear_color(
+                color.into(),
+                &encoding,
+                view_display_target.sanitized_paper_white_nits(),
+            ),
+            None => color.into(),
+        }
+    });
 
     // texture to be upscaled to the output texture
     let main_texture_view = target.main_texture_view();

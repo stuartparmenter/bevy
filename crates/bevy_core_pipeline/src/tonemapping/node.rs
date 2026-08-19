@@ -1,106 +1,180 @@
-use crate::tonemapping::{TonemappingLuts, TonemappingPipeline, ViewTonemappingPipeline};
+use crate::tonemapping::{
+    Gt7ParamsUniform, TonemappingLuts, TonemappingPipeline, ViewTonemappingPipeline,
+};
 
 use bevy_ecs::prelude::*;
 use bevy_render::{
-    camera::ExtractedCamera,
+    camera::TonemapInShader,
     diagnostic::RecordDiagnostics,
+    extract_component::{ComponentUniforms, DynamicUniformIndex},
     render_asset::RenderAssets,
     render_resource::{
         BindGroup, BindGroupEntries, BufferId, LoadOp, Operations, PipelineCache,
-        RenderPassColorAttachment, RenderPassDescriptor, StoreOp, TextureViewId,
+        RenderPassColorAttachment, RenderPassDescriptor, StoreOp, TextureFormat, TextureViewId,
     },
     renderer::{RenderContext, ViewQuery},
     texture::{FallbackImage, GpuImage},
     view::{ViewTarget, ViewUniformOffset, ViewUniforms},
 };
 
-use super::{get_lut_bindings, Tonemapping};
+use super::{get_lut_bindings, gt7_layout, Tonemapping};
 
 /// Cached bind group state for tonemapping.
 #[derive(Default)]
 pub struct TonemappingBindGroupCache {
-    cached: Option<(BufferId, TextureViewId, TextureViewId, BindGroup)>,
+    cached: Option<CachedBindGroup>,
     last_tonemapping: Option<Tonemapping>,
+}
+
+/// The inputs a cached tonemapping bind group was created from.
+struct CachedBindGroup {
+    view_uniforms: BufferId,
+    source: TextureViewId,
+    lut: TextureViewId,
+    /// `Some` when the pipeline binds the per-view GT7 params uniform.
+    gt7_params_uniforms: Option<BufferId>,
+    bind_group: BindGroup,
 }
 
 pub fn tonemapping(
     view: ViewQuery<(
-        &ExtractedCamera,
         &ViewUniformOffset,
         &ViewTarget,
         &ViewTonemappingPipeline,
-        &Tonemapping,
+        Option<&DynamicUniformIndex<Gt7ParamsUniform>>,
+        Has<TonemapInShader>,
     )>,
     pipeline_cache: Res<PipelineCache>,
     tonemapping_pipeline: Res<TonemappingPipeline>,
     gpu_images: Res<RenderAssets<GpuImage>>,
     fallback_image: Res<FallbackImage>,
     view_uniforms: Res<ViewUniforms>,
+    gt7_params_uniforms: Res<ComponentUniforms<Gt7ParamsUniform>>,
     tonemapping_luts: Res<TonemappingLuts>,
     mut cache: Local<TonemappingBindGroupCache>,
     mut ctx: RenderContext,
 ) {
-    let (camera, view_uniform_offset, target, view_tonemapping_pipeline, tonemapping) =
-        view.into_inner();
+    let (
+        view_uniform_offset,
+        target,
+        view_tonemapping_pipeline,
+        gt7_params_index,
+        tonemap_in_shader,
+    ) = view.into_inner();
 
-    if *tonemapping == Tonemapping::None {
+    // `TonemapInShader` cameras fold tone mapping into their material shaders, so running
+    // this node for one would tone-map twice. Those cameras keep an 8-bit main texture, so
+    // the format check is a backstop: node-side operators always run on `Rgba16Float`.
+    if tonemap_in_shader
+        || matches!(
+            target.main_texture_format(),
+            TextureFormat::Rgba8UnormSrgb | TextureFormat::Rgba8Unorm
+        )
+    {
         return;
     }
 
-    if !camera.hdr {
-        return;
-    }
-
-    let Some(pipeline) = pipeline_cache.get_render_pipeline(view_tonemapping_pipeline.0) else {
+    let Some(pipeline) = pipeline_cache.get_render_pipeline(view_tonemapping_pipeline.pipeline_id)
+    else {
         return;
     };
 
     let view_uniforms_buffer = &view_uniforms.uniforms;
     let view_uniforms_id = view_uniforms_buffer.buffer().unwrap().id();
 
+    // The buffer and index should always be present, since the pipeline was specialized
+    // off `Gt7ParamsUniform`. Skip the pass rather than bind a mismatched layout.
+    let needs_gt7_params = view_tonemapping_pipeline.binds_gt7_params;
+
+    let gt7_params_binding = if needs_gt7_params {
+        let (Some(_), Some(index)) = (gt7_params_uniforms.buffer(), gt7_params_index) else {
+            return;
+        };
+        Some((gt7_params_uniforms.uniforms(), index.index()))
+    } else {
+        None
+    };
+
+    let gt7_params_uniforms_id =
+        gt7_params_binding.map(|(uniforms, _)| uniforms.buffer().unwrap().id());
+
     let post_process = target.post_process_write();
     let source = post_process.source;
     let destination = post_process.destination;
 
-    let tonemapping_changed = cache.last_tonemapping != Some(*tonemapping);
+    let tonemapping = view_tonemapping_pipeline.operator;
+    let tonemapping_changed = cache.last_tonemapping != Some(tonemapping);
     if tonemapping_changed {
-        cache.last_tonemapping = Some(*tonemapping);
+        cache.last_tonemapping = Some(tonemapping);
     }
 
     let bind_group = match &mut cache.cached {
-        Some((buffer_id, texture_id, lut_id, bind_group))
-            if view_uniforms_id == *buffer_id
-                && source.id() == *texture_id
-                && *lut_id != fallback_image.d3.texture_view.id()
+        Some(cached)
+            if view_uniforms_id == cached.view_uniforms
+                && source.id() == cached.source
+                && cached.lut != fallback_image.d3.texture_view.id()
+                && gt7_params_uniforms_id == cached.gt7_params_uniforms
                 && !tonemapping_changed =>
         {
-            bind_group
+            &cached.bind_group
         }
         cached => {
-            let lut_bindings =
-                get_lut_bindings(&gpu_images, &tonemapping_luts, tonemapping, &fallback_image);
-
-            let bind_group = ctx.render_device().create_bind_group(
-                None,
-                &pipeline_cache.get_bind_group_layout(&tonemapping_pipeline.texture_bind_group),
-                &BindGroupEntries::sequential((
-                    view_uniforms_buffer,
-                    source,
-                    &tonemapping_pipeline.sampler,
-                    lut_bindings.0,
-                    lut_bindings.1,
-                )),
+            let lut_bindings = get_lut_bindings(
+                &gpu_images,
+                &tonemapping_luts,
+                &tonemapping,
+                &fallback_image,
             );
 
-            let (_, _, _, bind_group) = cached.insert((
-                view_uniforms_id,
-                source.id(),
-                lut_bindings.0.id(),
+            let layout = pipeline_cache
+                .get_bind_group_layout(gt7_layout(&tonemapping_pipeline, needs_gt7_params));
+            let render_device = ctx.render_device();
+            let bind_group = match gt7_params_binding {
+                None => render_device.create_bind_group(
+                    None,
+                    &layout,
+                    &BindGroupEntries::sequential((
+                        view_uniforms_buffer,
+                        source,
+                        &tonemapping_pipeline.sampler,
+                        lut_bindings.0,
+                        lut_bindings.1,
+                    )),
+                ),
+                Some((gt7_params_uniforms, _)) => render_device.create_bind_group(
+                    None,
+                    &layout,
+                    &BindGroupEntries::sequential((
+                        view_uniforms_buffer,
+                        source,
+                        &tonemapping_pipeline.sampler,
+                        lut_bindings.0,
+                        lut_bindings.1,
+                        gt7_params_uniforms,
+                    )),
+                ),
+            };
+
+            let cached = cached.insert(CachedBindGroup {
+                view_uniforms: view_uniforms_id,
+                source: source.id(),
+                lut: lut_bindings.0.id(),
+                gt7_params_uniforms: gt7_params_uniforms_id,
                 bind_group,
-            ));
-            bind_group
+            });
+            &cached.bind_group
         }
     };
+
+    // Dynamic offsets in increasing binding order: view (0), then GT7 params (5) if bound.
+    let mut dynamic_offsets = [0u32; 2];
+    let mut dynamic_offset_count = 0;
+    dynamic_offsets[dynamic_offset_count] = view_uniform_offset.offset;
+    dynamic_offset_count += 1;
+    if let Some((_, offset)) = gt7_params_binding {
+        dynamic_offsets[dynamic_offset_count] = offset;
+        dynamic_offset_count += 1;
+    }
 
     let pass_descriptor = RenderPassDescriptor {
         label: Some("tonemapping"),
@@ -127,7 +201,7 @@ pub fn tonemapping(
         let mut render_pass = ctx.command_encoder().begin_render_pass(&pass_descriptor);
 
         render_pass.set_pipeline(pipeline);
-        render_pass.set_bind_group(0, bind_group, &[view_uniform_offset.offset]);
+        render_pass.set_bind_group(0, bind_group, &dynamic_offsets[..dynamic_offset_count]);
         render_pass.draw(0..3, 0..1);
     }
 

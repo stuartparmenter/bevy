@@ -5,9 +5,12 @@ use bevy_ecs::{
     query::{QueryItem, With},
     reflect::ReflectComponent,
 };
-use bevy_math::{AspectRatio, URect, UVec4, Vec2, Vec4};
+use bevy_math::Vec2;
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
-use bevy_render::{extract_component::ExtractComponent, sync_component::SyncComponent, RenderApp};
+use bevy_render::{
+    extract_component::ExtractComponent, sync_component::SyncComponent,
+    view::NeedsSceneLinearTarget, RenderApp,
+};
 
 /// Applies a bloom effect to an HDR-enabled 2d or 3d camera.
 ///
@@ -29,7 +32,7 @@ use bevy_render::{extract_component::ExtractComponent, sync_component::SyncCompo
 /// used in Bevy as well as a visualization of the curve's respective scattering profile.
 #[derive(Component, Reflect, Clone)]
 #[reflect(Component, Default, Clone)]
-#[require(Hdr)]
+#[require(Hdr, NeedsSceneLinearTarget)]
 pub struct Bloom {
     /// Controls the baseline of how much the image is scattered (default: 0.15).
     ///
@@ -115,12 +118,18 @@ pub struct Bloom {
 
     /// Maximum size of each dimension for the largest mipchain texture used in downscaling/upscaling.
     /// Only tweak if you are seeing visual artifacts.
+    ///
+    /// The [`BloomScatterModel::Gt7Glare`] glare size is calibrated for the
+    /// default value of `512`. Other values rescale the glare pattern.
     pub max_mip_dimension: u32,
 
     /// Amount to stretch the bloom on each axis. Artistic control, can be used to emulate
     /// anamorphic blur by using a large x-value. For large values, you may need to increase
     /// [`Bloom::max_mip_dimension`] to reduce sampling artifacts.
     pub scale: Vec2,
+
+    /// Default: [`BloomScatterModel::Aesthetic`].
+    pub scatter: BloomScatterModel,
 }
 
 impl Bloom {
@@ -136,11 +145,22 @@ impl Bloom {
         high_pass_frequency: 1.0,
         prefilter: BloomPrefilter {
             threshold: 0.0,
+            threshold_nits: None,
             threshold_softness: 0.0,
         },
         composite_mode: BloomCompositeMode::EnergyConserving,
         max_mip_dimension: Self::DEFAULT_MAX_MIP_DIMENSION,
         scale: Vec2::ONE,
+        scatter: BloomScatterModel::Aesthetic,
+    };
+
+    /// A preset that uses physically based veiling glare at f/5.6.
+    /// See [`BloomScatterModel::Gt7Glare`].
+    pub const GT7_GLARE: Self = Self {
+        scatter: BloomScatterModel::Gt7Glare {
+            f_number: BloomScatterModel::DEFAULT_F_NUMBER,
+        },
+        ..Self::NATURAL
     };
 
     /// Emulates the look of stylized anamorphic bloom, stretched horizontally.
@@ -159,11 +179,13 @@ impl Bloom {
         high_pass_frequency: 1.0,
         prefilter: BloomPrefilter {
             threshold: 0.6,
+            threshold_nits: None,
             threshold_softness: 0.2,
         },
         composite_mode: BloomCompositeMode::Additive,
         max_mip_dimension: Self::DEFAULT_MAX_MIP_DIMENSION,
         scale: Vec2::ONE,
+        scatter: BloomScatterModel::Aesthetic,
     };
 
     /// A preset that applies a very strong bloom, and blurs the whole screen.
@@ -174,18 +196,82 @@ impl Bloom {
         high_pass_frequency: 1.0 / 3.0,
         prefilter: BloomPrefilter {
             threshold: 0.0,
+            threshold_nits: None,
             threshold_softness: 0.0,
         },
         composite_mode: BloomCompositeMode::EnergyConserving,
         max_mip_dimension: Self::DEFAULT_MAX_MIP_DIMENSION,
         scale: Vec2::ONE,
+        scatter: BloomScatterModel::Aesthetic,
     };
+
+    /// Returns `true` when the downsampling passes must apply the soft-threshold
+    /// prefilter curve. [`BloomScatterModel::Gt7Glare`] never does.
+    pub(crate) fn thresholding_active(&self) -> bool {
+        matches!(self.scatter, BloomScatterModel::Aesthetic) && self.prefilter.is_active()
+    }
+
+    /// The composite mode the upsampling pipeline uses.
+    /// [`BloomScatterModel::Gt7Glare`] forces [`BloomCompositeMode::EnergyConserving`].
+    pub(crate) fn effective_composite_mode(&self) -> BloomCompositeMode {
+        match self.scatter {
+            BloomScatterModel::Aesthetic => self.composite_mode,
+            BloomScatterModel::Gt7Glare { .. } => BloomCompositeMode::EnergyConserving,
+        }
+    }
 }
 
 impl Default for Bloom {
     fn default() -> Self {
         Self::NATURAL
     }
+}
+
+/// How [`Bloom`] distributes scattered light across its blur pyramid when
+/// compositing it back onto the image.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Reflect)]
+#[reflect(Default, Clone, PartialEq)]
+pub enum BloomScatterModel {
+    /// The hand-tuned parametric curve, shaped by [`Bloom::intensity`],
+    /// [`Bloom::low_frequency_boost`], [`Bloom::low_frequency_boost_curvature`]
+    /// and [`Bloom::high_pass_frequency`]. This is the default.
+    #[default]
+    Aesthetic,
+
+    /// Physically based veiling glare inspired by Gran Turismo 7 (SIGGRAPH
+    /// 2025). The per-level weights come from the Fraunhofer diffraction
+    /// point-spread function (the polychromatic Airy pattern) of an ideal
+    /// circular aperture at the given F-number, instead of the parametric curve.
+    /// GT7's own weights are unpublished, so Bevy derives its weights from the
+    /// same physical model.
+    ///
+    /// Under this model:
+    /// * [`Bloom::intensity`] is the total fraction of energy scattered out of
+    ///   the sharp image, and the F-number sets how that energy spreads across
+    ///   blur radii
+    /// * The [`Bloom::prefilter`] threshold is ignored, because a physical PSF
+    ///   scatters all light, and [`Bloom::composite_mode`] is forced to
+    ///   [`BloomCompositeMode::EnergyConserving`], because the blend constants
+    ///   are a chain of energy-conserving lerps
+    /// * [`Bloom::low_frequency_boost`],
+    ///   [`Bloom::low_frequency_boost_curvature`] and
+    ///   [`Bloom::high_pass_frequency`] are unused
+    Gt7Glare {
+        /// The aperture F-number (focal length over aperture diameter) of the
+        /// virtual camera, clamped to `[1.0, 22.0]`.
+        ///
+        /// Small values (f/1.0, wide aperture) give a tight glare that falls off
+        /// steeply with radius. Large values (f/22, stopped down) spread the
+        /// energy into a wide, soft veil. Non-finite or non-positive values warn
+        /// and fall back to [`BloomScatterModel::DEFAULT_F_NUMBER`].
+        f_number: f32,
+    },
+}
+
+impl BloomScatterModel {
+    /// The default aperture F-number for [`Self::Gt7Glare`], a mid-ladder
+    /// photographic aperture.
+    pub const DEFAULT_F_NUMBER: f32 = super::glare::DEFAULT_F_NUMBER;
 }
 
 /// Applies a threshold filter to the input image to extract the brightest
@@ -202,7 +288,21 @@ pub struct BloomPrefilter {
     /// Baseline of the quadratic threshold curve (default: 0.0).
     ///
     /// RGB values under the threshold curve will not contribute to the effect.
+    ///
+    /// In scene-linear framebuffer values, where `1.0` is paper white at the
+    /// tone-map operator output. HDR display targets have a configurable paper
+    /// white, so use [`threshold_nits`](Self::threshold_nits) there to keep the
+    /// cutoff at a fixed brightness.
     pub threshold: f32,
+
+    /// Optional luminance threshold in nits (default: `None`).
+    ///
+    /// Takes precedence over [`threshold`](Self::threshold). The shader compares
+    /// against this divided by the paper white of the view's resolved display
+    /// target (`DisplayTarget::paper_white_nits`, 100 nits for plain SDR targets).
+    ///
+    /// `Some(0.0)` or a negative value disables thresholding.
+    pub threshold_nits: Option<f32>,
 
     /// Controls how much to blend between the thresholded and non-thresholded colors (default: 0.0).
     ///
@@ -211,6 +311,28 @@ pub struct BloomPrefilter {
     ///
     /// Values outside of the range [0.0, 1.0] will be clamped.
     pub threshold_softness: f32,
+}
+
+impl BloomPrefilter {
+    /// Returns `true` when this prefilter requests any thresholding.
+    pub fn is_active(&self) -> bool {
+        match self.threshold_nits {
+            Some(nits) => nits > 0.0,
+            None => self.threshold > 0.0,
+        }
+    }
+
+    /// Resolves the threshold to scene-linear framebuffer units, where `1.0` is
+    /// paper white.
+    ///
+    /// `paper_white_nits` must be positive and finite: use
+    /// `DisplayTarget::sanitized_paper_white_nits`.
+    pub fn resolve_threshold(&self, paper_white_nits: f32) -> f32 {
+        match self.threshold_nits {
+            Some(nits) => (nits / paper_white_nits).max(0.0),
+            None => self.threshold,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Reflect, PartialEq, Eq, Hash, Copy)]
@@ -227,41 +349,107 @@ impl SyncComponent<RenderApp> for Bloom {
 impl ExtractComponent<RenderApp> for Bloom {
     type QueryData = (&'static Self, &'static Camera);
     type QueryFilter = With<Hdr>;
-    type Out = (Self, BloomUniforms);
+    type Out = Self;
 
     fn extract_component((bloom, camera): QueryItem<'_, '_, Self::QueryData>) -> Option<Self::Out> {
+        // `prepare_bloom_uniforms` builds the uniforms in the render world, where
+        // the resolved display target is available. This guard admits only active
+        // cameras with a drawable viewport, so that math never sees a zero size.
         match (
             camera.physical_viewport_rect(),
             camera.physical_viewport_size(),
             camera.physical_target_size(),
             camera.is_active,
         ) {
-            (Some(URect { min: origin, .. }), Some(size), Some(target_size), true)
-                if size.x != 0 && size.y != 0 =>
-            {
-                let threshold = bloom.prefilter.threshold;
-                let threshold_softness = bloom.prefilter.threshold_softness;
-                let knee = threshold * threshold_softness.clamp(0.0, 1.0);
-
-                let uniform = BloomUniforms {
-                    threshold_precomputations: Vec4::new(
-                        threshold,
-                        threshold - knee,
-                        2.0 * knee,
-                        0.25 / (knee + 0.00001),
-                    ),
-                    viewport: UVec4::new(origin.x, origin.y, size.x, size.y).as_vec4()
-                        / UVec4::new(target_size.x, target_size.y, target_size.x, target_size.y)
-                            .as_vec4(),
-                    aspect: AspectRatio::try_from_pixels(size.x, size.y)
-                        .expect("Valid screen size values for Bloom settings")
-                        .ratio(),
-                    scale: bloom.scale,
-                };
-
-                Some((bloom.clone(), uniform))
+            (Some(_), Some(size), Some(_), true) if size.x != 0 && size.y != 0 => {
+                Some(bloom.clone())
             }
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_math::Vec4;
+
+    #[test]
+    fn threshold_precomputations_match_reference_inline_math() {
+        for (threshold, threshold_softness) in [
+            (0.0_f32, 0.0_f32),
+            (0.6, 0.2),
+            (1.0, 1.0),
+            (2.5, 0.5),
+            (0.6, 2.0),
+        ] {
+            let knee = threshold * threshold_softness.clamp(0.0, 1.0);
+            let reference = Vec4::new(
+                threshold,
+                threshold - knee,
+                2.0 * knee,
+                0.25 / (knee + 0.00001),
+            );
+            let shared = BloomUniforms::threshold_precomputations(threshold, threshold_softness);
+            assert_eq!(
+                reference.to_array().map(f32::to_bits),
+                shared.to_array().map(f32::to_bits)
+            );
+        }
+    }
+
+    #[test]
+    fn prefilter_activity() {
+        let fb = BloomPrefilter {
+            threshold: 0.6,
+            ..Default::default()
+        };
+        assert!(fb.is_active());
+        assert!(!BloomPrefilter::default().is_active());
+
+        let nits = BloomPrefilter {
+            threshold: 0.0,
+            threshold_nits: Some(120.0),
+            ..Default::default()
+        };
+        assert!(nits.is_active());
+        let disabled = BloomPrefilter {
+            threshold: 0.6,
+            threshold_nits: Some(0.0),
+            ..Default::default()
+        };
+        assert!(!disabled.is_active());
+        assert!(!BloomPrefilter {
+            threshold_nits: Some(-5.0),
+            ..Default::default()
+        }
+        .is_active());
+    }
+
+    #[test]
+    fn resolve_threshold_converts_nits_by_paper_white() {
+        let fb = BloomPrefilter {
+            threshold: 0.6,
+            ..Default::default()
+        };
+        assert_eq!(fb.resolve_threshold(100.0), 0.6);
+        assert_eq!(fb.resolve_threshold(203.0), 0.6);
+
+        let nits = BloomPrefilter {
+            threshold: 123.0, // ignored
+            threshold_nits: Some(200.0),
+            ..Default::default()
+        };
+        assert_eq!(nits.resolve_threshold(100.0), 2.0);
+        assert_eq!(nits.resolve_threshold(200.0), 1.0);
+
+        assert_eq!(
+            BloomPrefilter {
+                threshold_nits: Some(-50.0),
+                ..Default::default()
+            }
+            .resolve_threshold(100.0),
+            0.0
+        );
     }
 }

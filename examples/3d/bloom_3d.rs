@@ -3,7 +3,7 @@
 use bevy::{
     core_pipeline::tonemapping::Tonemapping,
     math::ops,
-    post_process::bloom::{Bloom, BloomCompositeMode},
+    post_process::bloom::{Bloom, BloomCompositeMode, BloomScatterModel},
     prelude::*,
 };
 use std::{
@@ -135,6 +135,15 @@ fn update_bloom_settings(
                 bloom.prefilter.threshold_softness
             ));
             text.push_str(&format!("(I/K) Horizontal Scale: {:.2}\n", bloom.scale.x));
+            match bloom.scatter {
+                BloomScatterModel::Aesthetic => {
+                    text.push_str("(B) Scatter model: Aesthetic\n");
+                }
+                BloomScatterModel::Gt7Glare { f_number } => {
+                    text.push_str("(B) Scatter model: GT7-style glare\n");
+                    text.push_str(&format!("(O/L) Aperture: f/{f_number:.1}\n"));
+                }
+            }
 
             if keycode.just_pressed(KeyCode::Space) {
                 commands.entity(entity).remove::<Bloom>();
@@ -205,6 +214,25 @@ fn update_bloom_settings(
                 bloom.scale.x += dt * 2.0;
             }
             bloom.scale.x = bloom.scale.x.clamp(0.0, 8.0);
+
+            if keycode.just_pressed(KeyCode::KeyB) {
+                bloom.scatter = match bloom.scatter {
+                    BloomScatterModel::Aesthetic => BloomScatterModel::Gt7Glare {
+                        f_number: BloomScatterModel::DEFAULT_F_NUMBER,
+                    },
+                    BloomScatterModel::Gt7Glare { .. } => BloomScatterModel::Aesthetic,
+                };
+            }
+            if let BloomScatterModel::Gt7Glare { ref mut f_number } = bloom.scatter {
+                // Change the aperture by one f-stop per second.
+                if keycode.pressed(KeyCode::KeyL) {
+                    *f_number /= ops::exp2(dt * 0.5);
+                }
+                if keycode.pressed(KeyCode::KeyO) {
+                    *f_number *= ops::exp2(dt * 0.5);
+                }
+                *f_number = f_number.clamp(1.0, 22.0);
+            }
         }
 
         (entity, None) => {

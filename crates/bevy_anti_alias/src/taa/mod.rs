@@ -4,6 +4,7 @@ use bevy_camera::{Camera, Camera3d};
 use bevy_core_pipeline::{
     prepass::{DepthPrepass, MotionVectorPrepass, ViewPrepassTextures},
     schedule::{Core3d, Core3dSystems},
+    tonemapping::Tonemapping,
     FullscreenShader,
 };
 use bevy_diagnostic::FrameCount;
@@ -34,7 +35,7 @@ use bevy_render::{
     sync_component::{SyncComponent, SyncComponentPlugin},
     sync_world::RenderEntity,
     texture::{CachedTexture, TextureCache},
-    view::{ExtractedView, Msaa, ViewTarget},
+    view::{ExtractedView, Msaa, NeedsSceneLinearTarget, ViewDisplayTarget, ViewTarget},
     ExtractSchedule, MainWorld, Render, RenderApp, RenderStartup, RenderSystems,
 };
 use bevy_utils::default;
@@ -110,7 +111,13 @@ impl Plugin for TemporalAntiAliasPlugin {
 /// 2. Render particles after TAA
 #[derive(Component, Reflect, Clone)]
 #[reflect(Component, Default, Clone)]
-#[require(TemporalJitter, MipBias, DepthPrepass, MotionVectorPrepass)]
+#[require(
+    TemporalJitter,
+    MipBias,
+    DepthPrepass,
+    MotionVectorPrepass,
+    NeedsSceneLinearTarget
+)]
 #[doc(alias = "Taa")]
 pub struct TemporalAntiAliasing {
     /// Set to true to delete the saved temporal history (past frames).
@@ -443,12 +450,21 @@ fn prepare_taa_pipelines(
         &ExtractedCamera,
         &ExtractedView,
         &TemporalAntiAliasing,
+        Option<&Tonemapping>,
+        &ViewDisplayTarget,
     )>,
 ) -> Result<(), BevyError> {
-    for (entity, camera, view, taa_settings) in &cameras {
+    for (entity, camera, view, taa_settings, tonemapping, display_target) in &cameras {
         let mut pipeline_key = TaaPipelineKey {
             target_format: view.target_format,
-            tonemap: camera.hdr,
+            // The reversible tonemapper (`TONEMAP` def) is needed whenever the main
+            // texture holds unbounded scene-referred values at TAA time, so history
+            // blending and neighborhood clamping work on a compressed range. TAA runs
+            // before the tonemapping node, and an HDR-transfer display target keeps an
+            // fp16 main texture even with `Tonemapping::None`.
+            tonemap: camera.hdr
+                || tonemapping.is_some_and(Tonemapping::is_enabled)
+                || display_target.is_hdr_transfer(),
             reset: taa_settings.reset,
         };
         let pipeline_id = pipeline

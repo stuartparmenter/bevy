@@ -9,6 +9,12 @@ import package::tonemapping::lut_bindings::{
     dt_lut_sampler,
 };
 
+@if(TONEMAP_METHOD_GRAN_TURISMO_7)
+import package::tonemapping::gt7::tone_mapping_gran_turismo_7;
+
+@if(WORKING_COLOR_SPACE_REC2020)
+import bevy_render::working_color_space::rec2020_to_rec709;
+
 // Half the size of the crossfade region between shadows and midtones and
 // between midtones and highlights. This value, 0.1, corresponds to 10% of the
 // gamut on either side of the cutoff point.
@@ -374,6 +380,21 @@ fn tone_mapping(in: vec4<f32>, in_color_grading: ColorGrading) -> vec4<f32> {
     var color = max(in.rgb, vec3(0.0));
     var color_grading = in_color_grading;   // So we can take pointers to it.
 
+@if(WORKING_COLOR_SPACE_REC2020 && !TONEMAP_METHOD_GRAN_TURISMO_7) {
+    // The scene buffer holds linear Rec.2020 working-space values, but every operator
+    // below, and the grading stack, is fit to Rec.709 primaries. The AgX, Tony McMapface,
+    // and Blender Filmic LUTs have no algorithmic source, so they cannot be rebaked for
+    // Rec.2020. Convert at the pass entry instead. The output is Rec.709 display-linear
+    // with 1.0 = paper white. Colors outside the Rec.709 gamut are clipped here.
+    //
+    // Gran Turismo 7 is excluded because it is Rec.2020-native: it takes the working-space
+    // values directly and skips its own Rec.709 to Rec.2020 input expansion (see
+    // gt7.wesl). Its grading runs on Rec.2020 values with Rec.709-fit constants, as do the
+    // post-tonemapping saturation, the deband dither, and the FXAA/SMAA luma weights when
+    // TONEMAP_OUTPUT_REC2020 keeps GT7's output Rec.2020.
+    color = max(rec2020_to_rec709(color), vec3(0.0));
+}
+
     // Rotate hue if needed, by converting to and from HSV. Remember that hue is
     // an angle, so it needs to be modulo 2π.
 @if(HUE_ROTATE) {
@@ -401,6 +422,8 @@ fn tone_mapping(in: vec4<f32>, in_color_grading: ColorGrading) -> vec4<f32> {
 
     // tone_mapping
 @if(TONEMAP_METHOD_NONE) {
+    // No tone curve. Grading, dither, and the working-space conversion at the pass entry
+    // still apply, and the output stays unbounded display-linear.
     color = color;
 } @elif(TONEMAP_METHOD_REINHARD) {
     color = tonemapping_reinhard(color.rgb);
@@ -419,6 +442,8 @@ fn tone_mapping(in: vec4<f32>, in_color_grading: ColorGrading) -> vec4<f32> {
     color = sample_blender_filmic_lut(color.rgb);
 } @elif(TONEMAP_METHOD_PBR_NEUTRAL) {
     color = tonemapping_pbr_neutral(color.rgb);
+} @elif(TONEMAP_METHOD_GRAN_TURISMO_7) {
+    color = tone_mapping_gran_turismo_7(color.rgb);
 }
 
     // Perceptual post tonemapping grading

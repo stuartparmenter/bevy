@@ -16,6 +16,12 @@
 // have a lot of bright specular reflections.
 //
 // The final target_exposure is finally used to smoothly adjust the exposure value over time.
+// Optionally, a long-term envelope bounds this short-term exposure (see
+// `PhysiologicalAdaptation` on the Rust side).
+//
+// The same pass optionally meters the scene's luminance-weighted average chromaticity for auto
+// white balance (see `AutoWhiteBalance` on the Rust side) and composes a von Kries correction
+// into the view's color-grading balance matrix.
 
 import bevy_render::view::View;
 import bevy_render::globals::Globals;
@@ -32,6 +38,36 @@ struct AutoExposure {
     speed_up: f32,
     speed_down: f32,
     exponential_transition_distance: f32,
+    metering_bias: f32,
+    long_term_speed_up: f32,
+    long_term_speed_down: f32,
+    long_term_bound_up: f32,
+    long_term_bound_down: f32,
+    physiological: u32,
+    // Chromaticity adaptation speed, per second.
+    awb_speed: f32,
+    // Virtual-light anchor luminance, scene-linear units.
+    awb_anchor: f32,
+    // Non-zero when auto white balance is enabled for this view.
+    awb_enabled: u32,
+    // Tail padding to 80 bytes, matching the CPU mirror.
+    pad_0: u32,
+    pad_1: u32,
+    pad_2: u32,
+}
+
+// Per-view adaptation state, persisted on the GPU between frames.
+struct AutoExposureState {
+    // The short-term exposure correction, in EV.
+    exposure: f32,
+    // The long-term adaptation envelope, in EV.
+    long_term: f32,
+    // The adapted white point chromaticity, CIE 1931 xy.
+    chroma_x: f32,
+    chroma_y: f32,
+    // Fixed-point Yxy sums: luminance-weighted x, y, and the luminance weight.
+    // compute_histogram fills them, compute_average drains them.
+    chroma_sums: array<atomic<u32>, 3>,
 }
 
 struct CompensationCurve {
@@ -55,15 +91,142 @@ struct CompensationCurve {
 
 @group(0) @binding(6) var<storage, read_write> histogram: array<atomic<u32>, 64>;
 
-@group(0) @binding(7) var<storage, read_write> exposure: f32;
+@group(0) @binding(7) var<storage, read_write> state: AutoExposureState;
 
 @group(0) @binding(8) var<storage, read_write> view: View;
 
 var<workgroup> histogram_shared: array<atomic<u32>, 64>;
 
+var<workgroup> chroma_shared: array<atomic<u32>, 3>;
+
+// Fixed-point scale for the per-pixel accumulation into chroma_shared. Contributions
+// are bounded by the maximum metering weight (16), so a 256-pixel workgroup stays
+// below 16 * 256 * 2^16 = 2^28 < 2^32.
+const CHROMA_WORKGROUP_SCALE: f32 = 65536.0;
+
+// Fixed-point scale for the per-workgroup flush into state.chroma_sums. The flushed
+// values are normalized by the total pixel count, so the sums stay below
+// 16 * 2^24 = 2^28 < 2^32.
+const CHROMA_FLUSH_SCALE: f32 = 16777216.0;
+
+// CIE 1931 xy of the D65 white point. Keep in sync with `D65_XY` in
+// `bevy_render/src/view/mod.rs` and `D65_XY` in `buffers.rs`.
+const AWB_D65_XY = vec2<f32>(0.31272, 0.32903);
+
+// Rows of the linear-RGB -> CIE 1931 XYZ matrices (D65 white point), from the
+// Rec.709 (IEC 61966-2-1 / ITU-R BT.709) and ITU-R BT.2020 primaries.
+const AWB_REC709_TO_X = vec3<f32>(0.4123907992659595, 0.35758433938387796, 0.1804807884018343);
+const AWB_REC709_TO_Y = vec3<f32>(0.21263900587151036, 0.7151686787677559, 0.07219231536073371);
+const AWB_REC709_TO_Z = vec3<f32>(0.01933081871559185, 0.11919477979462599, 0.9505321522496607);
+const AWB_REC2020_TO_X = vec3<f32>(0.6369580483012913, 0.14461690358620838, 0.16888097516417205);
+const AWB_REC2020_TO_Y = vec3<f32>(0.26270021201126703, 0.677998071518871, 0.059301716469861945);
+const AWB_REC2020_TO_Z = vec3<f32>(0.0, 0.028072693049087508, 1.0609850577107909);
+
+// Rows of the inverse of `AWB_REC709_TO_*` (CIE 1931 XYZ -> linear Rec.709 RGB, D65).
+// Used to express white points in RGB for the von Kries gains below.
+const AWB_XYZ_TO_REC709_R = vec3<f32>(3.2409699419045208, -1.537383177570093, -0.49861076029300311);
+const AWB_XYZ_TO_REC709_G = vec3<f32>(-0.96924363628087962, 1.8759675015077208, 0.041555057407175612);
+const AWB_XYZ_TO_REC709_B = vec3<f32>(0.055630079696993608, -0.20397695888897655, 1.0569715142428784);
+
+// The CAM16-derived RGB <-> LMS matrices, copied from `RGB_TO_LMS` / `LMS_TO_RGB` in
+// `bevy_render/src/view/mod.rs`; keep in sync. This is bevy's white-normalized variant
+// of the CAM16 LMS basis (rows sum to 1.0, RGB white maps to LMS (1, 1, 1)), not the
+// raw CAM16 transform of CIE XYZ.
+const AWB_RGB_TO_LMS = mat3x3<f32>(
+    vec3(0.311692, 0.0905138, 0.00764433),
+    vec3(0.652085, 0.901341, 0.0486554),
+    vec3(0.0362225, 0.00814478, 0.943700),
+);
+const AWB_LMS_TO_RGB = mat3x3<f32>(
+    vec3(4.06305, -0.40791, -0.0118812),
+    vec3(-2.93241, 1.40437, -0.0486532),
+    vec3(-0.130646, 0.00353630, 1.0605344),
+);
+
+// The linear Rec.709 RGB coordinates of the white point with CIE 1931 chromaticity `xy`
+// at unit luminance (Y = 1).
+fn awb_xy_to_rec709(xy: vec2<f32>) -> vec3<f32> {
+    let xyz = vec3(xy.x / xy.y, 1.0, (1.0 - xy.x - xy.y) / xy.y);
+    return vec3(
+        dot(xyz, AWB_XYZ_TO_REC709_R),
+        dot(xyz, AWB_XYZ_TO_REC709_G),
+        dot(xyz, AWB_XYZ_TO_REC709_B),
+    );
+}
+
+// The correlated color temperature of a CIE 1931 chromaticity, using McCamy's
+// approximation (C. S. McCamy 1992, "Correlated color temperature as an explicit
+// function of chromaticity coordinates", Color Research & Application 17(2)).
+// The denominator stays negative: real illuminants sit above the y = 0.1858 epicenter,
+// and a sign flip would read chromaticities below it (deep blue scenes) as extremely
+// warm. The clamp on `n` bounds the CCT to 1632 K - 21334 K.
+fn awb_cct(xy: vec2<f32>) -> f32 {
+    let d = min(0.1858 - xy.y, -1e-6);
+    let n = clamp((xy.x - 0.3320) / d, -1.2, 1.3);
+    return ((449.0 * n + 3525.0) * n + 6823.3) * n + 5520.33;
+}
+
+// The CIE 1931 xy chromaticity of a Planckian (blackbody) radiator at the given
+// correlated color temperature, using the cubic approximation of Kang et al. 2002,
+// "Design of advanced color temperature control system for HDTV applications",
+// J. Korean Phys. Soc. 41(6). Valid 1667 K - 25000 K.
+fn awb_planckian_xy(cct: f32) -> vec2<f32> {
+    let t = cct;
+    let t2 = t * t;
+    let t3 = t2 * t;
+    var x = 0.0;
+    if t <= 4000.0 {
+        x = -0.2661239e9 / t3 - 0.2343589e6 / t2 + 0.8776956e3 / t + 0.179910;
+    } else {
+        x = -3.0258469e9 / t3 + 2.1070379e6 / t2 + 0.2226347e3 / t + 0.240390;
+    }
+    let x2 = x * x;
+    let x3 = x2 * x;
+    var y = 0.0;
+    if t <= 2222.0 {
+        y = -1.1063814 * x3 - 1.34811020 * x2 + 2.18555832 * x - 0.20219683;
+    } else if t <= 4000.0 {
+        y = -0.9549476 * x3 - 1.37418593 * x2 + 2.09137015 * x - 0.16748867;
+    } else {
+        y = 3.0817580 * x3 - 5.87338670 * x2 + 3.75112997 * x - 0.37001483;
+    }
+    return vec2(x, y);
+}
+
+// The white balance correction for a scene whose adapted illuminant chromaticity is
+// `adapted_xy`. The CCT is clamped to 2500 K - 7000 K, the output range of typical
+// real-camera AWB specifications. The off-locus tint is preserved, clamped to +/-0.05
+// in xy for stability. A von Kries adaptation in bevy's CAM16-derived RGB <-> LMS basis
+// then neutralizes the white point towards D65.
+fn awb_balance_matrix(adapted_xy: vec2<f32>) -> mat3x3<f32> {
+    let cct = awb_cct(adapted_xy);
+    let locus = awb_planckian_xy(clamp(cct, 1667.0, 25000.0));
+    let tint = clamp(adapted_xy - locus, vec2(-0.05), vec2(0.05));
+    let white_xy = awb_planckian_xy(clamp(cct, 2500.0, 7000.0)) + tint;
+
+    // Von Kries adaptation: one gain per cone response, scaling the estimated illuminant
+    // to D65. Derive the gains in the same LMS basis the
+    // `AWB_LMS_TO_RGB * diag(gain) * AWB_RGB_TO_LMS` sandwich uses, so both white points
+    // go through `AWB_RGB_TO_LMS` from their Rec.709 coordinates. In raw CAM16 LMS a
+    // converged correction leaves tungsten light at an R/B ratio of ~1.54 instead of ~1.0.
+    // Both white points use Y = 1, so the correction keeps the luminance, and D65 gives a
+    // gain of exactly 1.0.
+    let gain = (AWB_RGB_TO_LMS * awb_xy_to_rec709(AWB_D65_XY))
+        / (AWB_RGB_TO_LMS * awb_xy_to_rec709(white_xy));
+    let scaled = mat3x3<f32>(
+        gain * AWB_RGB_TO_LMS[0],
+        gain * AWB_RGB_TO_LMS[1],
+        gain * AWB_RGB_TO_LMS[2],
+    );
+    return AWB_LMS_TO_RGB * scaled;
+}
+
 // For a given color, return the histogram bin index
 fn color_to_bin(hdr: vec3<f32>) -> u32 {
     // Convert color to luminance
+@if(WORKING_COLOR_SPACE_REC2020)
+    let lum = dot(hdr, AWB_REC2020_TO_Y);
+@else
     let lum = dot(hdr, RGB_TO_LUM);
 
     if lum < exp2(settings.min_log_lum) {
@@ -96,7 +259,13 @@ fn compute_histogram(
 ) {
     // Clear the workgroup shared histogram
     if local_invocation_index < 64 {
-        histogram_shared[local_invocation_index] = 0u;
+        atomicStore(&histogram_shared[local_invocation_index], 0u);
+    }
+
+    // This guard is non-uniform, but no auto white balance branch contains a barrier:
+    // both workgroup barriers below sit at function scope.
+    if settings.awb_enabled != 0u && local_invocation_index < 3u {
+        atomicStore(&chroma_shared[local_invocation_index], 0u);
     }
 
     // Wait for all workgroup threads to clear the shared histogram
@@ -112,6 +281,38 @@ fn compute_histogram(
 
         // Increment the shared histogram bin by the weight obtained from the metering mask
         atomicAdd(&histogram_shared[index], weight);
+
+        if settings.awb_enabled != 0u {
+            let awb_col = max(col, vec3(0.0));
+
+@if(WORKING_COLOR_SPACE_REC2020)
+            let big_x = dot(awb_col, AWB_REC2020_TO_X);
+@else
+            let big_x = dot(awb_col, AWB_REC709_TO_X);
+@if(WORKING_COLOR_SPACE_REC2020)
+            let big_y = dot(awb_col, AWB_REC2020_TO_Y);
+@else
+            let big_y = dot(awb_col, AWB_REC709_TO_Y);
+@if(WORKING_COLOR_SPACE_REC2020)
+            let big_z = dot(awb_col, AWB_REC2020_TO_Z);
+@else
+            let big_z = dot(awb_col, AWB_REC709_TO_Z);
+
+            let xyz_sum = big_x + big_y + big_z;
+            if xyz_sum > 0.0 {
+                // Weight (x, y) by the metering mask and by the luminance. The luminance
+                // saturates at the top of the metering range so the sums cannot overflow.
+                let y_cap = exp2(settings.min_log_lum + settings.log_lum_range);
+                let y_norm = clamp(big_y / y_cap, 0.0, 1.0);
+                let lum_weight = y_norm * f32(weight);
+                let contribution = vec3(big_x / xyz_sum, big_y / xyz_sum, 1.0) * lum_weight;
+
+                let fixed_point = contribution * CHROMA_WORKGROUP_SCALE + vec3(0.5);
+                atomicAdd(&chroma_shared[0], u32(fixed_point.x));
+                atomicAdd(&chroma_shared[1], u32(fixed_point.y));
+                atomicAdd(&chroma_shared[2], u32(fixed_point.z));
+            }
+        }
     }
 
     // Wait for all workgroup threads to finish updating the workgroup histogram
@@ -119,9 +320,22 @@ fn compute_histogram(
 
     // Accumulate the workgroup histogram into the global histogram.
     // Note that the global histogram was not cleared at the beginning,
-    // as it will be cleared in compute_average.
-    var histogram_value = atomicLoad(&histogram_shared[local_invocation_index]);
-    atomicAdd(&histogram[local_invocation_index], histogram_value);
+    // as it will be cleared in compute_average. Without the guard, lanes 64..255 would
+    // clamp onto bin 63 (naga's default bounds-check policy) and inflate it.
+    if local_invocation_index < 64u {
+        atomicAdd(
+            &histogram[local_invocation_index],
+            atomicLoad(&histogram_shared[local_invocation_index]),
+        );
+    }
+
+    // Flush the workgroup chroma sums into the per-view state. Normalizing by the pixel
+    // count buys headroom in the fixed-point sums; compute_average cancels it out.
+    if settings.awb_enabled != 0u && local_invocation_index < 3u {
+        let workgroup_sum = f32(atomicLoad(&chroma_shared[local_invocation_index])) / CHROMA_WORKGROUP_SCALE;
+        let normalized = workgroup_sum / (f32(dim.x) * f32(dim.y));
+        atomicAdd(&state.chroma_sums[local_invocation_index], u32(normalized * CHROMA_FLUSH_SCALE + 0.5));
+    }
 }
 
 @compute @workgroup_size(1, 1, 1)
@@ -134,10 +348,10 @@ fn compute_average(@builtin(local_invocation_index) local_index: u32) {
     // the low_percent and high_percent settings.
     for (var i=0u; i<64u; i+=1u) {
         histogram_sum += atomicLoad(&histogram[i]);
-        histogram_shared[i] = histogram_sum;
+        atomicStore(&histogram_shared[i], histogram_sum);
 
         // Clear the histogram bin for the next frame
-        histogram[i] = 0u;
+        atomicStore(&histogram[i], 0u);
     }
 
     let first_index = u32(f32(histogram_sum) * settings.low_percent);
@@ -165,6 +379,12 @@ fn compute_average(@builtin(local_invocation_index) local_index: u32) {
             + settings.min_log_lum;
     }
 
+    // A constant EV offset on the metered luminance, applied before the compensation
+    // curve is sampled. The branch keeps the default path on the exact histogram average.
+    if settings.metering_bias != 0.0 {
+        avg_lum += settings.metering_bias;
+    }
+
     // The position in the compensation curve texture to sample for avg_lum.
     let u = (avg_lum - compensation_curve.min_log_lum) * compensation_curve.inv_log_lum_range;
 
@@ -176,7 +396,8 @@ fn compute_average(@builtin(local_invocation_index) local_index: u32) {
         + compensation_curve.min_compensation
         - avg_lum;
 
-    // Smoothly adjust the `exposure` towards the `target_exposure`
+    // Smoothly adjust the short-term `exposure` towards the `target_exposure`
+    var exposure = state.exposure;
     let delta = target_exposure - exposure;
     if target_exposure > exposure {
         let speed_down = settings.speed_down * globals.delta_time;
@@ -188,7 +409,74 @@ fn compute_average(@builtin(local_invocation_index) local_index: u32) {
         exposure = exposure + max(-speed_up, delta * exp_up);
     }
 
+    // The long-term envelope: a slow, asymmetric follower of the short-term exposure,
+    // modeling receptor sensitivity.
+    var long_term = state.long_term;
+    let long_term_delta = exposure - long_term;
+    if exposure > long_term {
+        let long_term_speed_down = settings.long_term_speed_down * globals.delta_time;
+        let long_term_exp_down = long_term_speed_down / settings.exponential_transition_distance;
+        long_term = long_term + min(long_term_speed_down, long_term_delta * long_term_exp_down);
+    } else {
+        let long_term_speed_up = settings.long_term_speed_up * globals.delta_time;
+        let long_term_exp_up = long_term_speed_up / settings.exponential_transition_distance;
+        long_term = long_term + max(-long_term_speed_up, long_term_delta * long_term_exp_up);
+    }
+
+    // The envelope bounds the short-term result, so dark scenes stay dark until the
+    // envelope has had time to adapt.
+    if settings.physiological != 0u {
+        exposure = clamp(
+            exposure,
+            long_term - settings.long_term_bound_down,
+            long_term + settings.long_term_bound_up,
+        );
+    }
+
+    state.exposure = exposure;
+    state.long_term = long_term;
+
     // Apply the exposure to the color grading settings, from where it will be used for the color
     // grading pass.
     view.color_grading.exposure += exposure;
+
+    // Auto white balance. The flag is uniform, so views without it do no extra work.
+    if settings.awb_enabled != 0u {
+        let sum_yx = f32(atomicLoad(&state.chroma_sums[0])) / CHROMA_FLUSH_SCALE;
+        let sum_yy = f32(atomicLoad(&state.chroma_sums[1])) / CHROMA_FLUSH_SCALE;
+        let sum_y = f32(atomicLoad(&state.chroma_sums[2])) / CHROMA_FLUSH_SCALE;
+        atomicStore(&state.chroma_sums[0], 0u);
+        atomicStore(&state.chroma_sums[1], 0u);
+        atomicStore(&state.chroma_sums[2], 0u);
+
+        // The mean metered scene luminance, in scene-linear units. The sums are normalized
+        // by the pixel count and by the top of the metering range, and histogram_sum is the
+        // total metering weight, so the pixel count cancels.
+        let dim = vec2<f32>(textureDimensions(tex_color));
+        var lum_scale = 0.0;
+        if histogram_sum > 0u {
+            let y_cap = exp2(settings.min_log_lum + settings.log_lum_range);
+            lum_scale = dim.x * dim.y * y_cap / f32(histogram_sum);
+        }
+        let scene_luminance = sum_y * lum_scale;
+
+        // Blend in the D65 virtual light anchor as one more luminance-weighted reference.
+        // Its relative weight rises as the scene darkens, keeping near-dark scenes stable.
+        let denom = scene_luminance + settings.awb_anchor;
+        if denom > 0.0 {
+            let target_x = (sum_yx * lum_scale + settings.awb_anchor * AWB_D65_XY.x) / denom;
+            let target_y = (sum_yy * lum_scale + settings.awb_anchor * AWB_D65_XY.y) / denom;
+
+            // Chromaticity only; auto exposure handles luminance. The saturate keeps a
+            // single frame from overshooting.
+            let alpha = saturate(settings.awb_speed * globals.delta_time);
+            state.chroma_x += (target_x - state.chroma_x) * alpha;
+            state.chroma_y += (target_y - state.chroma_y) * alpha;
+        }
+
+        // The tonemapping pass applies `balance * color`, so right-multiplying puts the
+        // automatic correction innermost: it runs first, the artist grade on top.
+        view.color_grading.balance = view.color_grading.balance
+            * awb_balance_matrix(vec2(state.chroma_x, state.chroma_y));
+    }
 }
