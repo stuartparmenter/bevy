@@ -7,6 +7,8 @@ import bevy_pbr::render::{
     pbr_bindings,
 };
 
+@if(TONEMAP_IN_SHADER) import bevy_core_pipeline::tonemapping::tone_mapping;
+
 @group(constants::MATERIAL_BIND_GROUP) @binding(0) var my_array_texture: texture_2d_array<f32>;
 @group(constants::MATERIAL_BIND_GROUP) @binding(1) var my_array_texture_sampler: sampler;
 
@@ -55,6 +57,11 @@ fn fragment(
 
     pbr_input.V = fns::calculate_view(mesh.world_position, pbr_input.is_orthographic);
 
-    // Scene-linear output
-    return fns::apply_pbr_lighting(pbr_input);
+    var out = fns::apply_pbr_lighting(pbr_input);
+    // Cameras on the in-shader path get no tone-mapping pass, so the shader
+    // applies the operator itself. Node-path cameras want scene-linear output.
+@if(TONEMAP_IN_SHADER) {
+    out = tone_mapping(out, view.color_grading);
+}
+    return out;
 }
