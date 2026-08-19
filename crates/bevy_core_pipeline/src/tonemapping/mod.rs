@@ -702,6 +702,7 @@ fn setup_tonemapping_lut_image(bytes: &[u8], image_type: ImageType) -> Image {
         image_sampler,
         // LUT must be kept in main world for render recovery reasons
         RenderAssetUsages::default(),
+        None,
     )
     .unwrap()
 }

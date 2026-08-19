@@ -1,6 +1,6 @@
 use crate::{Image, SourceColorPrimaries, TextureFormatPixelInfo};
 use bevy_asset::{io::Reader, AssetLoader, LoadContext, RenderAssetUsages};
-use bevy_color::Chromaticity;
+use bevy_color::{Chromaticity, RgbPrimaries};
 use bevy_reflect::TypePath;
 use image::ImageDecoder;
 use serde::{Deserialize, Serialize};
@@ -19,11 +19,9 @@ pub struct ExrTextureLoader;
 pub struct ExrTextureLoaderSettings {
     /// Where the asset will be used - see the docs on [`RenderAssetUsages`] for details.
     pub asset_usage: RenderAssetUsages,
-    /// The color primaries the image data is expressed in, stamped on
-    /// [`Image::source_primaries`].
-    ///
-    /// `None` (the default) reads the file's `chromaticities` header attribute, then
-    /// falls back to [`SourceColorPrimaries::Bt709`].
+    /// Overrides the primaries stamped on [`Image::source_primaries`]. With the default
+    /// `None`, the loader reads the file's `chromaticities` attribute. See
+    /// [`SourceColorPrimaries`] for the resolution order.
     #[serde(default)]
     pub source_primaries: Option<SourceColorPrimaries>,
 }
@@ -63,17 +61,8 @@ impl AssetLoader for ExrTextureLoader {
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes).await?;
 
-        // The `image` crate's OpenEXR decoder drops the header color metadata, so read
-        // the header again with the decoder's own `exr` crate. When a setting overrides
-        // the primaries, skip the parse and its unsupported-primaries warning.
-        let file_source_primaries = if settings.source_primaries.is_none() {
-            read_exr_chromaticities(&bytes)
-        } else {
-            None
-        };
-
         let decoder = image::codecs::openexr::OpenExrDecoder::with_alpha_preference(
-            std::io::Cursor::new(bytes),
+            std::io::Cursor::new(bytes.as_slice()),
             Some(true),
         )?;
         let (width, height) = decoder.dimensions();
@@ -94,10 +83,11 @@ impl AssetLoader for ExrTextureLoader {
             format,
             settings.asset_usage,
         );
-        image.source_primaries = settings
-            .source_primaries
-            .or(file_source_primaries)
-            .unwrap_or_default();
+        // The `image` crate's OpenEXR decoder drops the header color metadata, so read
+        // the header again with the decoder's own `exr` crate.
+        image.source_primaries = SourceColorPrimaries::resolve(settings.source_primaries, || {
+            read_exr_chromaticities(&bytes)
+        });
         Ok(image)
     }
 
@@ -106,27 +96,27 @@ impl AssetLoader for ExrTextureLoader {
     }
 }
 
-/// Reads the `chromaticities` header attribute (four CIE 1931 xy coordinates: red,
-/// green, blue, white) and matches it against the supported [`SourceColorPrimaries`].
+/// Reads the `chromaticities` header attribute and matches it against the supported
+/// [`SourceColorPrimaries`].
 ///
 /// Returns `None` when the attribute is absent, the header cannot be parsed, or the
-/// primaries are not supported. Unsupported primaries warn once.
+/// primaries are not supported. Unsupported primaries log a warning once.
 fn read_exr_chromaticities(bytes: &[u8]) -> Option<SourceColorPrimaries> {
-    // Errors are swallowed: this is best-effort metadata, and any structural problem
+    // Errors are swallowed. This is best-effort metadata, and any structural problem
     // with the file surfaces in the decode instead.
     let metadata =
         exr::meta::MetaData::read_from_buffered(std::io::Cursor::new(bytes), false).ok()?;
     let chromaticities = metadata.headers.first()?.shared_attributes.chromaticities?;
-    let source_primaries = SourceColorPrimaries::from_chromaticities(
-        Chromaticity::new(chromaticities.red.0, chromaticities.red.1),
-        Chromaticity::new(chromaticities.green.0, chromaticities.green.1),
-        Chromaticity::new(chromaticities.blue.0, chromaticities.blue.1),
-        Chromaticity::new(chromaticities.white.0, chromaticities.white.1),
-    );
+    let source_primaries = SourceColorPrimaries::from_chromaticities(RgbPrimaries {
+        red: Chromaticity::new(chromaticities.red.0, chromaticities.red.1),
+        green: Chromaticity::new(chromaticities.green.0, chromaticities.green.1),
+        blue: Chromaticity::new(chromaticities.blue.0, chromaticities.blue.1),
+        white: Chromaticity::new(chromaticities.white.0, chromaticities.white.1),
+    });
     if source_primaries.is_none() {
         once!(warn!(
-            "OpenEXR file declares chromaticities {chromaticities:?} that do not match a \
-            supported primary set; assuming BT.709",
+            "OpenEXR file declares chromaticities {chromaticities:?}, which Bevy does not \
+            support. Assuming BT.709 primaries.",
         ));
     }
     source_primaries
@@ -151,14 +141,18 @@ mod tests {
         bytes.into_inner()
     }
 
+    fn chromaticities(primaries: RgbPrimaries) -> exr::meta::attribute::Chromaticities {
+        exr::meta::attribute::Chromaticities {
+            red: exr::math::Vec2(primaries.red.x, primaries.red.y),
+            green: exr::math::Vec2(primaries.green.x, primaries.green.y),
+            blue: exr::math::Vec2(primaries.blue.x, primaries.blue.y),
+            white: exr::math::Vec2(primaries.white.x, primaries.white.y),
+        }
+    }
+
     #[test]
     fn exr_chromaticities_are_read_from_the_header() {
-        let bytes = write_test_exr(Some(exr::meta::attribute::Chromaticities {
-            red: exr::math::Vec2(0.708, 0.292),
-            green: exr::math::Vec2(0.170, 0.797),
-            blue: exr::math::Vec2(0.131, 0.046),
-            white: exr::math::Vec2(0.3127, 0.3290),
-        }));
+        let bytes = write_test_exr(Some(chromaticities(RgbPrimaries::BT2020)));
         assert_eq!(
             read_exr_chromaticities(&bytes),
             Some(SourceColorPrimaries::Bt2020)
@@ -173,13 +167,8 @@ mod tests {
 
     #[test]
     fn exr_with_unknown_chromaticities_yields_none() {
-        // ACEScg (AP1) primaries: a valid file value, but not a supported variant.
-        let bytes = write_test_exr(Some(exr::meta::attribute::Chromaticities {
-            red: exr::math::Vec2(0.713, 0.293),
-            green: exr::math::Vec2(0.165, 0.830),
-            blue: exr::math::Vec2(0.128, 0.044),
-            white: exr::math::Vec2(0.32168, 0.33767),
-        }));
+        // ACEScg primaries are a valid file value but not a supported variant.
+        let bytes = write_test_exr(Some(chromaticities(RgbPrimaries::ACES_CG)));
         assert_eq!(read_exr_chromaticities(&bytes), None);
     }
 }

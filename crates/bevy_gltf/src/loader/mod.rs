@@ -1203,6 +1203,12 @@ impl AssetLoader for GltfLoader {
     }
 }
 
+/// The primaries every glTF texture is stamped with, overriding file metadata.
+///
+/// The glTF 2.0 spec mandates BT.709 primaries for textures, and `KHR_texture_basisu`
+/// requires the same from KTX2 files.
+const GLTF_SOURCE_PRIMARIES: Option<SourceColorPrimaries> = Some(SourceColorPrimaries::Bt709);
+
 /// Loads a glTF texture as a bevy [`Image`] and returns it together with its label.
 async fn load_image<'a, 'b>(
     gltf_texture: gltf::Texture<'a>,
@@ -1219,22 +1225,20 @@ async fn load_image<'a, 'b>(
     } else {
         texture_sampler(&gltf_texture, default_sampler)
     };
-
     match gltf_texture.source().source() {
         Source::View { view, mime_type } => {
             let start = view.offset();
             let end = view.offset() + view.length();
             let buffer = &buffer_data[view.buffer().index()][start..end];
-            let mut image = Image::from_buffer(
+            let image = Image::from_buffer(
                 buffer,
                 ImageType::MimeType(mime_type),
                 supported_compressed_formats,
                 is_srgb,
                 ImageSampler::Descriptor(sampler_descriptor),
                 settings.load_materials,
+                GLTF_SOURCE_PRIMARIES,
             )?;
-            // glTF 2.0 core mandates sRGB (BT.709) primaries for all textures.
-            image.source_primaries = SourceColorPrimaries::Bt709;
             Ok(ImageOrPath::Image {
                 image,
                 label: GltfAssetLabel::Texture(gltf_texture.index()),
@@ -1248,17 +1252,16 @@ async fn load_image<'a, 'b>(
             if let Ok(data_uri) = DataUri::parse(uri) {
                 let bytes = data_uri.decode()?;
                 let image_type = ImageType::MimeType(data_uri.mime_type);
-                let mut image = Image::from_buffer(
-                    &bytes,
-                    mime_type.map(ImageType::MimeType).unwrap_or(image_type),
-                    supported_compressed_formats,
-                    is_srgb,
-                    ImageSampler::Descriptor(sampler_descriptor),
-                    settings.load_materials,
-                )?;
-                image.source_primaries = SourceColorPrimaries::Bt709;
                 Ok(ImageOrPath::Image {
-                    image,
+                    image: Image::from_buffer(
+                        &bytes,
+                        mime_type.map(ImageType::MimeType).unwrap_or(image_type),
+                        supported_compressed_formats,
+                        is_srgb,
+                        ImageSampler::Descriptor(sampler_descriptor),
+                        settings.load_materials,
+                        GLTF_SOURCE_PRIMARIES,
+                    )?,
                     label: GltfAssetLabel::Texture(gltf_texture.index()),
                 })
             } else {
@@ -2041,8 +2044,7 @@ impl ImageOrPath {
                 .load_builder()
                 .with_settings(move |settings: &mut ImageLoaderSettings| {
                     settings.is_srgb = is_srgb;
-                    // glTF 2.0 core mandates sRGB (BT.709) primaries for all textures.
-                    settings.source_primaries = Some(SourceColorPrimaries::Bt709);
+                    settings.source_primaries = GLTF_SOURCE_PRIMARIES;
                     settings.sampler = ImageSampler::Descriptor(sampler_descriptor.clone());
                     settings.asset_usage = render_asset_usages;
                 })

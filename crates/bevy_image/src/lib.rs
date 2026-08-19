@@ -39,6 +39,8 @@ mod hdr_texture_loader;
 mod image_loader;
 #[cfg(feature = "ktx2")]
 mod ktx2;
+#[cfg(feature = "png")]
+mod png;
 mod saver;
 mod source_color_primaries;
 mod texture_atlas;

@@ -632,14 +632,8 @@ impl ToExtents for UVec3 {
 ///
 /// ## Remote Inspection
 ///
-#[cfg_attr(
-    feature = "serialize",
-    doc = "To transmit an [`Image`] between two running Bevy apps, e.g. through BRP, use [`SerializedImage`](crate::SerializedImage)."
-)]
-#[cfg_attr(
-    not(feature = "serialize"),
-    doc = "To transmit an [`Image`] between two running Bevy apps, e.g. through BRP, use `SerializedImage` (requires the `serialize` feature)."
-)]
+/// To transmit an [`Image`] between two running Bevy apps, e.g. through BRP, use
+/// `SerializedImage`, which requires the `serialize` feature.
 /// This type is only meant for short-term transmission between same versions and should not be stored anywhere.
 #[derive(Asset, Debug, Clone, PartialEq)]
 #[cfg_attr(
@@ -1602,6 +1596,10 @@ impl Image {
 
     /// Load a bytes buffer in a [`Image`], according to type `image_type`, using the `image`
     /// crate
+    ///
+    /// `source_primaries` overrides the color primaries stamped on the image. With
+    /// `None`, the file's own color metadata wins where the format carries any, then
+    /// [`SourceColorPrimaries::Bt709`].
     pub fn from_buffer(
         buffer: &[u8],
         image_type: ImageType,
@@ -1613,6 +1611,7 @@ impl Image {
         is_srgb: bool,
         image_sampler: ImageSampler,
         asset_usage: RenderAssetUsages,
+        source_primaries: Option<SourceColorPrimaries>,
     ) -> Result<Image, TextureError> {
         let format = image_type.to_image_format()?;
 
@@ -1630,9 +1629,12 @@ impl Image {
             #[cfg(feature = "dds")]
             ImageFormat::Dds => dds_buffer_to_image(buffer, supported_compressed_formats, is_srgb)?,
             #[cfg(feature = "ktx2")]
-            ImageFormat::Ktx2 => {
-                ktx2_buffer_to_image(buffer, supported_compressed_formats, is_srgb)?
-            }
+            ImageFormat::Ktx2 => ktx2_buffer_to_image(
+                buffer,
+                supported_compressed_formats,
+                is_srgb,
+                source_primaries,
+            )?,
             #[expect(
                 clippy::allow_attributes,
                 reason = "`unreachable_patterns` may not always lint"
@@ -1649,9 +1651,27 @@ impl Image {
                 reader.set_format(image_crate_format);
                 reader.no_limits();
                 let dyn_img = reader.decode()?;
-                Self::from_dynamic(dyn_img, is_srgb, asset_usage)
+                #[cfg_attr(
+                    not(feature = "png"),
+                    expect(unused_mut, reason = "only mutated with the png feature")
+                )]
+                let mut image = Self::from_dynamic(dyn_img, is_srgb, asset_usage);
+                #[cfg(feature = "png")]
+                if matches!(format, ImageFormat::Png) {
+                    image.source_primaries =
+                        SourceColorPrimaries::resolve(source_primaries, || {
+                            crate::png::png_source_primaries(buffer)
+                        });
+                }
+                image
             }
         };
+        // Applies the override for the formats without color metadata. The KTX2 and
+        // PNG arms resolved it themselves, so their file reads and warnings are
+        // skipped when it is set; re-storing the same value here is fine.
+        if let Some(source_primaries) = source_primaries {
+            image.source_primaries = source_primaries;
+        }
         image.sampler = image_sampler;
         image.asset_usage = asset_usage;
         Ok(image)
