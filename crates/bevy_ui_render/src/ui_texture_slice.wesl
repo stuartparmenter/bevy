@@ -1,6 +1,6 @@
 import bevy_render::view::View;
 import bevy_render::globals::Globals;
-import bevy_ui_render::ui::encode_output;
+import package::ui::encode_output;
 
 @group(0) @binding(0)
 var<uniform> view: View;

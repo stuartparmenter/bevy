@@ -13,11 +13,11 @@
 //      blending happens in that space. The terminal decode reverses it.
 
 @if(OUTPUT_GAMUT_REC2020)
-import bevy_render::working_color_space::rec709_to_rec2020;
+import package::working_color_space::rec709_to_rec2020;
 @if(COMPOSITING_SPACE_SRGB)
-import bevy_render::color_operations::linear_to_srgb;
+import package::color_operations::linear_to_srgb;
 @if(COMPOSITING_SPACE_OKLAB)
-import bevy_render::color_operations::linear_rgb_to_oklab;
+import package::color_operations::linear_rgb_to_oklab;
 
 fn writer_encode(color_in: vec4<f32>) -> vec4<f32> {
     var color = color_in;

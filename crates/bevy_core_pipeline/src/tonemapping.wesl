@@ -10,7 +10,7 @@ import package::tonemapping::lut_bindings::{
 };
 
 @if(TONEMAP_METHOD_GRAN_TURISMO_7)
-import bevy_core_pipeline::tonemapping::gt7::tone_mapping_gran_turismo_7;
+import package::tonemapping::gt7::tone_mapping_gran_turismo_7;
 
 @if(WORKING_COLOR_SPACE_REC2020)
 import bevy_render::working_color_space::rec2020_to_rec709;

@@ -7,7 +7,7 @@
 // upscaling blit's `*UnormSrgb` writeback, so plain SDR views never run this
 // pass.
 
-import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput;
+import package::fullscreen_vertex_shader::FullscreenVertexOutput;
 import bevy_render::view::display_target::DisplayTargetUniform;
 import bevy_render::transfer_functions::{scrgb_encode, pq_inverse_eotf_from_nits, srgb_oetf_extended};
 import bevy_render::working_color_space::{REC709_TO_REC2020, REC2020_TO_REC709, REC709_TO_DISPLAYP3, REC2020_TO_DISPLAYP3};
