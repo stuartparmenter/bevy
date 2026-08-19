@@ -25,22 +25,10 @@ pub trait Luminance: Sized {
     /// Return a lighter version of this color. The `amount` should be between 0.0 and 1.0.
     /// The amount represents an absolute increase in luminance, and is distributive:
     /// `color.lighter(a).lighter(b) == color.lighter(a + b)`. Colors are clamped to white
-    /// if the amount would cause them to go above white. Colors already above white are not
-    /// clamped; in [`LinearRgba`](crate::LinearRgba) a single channel above `1.0` counts as
-    /// above white.
+    /// if the amount would cause them to go above white.
     ///
     /// For a relative increase in luminance, you can simply `mix()` with white.
     fn lighter(&self, amount: f32) -> Self;
-}
-
-/// Adds `amount` to a lightness channel, clamping to 1.0 unless `lightness` is already above 1.0.
-pub(crate) fn lighten_hdr_aware(lightness: f32, amount: f32) -> f32 {
-    let out = lightness + amount;
-    if lightness <= 1.0 {
-        out.min(1.0)
-    } else {
-        out
-    }
 }
 
 /// Linear interpolation of two colors within a given color space.
