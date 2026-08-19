@@ -63,10 +63,9 @@ impl AssetLoader for ExrTextureLoader {
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes).await?;
 
-        // The `image` crate's OpenEXR decoder drops the header color metadata (a TODO in
-        // image-0.25.9), so read the header directly with the same `exr` crate that decoder
-        // uses. An explicit loader setting skips the parse, so an override does not warn
-        // about chromaticities that go unused.
+        // The `image` crate's OpenEXR decoder drops the header color metadata, so read
+        // the header again with the decoder's own `exr` crate. When a setting overrides
+        // the primaries, skip the parse and its unsupported-primaries warning.
         let file_source_primaries = if settings.source_primaries.is_none() {
             read_exr_chromaticities(&bytes)
         } else {
