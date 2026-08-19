@@ -68,7 +68,7 @@ impl WorkingColorSpace {
 /// `gt7.wesl`. The Rust and WGSL constants must stay bit-identical so the CPU
 /// code is an exact parity reference for the shaders
 /// (`matrices_match_wgsl_f64_literals`). Equal to
-/// `bevy_color::rgb_to_rgb_matrix(BT709, BT2020)` within a few ULP.
+/// `RgbPrimaries::BT709.matrix_to(RgbPrimaries::BT2020)` within a few ULP.
 pub const REC709_TO_REC2020: Mat3 = Mat3::from_cols(
     Vec3::new(0.627_403_9, 0.069_097_29, 0.016_391_44),
     Vec3::new(0.329_283_03, 0.919_540_4, 0.088_013_306),
@@ -167,7 +167,7 @@ pub fn vec4_rec709_to_working(color: Vec4, working: WorkingColorSpace) -> Vec4 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bevy_color::{rgb_to_rgb_matrix, RgbPrimaries};
+    use bevy_color::RgbPrimaries;
 
     fn assert_mat3_rel_eq(a: Mat3, b: Mat3, max_rel: f32, context: &str) {
         let a = a.to_cols_array();
@@ -222,46 +222,46 @@ mod tests {
     }
 
     /// The literals are not bit-identical to the `bevy_color` runtime
-    /// derivation: `rgb_to_rgb_matrix` starts from the `f32` chromaticity
+    /// derivation: `RgbPrimaries::matrix_to` starts from the `f32` chromaticity
     /// fields, while these constants come from an f64 derivation. They must
     /// still agree to within a few ULP.
     #[test]
     fn matrices_match_bevy_color_primaries_within_tolerance() {
         assert_mat3_rel_eq(
             REC709_TO_REC2020,
-            rgb_to_rgb_matrix(RgbPrimaries::BT709, RgbPrimaries::BT2020),
+            RgbPrimaries::BT709.matrix_to(RgbPrimaries::BT2020),
             1e-5,
-            "REC709_TO_REC2020 vs rgb_to_rgb_matrix(BT709, BT2020)",
+            "REC709_TO_REC2020 vs BT709.matrix_to(BT2020)",
         );
         assert_mat3_rel_eq(
             REC2020_TO_REC709,
-            rgb_to_rgb_matrix(RgbPrimaries::BT2020, RgbPrimaries::BT709),
+            RgbPrimaries::BT2020.matrix_to(RgbPrimaries::BT709),
             1e-5,
-            "REC2020_TO_REC709 vs rgb_to_rgb_matrix(BT2020, BT709)",
+            "REC2020_TO_REC709 vs BT2020.matrix_to(BT709)",
         );
         assert_mat3_rel_eq(
             REC709_TO_DISPLAYP3,
-            rgb_to_rgb_matrix(RgbPrimaries::BT709, RgbPrimaries::DISPLAY_P3),
+            RgbPrimaries::BT709.matrix_to(RgbPrimaries::DISPLAY_P3),
             1e-5,
-            "REC709_TO_DISPLAYP3 vs rgb_to_rgb_matrix(BT709, DISPLAY_P3)",
+            "REC709_TO_DISPLAYP3 vs BT709.matrix_to(DISPLAY_P3)",
         );
         assert_mat3_rel_eq(
             DISPLAYP3_TO_REC709,
-            rgb_to_rgb_matrix(RgbPrimaries::DISPLAY_P3, RgbPrimaries::BT709),
+            RgbPrimaries::DISPLAY_P3.matrix_to(RgbPrimaries::BT709),
             1e-5,
-            "DISPLAYP3_TO_REC709 vs rgb_to_rgb_matrix(DISPLAY_P3, BT709)",
+            "DISPLAYP3_TO_REC709 vs DISPLAY_P3.matrix_to(BT709)",
         );
         assert_mat3_rel_eq(
             REC2020_TO_DISPLAYP3,
-            rgb_to_rgb_matrix(RgbPrimaries::BT2020, RgbPrimaries::DISPLAY_P3),
+            RgbPrimaries::BT2020.matrix_to(RgbPrimaries::DISPLAY_P3),
             1e-5,
-            "REC2020_TO_DISPLAYP3 vs rgb_to_rgb_matrix(BT2020, DISPLAY_P3)",
+            "REC2020_TO_DISPLAYP3 vs BT2020.matrix_to(DISPLAY_P3)",
         );
         assert_mat3_rel_eq(
             DISPLAYP3_TO_REC2020,
-            rgb_to_rgb_matrix(RgbPrimaries::DISPLAY_P3, RgbPrimaries::BT2020),
+            RgbPrimaries::DISPLAY_P3.matrix_to(RgbPrimaries::BT2020),
             1e-5,
-            "DISPLAYP3_TO_REC2020 vs rgb_to_rgb_matrix(DISPLAY_P3, BT2020)",
+            "DISPLAYP3_TO_REC2020 vs DISPLAY_P3.matrix_to(BT2020)",
         );
     }
 

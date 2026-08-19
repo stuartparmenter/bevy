@@ -43,7 +43,7 @@ impl SourceColorPrimaries {
     pub const CHROMATICITY_MATCH_TOLERANCE: f32 = 2e-3;
 
     /// Returns the [`RgbPrimaries`] chromaticities of this primary set, for use with
-    /// [`rgb_to_rgb_matrix`](bevy_color::rgb_to_rgb_matrix).
+    /// [`RgbPrimaries::matrix_to`].
     pub const fn to_rgb_primaries(self) -> RgbPrimaries {
         match self {
             SourceColorPrimaries::Bt709 => RgbPrimaries::BT709,

@@ -15,7 +15,7 @@
 // by the Lindbloom primaries-to-XYZ method. These literals round to f32 values
 // bit-identical to `bevy_render::working_color_space::REC709_TO_REC2020` and to
 // `GT7_REC_709_TO_REC_2020` in gt7.wesl. Keep them in sync. Re-deriving from
-// chromaticities (`bevy_color::rgb_to_rgb_matrix`) lands a few ULP away and is
+// chromaticities (`bevy_color::RgbPrimaries::matrix_to`) lands a few ULP away and is
 // not a substitute.
 const REC709_TO_REC2020 = mat3x3<f32>(
     0.627403895934699, 0.06909728935823199, 0.016391438875150228,   // column 0

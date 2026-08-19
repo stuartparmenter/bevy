@@ -1,6 +1,6 @@
 import bevy_render::view::View;
 import bevy_render::globals::Globals;
-import bevy_ui_render::ui::{
+import package::ui::{
     encode_output,
     select_corner_radius,
 };

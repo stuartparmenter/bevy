@@ -2,8 +2,8 @@ import bevy_render::{
     view::View,
     globals::Globals,
 };
-import bevy_ui_render::ui_vertex_output::UiVertexOutput;
-import bevy_ui_render::ui::encode_output;
+import package::ui_vertex_output::UiVertexOutput;
+import package::ui::encode_output;
 
 @group(0) @binding(0)
 var<uniform> view: View;
