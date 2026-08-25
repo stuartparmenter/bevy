@@ -6,6 +6,7 @@ use bevy_core_pipeline::{
     schedule::{Core2d, Core2dSystems, Core3d, Core3dSystems},
 };
 use bevy_ecs::prelude::*;
+use bevy_platform::collections::HashMap;
 use bevy_render::{
     camera::ExtractedCamera,
     diagnostic::RecordDiagnostics,
@@ -104,18 +105,36 @@ fn prepare_msaa_writeback_pipelines(
     blit_pipeline: Res<BlitPipeline>,
     view_targets: Query<(Entity, &ViewTarget, &ExtractedCamera, &Msaa)>,
 ) {
+    // The lowest sorted camera index writing to each main texture this frame.
+    // Cameras on one render target can still render into different main
+    // textures (an Hdr camera's fp16 next to an SDR camera's 8-bit one), so
+    // the writeback decision groups by the texture, not the target.
+    let mut first_writer_index = <HashMap<TextureId, usize>>::default();
+    for (_, view_target, camera, _) in view_targets.iter() {
+        let index = first_writer_index
+            .entry(view_target.main_texture().id())
+            .or_insert(usize::MAX);
+        *index = (*index).min(camera.sorted_camera_index_for_target);
+    }
+
     for (entity, view_target, camera, msaa) in view_targets.iter() {
         // Determine if we should do MSAA writeback based on the camera's setting
         let should_writeback = match camera.msaa_writeback {
             MsaaWriteback::Off => false,
-            // writeback is needed when the main pass must load existing content
-            // from the main texture, either because another camera already
-            // rendered to this target or because this camera preserves content across
-            // frames via load op load. otherwise we'd read from an ephemeral sampled
-            // texture that doesn't have the real content
+            // Writeback fills the sampled texture with the content the main
+            // pass would otherwise load: last frame's, for a camera that
+            // preserves content across frames via `ClearColorConfig::None`, or
+            // a lower camera's, for a fullscreen camera compositing over an
+            // earlier camera that rendered into the same main texture this
+            // frame. A camera that clears a texture no earlier camera wrote
+            // has nothing to load; writeback would feed it stale pixels and
+            // suppress its clear.
             MsaaWriteback::Auto => {
-                camera.sorted_camera_index_for_target > 0
-                    || matches!(camera.clear_color, ClearColorConfig::None)
+                matches!(camera.clear_color, ClearColorConfig::None)
+                    || (camera.viewport.is_none()
+                        && first_writer_index
+                            .get(&view_target.main_texture().id())
+                            .is_some_and(|first| *first < camera.sorted_camera_index_for_target))
             }
             MsaaWriteback::Always => true,
         };
