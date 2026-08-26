@@ -3,7 +3,7 @@
 //!
 //! The tonemapping pass outputs display-linear color scaled so `1.0` is paper
 //! white, in per-view source primaries. Those are Rec.709 for every resolved
-//! operator except `Tonemapping::GranTurismo7` on an HDR target, which emits
+//! method except `Tonemapping::GranTurismo7` on an HDR target, which emits
 //! its native Rec.2020. See `resolve_tonemapping`. UI composites in that same
 //! space.
 //!
@@ -170,7 +170,7 @@ const fn is_gamut_contraction(source: DisplayGamut, display: DisplayGamut) -> bo
 ///
 /// This is the CPU mirror of what the display-encoding pass does to rendered
 /// pixels, applied to the [`LoadOp::Clear`] value of the out texture. Without
-/// it, a viewport or letterboxed region that no blit covers would present raw
+/// it, a viewport or letterboxed region that no blit covers would show raw
 /// display-linear values as HDR signal, and a finalizer's clear would not match
 /// the encoded pixels it composites over.
 ///
@@ -318,7 +318,7 @@ pub struct DisplayEncodingPipelineKey {
     pub source_space: Option<CompositingSpace>,
     /// The color primaries of the pass's input
     /// ([`ViewStackContract::source_gamut`]): the tonemap output gamut of the
-    /// buffer this view's encode reads. For a deferred encode that is the
+    /// buffer this view's encode reads. For a handed-off encode that is the
     /// stack's last tonemap-enabled member; for a solo encode it is this view's
     /// own (see
     /// [`ResolvedTonemapping::output_gamut`](crate::tonemapping::ResolvedTonemapping)).
@@ -328,7 +328,7 @@ pub struct DisplayEncodingPipelineKey {
     /// [`ViewStackContract::source_gamut_is_rec2020`], so saturated UI colors do
     /// not oversaturate on a Rec.2020 (GT7) HDR view. Pre-tonemap writers (PBR
     /// meshes, 3D gizmos) convert off the global `WorkingColorSpace` instead, so
-    /// they match `source_gamut` only when an operator marks the buffer
+    /// they match `source_gamut` only when a method marks the buffer
     /// Rec.2020. A `Tonemapping::None` view leaves `source_gamut` Rec.709 while
     /// the buffer holds Rec.2020.
     pub source_gamut: DisplayGamut,
@@ -434,14 +434,14 @@ pub struct ViewDisplayEncodingPipeline {
 ///
 /// Returns `None` when the view runs no encode pass this frame: its stack's
 /// resolved display target requests no HDR transfer (`encoding` is `None`), or
-/// the pass is deferred to the stack's finalizer.
+/// the stack's finalizer runs the pass for this view.
 fn display_encoding_key(
     target_format: TextureFormat,
     contract: &ViewStackContract,
     gamut_compression: DisplayGamutCompression,
 ) -> Option<DisplayEncodingPipelineKey> {
     let encoding = contract.encoding?;
-    if matches!(contract.encode, StackRole::Deferred(_)) {
+    if matches!(contract.encode, StackRole::HandledBy(_)) {
         return None;
     }
     let out_of_gamut = match gamut_compression {
@@ -467,14 +467,14 @@ fn display_encoding_key(
 
 /// Specializes the display-encoding pipeline for views that need it, and keeps
 /// the [`ViewDisplayEncodingPipeline`] marker in sync: inserted for views whose
-/// [`ViewStackContract`] carries resolved encode parameters and a non-deferred
-/// encode role, removed otherwise.
+/// [`ViewStackContract`] carries resolved encode parameters and an encode role
+/// that runs, removed otherwise.
 ///
 /// The out-of-gamut handling resolves here, so a [`DisplayGamutCompression`]
 /// policy change re-keys the pipeline on the next prepare. The contract comes
 /// from
 /// [`resolve_camera_stack_contracts`](crate::camera_stack::resolve_camera_stack_contracts),
-/// which owns the coercion and display-target diagnostics.
+/// which owns the coercion and display-target warnings.
 pub fn prepare_view_display_encoding_pipelines(
     mut commands: Commands,
     mut pipeline_cache: ResMut<PipelineCache>,
@@ -512,9 +512,9 @@ pub fn prepare_view_display_encoding_pipelines(
         let pipeline_id = pipelines.specialize(&pipeline_cache, &encoding_pipeline, key);
 
         // The pass-through upscaling blit for HDR transfers blocks on its own
-        // pipeline and presents the main texture as-is, so an unready encoder
-        // pipeline would present raw display-linear values as HDR signal.
-        // Blocking here is O(1) once the encoder is compiled.
+        // pipeline and writes the main texture as-is to the out texture, so an
+        // unready encoder pipeline would show raw display-linear values as HDR
+        // signal. Blocking here is O(1) once the encoder is compiled.
         pipeline_cache.block_on_render_pipeline(pipeline_id);
 
         commands
@@ -542,15 +542,14 @@ mod tests {
             composites_fullscreen: false,
             encode_enabled: true,
             output_writes: true,
-            explicit_blend: false,
             tonemap_output_gamut: DisplayGamut::Rec2020,
             compositing_space: None,
             loads_previous: false,
-            operator: Tonemapping::GranTurismo7,
+            method: Tonemapping::GranTurismo7,
         }
     }
 
-    fn passthrough_overlay(raw: u32, index: usize) -> ContractInput<u32> {
+    fn passthrough_top(raw: u32, index: usize) -> ContractInput<u32> {
         ContractInput {
             entity: entity(raw),
             texture: 0,
@@ -558,11 +557,10 @@ mod tests {
             composites_fullscreen: true,
             encode_enabled: true,
             output_writes: true,
-            explicit_blend: false,
             tonemap_output_gamut: DisplayGamut::Rec709,
             compositing_space: None,
             loads_previous: true,
-            operator: Tonemapping::None,
+            method: Tonemapping::None,
         }
     }
 
@@ -591,12 +589,12 @@ mod tests {
     const PQ: Option<(DisplayTransfer, DisplayGamut)> =
         Some((DisplayTransfer::Pq, DisplayGamut::Rec2020));
 
-    /// The overlay finalizes the encode for the composed buffer the base
+    /// The top camera finalizes the encode for the composed buffer the base
     /// tonemapped, so the key's source gamut is Rec.2020 and there is no
     /// 709 to 2020 double expansion.
     #[test]
-    fn s1_deferred_encode_keys_the_buffer_not_the_finalizer() {
-        let outputs = resolve_contracts(vec![gt7_clearing(1, 0), passthrough_overlay(2, 1)]);
+    fn s1_handed_off_encode_keys_the_buffer_not_the_finalizer() {
+        let (outputs, _) = resolve_contracts(vec![gt7_clearing(1, 0), passthrough_top(2, 1)]);
 
         let base = contract(&outputs[&entity(1)], PQ);
         assert_eq!(auto_key(&base), None);
@@ -620,19 +618,19 @@ mod tests {
     fn resolved_compositing_space_keys_the_decode() {
         let mut base = gt7_clearing(1, 0);
         base.compositing_space = Some(CompositingSpace::Srgb);
-        let mut overlay = passthrough_overlay(2, 1);
-        overlay.compositing_space = Some(CompositingSpace::Srgb);
-        let outputs = resolve_contracts(vec![base, overlay]);
+        let mut top = passthrough_top(2, 1);
+        top.compositing_space = Some(CompositingSpace::Srgb);
+        let (outputs, _) = resolve_contracts(vec![base, top]);
         let finalizer = contract(&outputs[&entity(2)], PQ);
         let key = auto_key(&finalizer).unwrap();
         assert_eq!(key.source_space, Some(CompositingSpace::Srgb));
     }
 
-    /// A solo GT7 camera keys off its own gamut, because its own operator
+    /// A solo GT7 camera keys off its own gamut, because its own method
     /// produces the buffer.
     #[test]
     fn solo_gt7_on_pq_keys_its_own_gamut() {
-        let outputs = resolve_contracts(vec![gt7_clearing(1, 0)]);
+        let (outputs, _) = resolve_contracts(vec![gt7_clearing(1, 0)]);
         let solo = contract(&outputs[&entity(1)], PQ);
         let key = auto_key(&solo).unwrap();
         assert_eq!(
@@ -652,7 +650,7 @@ mod tests {
     /// the 709 to 2020 expansion is correct.
     #[test]
     fn solo_passthrough_on_pq_keys_rec709_source() {
-        let outputs = resolve_contracts(vec![passthrough_overlay(1, 0)]);
+        let (outputs, _) = resolve_contracts(vec![passthrough_top(1, 0)]);
         let solo = contract(&outputs[&entity(1)], PQ);
         let key = auto_key(&solo).unwrap();
         assert_eq!(key.source_gamut, DisplayGamut::Rec709);
@@ -663,7 +661,7 @@ mod tests {
 
     #[test]
     fn gt7_onto_scrgb_keys_the_contraction_compression() {
-        let outputs = resolve_contracts(vec![gt7_clearing(1, 0)]);
+        let (outputs, _) = resolve_contracts(vec![gt7_clearing(1, 0)]);
         let solo = contract(
             &outputs[&entity(1)],
             Some((DisplayTransfer::ScRgbLinear, DisplayGamut::Rec709)),
@@ -678,7 +676,7 @@ mod tests {
     /// plain clip.
     #[test]
     fn rec709_onto_extended_displayp3_keys_the_expansion() {
-        let outputs = resolve_contracts(vec![passthrough_overlay(1, 0)]);
+        let (outputs, _) = resolve_contracts(vec![passthrough_top(1, 0)]);
         let solo = contract(
             &outputs[&entity(1)],
             Some((DisplayTransfer::ExtendedSrgb, DisplayGamut::DisplayP3)),
@@ -692,7 +690,7 @@ mod tests {
 
     #[test]
     fn gt7_onto_extended_displayp3_keys_the_contraction_compression() {
-        let outputs = resolve_contracts(vec![gt7_clearing(1, 0)]);
+        let (outputs, _) = resolve_contracts(vec![gt7_clearing(1, 0)]);
         let solo = contract(
             &outputs[&entity(1)],
             Some((DisplayTransfer::ExtendedSrgb, DisplayGamut::DisplayP3)),
@@ -706,7 +704,7 @@ mod tests {
 
     #[test]
     fn always_policy_keys_compression_on_a_non_contracting_path() {
-        let outputs = resolve_contracts(vec![passthrough_overlay(1, 0)]);
+        let (outputs, _) = resolve_contracts(vec![passthrough_top(1, 0)]);
         let solo = contract(
             &outputs[&entity(1)],
             Some((DisplayTransfer::ScRgbLinear, DisplayGamut::Rec709)),
@@ -724,7 +722,7 @@ mod tests {
 
     #[test]
     fn clip_policy_keys_the_plain_clip_on_a_contracting_path() {
-        let outputs = resolve_contracts(vec![gt7_clearing(1, 0)]);
+        let (outputs, _) = resolve_contracts(vec![gt7_clearing(1, 0)]);
         let solo = contract(
             &outputs[&entity(1)],
             Some((DisplayTransfer::ScRgbLinear, DisplayGamut::Rec709)),
@@ -744,7 +742,7 @@ mod tests {
     fn sdr_contract_derives_no_key() {
         let mut solo_input = gt7_clearing(1, 0);
         solo_input.encode_enabled = false;
-        let outputs = resolve_contracts(vec![solo_input]);
+        let (outputs, _) = resolve_contracts(vec![solo_input]);
         let solo = contract(&outputs[&entity(1)], None);
         assert_eq!(auto_key(&solo), None);
     }

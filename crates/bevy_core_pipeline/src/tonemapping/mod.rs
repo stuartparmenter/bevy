@@ -569,10 +569,10 @@ pub fn prepare_view_tonemapping_pipelines(
         tonemap_in_shader,
     ) in view_targets.iter()
     {
-        // Stacked cameras share a main texture and tonemap once, on the stack's
-        // finalizer, so the finalizer's pass does not tonemap earlier cameras' pixels
-        // twice. Render world entities are retained, so remove a stale component.
-        if matches!(contract.tonemap, StackRole::Deferred(_)) {
+        // A `HandledBy` view doesn't run the pass. The finalizer tonemaps
+        // the shared buffer once. Render world entities are retained, so
+        // remove a stale component.
+        if matches!(contract.tonemap, StackRole::HandledBy(_)) {
             if existing_pipeline.is_some() {
                 commands.entity(entity).remove::<ViewTonemappingPipeline>();
             }
@@ -629,9 +629,10 @@ pub fn prepare_view_tonemapping_pipelines(
         };
         let pipeline = pipelines.specialize(&pipeline_cache, &upscaling_pipeline, key);
 
-        // The upscaling blit blocks on its own pipeline and presents whatever is in the
-        // main texture, so an unready tonemapping pipeline would present raw scene-linear
-        // frames. Block here too. This is O(1) once the pipeline is compiled.
+        // The upscaling blit blocks on its own pipeline and writes whatever is in the
+        // main texture to the out texture, so an unready tonemapping pipeline would
+        // show raw scene-linear frames. Block here too. This is O(1) once the pipeline
+        // is compiled.
         pipeline_cache.block_on_render_pipeline(pipeline);
 
         // The key determines the pipeline id, so an unchanged id means an

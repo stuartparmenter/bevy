@@ -14,12 +14,12 @@ the same as no request.
 
 Tonemapping and display encoding resolve per stack too. A buffer is never
 encoded before it is tonemapped, so when the stack shape would force that,
-tonemap deferral is cancelled for the whole stack, with a warning.
+the stack falls back to per-camera tonemapping, with a warning.
 
 ## What this fixes
 
 - The display encoder now takes its source gamut from the camera that
-  tonemapped the stack. A `Tonemapping::None` overlay over a
+  tonemapped the stack. A `Tonemapping::None` camera stacked over a
   `Tonemapping::GranTurismo7` camera used to expand Rec.709 to Rec.2020 twice on
   a PQ target, oversaturating the image.
 
@@ -27,9 +27,9 @@ tonemap deferral is cancelled for the whole stack, with a warning.
   linear value that read as full-peak nits. They now show the clear color,
   encoded for the resolved transfer, gamut, and paper white.
 
-- A default-tonemapped 3D camera and an `Hdr` 2D overlay on one target used to
-  blit over each other with a replacing blend. The overlay now composites over
-  the base.
+- A default-tonemapped 3D camera and an `Hdr` 2D camera above it on one target
+  used to blit over each other with a replacing blend. The top camera now
+  composites over the base.
 
 - FXAA's edge luma called `sqrt` on a Rec.601 dot that goes negative on a
   `CompositingSpace::Oklab` buffer's signed chroma, producing NaN. UI wrote

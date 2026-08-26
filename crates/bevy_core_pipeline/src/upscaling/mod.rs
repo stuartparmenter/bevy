@@ -63,13 +63,12 @@ fn blit_source_space(contract: Option<&ViewStackContract>) -> Option<Compositing
     }
 }
 
-/// The blend state of a camera whose upscaling blit auto-detects its blend
-/// (`CameraOutputMode::Write { blend_state: None }`).
+/// Auto-detected blend for an upscaling blit. `None` replaces the
+/// destination.
 ///
-/// The first camera to render to an output (`sorted_index == 0`) replaces.
-/// Later cameras alpha-blend so they do not overwrite earlier cameras'
-/// output. `force_replace` replaces too, because that blit carries the whole
-/// composition and must not blend over the cleared out texture.
+/// Later cameras blend so they don't overwrite earlier output.
+/// `force_replace` replaces because that blit is the first from its
+/// stack to write the out texture.
 fn auto_blit_blend_state(force_replace: bool, sorted_index: usize) -> Option<BlendState> {
     if force_replace || sorted_index == 0 {
         None
@@ -92,12 +91,14 @@ fn prepare_view_upscaling_pipelines(
     )>,
 ) {
     for (entity, view_target, camera, maybe_pipeline, contract) in view_targets.iter() {
-        // Removing the pipeline keeps the upscaling node from running, since
-        // its `ViewQuery` requires the component, so the out texture stays
-        // untouched until the finalizer blits.
         let force_replace = match contract.map(|contract| contract.blit) {
-            Some(BlitDisposition::SkipDeferred) => {
-                commands.entity(entity).remove::<ViewUpscalingPipeline>();
+            Some(BlitDisposition::SkipForFinalizer) => {
+                // The upscaling pass's `ViewQuery` requires the pipeline, so removing
+                // it leaves the out texture untouched until the finalizer
+                // blits.
+                if maybe_pipeline.is_some() {
+                    commands.entity(entity).remove::<ViewUpscalingPipeline>();
+                }
                 continue;
             }
             Some(BlitDisposition::Run { force_replace }) => force_replace,
@@ -225,7 +226,7 @@ mod tests {
     }
 
     #[test]
-    fn force_replace_upgrades_later_finalizer_to_replace() {
+    fn force_replace_makes_later_finalizer_replace() {
         assert_eq!(auto_blit_blend_state(true, 1), None);
         assert_eq!(auto_blit_blend_state(true, 2), None);
         assert_eq!(auto_blit_blend_state(true, 0), None);

@@ -31,7 +31,7 @@ struct CachedBindGroup {
 /// display-linear space this pass consumes, and before the upscaling blit,
 /// which passes the encoded signal through unchanged.
 ///
-/// Views without a [`ViewDisplayEncodingPipeline`] get no ping-pong flip.
+/// Views without a [`ViewDisplayEncodingPipeline`] get no main-texture flip.
 pub fn display_encoding(
     view: ViewQuery<(
         &ViewTarget,

@@ -50,7 +50,7 @@ pub fn upscaling(
     };
     // On an HDR-transfer target the out texture stores encoded signal, so the
     // `LoadOp::Clear` value has to be encoded on the CPU. Regions no blit
-    // covers would otherwise present raw display-linear values as HDR signal.
+    // covers would otherwise show raw display-linear values as HDR signal.
     // On an SDR target the hardware sRGB view encodes the linear clear on
     // store. The paper white must be the sanitized value the GPU encoder
     // folds in, so the clear and the rendered pixels agree for degenerate

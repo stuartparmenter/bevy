@@ -539,9 +539,9 @@ mod tests {
     fn stack_resolved_oklab_degrades_on_unorm_storage() {
         let mut base = view(1, 0, 0, None);
         base.1.signed_float_storage = false;
-        let mut overlay = view(2, 0, 1, OKLAB);
-        overlay.1.signed_float_storage = false;
-        let (resolved, diagnostics) = resolve_spaces([base, overlay]);
+        let mut top = view(2, 0, 1, OKLAB);
+        top.1.signed_float_storage = false;
+        let (resolved, diagnostics) = resolve_spaces([base, top]);
         assert_eq!(resolved_for(&resolved, 1), None);
         assert_eq!(resolved_for(&resolved, 2), None);
         assert!(has_oklab_storage(&diagnostics));
@@ -572,7 +572,7 @@ mod tests {
     fn sorted_index_orders_the_group_not_insertion_order() {
         let mut base = view(1, 0, 0, None);
         base.1.composites_fullscreen = false;
-        // The overlay comes first in the input. Sorting by sorted_index puts
+        // The top camera comes first in the input. Sorting by sorted_index puts
         // the clearing camera back at the front, so the group still counts as
         // a stack.
         let (resolved, diagnostics) = resolve_spaces([view(2, 0, 1, SRGB), base]);

@@ -439,10 +439,10 @@ pub fn queue_gt7_params_uniforms(
 ) {
     for (entity, tonemapping, params, view_display_target, contract, has_uniform) in &views {
         // Cameras stacked on a shared main texture tonemap once, on the
-        // stack's finalizer. The deferred members never run the pass.
-        let deferred =
-            contract.is_some_and(|contract| matches!(contract.tonemap, StackRole::Deferred(_)));
-        let active = !deferred
+        // stack's finalizer. `HandledBy` members never run the pass.
+        let handled_by_finalizer =
+            contract.is_some_and(|contract| matches!(contract.tonemap, StackRole::HandledBy(_)));
+        let active = !handled_by_finalizer
             && gt7_params_uniform_active(
                 resolve_tonemapping(tonemapping, view_display_target).method,
                 params.is_some(),
