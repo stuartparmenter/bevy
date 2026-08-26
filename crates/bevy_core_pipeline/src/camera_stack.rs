@@ -15,7 +15,7 @@
 //! tonemapping.
 
 use bevy_app::{App, Plugin};
-use bevy_camera::{CameraOutputMode, ClearColorConfig, CompositingSpace};
+use bevy_camera::{CameraOutputMode, ClearColorConfig};
 use bevy_ecs::{
     change_detection::DetectChangesMut,
     component::Component,
@@ -30,7 +30,7 @@ use bevy_render::{
     render_resource::TextureId,
     view::{
         composites_fullscreen, prepare_view_display_targets, prepare_view_targets,
-        ResolvedCompositingSpace, ViewDisplayTarget, ViewTarget,
+        ViewDisplayTarget, ViewTarget,
     },
     working_color_space::WorkingColorSpace,
     Render, RenderApp, RenderSystems,
@@ -116,9 +116,6 @@ pub struct ViewStackContract {
     pub encode: StackRole,
     /// The view's upscaling blit disposition.
     pub blit: BlitDisposition,
-    /// The compositing space of the buffer this view renders into, copied
-    /// from [`ResolvedCompositingSpace`].
-    pub compositing_space: Option<CompositingSpace>,
     /// Color primaries of the buffer at display-encoding time. A handed-off
     /// encode uses the tonemap output gamut of the last tonemap-enabled
     /// member of the stack. A solo encode uses this view's own, because each
@@ -171,8 +168,6 @@ pub(crate) struct ContractInput<K> {
     /// This view's own tonemap output gamut
     /// (`resolve_tonemapping(own method, own display target).output_gamut`).
     pub tonemap_output_gamut: DisplayGamut,
-    /// The resolved compositing space, passed through to the contract.
-    pub compositing_space: Option<CompositingSpace>,
     /// Whether the view's main pass loads the previous buffer contents,
     /// true for [`ClearColorConfig::None`]. This tells viewport members
     /// from clearing members in the stack-shape checks.
@@ -222,7 +217,6 @@ pub(crate) struct ContractOutput {
     pub tonemap: StackRole,
     pub encode: StackRole,
     pub blit: BlitDisposition,
-    pub compositing_space: Option<CompositingSpace>,
     pub source_gamut: DisplayGamut,
 }
 
@@ -437,7 +431,6 @@ fn resolve_group<K>(
                 tonemap,
                 encode,
                 blit,
-                compositing_space: member.compositing_space,
                 source_gamut,
             },
         );
@@ -450,7 +443,7 @@ fn resolve_group<K>(
 /// which supplies the `ViewTarget`, and `prepare_view_display_targets`, which
 /// supplies the `ViewDisplayTarget`.
 ///
-/// A texture group never spans two [`ResolvedCompositingSpace`] groups: equal
+/// A texture group never spans two [`ResolvedCompositingSpace`](bevy_render::view::ResolvedCompositingSpace) groups: equal
 /// main-texture ids imply equal main-texture keys, and `prepare_view_targets`
 /// dedups allocations on exactly that key.
 ///
@@ -463,7 +456,6 @@ pub fn resolve_camera_stack_contracts(
         &ViewTarget,
         &ViewDisplayTarget,
         Option<&Tonemapping>,
-        Option<&ResolvedCompositingSpace>,
     )>,
     mut contracts: Query<&mut ViewStackContract>,
     working_color_space: Res<WorkingColorSpace>,
@@ -479,7 +471,7 @@ pub fn resolve_camera_stack_contracts(
     // an unencoded out-texture clear.
     let mut group_encodings: HashMap<TextureId, Option<ResolvedEncoding>> = HashMap::default();
     let mut inputs = Vec::new();
-    for (entity, camera, view_target, view_display_target, tonemapping, resolved_space) in &views {
+    for (entity, camera, view_target, view_display_target, tonemapping) in &views {
         let texture = view_target.main_texture().id();
         let encode_enabled = view_display_target.is_hdr_transfer();
         let encoding = *group_encodings.entry(texture).or_insert_with(|| {
@@ -499,7 +491,6 @@ pub fn resolve_camera_stack_contracts(
             encode_enabled,
             output_writes: !matches!(camera.output_mode, CameraOutputMode::Skip),
             tonemap_output_gamut: resolved.output_gamut,
-            compositing_space: ResolvedCompositingSpace::space(resolved_space),
             loads_previous: matches!(camera.clear_color, ClearColorConfig::None),
             method: resolved.method,
         });
@@ -524,7 +515,6 @@ pub fn resolve_camera_stack_contracts(
             tonemap: output.tonemap,
             encode: output.encode,
             blit: output.blit,
-            compositing_space: output.compositing_space,
             source_gamut: output.source_gamut,
             encoding,
         };
@@ -715,7 +705,6 @@ mod contract_tests {
             encode_enabled: false,
             output_writes: true,
             tonemap_output_gamut: DisplayGamut::Rec709,
-            compositing_space: None,
             loads_previous: false,
             method: Tonemapping::TonyMcMapface,
         }
@@ -773,7 +762,6 @@ mod contract_tests {
         assert_eq!(solo.encode, StackRole::Solo);
         assert_eq!(solo.blit, RUN);
         assert_eq!(solo.source_gamut, DisplayGamut::Rec709);
-        assert_eq!(solo.compositing_space, None);
         assert!(errors.is_empty());
     }
 
@@ -1030,10 +1018,11 @@ mod contract_tests {
     // quiet since nothing below the finalizer runs a per-camera pass.
     #[test]
     fn divergent_stack_hands_off_and_skips_blits() {
-        let mut top = compositing(3, 2);
-        top.compositing_space = Some(CompositingSpace::Oklab);
-        let (outputs, errors) =
-            resolve_contracts(vec![clearing(1, 0), disabled(clearing(2, 1)), top]);
+        let (outputs, errors) = resolve_contracts(vec![
+            clearing(1, 0),
+            disabled(clearing(2, 1)),
+            compositing(3, 2),
+        ]);
         let base = output(&outputs, 1);
         let middle = output(&outputs, 2);
         let finalizer = output(&outputs, 3);
@@ -1043,9 +1032,6 @@ mod contract_tests {
         assert_eq!(base.blit, BlitDisposition::SkipForFinalizer);
         assert_eq!(middle.blit, BlitDisposition::SkipForFinalizer);
         assert_eq!(finalizer.blit, RUN_REPLACE);
-        // The compositing space passes through per view.
-        assert_eq!(base.compositing_space, None);
-        assert_eq!(finalizer.compositing_space, Some(CompositingSpace::Oklab));
         assert!(errors.is_empty());
     }
 

@@ -40,7 +40,7 @@ use bevy_render::{
     },
     renderer::RenderDevice,
     transfer_functions::{pq_inverse_eotf_from_nits, scrgb_encode, srgb_oetf_extended},
-    view::{DisplayTargetUniform, ExtractedView, ViewTarget},
+    view::{DisplayTargetUniform, ExtractedView, ResolvedCompositingSpace, ViewTarget},
     working_color_space::{REC709_TO_DISPLAYP3, REC709_TO_REC2020},
     GpuResourceAppExt, Render, RenderApp, RenderStartup, RenderSystems,
 };
@@ -311,7 +311,7 @@ pub struct DisplayEncodingPipelineKey {
     /// destination).
     pub target_format: TextureFormat,
     /// The view's resolved [`CompositingSpace`]
-    /// ([`ViewStackContract::compositing_space`]), if any. `Some(Srgb)` and
+    /// ([`ResolvedCompositingSpace`](bevy_render::view::ResolvedCompositingSpace)), if any. `Some(Srgb)` and
     /// `Some(Oklab)` main textures hold encoded values that must be decoded
     /// back to linear before the gamut and transfer encoding. This is the same
     /// decode the upscaling blit performs for views that skip this pass.
@@ -438,6 +438,7 @@ pub struct ViewDisplayEncodingPipeline {
 fn display_encoding_key(
     target_format: TextureFormat,
     contract: &ViewStackContract,
+    space: Option<CompositingSpace>,
     gamut_compression: DisplayGamutCompression,
 ) -> Option<DisplayEncodingPipelineKey> {
     let encoding = contract.encoding?;
@@ -457,7 +458,7 @@ fn display_encoding_key(
     };
     Some(DisplayEncodingPipelineKey {
         target_format,
-        source_space: contract.compositing_space,
+        source_space: space,
         source_gamut: contract.source_gamut,
         gamut: encoding.gamut,
         transfer: encoding.transfer,
@@ -486,6 +487,7 @@ pub fn prepare_view_display_encoding_pipelines(
             Entity,
             &ExtractedView,
             &ViewStackContract,
+            Option<&ResolvedCompositingSpace>,
             Has<ViewDisplayEncodingPipeline>,
         ),
         // `ViewStackContract` is overwritten in place and never removed, so a
@@ -495,9 +497,13 @@ pub fn prepare_view_display_encoding_pipelines(
         With<ViewTarget>,
     >,
 ) {
-    for (entity, view, contract, has_pipeline) in &views {
-        let Some(key) = display_encoding_key(view.target_format, contract, *gamut_compression)
-        else {
+    for (entity, view, contract, resolved_space, has_pipeline) in &views {
+        let Some(key) = display_encoding_key(
+            view.target_format,
+            contract,
+            ResolvedCompositingSpace::space(resolved_space),
+            *gamut_compression,
+        ) else {
             // Render-world entities are retained, so a stale component has to
             // be actively removed. Guarding on `has_pipeline` keeps plain SDR
             // views from issuing a command every frame.
@@ -543,7 +549,6 @@ mod tests {
             encode_enabled: true,
             output_writes: true,
             tonemap_output_gamut: DisplayGamut::Rec2020,
-            compositing_space: None,
             loads_previous: false,
             method: Tonemapping::GranTurismo7,
         }
@@ -558,7 +563,6 @@ mod tests {
             encode_enabled: true,
             output_writes: true,
             tonemap_output_gamut: DisplayGamut::Rec709,
-            compositing_space: None,
             loads_previous: true,
             method: Tonemapping::None,
         }
@@ -572,7 +576,6 @@ mod tests {
             tonemap: output.tonemap,
             encode: output.encode,
             blit: output.blit,
-            compositing_space: output.compositing_space,
             source_gamut: output.source_gamut,
             encoding: encoding.map(|(transfer, gamut)| ResolvedEncoding { transfer, gamut }),
         }
@@ -582,6 +585,7 @@ mod tests {
         display_encoding_key(
             TextureFormat::Rgba16Float,
             contract,
+            None,
             DisplayGamutCompression::Auto,
         )
     }
@@ -616,13 +620,15 @@ mod tests {
 
     #[test]
     fn resolved_compositing_space_keys_the_decode() {
-        let mut base = gt7_clearing(1, 0);
-        base.compositing_space = Some(CompositingSpace::Srgb);
-        let mut top = passthrough_top(2, 1);
-        top.compositing_space = Some(CompositingSpace::Srgb);
-        let (outputs, _) = resolve_contracts(vec![base, top]);
+        let (outputs, _) = resolve_contracts(vec![gt7_clearing(1, 0), passthrough_top(2, 1)]);
         let finalizer = contract(&outputs[&entity(2)], PQ);
-        let key = auto_key(&finalizer).unwrap();
+        let key = display_encoding_key(
+            TextureFormat::Rgba16Float,
+            &finalizer,
+            Some(CompositingSpace::Srgb),
+            DisplayGamutCompression::Auto,
+        )
+        .unwrap();
         assert_eq!(key.source_space, Some(CompositingSpace::Srgb));
     }
 
@@ -712,6 +718,7 @@ mod tests {
         let key = display_encoding_key(
             TextureFormat::Rgba16Float,
             &solo,
+            None,
             DisplayGamutCompression::Always,
         )
         .unwrap();
@@ -730,6 +737,7 @@ mod tests {
         let key = display_encoding_key(
             TextureFormat::Rgba16Float,
             &solo,
+            None,
             DisplayGamutCompression::Clip,
         )
         .unwrap();

@@ -19,7 +19,10 @@ use bevy_render::{
     },
     renderer::RenderDevice,
     texture::{FallbackImage, GpuImage},
-    view::{ColorGrading, ExtractedView, ViewDisplayTarget, ViewTarget, ViewUniform},
+    view::{
+        ColorGrading, ExtractedView, ResolvedCompositingSpace, ViewDisplayTarget, ViewTarget,
+        ViewUniform,
+    },
     working_color_space::WorkingColorSpace,
     GpuResourceAppExt, Render, RenderApp, RenderStartup, RenderSystems,
 };
@@ -548,6 +551,7 @@ pub fn prepare_view_tonemapping_pipelines(
             Has<ExternalWhiteBalance>,
             Option<&ViewTonemappingPipeline>,
             Has<TonemapInShader>,
+            Option<&ResolvedCompositingSpace>,
         ),
         // `ViewStackContract` is overwritten in place and never removed, so a view whose
         // `ViewTarget` was dropped keeps a stale contract. This filter must stay even
@@ -567,6 +571,7 @@ pub fn prepare_view_tonemapping_pipelines(
         external_white_balance,
         existing_pipeline,
         tonemap_in_shader,
+        resolved_space,
     ) in view_targets.iter()
     {
         // A `HandledBy` view doesn't run the pass. The finalizer tonemaps
@@ -616,7 +621,7 @@ pub fn prepare_view_tonemapping_pipelines(
         let flags = tonemapping_key_flags(
             &view.color_grading,
             external_white_balance,
-            contract.compositing_space,
+            ResolvedCompositingSpace::space(resolved_space),
             resolved.output_gamut,
             has_gt7_params_uniform,
         );

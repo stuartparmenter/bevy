@@ -4,8 +4,10 @@ use bevy_app::prelude::*;
 use bevy_camera::{CameraOutputMode, CompositingSpace};
 use bevy_ecs::prelude::*;
 use bevy_render::{
-    camera::ExtractedCamera, render_resource::*, view::ViewTarget, Render, RenderApp,
-    RenderStartup, RenderSystems,
+    camera::ExtractedCamera,
+    render_resource::*,
+    view::{ResolvedCompositingSpace, ViewTarget},
+    Render, RenderApp, RenderStartup, RenderSystems,
 };
 
 mod node;
@@ -54,12 +56,15 @@ fn clear_view_upscaling_pipelines(
 /// holds encoded signal, so the blit passes it through. A request downgraded
 /// to plain SDR carries no encode parameters and keeps the
 /// decode-and-hardware-encode path.
-fn blit_source_space(contract: Option<&ViewStackContract>) -> Option<CompositingSpace> {
+fn blit_source_space(
+    contract: Option<&ViewStackContract>,
+    space: Option<CompositingSpace>,
+) -> Option<CompositingSpace> {
     let contract = contract?;
     if contract.encoding.is_some() {
         None
     } else {
-        contract.compositing_space
+        space
     }
 }
 
@@ -88,9 +93,12 @@ fn prepare_view_upscaling_pipelines(
         Option<&ExtractedCamera>,
         Option<&ViewUpscalingPipeline>,
         Option<&ViewStackContract>,
+        Option<&ResolvedCompositingSpace>,
     )>,
 ) {
-    for (entity, view_target, camera, maybe_pipeline, contract) in view_targets.iter() {
+    for (entity, view_target, camera, maybe_pipeline, contract, resolved_space) in
+        view_targets.iter()
+    {
         let force_replace = match contract.map(|contract| contract.blit) {
             Some(BlitDisposition::SkipForFinalizer) => {
                 // The upscaling pass's `ViewQuery` requires the pipeline, so removing
@@ -124,7 +132,8 @@ fn prepare_view_upscaling_pipelines(
             continue;
         };
 
-        let source_space = blit_source_space(contract);
+        let source_space =
+            blit_source_space(contract, ResolvedCompositingSpace::space(resolved_space));
 
         let key = BlitPipelineKey {
             target_format,
@@ -154,14 +163,13 @@ mod tests {
     use bevy_window::{DisplayGamut, DisplayTransfer};
 
     /// A solo SDR view's contract, with no encode parameters.
-    fn sdr_contract(compositing_space: Option<CompositingSpace>) -> ViewStackContract {
+    fn sdr_contract() -> ViewStackContract {
         ViewStackContract {
             tonemap: StackRole::Solo,
             encode: StackRole::Solo,
             blit: BlitDisposition::Run {
                 force_replace: false,
             },
-            compositing_space,
             source_gamut: DisplayGamut::Rec709,
             encoding: None,
         }
@@ -169,12 +177,12 @@ mod tests {
 
     #[test]
     fn solo_sdr_default_keys_no_source_space() {
-        let contract = sdr_contract(None);
+        let contract = sdr_contract();
         let key = BlitPipelineKey {
             target_format: TextureFormat::Bgra8UnormSrgb,
             blend_state: None,
             samples: 1,
-            source_space: blit_source_space(Some(&contract)),
+            source_space: blit_source_space(Some(&contract), None),
         };
         let expected = BlitPipelineKey {
             target_format: TextureFormat::Bgra8UnormSrgb,
@@ -188,28 +196,31 @@ mod tests {
     #[test]
     fn resolved_space_keys_the_blit_decode_on_sdr() {
         assert_eq!(
-            blit_source_space(Some(&sdr_contract(Some(CompositingSpace::Oklab)))),
+            blit_source_space(Some(&sdr_contract()), Some(CompositingSpace::Oklab)),
             Some(CompositingSpace::Oklab)
         );
         assert_eq!(
-            blit_source_space(Some(&sdr_contract(Some(CompositingSpace::Srgb)))),
+            blit_source_space(Some(&sdr_contract()), Some(CompositingSpace::Srgb)),
             Some(CompositingSpace::Srgb)
         );
     }
 
     #[test]
     fn encoded_views_blit_without_decode() {
-        let mut contract = sdr_contract(Some(CompositingSpace::Srgb));
+        let mut contract = sdr_contract();
         contract.encoding = Some(ResolvedEncoding {
             transfer: DisplayTransfer::Pq,
             gamut: DisplayGamut::Rec2020,
         });
-        assert_eq!(blit_source_space(Some(&contract)), None);
+        assert_eq!(
+            blit_source_space(Some(&contract), Some(CompositingSpace::Srgb)),
+            None
+        );
     }
 
     #[test]
     fn missing_contract_blits_without_decode() {
-        assert_eq!(blit_source_space(None), None);
+        assert_eq!(blit_source_space(None, Some(CompositingSpace::Srgb)), None);
     }
 
     #[test]
