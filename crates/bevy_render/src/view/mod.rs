@@ -187,12 +187,16 @@ impl Plugin for ViewPlugin {
             ));
 
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+            render_app.configure_sets(
+                Render,
+                ResolveCompositingSpaces
+                    .in_set(RenderSystems::CreateViews)
+                    .after(crate::camera::sort_cameras),
+            );
             render_app.add_systems(
                 Render,
                 (
-                    resolve_composition_spaces
-                        .in_set(RenderSystems::CreateViews)
-                        .after(crate::camera::sort_cameras),
+                    resolve_composition_spaces.in_set(ResolveCompositingSpaces),
                     // `TextureView`s need to be dropped before reconfiguring window surfaces.
                     clear_view_attachments
                         .in_set(RenderSystems::PrepareViews)
@@ -1479,9 +1483,9 @@ pub fn cleanup_view_targets_for_resize(
     }
 }
 
-/// The identity key of a camera's main-texture ping-pong. Cameras with equal
-/// keys share one ping-pong allocation in [`prepare_view_targets`], and
-/// [`resolve_composition_spaces`] groups by the same key.
+/// The settings that decide which cameras share main textures. Cameras with
+/// equal keys share one allocation in [`prepare_view_targets`], and
+/// [`resolve_composition_spaces`] groups them the same way.
 pub(crate) type MainTextureKey = (
     Option<NormalizedRenderTarget>,
     TextureUsages,
@@ -1563,7 +1567,7 @@ pub fn prepare_view_targets(
         // tonemapping decode's working-to-Rec.709 step would mis-convert them.
         // Oklab's LMS matrices are still Rec.709-fit, so perceptual blending of
         // Rec.2020 values is approximate.
-        let resolved_space = resolved_space.and_then(|space| space.0);
+        let resolved_space = ResolvedCompositingSpace::space(resolved_space);
         let converted_clear_color: Option<WgpuColor> =
             clear_color.map(|color| match resolved_space {
                 // If main texture stores Oklab or Srgb, convert Color to it for correct clear.

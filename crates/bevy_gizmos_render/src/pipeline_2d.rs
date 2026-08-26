@@ -329,7 +329,7 @@ fn queue_line_and_joint_gizmos_2d(
             continue;
         };
 
-        let compositing_space = resolved_space.and_then(|space| space.0);
+        let compositing_space = ResolvedCompositingSpace::space(resolved_space);
 
         let mesh_key = Mesh2dPipelineKey::from_msaa_samples(msaa.samples())
             | Mesh2dPipelineKey::from_target_format(view.target_format);

@@ -8,12 +8,12 @@ render-world components on the view entity: `ResolvedCompositingSpace` (the view
 `Option<CompositingSpace>`), written in `RenderSystems::CreateViews`, and
 `ViewStackContract`, written in `RenderSystems::PrepareViews`.
 
-- `ViewTarget::compositing_space` has been removed. Read `ResolvedCompositingSpace`
-  (in `bevy_render`) or `ViewStackContract::compositing_space` (in
-  `bevy_core_pipeline`) instead. `ViewStackContract` is overwritten in place and
-  never removed, so keep a `ViewTarget` term in your query to skip views whose
-  target was dropped. Don't use `ExtractedCamera::compositing_space`, the raw
-  per-camera request, for pass or pipeline-key decisions.
+- `ViewTarget::compositing_space` and `ExtractedCamera::compositing_space` have
+  been removed (see the `resolved_compositing_space` guide). In
+  `bevy_core_pipeline`, `ViewStackContract::compositing_space` carries the
+  resolved value. `ViewStackContract` is overwritten in place and never removed,
+  so keep a `ViewTarget` term in your query to skip views whose target was
+  dropped.
 - `encoder_input_gamut` has been removed from `bevy_core_pipeline::display_encoding`.
   Read `ViewStackContract::source_gamut` instead.
 - `bevy_core_pipeline::tonemapping::effective_tonemapping` and

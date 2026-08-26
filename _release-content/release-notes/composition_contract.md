@@ -9,7 +9,8 @@ Cameras that share a main texture and form a stack now resolve their
 first has `ClearColorConfig::None` and no viewport. Give every stack member the
 same `CompositingSpace`, or none: if they conflict, or if any member is not a 2D
 camera, the group resolves to linear with a warning. Cameras that do not form a
-stack keep their own requests.
+stack keep their own requests, normalized: an explicit `Linear` request resolves
+the same as no request.
 
 Tone mapping and display encoding resolve per stack too. A buffer is never
 encoded before it is tone-mapped, so when the stack shape would force that,

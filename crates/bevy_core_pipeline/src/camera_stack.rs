@@ -481,7 +481,7 @@ pub fn resolve_camera_stack_contracts(
                 }
             ),
             tonemap_output_gamut: resolved.output_gamut,
-            compositing_space: resolved_space.and_then(|space| space.0),
+            compositing_space: ResolvedCompositingSpace::space(resolved_space),
             loads_previous: matches!(camera.clear_color, ClearColorConfig::None),
             operator: resolved.operator,
         });

@@ -166,8 +166,7 @@ impl SpritePipelineKey {
             .expect("Unknown bits in `COLOR_TARGET_FORMAT_MASK_BITS` of the pipeline key")
     }
 
-    /// Key bits for a view's resolved [`CompositingSpace`], taken from
-    /// [`ResolvedCompositingSpace`] and never from the camera's raw request.
+    /// Key bits for a view's resolved [`CompositingSpace`].
     #[inline]
     pub fn from_compositing_space(space: Option<CompositingSpace>) -> Self {
         match space {
@@ -576,7 +575,7 @@ pub fn queue_sprites(
 
         let mut view_key = SpritePipelineKey::from_target_format(view.target_format)
             | SpritePipelineKey::from_msaa_samples(msaa.samples())
-            | SpritePipelineKey::from_compositing_space(resolved_space.and_then(|space| space.0));
+            | SpritePipelineKey::from_compositing_space(ResolvedCompositingSpace::space(resolved_space));
 
         if tonemap_in_shader
             && let Some(tonemapping) = tonemapping

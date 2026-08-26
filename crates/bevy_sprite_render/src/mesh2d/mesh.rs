@@ -60,8 +60,9 @@ use bevy_render::{
     sync_world::{MainEntity, MainEntityHashMap},
     texture::{FallbackImage, GpuImage},
     view::{
-        resolve_composition_spaces, texture_format_from_code, texture_format_to_code,
-        ExtractedView, ResolvedCompositingSpace, ViewUniform, ViewUniformOffset, ViewUniforms,
+        texture_format_from_code, texture_format_to_code, ExtractedView,
+        ResolveCompositingSpaces, ResolvedCompositingSpace, ViewUniform, ViewUniformOffset,
+        ViewUniforms,
     },
     Extract, ExtractSchedule, GpuResourceAppExt, Render, RenderApp, RenderSystems,
 };
@@ -114,7 +115,7 @@ impl Plugin for Mesh2dRenderPlugin {
                         // and `specialize_wireframes` run in `Specialize`, after this set.
                         check_views_need_specialization
                             .in_set(RenderSystems::CreateViews)
-                            .after(resolve_composition_spaces),
+                            .after(ResolveCompositingSpaces),
                         batch_and_prepare_binned_render_phase::<Opaque2d, Mesh2dPipeline>
                             .in_set(RenderSystems::PrepareResources),
                         batch_and_prepare_binned_render_phase::<AlphaMask2d, Mesh2dPipeline>
@@ -158,7 +159,7 @@ pub fn check_views_need_specialization(
     {
         let mut view_key = Mesh2dPipelineKey::from_msaa_samples(msaa.samples())
             | Mesh2dPipelineKey::from_target_format(view.target_format)
-            | Mesh2dPipelineKey::from_compositing_space(resolved_space.and_then(|space| space.0));
+            | Mesh2dPipelineKey::from_compositing_space(ResolvedCompositingSpace::space(resolved_space));
 
         if tonemap_in_shader
             && let Some(tonemapping) = tonemapping
@@ -689,8 +690,7 @@ impl Mesh2dPipelineKey {
             .expect("Unknown bits in `COLOR_TARGET_FORMAT_MASK_BITS` of the pipeline key")
     }
 
-    /// Key bits for a view's resolved [`CompositingSpace`], taken from
-    /// `ResolvedCompositingSpace` and never from the camera's raw request.
+    /// Key bits for a view's resolved [`CompositingSpace`].
     #[inline]
     pub fn from_compositing_space(space: Option<CompositingSpace>) -> Self {
         match space {

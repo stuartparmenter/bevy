@@ -622,7 +622,6 @@ mod tests {
                     sorted_camera_index_for_target: 0,
                     exposure: 1.0,
                     hdr: true,
-                    compositing_space: None,
                 },
                 ExtractedView {
                     retained_view_entity: RetainedViewEntity::new(
