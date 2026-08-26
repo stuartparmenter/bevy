@@ -11,7 +11,10 @@ the stack.
 
 Adding `GranTurismo7Params` to a camera moves its tonemapping from the material shaders
 to the tonemapping pass. This costs an `Rgba16Float` intermediate and one fullscreen
-pass; the pixels match. Remove the component to return to the in-shader path.
+pass. Transparents blend in scene-linear before tonemapping instead of after it, so
+scenes with transparency can look slightly different. `TonemappingPass` is a required
+component of `GranTurismo7Params` and outlives it, so removing the params alone does
+not restore the in-shader path; remove `TonemappingPass` too.
 
 An HDR display target, or an SDR target with a recalibrated `DisplayTarget`, moves a
 camera onto the same pass and intermediate. Budget for the fp16 main texture on such

@@ -22,7 +22,7 @@ fn enable_hdr_output(
         ..DisplayTarget::SDR_SRGB
     };
     // On HDR display targets GT7 runs in its HDR mode automatically. Add a
-    // `GranTurismo7Params` component to change the operator's defaults.
+    // `GranTurismo7Params` component to change the method's defaults.
     commands.entity(*camera).insert(Tonemapping::GranTurismo7);
 }
 ```
@@ -64,7 +64,7 @@ Paper white, peak, and other gamut changes take effect without reconfiguring.
 ## The display-encoding pass
 
 A per-view pass turns the tonemapped image into the signal the display
-expects, with no per-camera setup: it converts the operator's output primaries
+expects, with no per-camera setup: it converts the method's output primaries
 to the display's, then applies the transfer function. The encode functions are
 importable in WGSL as `bevy_render::transfer_functions`, mirrored in a Rust
 module; the decodes (the extended sRGB and PQ EOTFs) are CPU-only.
@@ -78,15 +78,15 @@ only when the gamut narrows, `Always` compresses on every HDR-target view and
 also desaturates saturated in-gamut colors, and `Clip` restores the per-channel
 clip.
 
-## Cameras without an HDR-capable operator
+## Cameras without an HDR-capable method
 
-Every operator except `GranTurismo7`, `Linear`, and `None` caps its output at
+Every method except `GranTurismo7`, `Linear`, and `None` caps its output at
 paper white, including `TonyMcMapface`, the `Camera3d` default. On an
 HDR display target such a view runs `Tonemapping::GranTurismo7` instead, with
 the camera's `GranTurismo7Params` if present, and Bevy warns once. Your
 `Tonemapping` component is never modified: set `Tonemapping::GranTurismo7`
 yourself to silence the warning, or use an SDR display target to keep the
-authored operator. `Tonemapping::None` is never substituted, but also warns on
+authored method. `Tonemapping::None` is never substituted, but also warns on
 HDR display targets.
 
 Views on an SDR display target, including the default

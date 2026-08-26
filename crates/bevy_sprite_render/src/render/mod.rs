@@ -575,7 +575,9 @@ pub fn queue_sprites(
 
         let mut view_key = SpritePipelineKey::from_target_format(view.target_format)
             | SpritePipelineKey::from_msaa_samples(msaa.samples())
-            | SpritePipelineKey::from_compositing_space(ResolvedCompositingSpace::space(resolved_space));
+            | SpritePipelineKey::from_compositing_space(ResolvedCompositingSpace::space(
+                resolved_space,
+            ));
 
         if tonemap_in_shader && let Some(tonemapping) = tonemapping {
             view_key |= SpritePipelineKey::TONEMAP_IN_SHADER;

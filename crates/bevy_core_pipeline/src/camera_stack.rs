@@ -443,7 +443,7 @@ fn resolve_group<K>(
 /// which supplies the `ViewTarget`, and `prepare_view_display_targets`, which
 /// supplies the `ViewDisplayTarget`.
 ///
-/// A texture group never spans two [`ResolvedCompositingSpace`](bevy_render::view::ResolvedCompositingSpace) groups: equal
+/// A texture group never spans two `ResolvedCompositingSpace` groups: equal
 /// main-texture ids imply equal main-texture keys, and `prepare_view_targets`
 /// dedups allocations on exactly that key.
 ///

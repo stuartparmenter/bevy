@@ -12,7 +12,7 @@ implementation is MIT licensed, Copyright (c) 2025 Polyphony Digital Inc.
 It blends a per-channel filmic curve with a hue-preserving ICtCp branch (60%
 ICtCp, 40% per-channel by default) and adds a luminance-driven chroma fade, so
 colors desaturate near peak white instead of clipping. Unlike the LUT-based
-operators (AgX, TonyMcMapface, BlenderFilmic) it is algorithmic and does not
+methods (AgX, TonyMcMapface, BlenderFilmic) it is algorithmic and does not
 need the `tonemapping_luts` cargo feature.
 
 ```rust
@@ -25,7 +25,7 @@ commands.spawn((
 On an SDR display target it tonemaps against Gran Turismo's 250-nit paper
 white and rescales into the sRGB range.
 
-Add `GranTurismo7Params` to the camera to replace the operator's baked
+Add `GranTurismo7Params` to the camera to replace the method's baked
 defaults: `blend_ratio`, the chroma fade band, and the curve shape parameters.
 Out-of-range values are clamped, with a warning.
 

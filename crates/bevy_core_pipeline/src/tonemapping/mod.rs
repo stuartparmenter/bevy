@@ -478,9 +478,10 @@ pub fn gt7_params_uniform_active(
 /// `CompositingSpace`, so the pass decodes and re-encodes in the space the main texture
 /// actually holds.
 ///
-/// `compositing_space` must be the resolved space from the view's `ViewStackContract`.
-/// Stack members share one main texture, so the decode and re-encode flags have to match
-/// the one space the whole stack composites in.
+/// `compositing_space` must be the view's resolved space, from
+/// [`ResolvedCompositingSpace`]. Stack members share one main texture, so the
+/// decode and re-encode flags have to match the one space the whole stack
+/// composites in.
 ///
 /// `output_gamut` must be the view's [`ResolvedTonemapping::output_gamut`].
 ///

@@ -1,5 +1,5 @@
 ---
-title: "`ViewTarget::compositing_space` removed: camera compositing resolves once per frame"
+title: "The composition contract: camera compositing resolves once per frame"
 pull_requests: []
 ---
 

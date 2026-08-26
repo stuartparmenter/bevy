@@ -311,7 +311,7 @@ pub struct DisplayEncodingPipelineKey {
     /// destination).
     pub target_format: TextureFormat,
     /// The view's resolved [`CompositingSpace`]
-    /// ([`ResolvedCompositingSpace`](bevy_render::view::ResolvedCompositingSpace)), if any. `Some(Srgb)` and
+    /// ([`ResolvedCompositingSpace`]), if any. `Some(Srgb)` and
     /// `Some(Oklab)` main textures hold encoded values that must be decoded
     /// back to linear before the gamut and transfer encoding. This is the same
     /// decode the upscaling blit performs for views that skip this pass.

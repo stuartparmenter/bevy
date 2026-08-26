@@ -60,9 +60,8 @@ use bevy_render::{
     sync_world::{MainEntity, MainEntityHashMap},
     texture::{FallbackImage, GpuImage},
     view::{
-        texture_format_from_code, texture_format_to_code, ExtractedView,
-        ResolveCompositingSpaces, ResolvedCompositingSpace, ViewUniform, ViewUniformOffset,
-        ViewUniforms,
+        texture_format_from_code, texture_format_to_code, ExtractedView, ResolveCompositingSpaces,
+        ResolvedCompositingSpace, ViewUniform, ViewUniformOffset, ViewUniforms,
     },
     Extract, ExtractSchedule, GpuResourceAppExt, Render, RenderApp, RenderSystems,
 };
@@ -159,7 +158,9 @@ pub fn check_views_need_specialization(
     {
         let mut view_key = Mesh2dPipelineKey::from_msaa_samples(msaa.samples())
             | Mesh2dPipelineKey::from_target_format(view.target_format)
-            | Mesh2dPipelineKey::from_compositing_space(ResolvedCompositingSpace::space(resolved_space));
+            | Mesh2dPipelineKey::from_compositing_space(ResolvedCompositingSpace::space(
+                resolved_space,
+            ));
 
         if tonemap_in_shader && let Some(tonemapping) = tonemapping {
             view_key |= Mesh2dPipelineKey::TONEMAP_IN_SHADER;

@@ -228,7 +228,7 @@ fn rgb_to_ictcp(rgb: [f32; 3]) -> [f32; 3] {
 /// GPU uniform feeding the GT7 method's `Gt7Params` WGSL struct (see
 /// `gt7.wesl`; field order and meaning must stay identical).
 ///
-/// [`Self::from_params`] computes the derived curve constants (`k_a`, `k_b`,
+/// `Self::from_params` computes the derived curve constants (`k_a`, `k_b`,
 /// `k_c`, `peak_ucs`) on the CPU so the shader stays cheap.
 #[derive(Component, Clone, Copy, Debug, PartialEq, ShaderType)]
 pub struct Gt7ParamsUniform {

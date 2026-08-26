@@ -8,9 +8,9 @@
 
 use bevy_camera::NormalizedRenderTarget;
 use bevy_ecs::{entity::ContainsEntity, prelude::*};
+use bevy_extract_macros::ExtractResource;
 use bevy_platform::collections::HashMap;
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
-use bevy_extract_macros::ExtractResource;
 use bevy_window::{
     DisplayCalibrationPolicy, DisplayTarget, EffectiveDisplayTarget, MonitorDisplayCapability,
     OnMonitor, Window, WindowDisplayState,
