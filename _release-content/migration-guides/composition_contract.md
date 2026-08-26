@@ -20,10 +20,6 @@ render-world components on the view entity: `ResolvedCompositingSpace` (the view
   `tonemap_output_gamut` have been replaced by `resolve_tonemapping`, which returns
   the substituted operator and its output gamut together
   (`ResolvedTonemapping::output_gamut`).
-- `SortedCamera::hdr` has been removed: cameras sort by `(order, target)` alone.
-  Read `ExtractedCamera::hdr` on the view entity if you need a camera's raw HDR
-  request.
-
 The writer-side encode shader defs that 2D pipelines (sprites, 2D meshes and
 materials, gizmos, UI) push into their shaders are renamed: `SRGB_OUTPUT` is now
 `COMPOSITING_SPACE_SRGB`, and `OKLAB_OUTPUT` is now `COMPOSITING_SPACE_OKLAB`. A

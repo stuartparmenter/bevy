@@ -160,6 +160,8 @@ pub(crate) struct ContractInput<K> {
     /// resolve together only when they share it.
     pub texture: K,
     /// The camera's position in its render target's sorted camera order.
+    /// The resolver and the upscaling auto-blend rely on this bottom-to-top
+    /// order.
     pub sorted_index: usize,
     /// See [`composites_fullscreen`].
     pub composites_fullscreen: bool,
