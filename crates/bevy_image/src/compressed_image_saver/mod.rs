@@ -130,7 +130,7 @@ impl AssetSaver for CompressedImageSaver {
         settings: &Self::Settings,
         asset_path: AssetPath<'_>,
     ) -> Result<ImageLoaderSettings, Self::Error> {
-        let is_srgb = asset.texture_descriptor.format.is_srgb();
+        let is_srgb = asset.texture_descriptor.format.has_srgb_suffix();
         if settings.is_normal_map && is_srgb {
             return Err(CompressedImageSaverError::NormalMapMustBeLinear(
                 asset.texture_descriptor.format,

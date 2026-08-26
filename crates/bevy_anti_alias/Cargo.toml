@@ -13,7 +13,14 @@ trace = []
 webgl = []
 webgpu = []
 smaa_luts = ["bevy_image/ktx2", "bevy_image/zstd"]
-dlss = ["dep:dlss_wgpu", "dep:uuid", "bevy_render/raw_vulkan_init"]
+dlss = [
+  "dep:dlss_wgpu",
+  "dep:uuid",
+  "dep:bevy_log",
+  "dep:bevy_window",
+  "bevy_render/raw_vulkan_init",
+  "bevy_render/paced_present",
+]
 force_disable_dlss = ["dlss_wgpu?/mock"]
 
 [dependencies]
@@ -32,10 +39,12 @@ bevy_ecs = { path = "../bevy_ecs", version = "0.20.0-dev" }
 bevy_extract = { path = "../bevy_extract", version = "0.20.0-dev" }
 bevy_core_pipeline = { path = "../bevy_core_pipeline", version = "0.20.0-dev" }
 bevy_diagnostic = { path = "../bevy_diagnostic", version = "0.20.0-dev" }
+bevy_log = { path = "../bevy_log", version = "0.20.0-dev", optional = true }
+bevy_window = { path = "../bevy_window", version = "0.20.0-dev", optional = true }
 
 # other
 tracing = { version = "0.1", default-features = false, features = ["std"] }
-dlss_wgpu = { version = "5.0.0", optional = true }
+dlss_wgpu = { git = "https://github.com/stuartparmenter/dlss_wgpu", branch = "frame-generation", optional = true }
 uuid = { version = "1.21.0", optional = true }
 
 [lints]

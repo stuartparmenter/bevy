@@ -125,7 +125,7 @@ This is the complete `bevy` cargo feature list, without "profiles" or "collectio
 |default_font|Include a default font, containing only ASCII characters, at the cost of a 20kB binary size increase|
 |detailed_trace|Enable detailed trace event logging. These trace events are expensive even when off, thus they require compile time opt-in|
 |dfg_lut|Include a preintegrated BRDF Look Up Table for more accurate specular shading.|
-|dlss|NVIDIA Deep Learning Super Sampling|
+|dlss|NVIDIA DLSS Super Resolution, Ray Reconstruction, and Frame Generation|
 |dynamic_linking|Force dynamic linking, which improves iterative compile times|
 |embedded_watcher|Enables watching in memory asset providers for Bevy Asset hot-reloading|
 |experimental_pbr_pcss|Enable support for PCSS, at the risk of blowing past the global, per-shader sampler limit on older/lower-end GPUs|

@@ -7,6 +7,7 @@ use crate::{
     Extract, ExtractSchedule, Render, RenderApp, RenderSystems,
 };
 use bevy_app::{App, Plugin};
+use bevy_ecs::entity::EntityHashMap;
 use bevy_ecs::prelude::*;
 use bevy_ecs::system::RunSystemOnce;
 use bevy_log::{debug, info, warn};
@@ -15,10 +16,14 @@ use bevy_window::{
     CompositeAlphaMode, PresentMode, PrimaryWindow, RawHandleWrapper, Window, WindowClosing,
 };
 use core::num::NonZero;
+#[cfg(feature = "paced_present")]
+use paced_present::PacedWindows;
 use wgpu::{
     SurfaceConfiguration, SurfaceTargetUnsafe, TextureFormat, TextureUsages, TextureViewDescriptor,
 };
 
+#[cfg(feature = "paced_present")]
+pub mod paced_present;
 pub mod screenshot;
 
 use screenshot::ScreenshotPlugin;
@@ -51,6 +56,7 @@ impl Plugin for WindowRenderPlugin {
 
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
             render_app
+                .init_resource::<PacedSwapchainDepths>()
                 .add_systems(ExtractSchedule, extract_windows.before(extract_cameras))
                 .add_systems(
                     Render,
@@ -59,7 +65,71 @@ impl Plugin for WindowRenderPlugin {
                         .before(prepare_windows),
                 )
                 .add_systems(Render, prepare_windows.in_set(RenderSystems::PrepareViews));
+
+            #[cfg(feature = "paced_present")]
+            render_app
+                .init_resource::<PacedWindows>()
+                .init_resource::<paced_present::PacedPresentPlans>()
+                .init_resource::<paced_present::PacedPresentedFrames>()
+                .add_systems(
+                    ExtractSchedule,
+                    paced_present::reset_paced_windows
+                        .in_set(paced_present::PacedWindowReset)
+                        .before(extract_windows),
+                )
+                .add_systems(
+                    Render,
+                    paced_present::prewarm_paced_blit_pipelines
+                        .in_set(RenderSystems::PrepareViews)
+                        .after(prepare_windows)
+                        .run_if(|depths: Res<PacedSwapchainDepths>| !depths.is_empty()),
+                );
         }
+    }
+}
+
+/// Swapchain depth declared per window, keyed by main world window entity.
+///
+/// A paced presentation producer declares the largest batch it will ever present,
+/// generated frames plus the real frame. Surface configuration then sizes the swapchain
+/// so a full batch can queue while one image is still on display. A smaller swapchain
+/// does not deadlock, but FIFO acquire serializes the batch across vblanks and defeats
+/// present metering, which is armed on the first present of a batch only.
+///
+/// The depth comes from the producer's maximum, never from a plan's length. Plan length
+/// drops to one on reset and fallback frames, and reconfiguring the surface drains the
+/// device.
+///
+/// Unlike the per-frame pacing claim in `PacedWindows`, this is not cleared between
+/// frames. Entries persist until the window closes, so toggling a producer off does not
+/// reconfigure the surface. The cost is a deeper swapchain, and more permitted frame
+/// latency, while no producer paces the window.
+///
+/// The resource exists even without the `paced_present` feature, so surface sizing has
+/// one code path. Without the feature nothing declares a depth.
+#[derive(Resource, Default)]
+pub struct PacedSwapchainDepths(EntityHashMap<u32>);
+
+impl PacedSwapchainDepths {
+    /// Declares that plans for `window` can hold up to `frames_per_batch` frames.
+    /// Keeps the largest value ever declared.
+    pub fn declare(&mut self, window: Entity, frames_per_batch: u32) {
+        let depth = self.0.entry(window).or_default();
+        *depth = (*depth).max(frames_per_batch);
+    }
+
+    /// The declared depth for `window`, or zero when none was declared.
+    pub fn get(&self, window: Entity) -> u32 {
+        self.0.get(&window).copied().unwrap_or(0)
+    }
+
+    /// Whether any window has a declared depth.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub(crate) fn remove(&mut self, window: Entity) {
+        self.0.remove(&window);
     }
 }
 
@@ -119,6 +189,7 @@ impl ExtractedWindow {
 fn extract_windows(
     mut commands: Commands,
     mut extracted_windows: Query<&mut ExtractedWindow>,
+    mut paced_depths: ResMut<PacedSwapchainDepths>,
     mut closing: Extract<MessageReader<WindowClosing>>,
     windows: Extract<Query<(RenderEntity, &Window, &RawHandleWrapper, Has<PrimaryWindow>)>>,
     mut removed: Extract<RemovedComponents<RawHandleWrapper>>,
@@ -191,11 +262,13 @@ fn extract_windows(
     }
 
     for closing_window in closing.read() {
+        paced_depths.remove(closing_window.window);
         if let Ok(render_entity) = mapper.get(closing_window.window) {
             commands.entity(render_entity.entity()).despawn();
         }
     }
     for removed_window in removed.read() {
+        paced_depths.remove(removed_window);
         if let Ok(render_entity) = mapper.get(removed_window) {
             commands.entity(render_entity.entity()).despawn();
         }
@@ -242,6 +315,7 @@ pub fn prepare_windows(
     mut windows: Query<(MainEntity, &mut ExtractedWindow, Option<&SurfaceData>)>,
     render_device: Res<RenderDevice>,
     sorted_cameras: Res<crate::camera::SortedCameras>,
+    #[cfg(feature = "paced_present")] paced_windows: Res<PacedWindows>,
     #[cfg(target_os = "linux")] render_instance: Res<RenderInstance>,
 ) {
     for (main_entity, mut window, maybe_surface_data) in &mut windows {
@@ -263,6 +337,15 @@ pub fn prepare_windows(
         let Some(surface_data) = maybe_surface_data else {
             continue;
         };
+        window.swap_chain_texture_format = Some(surface_data.configuration.format);
+        window.swap_chain_texture_view_format =
+            Some(surface_data.configuration.format.add_srgb_suffix());
+
+        // Paced windows have their swapchain textures acquired during presentation
+        #[cfg(feature = "paced_present")]
+        if paced_windows.0.contains(&main_entity) {
+            continue;
+        }
 
         // We didn't present the previous frame, so we can keep using our existing swapchain texture.
         if window.has_swapchain_texture() && !window.size_changed && !window.present_mode_changed {
@@ -328,13 +411,23 @@ pub fn prepare_windows(
                 bevy_log::error!("Couldn't get swap chain texture: {other:?}");
             }
         }
-        window.swap_chain_texture_format = Some(surface_data.configuration.format);
     }
 }
 
-pub fn need_surface_configuration(windows: Query<(&ExtractedWindow, Has<SurfaceData>)>) -> bool {
-    for (window, has_surface_data) in &windows {
-        if !has_surface_data || window.size_changed || window.present_mode_changed {
+pub fn need_surface_configuration(
+    windows: Query<(MainEntity, &ExtractedWindow, Option<&SurfaceData>)>,
+    paced_depths: Res<PacedSwapchainDepths>,
+) -> bool {
+    for (main_entity, window, surface_data) in &windows {
+        let Some(surface_data) = surface_data else {
+            return true;
+        };
+        if window.size_changed || window.present_mode_changed {
+            return true;
+        }
+        if surface_data.configuration.desired_maximum_frame_latency
+            != desired_frame_latency(window, paced_depths.get(main_entity))
+        {
             return true;
         }
     }
@@ -347,6 +440,19 @@ pub fn need_surface_configuration(windows: Query<(&ExtractedWindow, Has<SurfaceD
 // has to wait for the cpu to finish to start on the next frame.
 const DEFAULT_DESIRED_MAXIMUM_FRAME_LATENCY: u32 = 2;
 
+/// Frame latency for the surface configuration.
+///
+/// A paced batch of `paced_depth` frames needs `paced_depth` acquirable images while one
+/// image is still on display. On Vulkan, wgpu creates `desired_maximum_frame_latency + 1`
+/// swapchain images and clamps the value to the surface capabilities.
+fn desired_frame_latency(window: &ExtractedWindow, paced_depth: u32) -> u32 {
+    window
+        .desired_maximum_frame_latency
+        .map(NonZero::<u32>::get)
+        .unwrap_or(DEFAULT_DESIRED_MAXIMUM_FRAME_LATENCY)
+        .max(paced_depth)
+}
+
 /// Creates window surfaces.
 pub fn create_surfaces(
     mut commands: Commands,
@@ -355,6 +461,7 @@ pub fn create_surfaces(
     #[cfg(any(target_os = "macos", target_os = "ios"))] _marker: bevy_ecs::system::NonSendMarker,
     mut windows: Query<(
         Entity,
+        MainEntity,
         &mut ExtractedWindow,
         &RawHandleWrapper,
         Option<&mut SurfaceData>,
@@ -362,8 +469,10 @@ pub fn create_surfaces(
     render_instance: Res<RenderInstance>,
     render_adapter: Res<RenderAdapter>,
     render_device: Res<RenderDevice>,
+    paced_depths: Res<PacedSwapchainDepths>,
 ) {
-    for (entity, mut window, handle, mut maybe_surface_data) in &mut windows {
+    for (entity, main_entity, mut window, handle, mut maybe_surface_data) in &mut windows {
+        let target_latency = desired_frame_latency(&window, paced_depths.get(main_entity));
         let Some(data) = maybe_surface_data.as_mut() else {
             let surface_target = SurfaceTargetUnsafe::RawHandle {
                 raw_display_handle: Some(handle.get_display_handle()),
@@ -394,7 +503,7 @@ pub fn create_surfaces(
                 }
             }
 
-            let texture_view_format = if !format.is_srgb() {
+            let texture_view_format = if !format.has_srgb_suffix() {
                 Some(format.add_srgb_suffix())
             } else {
                 None
@@ -405,10 +514,7 @@ pub fn create_surfaces(
                 height: window.physical_height,
                 usage: TextureUsages::RENDER_ATTACHMENT,
                 present_mode,
-                desired_maximum_frame_latency: window
-                    .desired_maximum_frame_latency
-                    .map(NonZero::<u32>::get)
-                    .unwrap_or(DEFAULT_DESIRED_MAXIMUM_FRAME_LATENCY),
+                desired_maximum_frame_latency: target_latency,
                 alpha_mode: match window.alpha_mode {
                     CompositeAlphaMode::Auto => wgpu::CompositeAlphaMode::Auto,
                     CompositeAlphaMode::Opaque => wgpu::CompositeAlphaMode::Opaque,
@@ -433,7 +539,10 @@ pub fn create_surfaces(
             continue;
         };
 
-        if window.size_changed || window.present_mode_changed {
+        if window.size_changed
+            || window.present_mode_changed
+            || data.configuration.desired_maximum_frame_latency != target_latency
+        {
             // normally this is dropped on present but we double check here to be safe as failure to
             // drop it will cause validation errors in wgpu
             drop(window.swap_chain_texture.take());
@@ -445,6 +554,7 @@ pub fn create_surfaces(
 
             data.configuration.width = window.physical_width;
             data.configuration.height = window.physical_height;
+            data.configuration.desired_maximum_frame_latency = target_latency;
             let caps = data.surface.get_capabilities(&render_adapter);
             data.configuration.present_mode = present_mode(&window, &caps);
             render_device.configure_surface(&data.surface, &data.configuration);

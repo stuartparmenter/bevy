@@ -18,7 +18,7 @@ impl CompressedImageSaverUniversal {
         settings: &CompressedImageSaverSettings,
         _asset_path: AssetPath<'_>,
     ) -> Result<ImageLoaderSettings, CompressedImageSaverError> {
-        let is_srgb = image.texture_descriptor.format.is_srgb();
+        let is_srgb = image.texture_descriptor.format.has_srgb_suffix();
 
         let compressed_basis_data = {
             let mut compressor_params = CompressorParams::new();

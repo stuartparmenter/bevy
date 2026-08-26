@@ -88,6 +88,9 @@ pub fn render_system(
         Res<RenderQueue>,
     )>,
     screenshot_state: &mut SystemState<SubmitScreenshotCommandsState>,
+    #[cfg(feature = "paced_present")] paced_present_state: &mut SystemState<
+        crate::view::window::paced_present::PacedPresentState,
+    >,
 ) {
     #[cfg(feature = "trace")]
     let _span = info_span!("main_render_schedule").entered();
@@ -111,8 +114,18 @@ pub fn render_system(
         #[cfg(feature = "trace")]
         let _span = info_span!("present_frames").entered();
 
+        // Windows owned by paced presentation this frame, skipped by the loop below. A
+        // claimed window is skipped even when the pacer presented nothing for it.
+        #[cfg(feature = "paced_present")]
+        let paced_windows =
+            crate::view::window::paced_present::present_paced_plans(world, paced_present_state);
+
         if let Ok((views, mut windows, render_queue)) = present_state.get_mut(world) {
             for (window_entity, mut window) in &mut windows {
+                #[cfg(feature = "paced_present")]
+                if paced_windows.contains(&window_entity) {
+                    continue;
+                }
                 let view_needs_present = views.iter().any(|(view_target, camera)| {
                     matches!(
                         camera.target,

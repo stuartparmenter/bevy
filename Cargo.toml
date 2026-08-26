@@ -593,7 +593,7 @@ dfg_lut = ["bevy_internal/dfg_lut"]
 # Include Look Up Tables that are required for area lights.
 area_light_luts = ["bevy_internal/area_light_luts"]
 
-# NVIDIA Deep Learning Super Sampling
+# NVIDIA DLSS Super Resolution, Ray Reconstruction, and Frame Generation
 dlss = ["bevy_internal/dlss"]
 
 # Forcibly disable DLSS so that `cargo build --all-features` works without the DLSS SDK being installed. Not meant for users.
@@ -746,6 +746,15 @@ tracing = { version = "0.1", default-features = false, optional = true }
 # Wasm does not support dynamic linking.
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 bevy_dylib = { path = "crates/bevy_dylib", version = "0.20.0-dev", default-features = false, optional = true }
+
+# wgpu trunk for `Surface::set_next_present_chain` (gfx-rs/wgpu#9847), which releases in
+# wgpu 31.
+# TODO: Point back at crates.io once wgpu 31 releases.
+[patch.crates-io]
+wgpu = { git = "https://github.com/gfx-rs/wgpu", branch = "trunk" }
+wgpu-types = { git = "https://github.com/gfx-rs/wgpu", branch = "trunk" }
+wgpu-naga-bridge = { git = "https://github.com/gfx-rs/wgpu", branch = "trunk" }
+naga = { git = "https://github.com/gfx-rs/wgpu", branch = "trunk" }
 
 [dev-dependencies]
 rand = "0.10.0"

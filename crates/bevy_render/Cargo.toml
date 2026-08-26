@@ -25,6 +25,13 @@ statically-linked-dxc = ["wgpu/static-dxc"]
 # Forces the wgpu instance to be initialized using the raw Vulkan HAL, enabling additional configuration
 raw_vulkan_init = ["wgpu/vulkan"]
 
+# Presentation of multiple textures per rendered frame, used by frame generation such as
+# DLSS Frame Generation. Display timing is metered only when a producer supplies a Vulkan
+# present chain link, for example VK_NV_present_metering enabled by the DLSS plugin. The
+# wgpu/vulkan dependency exists to arm that link. The feature compiles on other backends,
+# but frames then present back to back with no useful pacing.
+paced_present = ["wgpu/vulkan"]
+
 trace = ["profiling"]
 tracing-tracy = ["dep:tracy-client"]
 ci_limits = []
