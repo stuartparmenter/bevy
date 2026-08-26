@@ -13,6 +13,8 @@ use bevy_ecs::{
 };
 use bevy_math::{Affine2, FloatOrd, Rect, Vec2};
 use bevy_mesh::VertexBufferLayout;
+use bevy_render::material_bind_groups::FallbackBuffer;
+use bevy_render::storage::GpuShaderBuffer;
 use bevy_render::{
     globals::{GlobalsBuffer, GlobalsUniform},
     render_asset::{PrepareAssetError, RenderAsset, RenderAssetPlugin, RenderAssets},
@@ -52,7 +54,10 @@ where
 
         app.init_asset::<M>()
             .register_type::<MaterialNode<M>>()
-            .add_plugins(RenderAssetPlugin::<PreparedUiMaterial<M>, GpuImage>::default());
+            .add_plugins(RenderAssetPlugin::<
+                PreparedUiMaterial<M>,
+                (GpuImage, GpuShaderBuffer),
+            >::default());
 
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
             render_app
@@ -622,6 +627,8 @@ impl<M: UiMaterial> RenderAsset for PreparedUiMaterial<M> {
     type Param = (
         SRes<RenderDevice>,
         SRes<PipelineCache>,
+        SRes<FallbackBuffer>,
+        SRes<RenderAssets<GpuShaderBuffer>>,
         SRes<UiMaterialPipeline<M>>,
         M::Param,
     );
@@ -629,9 +636,14 @@ impl<M: UiMaterial> RenderAsset for PreparedUiMaterial<M> {
     fn prepare_asset(
         material: Self::SourceAsset,
         _: AssetId<Self::SourceAsset>,
-        (render_device, pipeline_cache, pipeline, material_param): &mut SystemParamItem<
-            Self::Param,
-        >,
+        (
+            render_device,
+            pipeline_cache,
+            fallback_buffer,
+            shader_buffer_assets,
+            pipeline,
+            material_param,
+        ): &mut SystemParamItem<Self::Param>,
         _: Option<&Self>,
     ) -> Result<Self, PrepareAssetError<Self::SourceAsset>> {
         let bind_group_data = material.bind_group_data();
@@ -639,6 +651,8 @@ impl<M: UiMaterial> RenderAsset for PreparedUiMaterial<M> {
             &pipeline.ui_layout.clone(),
             render_device,
             pipeline_cache,
+            fallback_buffer,
+            shader_buffer_assets,
             material_param,
         ) {
             Ok(prepared) => Ok(PreparedUiMaterial {

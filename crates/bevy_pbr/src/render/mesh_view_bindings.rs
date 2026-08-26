@@ -18,7 +18,7 @@ use bevy_ecs::{
     entity::Entity,
     query::{Has, With},
     resource::Resource,
-    system::{Commands, Local, Query, Res},
+    system::{Commands, Query, Res},
 };
 use bevy_light::{EnvironmentMapLight, IrradianceVolume};
 use bevy_math::Vec4;
@@ -690,11 +690,10 @@ pub fn prepare_mesh_view_bind_groups(
         Res<DfgLut>,
     ),
     // TODO: Figure out how to reuse the memory. `BindGroupEntry` is non-send on wasm with atomics.
-    #[cfg(not(all(target_arch = "wasm32", target_feature = "atomics")))] mut entries_cache: Local<
-        Vec<BindGroupEntry>,
-    >,
     #[cfg(not(all(target_arch = "wasm32", target_feature = "atomics")))]
-    mut entries_binding_array_cache: Local<Vec<BindGroupEntry>>,
+    mut entries_cache: bevy_ecs::system::Local<Vec<BindGroupEntry>>,
+    #[cfg(not(all(target_arch = "wasm32", target_feature = "atomics")))]
+    mut entries_binding_array_cache: bevy_ecs::system::Local<Vec<BindGroupEntry>>,
 ) {
     if let (
         Some(view_binding),
@@ -753,7 +752,7 @@ pub fn prepare_mesh_view_bind_groups(
                     .collect();
             }
 
-            let tonemap_in_shader = has_tonemap_in_shader && *tonemapping != Tonemapping::None;
+            let tonemap_in_shader = has_tonemap_in_shader && tonemapping.is_enabled();
             let mut layout_key = MeshPipelineViewLayoutKey::from(*msaa)
                 | MeshPipelineViewLayoutKey::from(prepass_textures);
             let mut offsets = ArrayVec::from_iter([

@@ -30,8 +30,6 @@ use bitflags::bitflags;
 mod gt7;
 mod node;
 
-/// These live in `bevy_render` so camera extraction can pick the main-texture format from
-/// the operator.
 pub use bevy_render::view::{DebandDither, Tonemapping};
 use bevy_utils::default;
 pub use gt7::{
@@ -265,7 +263,7 @@ impl SpecializedRenderPipeline for TonemappingPipeline {
 
         match key.tonemapping {
             Tonemapping::None | Tonemapping::Linear => {
-                shader_defs.push("TONEMAP_METHOD_NONE".into());
+                shader_defs.push("TONEMAP_METHOD_LINEAR".into());
             }
             Tonemapping::Reinhard => shader_defs.push("TONEMAP_METHOD_REINHARD".into()),
             Tonemapping::ReinhardLuminance => {

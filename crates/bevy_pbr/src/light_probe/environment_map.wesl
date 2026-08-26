@@ -6,6 +6,7 @@ import package::render::mesh_view_types::{
 };
 import package::render::pbr_lighting::{F_Schlick_vec, LightingInput, LayerLightingInput, LAYER_BASE, LAYER_CLEARCOAT};
 import package::render::clustered_forward::ClusterableObjectIndexRanges;
+import bevy_render::maths::quat_rotate;
 
 @if(WORKING_COLOR_SPACE_REC2020)
 import bevy_render::working_color_space::rec709_to_rec2020;
@@ -418,9 +419,4 @@ fn radiance_sample_direction(N: vec3<f32>, R: vec3<f32>, roughness: f32) -> vec3
     let smoothness = saturate(1.0 - roughness);
     let lerp_factor = smoothness * (sqrt(smoothness) + roughness);
     return mix(N, R, lerp_factor);
-}
-
-fn quat_rotate(q: vec4<f32>, dir: vec3<f32>) -> vec3<f32> {
-    let t = 2.0 * cross(q.xyz, dir);
-    return dir + q.w * t + cross(q.xyz, t);
 }

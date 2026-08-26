@@ -225,7 +225,7 @@ pub struct Dlss<F: DlssFeature = DlssSuperResolutionFeature> {
     pub _phantom_data: PhantomData<F>,
 }
 
-impl Default for Dlss<DlssSuperResolutionFeature> {
+impl<F: DlssFeature> Default for Dlss<F> {
     fn default() -> Self {
         Self {
             perf_quality_mode: Default::default(),
@@ -368,6 +368,7 @@ pub struct ViewDlssRayReconstructionTextures {
     pub diffuse_albedo: CachedTexture,
     pub specular_albedo: CachedTexture,
     pub normal_roughness: CachedTexture,
+    pub depth: CachedTexture,
     pub specular_motion_vectors: CachedTexture,
 }
 

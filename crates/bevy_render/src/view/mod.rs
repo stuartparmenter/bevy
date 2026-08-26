@@ -36,11 +36,11 @@ use bevy_app::{App, Plugin};
 use bevy_color::{LinearRgba, Oklaba, Srgba};
 use bevy_derive::{Deref, DerefMut};
 use bevy_ecs::{prelude::*, VariantDefaults};
+use bevy_extract_macros::ExtractComponent;
 use bevy_image::ToExtents;
 use bevy_math::{mat3, vec2, vec3, Mat3, Mat4, UVec4, Vec2, Vec3, Vec4, Vec4Swizzles};
 use bevy_platform::collections::{hash_map::Entry, HashMap};
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
-use bevy_render_macros::ExtractComponent;
 use bevy_shader::load_shader_library;
 use bevy_transform::components::GlobalTransform;
 use core::{
@@ -285,14 +285,13 @@ impl Msaa {
 ///
 /// Feedback and trail effects that load the previous frame's buffer (a camera
 /// with `ClearColorConfig::None` at the bottom of its stack) are only stable
-/// with [`Tonemapping::None`] on an SDR target. Any other operator, or an HDR
+/// with [`Tonemapping::None`] on an SDR target. Any other method, or an HDR
 /// target, reprocesses last frame's already tone-mapped and display-encoded
 /// output every frame, so the image drifts over time.
-/// `bevy_core_pipeline::camera_stack` reports this as a diagnostic.
+/// `bevy_core_pipeline::camera_stack` warns about this.
 ///
-/// The tonemapping pass itself lives in `bevy_core_pipeline`. This component
-/// sits here so camera extraction can read it when it picks the main-texture
-/// format.
+/// The tonemapping pass lives in `bevy_core_pipeline`. The type is defined in
+/// `bevy_render` so render-world code can read it.
 #[derive(
     Component, Debug, Hash, Clone, Copy, Reflect, Default, ExtractComponent, PartialEq, Eq,
 )]
@@ -300,17 +299,16 @@ impl Msaa {
 #[reflect(Component, Debug, Hash, Default, PartialEq)]
 #[extract_app(RenderApp)]
 pub enum Tonemapping {
-    /// Bypass tonemapping.
+    /// Bypass tonemapping. No color grading, exposure, or dither applies.
     None,
-    /// Runs the tonemapping pass with no tone curve. The output is unbounded
-    /// display-linear.
+    /// Identity tone curve. [`ColorGrading`], exposure, and [`DebandDither`]
+    /// still apply. The output is unbounded display-linear.
     ///
-    /// Unlike [`Tonemapping::None`], which skips the pass, `Linear` still
-    /// applies [`ColorGrading`] and exposure, [`DebandDither`], and, under
-    /// `WorkingColorSpace::Rec2020`, the working-space to display conversion.
-    /// Use it on cameras that need that conversion but no artistic operator,
-    /// typically 2D and UI cameras: their `Tonemapping::None` default skips the
-    /// conversion and renders desaturated.
+    /// Under `WorkingColorSpace::Rec2020`, the pass also applies the
+    /// working-space to display conversion. Use `Linear` on cameras that need
+    /// that conversion without a tone curve, typically 2D and UI cameras:
+    /// their `Tonemapping::None` default skips the conversion and renders
+    /// desaturated.
     Linear,
     /// Suffers from lots hue shifting, brights don't desaturate naturally.
     /// Bright primaries and secondaries don't desaturate at all.

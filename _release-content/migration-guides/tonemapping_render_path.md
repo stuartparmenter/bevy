@@ -34,15 +34,6 @@ Every other tone-mapped camera now tone-maps in the post-process pass on a scene
 - Stacked cameras rendering to the same target compose in scene-linear and tone-map once,
   on the last camera. Earlier cameras' operators do not run (Bevy warns if they differ).
 
-`Tonemapping` and `DebandDither` moved from `bevy_core_pipeline::tonemapping` to
-`bevy_render::view`. Rust imports still work through re-exports, but the reflected type
-paths changed: update scene files and Bevy Remote Protocol component keys that name them.
-
-`Tonemapping::None` is now a pure passthrough: no tone-mapping pass runs, and no
-`ColorGrading` exposure or post-saturation is applied. If you used `ColorGrading` or
-`AutoExposure` with `Tonemapping::None`, switch to `Tonemapping::Linear`, which applies
-grading and dither with no tone curve.
-
 `NeedsSceneLinearTarget` and `TonemappingPass` are ordinary required components, so
 `remove_with_requires` on one effect also strips a marker other effects on the camera may
 still need; use plain `remove::<T>()` instead. On WebGL2 the fp16 path requires

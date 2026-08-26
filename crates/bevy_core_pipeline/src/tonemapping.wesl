@@ -421,9 +421,8 @@ fn tone_mapping(in: vec4<f32>, in_color_grading: ColorGrading) -> vec4<f32> {
 }
 
     // tone_mapping
-@if(TONEMAP_METHOD_NONE) {
-    // No tone curve. Grading, dither, and the working-space conversion at the pass entry
-    // still apply, and the output stays unbounded display-linear.
+@if(TONEMAP_METHOD_LINEAR) {
+    // The working-space conversion at the pass entry still applies.
     color = color;
 } @elif(TONEMAP_METHOD_REINHARD) {
     color = tonemapping_reinhard(color.rgb);
