@@ -67,11 +67,11 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     let tex_color = textureSample(tileset, tileset_sampler, local_uv, tile.tileset_index);
-    let composed_color = tex_color * tile.color;
+    let final_color = tex_color * tile.color;
 
-    if (composed_color.a < 0.001) {
+    if (final_color.a < 0.001) {
         discard;
     }
 
-    return writer_encode(composed_color);
+    return writer_encode(final_color);
 }

@@ -161,7 +161,8 @@ struct FragmentOutput {
     @location(0) color: vec4<f32>,
 };
 
-// Gizmos render pre-tonemap, so each fragment writer-encodes its color.
+// Gizmos draw into the view's main texture, so each fragment entry point
+// encodes for the compositing space.
 @fragment
 fn fragment_solid(in: FragmentInput) -> FragmentOutput {
     return FragmentOutput(writer_encode(in.color));

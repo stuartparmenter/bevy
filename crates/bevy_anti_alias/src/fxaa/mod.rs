@@ -17,7 +17,7 @@ use bevy_render::{
         *,
     },
     renderer::RenderDevice,
-    view::{ExtractedView, ViewTarget},
+    view::{ExtractedView, ResolvedCompositingSpace, ViewTarget},
     GpuResourceAppExt, Render, RenderApp, RenderStartup, RenderSystems,
 };
 use bevy_shader::{Shader, ShaderDefVal};
@@ -52,9 +52,8 @@ impl Sensitivity {
 /// A component for enabling Fast Approximate Anti-Aliasing (FXAA)
 /// for a [`bevy_camera::Camera`].
 ///
-/// On a view composited in [`CompositingSpace::Oklab`], edge detection uses the
-/// Oklab lightness channel as the luma. The Rec.601 luma approximation works
-/// only for sRGB views; it can return NaN on Oklab's signed chroma channels.
+/// On a view composited in [`CompositingSpace::Oklab`], edge detection uses
+/// the Oklab lightness channel.
 #[derive(Reflect, Component, Clone, ExtractComponent)]
 #[reflect(Component, Default, Clone)]
 #[extract_component_filter(With<Camera>)]
@@ -214,11 +213,17 @@ pub fn prepare_fxaa_pipelines(
     mut pipelines: ResMut<SpecializedRenderPipelines<FxaaPipeline>>,
     fxaa_pipeline: Res<FxaaPipeline>,
     cameras: Query<
-        (Entity, &ExtractedView, &Fxaa, &ViewStackContract),
+        (
+            Entity,
+            &ExtractedView,
+            &Fxaa,
+            &ViewStackContract,
+            Option<&ResolvedCompositingSpace>,
+        ),
         (With<ExtractedCamera>, With<ViewTarget>),
     >,
 ) {
-    for (entity, view, fxaa, contract) in &cameras {
+    for (entity, view, fxaa, contract, resolved_space) in &cameras {
         if !fxaa.enabled {
             continue;
         }
@@ -230,7 +235,8 @@ pub fn prepare_fxaa_pipelines(
                 edge_threshold_min: fxaa.edge_threshold_min,
                 target_format: view.target_format,
                 hdr_encode: contract.is_hdr_encode(),
-                oklab_compositing: contract.compositing_space == Some(CompositingSpace::Oklab),
+                oklab_compositing: ResolvedCompositingSpace::space(resolved_space)
+                    == Some(CompositingSpace::Oklab),
             },
         );
 
@@ -255,44 +261,36 @@ mod tests {
     }
 
     #[test]
-    fn non_oklab_def_vector_is_byte_identical() {
-        let sdr = fxaa_shader_defs(&base_key(false, false));
+    fn non_oklab_key_pushes_only_threshold_defs() {
         assert_eq!(
-            sdr,
+            fxaa_shader_defs(&base_key(false, false)),
             vec![
                 ShaderDefVal::from("EDGE_THRESH_HIGH"),
                 ShaderDefVal::from("EDGE_THRESH_MIN_HIGH"),
             ]
         );
-        assert!(!sdr.contains(&ShaderDefVal::from("COMPOSITING_SPACE_OKLAB")));
-
-        let hdr = fxaa_shader_defs(&base_key(true, false));
         assert_eq!(
-            hdr,
+            fxaa_shader_defs(&base_key(true, false)),
             vec![
                 ShaderDefVal::from("EDGE_THRESH_HIGH"),
                 ShaderDefVal::from("EDGE_THRESH_MIN_HIGH"),
                 ShaderDefVal::from("HDR_DISPLAY_TARGET"),
             ]
         );
-        assert!(!hdr.contains(&ShaderDefVal::from("COMPOSITING_SPACE_OKLAB")));
     }
 
     #[test]
-    fn oklab_def_present_only_when_set() {
-        let sdr = fxaa_shader_defs(&base_key(false, true));
+    fn oklab_key_appends_compositing_space_def() {
         assert_eq!(
-            sdr,
+            fxaa_shader_defs(&base_key(false, true)),
             vec![
                 ShaderDefVal::from("EDGE_THRESH_HIGH"),
                 ShaderDefVal::from("EDGE_THRESH_MIN_HIGH"),
                 ShaderDefVal::from("COMPOSITING_SPACE_OKLAB"),
             ]
         );
-
-        let hdr = fxaa_shader_defs(&base_key(true, true));
         assert_eq!(
-            hdr,
+            fxaa_shader_defs(&base_key(true, true)),
             vec![
                 ShaderDefVal::from("EDGE_THRESH_HIGH"),
                 ShaderDefVal::from("EDGE_THRESH_MIN_HIGH"),

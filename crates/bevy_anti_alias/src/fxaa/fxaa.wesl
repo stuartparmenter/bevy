@@ -59,7 +59,8 @@ fn QUALITY(q: i32) -> f32 {
 
 fn rgb2luma(rgb: vec3<f32>) -> f32 {
 @if(COMPOSITING_SPACE_OKLAB) {
-    // rgb.x is the Oklab lightness L.
+    // rgb.x is the Oklab lightness. The Rec.601 luma below takes a sqrt,
+    // which is NaN on Oklab's signed chroma channels.
     return saturate(rgb.x);
 } @else {
     let luma = dot(rgb, vec3<f32>(0.299, 0.587, 0.114));

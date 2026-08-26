@@ -6,7 +6,6 @@ use crate::{
 use bevy_app::{App, Plugin};
 use bevy_asset::{load_embedded_asset, AssetServer, Handle};
 use bevy_camera::visibility::RenderLayers;
-use bevy_camera::CompositingSpace;
 use bevy_core_pipeline::core_2d::{Transparent2d, CORE_2D_DEPTH_FORMAT};
 use bevy_gizmos::config::{GizmoLineJoint, GizmoLineStyle, GizmoMeshConfig};
 
@@ -106,7 +105,6 @@ struct LineGizmoPipelineKey {
     mesh_key: Mesh2dPipelineKey,
     strip: bool,
     line_style: GizmoLineStyle,
-    compositing_space: Option<CompositingSpace>,
 }
 
 impl SpecializedRenderPipeline for LineGizmoPipeline {
@@ -119,11 +117,10 @@ impl SpecializedRenderPipeline for LineGizmoPipeline {
             #[cfg(all(feature = "webgl", target_arch = "wasm32", not(feature = "webgpu")))]
             "SIXTEEN_BYTE_ALIGNMENT".into(),
         ];
-        crate::push_gizmo_2d_color_space_defs(
-            &mut shader_defs,
-            self.working_color_space,
-            key.compositing_space,
-        );
+        if self.working_color_space.is_rec2020() {
+            shader_defs.push("OUTPUT_GAMUT_REC2020".into());
+        }
+        key.mesh_key.push_compositing_space_defs(&mut shader_defs);
 
         let layout = vec![
             self.mesh_pipeline.view_layout.clone(),
@@ -195,7 +192,6 @@ struct LineJointGizmoPipeline {
 struct LineJointGizmoPipelineKey {
     mesh_key: Mesh2dPipelineKey,
     joints: GizmoLineJoint,
-    compositing_space: Option<CompositingSpace>,
 }
 
 impl SpecializedRenderPipeline for LineJointGizmoPipeline {
@@ -208,11 +204,10 @@ impl SpecializedRenderPipeline for LineJointGizmoPipeline {
             #[cfg(all(feature = "webgl", target_arch = "wasm32", not(feature = "webgpu")))]
             "SIXTEEN_BYTE_ALIGNMENT".into(),
         ];
-        crate::push_gizmo_2d_color_space_defs(
-            &mut shader_defs,
-            self.working_color_space,
-            key.compositing_space,
-        );
+        if self.working_color_space.is_rec2020() {
+            shader_defs.push("OUTPUT_GAMUT_REC2020".into());
+        }
+        key.mesh_key.push_compositing_space_defs(&mut shader_defs);
 
         let layout = vec![
             self.mesh_pipeline.view_layout.clone(),
@@ -329,10 +324,11 @@ fn queue_line_and_joint_gizmos_2d(
             continue;
         };
 
-        let compositing_space = ResolvedCompositingSpace::space(resolved_space);
-
         let mesh_key = Mesh2dPipelineKey::from_msaa_samples(msaa.samples())
-            | Mesh2dPipelineKey::from_target_format(view.target_format);
+            | Mesh2dPipelineKey::from_target_format(view.target_format)
+            | Mesh2dPipelineKey::from_compositing_space(ResolvedCompositingSpace::space(
+                resolved_space,
+            ));
 
         let render_layers = render_layers.unwrap_or_default();
         for (entity, config) in &line_gizmos {
@@ -353,7 +349,6 @@ fn queue_line_and_joint_gizmos_2d(
                         mesh_key,
                         strip: false,
                         line_style: config.line_style,
-                        compositing_space,
                     },
                 );
                 transparent_phase.add_transient(Transparent2d {
@@ -376,7 +371,6 @@ fn queue_line_and_joint_gizmos_2d(
                         mesh_key,
                         strip: true,
                         line_style: config.line_style,
-                        compositing_space,
                     },
                 );
                 transparent_phase.add_transient(Transparent2d {
@@ -402,7 +396,6 @@ fn queue_line_and_joint_gizmos_2d(
                 LineJointGizmoPipelineKey {
                     mesh_key,
                     joints: config.line_joints,
-                    compositing_space,
                 },
             );
             transparent_phase.add_transient(Transparent2d {

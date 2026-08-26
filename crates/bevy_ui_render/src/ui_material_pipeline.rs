@@ -677,7 +677,11 @@ pub fn queue_ui_material_nodes<M: UiMaterial>(
     render_materials: Res<RenderAssets<PreparedUiMaterial<M>>>,
     mut transparent_render_phases: ResMut<ViewSortedRenderPhases<TransparentUi>>,
     render_views: Query<
-        (&UiCameraView, &ViewStackContract),
+        (
+            &UiCameraView,
+            &ViewStackContract,
+            Option<&ResolvedCompositingSpace>,
+        ),
         (With<ExtractedView>, With<ViewTarget>),
     >,
     camera_views: Query<&ExtractedView>,
@@ -693,7 +697,7 @@ pub fn queue_ui_material_nodes<M: UiMaterial>(
     {
         if current_camera_entity != *extracted_camera_entity {
             current_phase = render_views.get(*extracted_camera_entity).ok().and_then(
-                |(default_camera_view, contract)| {
+                |(default_camera_view, contract, resolved_space)| {
                     camera_views
                         .get(default_camera_view.0)
                         .ok()
@@ -703,7 +707,11 @@ pub fn queue_ui_material_nodes<M: UiMaterial>(
                                 .map(|transparent_phase| {
                                     (
                                         view.target_format,
-                                        UiWriterEncodeKey::from(contract),
+                                        UiWriterEncodeKey {
+                                            buffer_gamut_rec2020: contract
+                                                .source_gamut_is_rec2020(),
+                                            ..UiWriterEncodeKey::from_resolved_space(resolved_space)
+                                        },
                                         transparent_phase,
                                     )
                                 })

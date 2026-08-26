@@ -183,6 +183,7 @@ fn nearest_border_active(point_vs_mid: vec2<f32>, size: vec2<f32>, width: vec4<f
         (enabled(flags, BORDER_BOTTOM) && min_dist == bottom);
 }
 
+// The encode entry point for UI shaders, including custom UiMaterial shaders.
 fn encode_output(color: vec4<f32>) -> vec4<f32> {
     return writer_encode(color);
 }

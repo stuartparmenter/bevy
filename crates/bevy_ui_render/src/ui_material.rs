@@ -1,4 +1,4 @@
-use crate::Node;
+use crate::{pipeline::UiWriterEncodeKey, Node};
 use bevy_asset::{Asset, AssetId, Handle};
 use bevy_derive::{Deref, DerefMut};
 use bevy_ecs::{component::Component, reflect::ReflectComponent, template::FromTemplate};
@@ -128,7 +128,7 @@ pub trait UiMaterial: AsBindGroup + Asset + Clone + Sized {
 pub struct UiMaterialKey<M: UiMaterial> {
     pub target_format: TextureFormat,
     pub bind_group_data: M::Data,
-    pub writer_encode: crate::pipeline::UiWriterEncodeKey,
+    pub writer_encode: UiWriterEncodeKey,
 }
 
 impl<M: UiMaterial> Eq for UiMaterialKey<M> where M::Data: PartialEq {}

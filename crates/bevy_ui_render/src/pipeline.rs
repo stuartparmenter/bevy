@@ -1,6 +1,5 @@
 use bevy_asset::{load_embedded_asset, AssetServer, Handle};
 use bevy_camera::CompositingSpace;
-use bevy_core_pipeline::camera_stack::ViewStackContract;
 use bevy_ecs::prelude::*;
 use bevy_mesh::VertexBufferLayout;
 use bevy_render::{
@@ -8,26 +7,39 @@ use bevy_render::{
         binding_types::{sampler, texture_2d, uniform_buffer},
         *,
     },
-    view::ViewUniform,
+    view::{ResolvedCompositingSpace, ViewUniform},
 };
 use bevy_shader::{Shader, ShaderDefVal};
 use bevy_utils::default;
 
-/// Writer-side encode state of the view a UI node renders into, shared by
-/// every UI pipeline key.
+/// How a UI fragment encodes its output for the view it renders into,
+/// shared by every UI pipeline key.
 ///
-/// UI colors are authored in Rec.709 and composite into the post-tonemap
-/// buffer, so the fragment converts and encodes them to match it.
-#[derive(Clone, Copy, Default, Hash, PartialEq, Eq)]
+/// UI draws into the view's buffer after tonemapping, so each fragment
+/// encodes to match the buffer's compositing space.
+#[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq)]
 pub struct UiWriterEncodeKey {
-    /// Resolved [`CompositingSpace`] of the view ([`ViewStackContract::compositing_space`]).
+    /// The view's resolved [`CompositingSpace`]. Never `Some(Linear)`;
+    /// linear needs no encode.
     pub compositing_space: Option<CompositingSpace>,
     /// Whether the post-tonemap buffer uses Rec.2020 primaries
-    /// ([`ViewStackContract::source_gamut_is_rec2020`]).
+    /// ([`ViewStackContract::source_gamut_is_rec2020`]). This field is not
+    /// upstreamed yet; it belongs to the wide-gamut work.
+    ///
+    /// [`ViewStackContract::source_gamut_is_rec2020`]: bevy_core_pipeline::camera_stack::ViewStackContract::source_gamut_is_rec2020
     pub buffer_gamut_rec2020: bool,
 }
 
 impl UiWriterEncodeKey {
+    /// Builds the key from a view's [`ResolvedCompositingSpace`].
+    pub fn from_resolved_space(resolved: Option<&ResolvedCompositingSpace>) -> Self {
+        Self {
+            compositing_space: ResolvedCompositingSpace::space(resolved)
+                .filter(|space| !space.is_linear()),
+            ..Self::default()
+        }
+    }
+
     /// Appends the writer-encode defs: gamut convert first, then compositing space.
     pub fn push_shader_defs(&self, shader_defs: &mut Vec<ShaderDefVal>) {
         if self.buffer_gamut_rec2020 {
@@ -37,15 +49,6 @@ impl UiWriterEncodeKey {
             Some(CompositingSpace::Srgb) => shader_defs.push("COMPOSITING_SPACE_SRGB".into()),
             Some(CompositingSpace::Oklab) => shader_defs.push("COMPOSITING_SPACE_OKLAB".into()),
             Some(CompositingSpace::Linear) | None => {}
-        }
-    }
-}
-
-impl From<&ViewStackContract> for UiWriterEncodeKey {
-    fn from(contract: &ViewStackContract) -> Self {
-        Self {
-            compositing_space: contract.compositing_space,
-            buffer_gamut_rec2020: contract.source_gamut_is_rec2020(),
         }
     }
 }
@@ -161,35 +164,24 @@ mod tests {
 
     #[test]
     fn no_writer_encode_for_default_or_linear() {
-        let baseline = vec![ShaderDefVal::from("ANTI_ALIAS")];
+        assert!(defs_for(UiWriterEncodeKey::default()).is_empty());
 
-        let mut none_defs = baseline.clone();
-        UiWriterEncodeKey::default().push_shader_defs(&mut none_defs);
-        assert_eq!(none_defs, baseline);
-
-        let mut linear_defs = baseline.clone();
-        UiWriterEncodeKey {
-            compositing_space: Some(CompositingSpace::Linear),
-            buffer_gamut_rec2020: false,
-        }
-        .push_shader_defs(&mut linear_defs);
-        assert_eq!(linear_defs, baseline);
+        let linear = ResolvedCompositingSpace(Some(CompositingSpace::Linear));
+        let key = UiWriterEncodeKey::from_resolved_space(Some(&linear));
+        assert_eq!(key, UiWriterEncodeKey::default());
+        assert!(defs_for(key).is_empty());
     }
 
     #[test]
     fn compositing_space_appends_exactly_its_def() {
+        let srgb = ResolvedCompositingSpace(Some(CompositingSpace::Srgb));
         assert_eq!(
-            defs_for(UiWriterEncodeKey {
-                compositing_space: Some(CompositingSpace::Srgb),
-                buffer_gamut_rec2020: false,
-            }),
+            defs_for(UiWriterEncodeKey::from_resolved_space(Some(&srgb))),
             vec![ShaderDefVal::from("COMPOSITING_SPACE_SRGB")]
         );
+        let oklab = ResolvedCompositingSpace(Some(CompositingSpace::Oklab));
         assert_eq!(
-            defs_for(UiWriterEncodeKey {
-                compositing_space: Some(CompositingSpace::Oklab),
-                buffer_gamut_rec2020: false,
-            }),
+            defs_for(UiWriterEncodeKey::from_resolved_space(Some(&oklab))),
             vec![ShaderDefVal::from("COMPOSITING_SPACE_OKLAB")]
         );
     }

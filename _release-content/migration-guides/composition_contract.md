@@ -20,12 +20,6 @@ render-world components on the view entity: `ResolvedCompositingSpace` (the view
   `tonemap_output_gamut` have been replaced by `resolve_tonemapping`, which returns
   the substituted method and its output gamut together
   (`ResolvedTonemapping::output_gamut`).
-The writer-side encode shader defs that 2D pipelines (sprites, 2D meshes and
-materials, gizmos, UI) push into their shaders are renamed: `SRGB_OUTPUT` is now
-`COMPOSITING_SPACE_SRGB`, and `OKLAB_OUTPUT` is now `COMPOSITING_SPACE_OKLAB`. A
-custom `Material2d` or UI shader that read the old defs should switch to the new
-names, or call `bevy_render::writer_encode::writer_encode` on its composed color,
-which also applies the `OUTPUT_GAMUT_REC2020` gamut conversion.
 
 The rendering behavior changes that come with this, in how camera stacks compose,
 tonemap, and display-encode, need no migration and never affect default SDR
