@@ -32,7 +32,7 @@ pub const WORKING_COLOR_SPACE_REC2020_SHADER_DEF: &str = "WORKING_COLOR_SPACE_RE
 ///   of composition, under the `WORKING_COLOR_SPACE_REC2020` shader def. The
 ///   renderer assumes every sampled color texture is Rec.709. A texture with
 ///   wide primaries has no escape hatch and is over-converted. See
-///   `GpuImage::source_primaries`.
+///   `GpuImage::source_color_primaries`.
 /// * The Gran Turismo 7 tone mapping operator takes the working space
 ///   natively, so its Rec.709 to Rec.2020 input expansion is skipped. Every
 ///   other operator and the color-grading stack are fit to Rec.709 and get a

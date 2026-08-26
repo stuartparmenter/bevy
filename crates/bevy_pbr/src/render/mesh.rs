@@ -2810,7 +2810,7 @@ pub fn build_dummy_white_gpu_image(
         texture_descriptor: image.texture_descriptor,
         texture_view_descriptor: image.texture_view_descriptor,
         had_data: true,
-        source_primaries: image.source_primaries,
+        source_color_primaries: image.source_color_primaries,
     }
 }
 

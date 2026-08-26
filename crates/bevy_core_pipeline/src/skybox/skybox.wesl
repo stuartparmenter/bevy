@@ -83,7 +83,7 @@ fn skybox_fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let out = textureSample(skybox, skybox_sampler, ray_direction * vec3(1.0, 1.0, -1.0));
 @if(WORKING_COLOR_SPACE_REC2020) {
     // Skybox cubemaps are assumed Rec.709-authored, so convert the sampled
-    // radiance into the working space (see `GpuImage::source_primaries`).
+    // radiance into the working space (see `GpuImage::source_color_primaries`).
     return vec4(rec709_to_rec2020(out.rgb) * uniforms.brightness, out.a);
 } @else {
     return vec4(out.rgb * uniforms.brightness, out.a);

@@ -22,12 +22,12 @@ pub struct GpuImage {
     pub texture_view_descriptor: Option<TextureViewDescriptor<Option<&'static str>>>,
     pub had_data: bool,
     /// The color primaries the source [`Image`] was authored against, copied from
-    /// [`Image::source_primaries`].
+    /// [`Image::source_color_primaries`].
     ///
     /// Nothing converts the data at upload time. The field is here so a
     /// working-space-aware consumer can add a per-texture escape hatch. See
     /// [`WorkingColorSpace`](crate::WorkingColorSpace).
-    pub source_primaries: SourceColorPrimaries,
+    pub source_color_primaries: SourceColorPrimaries,
 }
 
 impl RenderAsset for GpuImage {
@@ -183,7 +183,7 @@ impl RenderAsset for GpuImage {
             texture_descriptor: image.texture_descriptor,
             texture_view_descriptor: image.texture_view_descriptor,
             had_data,
-            source_primaries: image.source_primaries,
+            source_color_primaries: image.source_color_primaries,
         })
     }
 }

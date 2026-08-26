@@ -1,5 +1,5 @@
 ---
-title: "`RenderPlugin::working_color_space` and `GpuImage::source_primaries`"
+title: "`RenderPlugin::working_color_space` and `GpuImage::source_color_primaries`"
 pull_requests: []
 ---
 
@@ -12,6 +12,6 @@ the release note "Wide working color space: opt-in Rec.2020 rendering".
 fill it from the `WorkingColorSpace` resource, now present in both the main and render
 worlds.
 
-`GpuImage` has a new field, `source_primaries: bevy_image::SourceColorPrimaries`,
-propagated from `Image::source_primaries`. When constructing a `GpuImage` manually,
+`GpuImage` has a new field, `source_color_primaries: bevy_image::SourceColorPrimaries`,
+propagated from `Image::source_color_primaries`. When constructing a `GpuImage` manually,
 use the source image's value or `Default::default()` (`Bt709`).
