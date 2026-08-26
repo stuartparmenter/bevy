@@ -136,15 +136,11 @@ pub fn prepare_material_meshlet_meshes_main_opaque_pass(
             }
         }
 
-        if tonemap_in_shader {
-            if let Some(tonemapping) = tonemapping {
-                if *tonemapping != Tonemapping::None {
-                    view_key |= MeshPipelineKey::TONEMAP_IN_SHADER;
-                    view_key |= tonemapping_pipeline_key(*tonemapping);
-                    if let Some(DebandDither::Enabled) = dither {
-                        view_key |= MeshPipelineKey::DEBAND_DITHER;
-                    }
-                }
+        if tonemap_in_shader && let Some(tonemapping) = tonemapping {
+            view_key |= MeshPipelineKey::TONEMAP_IN_SHADER;
+            view_key |= tonemapping_pipeline_key(*tonemapping);
+            if let Some(DebandDither::Enabled) = dither {
+                view_key |= MeshPipelineKey::DEBAND_DITHER;
             }
         }
 

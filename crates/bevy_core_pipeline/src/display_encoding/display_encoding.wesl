@@ -1,5 +1,5 @@
 // Display-encoding pass: paper-white-relative display-linear color, in the
-// tone-map operator's output space with UI already composited, to an encoded
+// tonemap output space with UI already composited, to an encoded
 // display signal. The `display_encoding` module docs describe where the pass
 // sits in the display pipeline.
 //
@@ -21,7 +21,7 @@ import bevy_render::color_operations::oklab_to_linear_rgb;
 // Per-view display-target calibration. The gamut and transfer are compile-time
 // shader defs, so paper white is the only value read at runtime. The uniform
 // producer `prepare_view_display_targets` sanitizes it (finite, positive,
-// <= 10000) with the same rules the tone-map operators fold at prepare time, so
+// <= 10000) with the same rules the tonemapping methods fold at prepare time, so
 // the seam scale factors cancel exactly.
 @group(0) @binding(2) var<uniform> display_target: DisplayTargetUniform;
 
@@ -101,9 +101,9 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
 
     var rgb = color.rgb;
 
-    // 2. Gamut transform: tone-map-output primaries to display primaries.
+    // 2. Gamut transform: tonemap-output primaries to display primaries.
     //
-    // Input contract: the tone-mapping pass emits Rec.709 display-linear,
+    // Input contract: the tonemapping pass emits Rec.709 display-linear,
     // except `Tonemapping::GranTurismo7` on an HDR-transfer target, which emits
     // its native linear Rec.2020 through the `TONEMAP_OUTPUT_REC2020` path in
     // gt7.wesl. Prepare keys exactly one of the defs below, or none for an

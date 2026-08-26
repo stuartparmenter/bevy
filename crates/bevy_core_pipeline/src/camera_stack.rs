@@ -6,7 +6,7 @@
 //! (see `prepare_view_targets`), so a fullscreen pass run by an earlier
 //! camera feeds already-processed pixels into every later camera that
 //! composites on top with [`ClearColorConfig::None`]. Running the pass per
-//! camera would apply it twice to the earlier camera's pixels: tone mapping
+//! camera would apply it twice to the earlier camera's pixels: tonemapping
 //! the lower camera's output a second time, or alpha-blending PQ-encoded
 //! signal. The pass defers to the last enabled camera in the stack, which
 //! processes the composed buffer once.
@@ -184,8 +184,8 @@ pub(crate) struct ContractInput<K> {
     /// (`ClearColorConfig::None`). This tells viewport members from clearing
     /// members in the stack-shape diagnostics.
     pub loads_previous: bool,
-    /// The view's resolved tone-mapping operator
-    /// (`resolve_tonemapping(..).operator`).
+    /// The view's resolved tonemapping method
+    /// (`resolve_tonemapping(..).method`).
     /// [`Tonemapping::is_enabled`] gates the view's tonemapping pass.
     pub operator: Tonemapping,
 }
@@ -295,7 +295,7 @@ fn resolve_group<K>(members: &[ContractInput<K>], outputs: &mut EntityHashMap<Co
     // not-yet-tonemapped buffer. Each deferral test looks only at enabled
     // views, so a pass-disabled viewport member is invisible to the tonemap
     // test but breaks the shape for the encode test. Tonemap deferral is then
-    // cancelled and every member tone-maps per camera.
+    // cancelled and every member tonemaps per camera.
     let coherence_cancelled =
         encode_enabled_group && tonemap_finalizer.is_some() && encode_finalizer.is_none();
     if coherence_cancelled {
@@ -331,7 +331,7 @@ fn resolve_group<K>(members: &[ContractInput<K>], outputs: &mut EntityHashMap<Co
     let encode_without_tonemap = encode_enabled_group && !stack_tonemaps;
 
     // The diagnostic only fires when a pass runs over the group: a stack that
-    // neither tone-maps nor encodes leaves the buffer scene-referred and
+    // neither tonemaps nor encodes leaves the buffer scene-referred and
     // accumulates stably.
     let frame_start_loads_processed_output =
         members.first().is_some_and(|first| first.loads_previous)
@@ -483,7 +483,7 @@ pub fn resolve_camera_stack_contracts(
             tonemap_output_gamut: resolved.output_gamut,
             compositing_space: ResolvedCompositingSpace::space(resolved_space),
             loads_previous: matches!(camera.clear_color, ClearColorConfig::None),
-            operator: resolved.operator,
+            operator: resolved.method,
         });
     }
 
@@ -610,19 +610,19 @@ pub(crate) fn coerce_display_encode(
 fn emit_contract_diagnostics(diagnostics: &ContractDiagnostics) {
     if diagnostics.coherence_cancelled {
         warn_once!(
-            "Tone mapping cannot be deferred to the last camera of a stack rendering to \
+            "Tonemapping cannot be deferred to the last camera of a stack rendering to \
             an HDR display target, because a viewport-scoped or clearing camera prevents \
-            deferring the display encoding with it. Each camera tone-maps its own pass \
-            instead, so the composed buffer is not tone-mapped as one image. Give every \
+            deferring the display encoding with it. Each camera tonemaps its own pass \
+            instead, so the composed buffer is not tonemapped as one image. Give every \
             overlay camera fullscreen `ClearColorConfig::None` composition, or move the \
             viewport camera to its own render target."
         );
     }
     if diagnostics.encode_without_tonemap {
         warn_once!(
-            "No camera rendering to an HDR display target has an active tone-mapping \
-            operator, so scene-linear values are transfer-encoded without tone mapping. \
-            Add an operator like `Tonemapping::GranTurismo7`, or `Tonemapping::Linear` to \
+            "No camera rendering to an HDR display target has an active tonemapping \
+            method, so scene-linear values are transfer-encoded without tonemapping. \
+            Add a method like `Tonemapping::GranTurismo7`, or `Tonemapping::Linear` to \
             encode with no tone curve; raw pass-through is intentional only for debug or \
             calibration passes."
         );
@@ -630,7 +630,7 @@ fn emit_contract_diagnostics(diagnostics: &ContractDiagnostics) {
     if diagnostics.fullscreen_blit_over_per_camera_passes {
         warn_once!(
             "A fullscreen `ClearColorConfig::None` camera composites above viewport-scoped \
-            or clearing cameras whose tone-mapping or display-encoding passes run per \
+            or clearing cameras whose tonemapping or display-encoding passes run per \
             camera; its full-target blit re-presents their already-processed pixels \
             (double-processed). Give the overlay camera its own render target."
         );
@@ -638,8 +638,8 @@ fn emit_contract_diagnostics(diagnostics: &ContractDiagnostics) {
     if diagnostics.frame_start_loads_processed_output {
         warn_once!(
             "The first camera rendering to a target uses `ClearColorConfig::None` while \
-            its stack runs a tone-mapping or display-encoding pass. The main texture \
-            persists across frames, so each frame starts from last frame's tone-mapped \
+            its stack runs a tonemapping or display-encoding pass. The main texture \
+            persists across frames, so each frame starts from last frame's tonemapped \
             (and, on an HDR target, display-encoded) output and reprocesses it; \
             feedback/trail effects built this way drift over time. Stable feedback \
             accumulation needs `Tonemapping::None` on an SDR target."
@@ -647,9 +647,9 @@ fn emit_contract_diagnostics(diagnostics: &ContractDiagnostics) {
     }
     if let Some((own, finalizing)) = diagnostics.operator_mismatch {
         warn_once!(
-            "Stacked cameras rendering to the same target use different tone-mapping \
-            operators ({own:?} and {finalizing:?}). The stack is composed in scene-linear \
-            space and tone-mapped once, by the last camera, so its operator, ColorGrading, \
+            "Stacked cameras rendering to the same target use different tonemapping \
+            methods ({own:?} and {finalizing:?}). The stack is composed in scene-linear \
+            space and tonemapped once, by the last camera, so its method, ColorGrading, \
             GranTurismo7Params, and DebandDither settings apply to the whole stack."
         );
     }

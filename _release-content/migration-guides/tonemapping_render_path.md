@@ -1,40 +1,18 @@
 ---
-title: "Tone mapping render path: node-based tone mapping and the `Rgba16Float` intermediate"
+title: "Camera stacks tonemap once"
 pull_requests: []
 ---
 
-In 0.19, `Hdr` cameras tone-mapped in the post-process pass on an `Rgba16Float` main
-texture. Every other camera applied its `Tonemapping` operator in the sprite, mesh2d, and
-PBR fragment shaders (the `TONEMAP_IN_SHADER` shader def) on an 8-bit main texture.
+Stacked cameras rendering to the same target now compose in scene-linear space and
+tonemap once, in the last camera's tonemapping pass. Earlier cameras' `Tonemapping`,
+`ColorGrading`, `GranTurismo7Params`, and `DebandDither` settings do not run, and Bevy
+warns when their tonemapping methods differ. Set those components on the last camera of
+the stack.
 
-In 0.20, a tone-mapped camera keeps the in-shader path only when all of these hold:
+Adding `GranTurismo7Params` to a camera moves its tonemapping from the material shaders
+to the tonemapping pass. This costs an `Rgba16Float` intermediate and one fullscreen
+pass; the pixels match. Remove the component to return to the in-shader path.
 
-- no `Hdr`
-- no `bevy_render::view::NeedsSceneLinearTarget`, a required component of bloom, auto
-  exposure, auto white balance, depth of field, motion blur, TAA, and DLSS
-- no `bevy_camera::TonemappingPass`, a required component of `GranTurismo7Params`
-- a `CompositingSpace` that is absent or `Linear`
-- an SDR sRGB `Window` render target
-- no other active camera on that target
-
-The default `Camera3d` meets all of these and renders unchanged from 0.19. The render
-world marks these cameras with `bevy_render::camera::TonemapInShader`. Read it to detect
-the path; do not insert or remove it yourself.
-
-Every other tone-mapped camera now tone-maps in the post-process pass on a scene-linear
-`Rgba16Float` intermediate. Expect small visual differences:
-
-- Transparents blend in scene-linear before tone mapping, instead of tone-mapped values
-  being alpha-blended.
-- Everything the camera renders is tone-mapped, including gizmos and custom materials
-  that did not call `tone_mapping()` themselves. Custom material shaders should output
-  scene-linear color.
-- `DebandDither` runs once on the blended image instead of per fragment, and the fp16
-  intermediate removes the banding the old 8-bit intermediate introduced.
-- Stacked cameras rendering to the same target compose in scene-linear and tone-map once,
-  on the last camera. Earlier cameras' operators do not run (Bevy warns if they differ).
-
-`NeedsSceneLinearTarget` and `TonemappingPass` are ordinary required components, so
-`remove_with_requires` on one effect also strips a marker other effects on the camera may
-still need; use plain `remove::<T>()` instead. On WebGL2 the fp16 path requires
-`EXT_color_buffer_float`, already required for `Hdr` cameras.
+An HDR display target, or an SDR target with a recalibrated `DisplayTarget`, moves a
+camera onto the same pass and intermediate. Budget for the fp16 main texture on such
+targets.

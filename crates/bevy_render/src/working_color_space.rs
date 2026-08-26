@@ -33,10 +33,10 @@ pub const WORKING_COLOR_SPACE_REC2020_SHADER_DEF: &str = "WORKING_COLOR_SPACE_RE
 ///   renderer assumes every sampled color texture is Rec.709. A texture with
 ///   wide primaries has no escape hatch and is over-converted. See
 ///   `GpuImage::source_color_primaries`.
-/// * The Gran Turismo 7 tone mapping operator takes the working space
+/// * The Gran Turismo 7 tonemapping method takes the working space
 ///   natively, so its Rec.709 to Rec.2020 input expansion is skipped. Every
 ///   other operator and the color-grading stack are fit to Rec.709 and get a
-///   Rec.2020 to Rec.709 conversion at the tone mapping pass entry, which
+///   Rec.2020 to Rec.709 conversion at the tonemapping pass entry, which
 ///   clips colors outside the Rec.709 gamut.
 ///
 /// `LinearRgba` and the rest of `bevy_color` stay defined as linear Rec.709.
@@ -91,7 +91,7 @@ pub const REC2020_TO_REC709: Mat3 = Mat3::from_cols(
 /// [`bevy_color::RgbPrimaries::DISPLAY_P3`]. Its blue primary is the same as
 /// Rec.709's, so the third column's off-diagonal entries are exactly zero.
 ///
-/// The display-encoding pass uses this to carry Rec.709 tone-map output into
+/// The display-encoding pass uses this to carry Rec.709 tonemap output into
 /// the P3-gamut
 /// [`ExtendedDisplayP3`](bevy_window::DisplayTransfer::ExtendedSrgb) signal.
 /// Bit-identical to `REC709_TO_DISPLAYP3` in `working_color_space.wesl`.
@@ -114,7 +114,7 @@ pub const DISPLAYP3_TO_REC709: Mat3 = Mat3::from_cols(
 /// Linear Rec.2020 to Display-P3 conversion matrix, both D65. Bit-identical to
 /// `REC2020_TO_DISPLAYP3` in `working_color_space.wesl`.
 ///
-/// The display-encoding pass uses this on the GT7-on-HDR path, whose tone-map
+/// The display-encoding pass uses this on the GT7-on-HDR path, whose tonemap
 /// output is native Rec.2020. Display-P3 sits inside Rec.2020, so this
 /// contracts the gamut.
 pub const REC2020_TO_DISPLAYP3: Mat3 = Mat3::from_cols(

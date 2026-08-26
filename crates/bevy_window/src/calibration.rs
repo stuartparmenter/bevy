@@ -98,7 +98,7 @@ pub struct WindowDisplayState {
     /// The one cross-platform live HDR value, folded from whatever the backend
     /// reports: Apple's live EDR headroom, `max_nits / sdr_white_nits` on
     /// Windows, or `1.0` for a definitively-SDR display. `None` means "can't
-    /// tell here", never "SDR". Peak-aware tone mapping targets it: GT7's HDR
+    /// tell here", never "SDR". Peak-aware tonemapping targets it: GT7's HDR
     /// ceiling is `peak / paper_white`, which auto-resolves to this multiplier.
     pub tone_map_headroom: Option<f32>,
     /// The luminance, in nits, of SDR reference white on this surface right now.

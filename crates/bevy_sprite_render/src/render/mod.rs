@@ -176,8 +176,8 @@ impl SpritePipelineKey {
         }
     }
 
-    /// Method-selection bits for a tone-mapping operator. Specialization reads
-    /// them only when [`Self::TONEMAP_IN_SHADER`] is also set.
+    /// The `TONEMAP_METHOD_*` bits for a tonemapping method. Specialization
+    /// reads them only when [`Self::TONEMAP_IN_SHADER`] is also set.
     #[inline]
     const fn from_tonemapping(tonemapping: Tonemapping) -> Self {
         match tonemapping {
@@ -577,10 +577,7 @@ pub fn queue_sprites(
             | SpritePipelineKey::from_msaa_samples(msaa.samples())
             | SpritePipelineKey::from_compositing_space(ResolvedCompositingSpace::space(resolved_space));
 
-        if tonemap_in_shader
-            && let Some(tonemapping) = tonemapping
-            && *tonemapping != Tonemapping::None
-        {
+        if tonemap_in_shader && let Some(tonemapping) = tonemapping {
             view_key |= SpritePipelineKey::TONEMAP_IN_SHADER;
             view_key |= SpritePipelineKey::from_tonemapping(*tonemapping);
             if let Some(DebandDither::Enabled) = dither {

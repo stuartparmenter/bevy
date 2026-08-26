@@ -1,6 +1,6 @@
 //! Render-side display sensing.
 //!
-//! The single live value the tone mapper consumes is
+//! The single live value the tonemapper consumes is
 //! [`DisplayHdrInfo::tone_map_headroom`], the linear multiplier of SDR white
 //! the display can drive right now. wgpu folds the platform-specific
 //! reporting into it (Apple's relative EDR headroom, Windows' absolute

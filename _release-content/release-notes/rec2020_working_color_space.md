@@ -41,7 +41,7 @@ def instead; a custom `Material2d` fragment shader can call
 `bevy_render::writer_encode::writer_encode` on its composed color.
 
 `Tonemapping::GranTurismo7` runs natively on Rec.2020 values. Every other
-operator, and the color-grading stack, is Rec.709-fit, so the tone-mapping pass
+method, and the color-grading stack, is Rec.709-fit, so the tonemapping pass
 converts Rec.2020 to Rec.709 at its entry and clips out-of-gamut colors.
 `Tonemapping::None` cameras (the `Camera2d` default) skip that conversion and
 render desaturated, with a `warn_once`; the new `Tonemapping::Linear` runs the

@@ -722,7 +722,7 @@ pub fn prepare_mesh_view_bind_groups(
             transmission_texture,
             atmosphere_textures,
             atmosphere_buffer,
-            (tonemapping, has_tonemap_in_shader),
+            (tonemapping, tonemap_in_shader),
             (render_view_environment_maps, render_view_irradiance_volumes),
             has_atmosphere,
             (
@@ -752,7 +752,6 @@ pub fn prepare_mesh_view_bind_groups(
                     .collect();
             }
 
-            let tonemap_in_shader = has_tonemap_in_shader && tonemapping.is_enabled();
             let mut layout_key = MeshPipelineViewLayoutKey::from(*msaa)
                 | MeshPipelineViewLayoutKey::from(prepass_textures);
             let mut offsets = ArrayVec::from_iter([

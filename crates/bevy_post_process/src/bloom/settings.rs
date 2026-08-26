@@ -290,7 +290,7 @@ pub struct BloomPrefilter {
     /// RGB values under the threshold curve will not contribute to the effect.
     ///
     /// In scene-linear framebuffer values, where `1.0` is paper white at the
-    /// tone-map operator output. HDR display targets have a configurable paper
+    /// tonemap output. HDR display targets have a configurable paper
     /// white, so use [`threshold_nits`](Self::threshold_nits) there to keep the
     /// cutoff at a fixed brightness.
     pub threshold: f32,

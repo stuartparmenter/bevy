@@ -1,7 +1,7 @@
 //! Display encoding: the gamut transform and transfer encoding stage of the
 //! display pipeline.
 //!
-//! The tone-mapping pass outputs display-linear color scaled so `1.0` is paper
+//! The tonemapping pass outputs display-linear color scaled so `1.0` is paper
 //! white, in per-view source primaries. Those are Rec.709 for every resolved
 //! operator except `Tonemapping::GranTurismo7` on an HDR target, which emits
 //! its native Rec.2020. See `resolve_tonemapping`. UI composites in that same
@@ -592,7 +592,7 @@ mod tests {
         Some((DisplayTransfer::Pq, DisplayGamut::Rec2020));
 
     /// The overlay finalizes the encode for the composed buffer the base
-    /// tone-mapped, so the key's source gamut is Rec.2020 and there is no
+    /// tonemapped, so the key's source gamut is Rec.2020 and there is no
     /// 709 to 2020 double expansion.
     #[test]
     fn s1_deferred_encode_keys_the_buffer_not_the_finalizer() {

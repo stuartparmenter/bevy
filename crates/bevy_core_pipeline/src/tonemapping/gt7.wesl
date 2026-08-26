@@ -1,4 +1,4 @@
-// Gran Turismo 7 tone-mapping operator.
+// Gran Turismo 7 tonemapping method.
 //
 // Native WGSL port of Polyphony Digital's reference implementation
 // (gt7_tone_mapping.cpp, MIT License, Copyright (c) 2025 Polyphony Digital Inc.),
@@ -6,10 +6,10 @@
 // Gran Turismo 7". The CPU parity reference and the fixture tests that gate
 // changes to this file live in `gt7.rs`. Keep both in sync.
 //
-// Unit convention: the operator works on linear Rec.2020 RGB "frame buffer
+// Unit convention: the method works on linear Rec.2020 RGB "frame buffer
 // values" where 1.0 is 100 nits.
 
-// Precomputed parameters for the GT7 tone-mapping pipeline. Under
+// Precomputed parameters for the GT7 tonemapping pipeline. Under
 // GT7_PARAMS_UNIFORM, filled per view from the `Gt7ParamsUniform` buffer in
 // gt7.rs; keep the field order in sync.
 //
@@ -35,7 +35,7 @@ struct Gt7Params {
     fade_end: f32,
     // Post-clamp output scale. In SDR mode it is 1 / 2.5, which rescales the
     // 250-nit-referred result into [0, 1]. In HDR mode it is
-    // 100 / paper_white_nits, so 1.0 at the operator output is paper white.
+    // 100 / paper_white_nits, so 1.0 at the tonemap output is paper white.
     sdr_correction_factor: f32,
 }
 
@@ -184,8 +184,8 @@ fn gt7_evaluate_curve(x: f32, params: Gt7Params) -> f32 {
     }
 }
 
-// The full GT7 tone-mapping pipeline in native units: linear Rec.2020
-// frame-buffer values (1.0 = 100 nits) in, tone-mapped linear Rec.2020 out
+// The full GT7 tonemapping pipeline in native units: linear Rec.2020
+// frame-buffer values (1.0 = 100 nits) in, tonemapped linear Rec.2020 out
 // ([0, 1] in SDR mode, [0, peak_nits / paper_white_nits] in HDR mode).
 fn gt7_tone_map(rgb: vec3<f32>, params: Gt7Params) -> vec3<f32> {
     // Convert to UCS to separate luminance and chroma.
@@ -212,9 +212,9 @@ fn gt7_tone_map(rgb: vec3<f32>, params: Gt7Params) -> vec3<f32> {
     return params.sdr_correction_factor * min(blended, vec3(params.peak));
 }
 
-// Integration seam for Bevy's tone-mapping pass, dispatched as
+// Integration seam for Bevy's tonemapping pass, dispatched as
 // `TONEMAP_METHOD_GRAN_TURISMO_7` from `tone_mapping()` in tonemapping.wesl.
-// The CPU reference in gt7.rs covers the operator itself, not the four
+// The CPU reference in gt7.rs covers the method itself, not the four
 // working-space/output-gamut combinations below. Those stay unverified until a
 // GPU readback test exists.
 //
@@ -232,7 +232,7 @@ fn gt7_tone_map(rgb: vec3<f32>, params: Gt7Params) -> vec3<f32> {
 //   out-of-gamut Rec.2020 results have no SDR Rec.709 representation. The
 //   conversion also runs under WORKING_COLOR_SPACE_REC2020, because the pass's
 //   SDR output contract is Rec.709 display-linear.
-// - With the def, emit the operator's native linear Rec.2020 output. The
+// - With the def, emit the method's native linear Rec.2020 output. The
 //   display-encoding pass does the transform to the display.
 fn tone_mapping_gran_turismo_7(color: vec3<f32>) -> vec3<f32> {
 @if(GT7_PARAMS_UNIFORM)

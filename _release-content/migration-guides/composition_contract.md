@@ -28,6 +28,6 @@ names, or call `bevy_render::writer_encode::writer_encode` on its composed color
 which also applies the `OUTPUT_GAMUT_REC2020` gamut conversion.
 
 The rendering behavior changes that come with this, in how camera stacks compose,
-tone-map, and display-encode, need no migration and never affect default SDR
+tonemap, and display-encode, need no migration and never affect default SDR
 cameras. See the release note "The composition contract: one resolution for
 camera compositing".

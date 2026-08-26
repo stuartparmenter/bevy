@@ -4,7 +4,7 @@ authors: ["@stuartparmenter"]
 pull_requests: []
 ---
 
-On an HDR display target the tone-mapped image is no longer confined to
+On an HDR display target the tonemapped image is no longer confined to
 `[0, 1]`: highlights reach `peak_luminance_nits / paper_white_nits`, 10.0 on a
 1000-nit display at 100-nit paper white (see the release note "HDR display
 output (scRGB-linear and HDR10/PQ)"). Several post-process effects assumed that

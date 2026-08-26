@@ -90,7 +90,7 @@ pub fn srgb_eotf_extended(s: f32) -> f32 {
 }
 
 /// Encodes paper-white-relative display-linear color (1.0 = paper white at the
-/// tone-map operator output) as an scRGB-linear signal (1.0 = 80 nits):
+/// tonemap output) as an scRGB-linear signal (1.0 = 80 nits):
 /// `V = L * paper_white_nits / 80`.
 ///
 /// scRGB is unbounded and allows negative components, so nothing is clamped.

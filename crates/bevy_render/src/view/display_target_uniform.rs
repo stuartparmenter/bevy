@@ -61,7 +61,7 @@ impl ViewDisplayTarget {
 #[derive(Component, Clone, Copy, Debug, PartialEq, ShaderType)]
 pub struct DisplayTargetUniform {
     /// [`DisplayTarget::paper_white_nits`], the luminance in nits that `1.0` at
-    /// the tone-map operator output corresponds to.
+    /// the tonemap output corresponds to.
     pub paper_white_nits: f32,
 }
 

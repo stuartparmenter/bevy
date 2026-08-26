@@ -161,10 +161,7 @@ pub fn check_views_need_specialization(
             | Mesh2dPipelineKey::from_target_format(view.target_format)
             | Mesh2dPipelineKey::from_compositing_space(ResolvedCompositingSpace::space(resolved_space));
 
-        if tonemap_in_shader
-            && let Some(tonemapping) = tonemapping
-            && *tonemapping != Tonemapping::None
-        {
+        if tonemap_in_shader && let Some(tonemapping) = tonemapping {
             view_key |= Mesh2dPipelineKey::TONEMAP_IN_SHADER;
             view_key |= tonemapping_pipeline_key(*tonemapping);
             if let Some(DebandDither::Enabled) = dither {

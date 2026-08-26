@@ -1,11 +1,11 @@
 ---
-title: Gran Turismo 7 tone mapping and physically based glare
+title: Gran Turismo 7 tonemapping and physically based glare
 authors: ["@stuartparmenter"]
 pull_requests: []
 ---
 
-Bevy has a new tone-mapping operator, `Tonemapping::GranTurismo7`. It ports the
-operator Polyphony Digital published with their SIGGRAPH 2025 course
+Bevy has a new tonemapping method, `Tonemapping::GranTurismo7`. It ports the
+curve Polyphony Digital published with their SIGGRAPH 2025 course
 "Physically Based Tone Mapping in Gran Turismo 7". Their reference
 implementation is MIT licensed, Copyright (c) 2025 Polyphony Digital Inc.
 
@@ -22,7 +22,7 @@ commands.spawn((
 ));
 ```
 
-On an SDR display target it tone-maps against Gran Turismo's 250-nit paper
+On an SDR display target it tonemaps against Gran Turismo's 250-nit paper
 white and rescales into the sRGB range.
 
 Add `GranTurismo7Params` to the camera to replace the operator's baked

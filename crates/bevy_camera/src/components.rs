@@ -88,10 +88,10 @@ impl From<Camera3dDepthLoadOp> for LoadOp<f32> {
 #[reflect(Component, Default, PartialEq, Hash, Debug)]
 pub struct Hdr;
 
-/// Marker that forces a camera's tone mapping to run in the node-side pass instead of
-/// folding it into the material shaders.
+/// Marker that moves a camera's tonemapping from the material shaders to the
+/// tonemapping pass.
 ///
-/// `GranTurismo7Params` pulls this in as a required component. The in-shader fold has no
+/// `GranTurismo7Params` pulls this in as a required component. The in-shader path has no
 /// way to bind the per-view GT7 params uniform, so it would fall back to the baked SDR
 /// defaults and drop the camera's parameters.
 ///

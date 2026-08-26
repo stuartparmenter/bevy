@@ -478,10 +478,7 @@ pub fn check_views_need_specialization(
             }
         }
 
-        if tonemap_in_shader
-            && let Some(tonemapping) = tonemapping
-            && *tonemapping != Tonemapping::None
-        {
+        if tonemap_in_shader && let Some(tonemapping) = tonemapping {
             view_key |= MeshPipelineKey::TONEMAP_IN_SHADER;
             view_key |= tonemapping_pipeline_key(*tonemapping);
             if let Some(DebandDither::Enabled) = dither {

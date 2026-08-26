@@ -290,7 +290,7 @@ impl Msaa {
 /// Feedback and trail effects that load the previous frame's buffer (a camera
 /// with `ClearColorConfig::None` at the bottom of its stack) are only stable
 /// with [`Tonemapping::None`] on an SDR target. Any other method, or an HDR
-/// target, reprocesses last frame's already tone-mapped and display-encoded
+/// target, reprocesses last frame's already tonemapped and display-encoded
 /// output every frame, so the image drifts over time.
 /// `bevy_core_pipeline::camera_stack` warns about this.
 ///
@@ -361,7 +361,7 @@ pub enum Tonemapping {
     /// Designed for e-commerce to faithfully reproduce the colors of brand's logos when used with low brightness grayscale lighting.
     /// See [the KhronosGroup spec](https://github.com/KhronosGroup/ToneMapping/tree/main/PBR_Neutral) for more information.
     KhronosPbrNeutral,
-    /// By Polyphony Digital, the operator used in Gran Turismo 7.
+    /// By Polyphony Digital, the method used in Gran Turismo 7.
     /// Published with the SIGGRAPH 2025 course "Physically Based Tone Mapping in Gran Turismo 7"
     /// (MIT License, Copyright (c) 2025 Polyphony Digital Inc.).
     /// Blends a per-channel filmic curve ("camera-like" highlight skew) with a hue-preserving
@@ -376,7 +376,7 @@ pub enum Tonemapping {
 }
 
 impl Tonemapping {
-    /// Every operator, in declaration order, for exhaustive table tests.
+    /// Every method, in declaration order, for exhaustive table tests.
     ///
     /// The `match` fails to compile when a variant is added, so the array and
     /// its length cannot go stale.
@@ -413,13 +413,13 @@ impl Tonemapping {
         *self != Tonemapping::None
     }
 
-    /// Whether this operator's output is capped at the `[0, 1]`
+    /// Whether this method's output is capped at the `[0, 1]`
     /// paper-white-relative range.
     ///
     /// On a view whose resolved display target requests an HDR transfer, an
-    /// SDR-only operator would cap the image at paper white and leave the
+    /// SDR-only method would cap the image at paper white and leave the
     /// display's HDR headroom unused. `resolve_tonemapping` in
-    /// `bevy_core_pipeline` substitutes an HDR-capable operator instead, with a
+    /// `bevy_core_pipeline` substitutes an HDR-capable method instead, with a
     /// `warn_once!`.
     pub fn is_sdr_only(&self) -> bool {
         !matches!(
@@ -442,18 +442,22 @@ pub enum DebandDither {
     Enabled,
 }
 
-/// Marker requiring a camera's main texture to be the scene-linear
-/// (pre-tone-mapping) `Rgba16Float` intermediate.
+/// Marker for effects that read the scene-referred buffer before tonemapping.
 ///
-/// Every effect that reads the scene-referred buffer before tone mapping pulls
-/// this in as a required component: bloom, auto exposure, auto white balance,
-/// depth of field, motion blur, temporal anti-aliasing, and DLSS. Its presence
-/// vetoes the SDR in-shader tone-mapping fast path in camera extraction, which
-/// would otherwise keep the camera on an 8-bit intermediate.
+/// Camera extraction reads it when it picks the main texture format. A camera
+/// carrying it renders to the scene-linear `Rgba16Float` intermediate and
+/// tonemaps in the pass rather than in the material shaders. It does not force
+/// that format on its own. Cameras with tonemapping disabled keep their 8-bit
+/// texture, and stack members follow the stack's texture. See
+/// [`TonemapInShader`](crate::camera::TonemapInShader).
+///
+/// Every effect that reads the scene-referred buffer pulls this in as a
+/// required component: bloom, auto exposure, auto white balance, depth of
+/// field, motion blur, temporal anti-aliasing, and DLSS.
 ///
 /// Because those effects share one marker, removing any of them with
 /// `remove_with_requires` takes it along, and a second scene-linear effect on
-/// the same camera is left sampling a tone-mapped 8-bit buffer. Prefer plain
+/// the same camera is left sampling a tonemapped 8-bit buffer. Prefer plain
 /// `remove::<T>()`, which leaves the marker behind and keeps the fp16
 /// intermediate.
 #[derive(Component, Default, Copy, Clone, Reflect, PartialEq, Eq, Hash, Debug)]

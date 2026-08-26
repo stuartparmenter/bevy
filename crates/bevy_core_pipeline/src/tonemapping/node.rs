@@ -2,9 +2,8 @@ use crate::tonemapping::{
     Gt7ParamsUniform, TonemappingLuts, TonemappingPipeline, ViewTonemappingPipeline,
 };
 
-use bevy_ecs::prelude::*;
+use bevy_ecs::{entity::EntityHashMap, prelude::*};
 use bevy_render::{
-    camera::TonemapInShader,
     diagnostic::RecordDiagnostics,
     extract_component::{ComponentUniforms, DynamicUniformIndex},
     render_asset::RenderAssets,
@@ -19,18 +18,14 @@ use bevy_render::{
 
 use super::{get_lut_bindings, gt7_layout, Tonemapping};
 
-/// Cached bind group state for tonemapping.
-#[derive(Default)]
-pub struct TonemappingBindGroupCache {
-    cached: Option<CachedBindGroup>,
-    last_tonemapping: Option<Tonemapping>,
-}
-
-/// The inputs a cached tonemapping bind group was created from.
-struct CachedBindGroup {
+/// The inputs a view's cached tonemapping bind group was created from. The
+/// `camera_driver` system runs the pass once per view and each view has its
+/// own post-process source, so the cache keys by view.
+pub struct CachedBindGroup {
     view_uniforms: BufferId,
     source: TextureViewId,
     lut: TextureViewId,
+    tonemapping: Tonemapping,
     /// `Some` when the pipeline binds the per-view GT7 params uniform.
     gt7_params_uniforms: Option<BufferId>,
     bind_group: BindGroup,
@@ -38,11 +33,11 @@ struct CachedBindGroup {
 
 pub fn tonemapping(
     view: ViewQuery<(
+        Entity,
         &ViewUniformOffset,
         &ViewTarget,
         &ViewTonemappingPipeline,
         Option<&DynamicUniformIndex<Gt7ParamsUniform>>,
-        Has<TonemapInShader>,
     )>,
     pipeline_cache: Res<PipelineCache>,
     tonemapping_pipeline: Res<TonemappingPipeline>,
@@ -51,28 +46,17 @@ pub fn tonemapping(
     view_uniforms: Res<ViewUniforms>,
     gt7_params_uniforms: Res<ComponentUniforms<Gt7ParamsUniform>>,
     tonemapping_luts: Res<TonemappingLuts>,
-    mut cache: Local<TonemappingBindGroupCache>,
+    mut cache: Local<EntityHashMap<CachedBindGroup>>,
     mut ctx: RenderContext,
 ) {
-    let (
-        view_uniform_offset,
-        target,
-        view_tonemapping_pipeline,
-        gt7_params_index,
-        tonemap_in_shader,
-    ) = view.into_inner();
+    let (view_entity, view_uniform_offset, target, view_tonemapping_pipeline, gt7_params_index) =
+        view.into_inner();
 
-    // `TonemapInShader` cameras fold tone mapping into their material shaders, so running
-    // this node for one would tone-map twice. Those cameras keep an 8-bit main texture, so
-    // the format check is a backstop: node-side operators always run on `Rgba16Float`.
-    if tonemap_in_shader
-        || matches!(
-            target.main_texture_format(),
-            TextureFormat::Rgba8UnormSrgb | TextureFormat::Rgba8Unorm
-        )
-    {
-        return;
-    }
+    // Views that run this pass always have an fp16 main texture.
+    debug_assert!(!matches!(
+        target.main_texture_format(),
+        TextureFormat::Rgba8UnormSrgb | TextureFormat::Rgba8Unorm
+    ));
 
     let Some(pipeline) = pipeline_cache.get_render_pipeline(view_tonemapping_pipeline.pipeline_id)
     else {
@@ -102,69 +86,64 @@ pub fn tonemapping(
     let source = post_process.source;
     let destination = post_process.destination;
 
-    let tonemapping = view_tonemapping_pipeline.operator;
-    let tonemapping_changed = cache.last_tonemapping != Some(tonemapping);
-    if tonemapping_changed {
-        cache.last_tonemapping = Some(tonemapping);
-    }
+    let tonemapping = view_tonemapping_pipeline.method;
+    let valid = cache.get(&view_entity).is_some_and(|cached| {
+        view_uniforms_id == cached.view_uniforms
+            && source.id() == cached.source
+            && cached.lut != fallback_image.d3.texture_view.id()
+            && cached.tonemapping == tonemapping
+            && cached.gt7_params_uniforms == gt7_params_uniforms_id
+    });
+    if !valid {
+        let lut_bindings = get_lut_bindings(
+            &gpu_images,
+            &tonemapping_luts,
+            &tonemapping,
+            &fallback_image,
+        );
 
-    let bind_group = match &mut cache.cached {
-        Some(cached)
-            if view_uniforms_id == cached.view_uniforms
-                && source.id() == cached.source
-                && cached.lut != fallback_image.d3.texture_view.id()
-                && gt7_params_uniforms_id == cached.gt7_params_uniforms
-                && !tonemapping_changed =>
-        {
-            &cached.bind_group
-        }
-        cached => {
-            let lut_bindings = get_lut_bindings(
-                &gpu_images,
-                &tonemapping_luts,
-                &tonemapping,
-                &fallback_image,
-            );
+        let layout = pipeline_cache
+            .get_bind_group_layout(gt7_layout(&tonemapping_pipeline, needs_gt7_params));
+        let render_device = ctx.render_device();
+        let bind_group = match gt7_params_binding {
+            None => render_device.create_bind_group(
+                None,
+                &layout,
+                &BindGroupEntries::sequential((
+                    view_uniforms_buffer,
+                    source,
+                    &tonemapping_pipeline.sampler,
+                    lut_bindings.0,
+                    lut_bindings.1,
+                )),
+            ),
+            Some((gt7_params_uniforms, _)) => render_device.create_bind_group(
+                None,
+                &layout,
+                &BindGroupEntries::sequential((
+                    view_uniforms_buffer,
+                    source,
+                    &tonemapping_pipeline.sampler,
+                    lut_bindings.0,
+                    lut_bindings.1,
+                    gt7_params_uniforms,
+                )),
+            ),
+        };
 
-            let layout = pipeline_cache
-                .get_bind_group_layout(gt7_layout(&tonemapping_pipeline, needs_gt7_params));
-            let render_device = ctx.render_device();
-            let bind_group = match gt7_params_binding {
-                None => render_device.create_bind_group(
-                    None,
-                    &layout,
-                    &BindGroupEntries::sequential((
-                        view_uniforms_buffer,
-                        source,
-                        &tonemapping_pipeline.sampler,
-                        lut_bindings.0,
-                        lut_bindings.1,
-                    )),
-                ),
-                Some((gt7_params_uniforms, _)) => render_device.create_bind_group(
-                    None,
-                    &layout,
-                    &BindGroupEntries::sequential((
-                        view_uniforms_buffer,
-                        source,
-                        &tonemapping_pipeline.sampler,
-                        lut_bindings.0,
-                        lut_bindings.1,
-                        gt7_params_uniforms,
-                    )),
-                ),
-            };
-
-            let cached = cached.insert(CachedBindGroup {
+        cache.insert(
+            view_entity,
+            CachedBindGroup {
                 view_uniforms: view_uniforms_id,
                 source: source.id(),
                 lut: lut_bindings.0.id(),
+                tonemapping,
                 gt7_params_uniforms: gt7_params_uniforms_id,
                 bind_group,
-            });
-            &cached.bind_group
-        }
-    };
+            },
+        );
+    }
+    let bind_group = &cache.get(&view_entity).unwrap().bind_group;
 
     // Dynamic offsets in increasing binding order: view (0), then GT7 params (5) if bound.
     let mut dynamic_offsets = [0u32; 2];

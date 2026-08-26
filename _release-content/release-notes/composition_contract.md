@@ -12,14 +12,14 @@ camera, the group resolves to linear with a warning. Cameras that do not form a
 stack keep their own requests, normalized: an explicit `Linear` request resolves
 the same as no request.
 
-Tone mapping and display encoding resolve per stack too. A buffer is never
-encoded before it is tone-mapped, so when the stack shape would force that,
-tone-map deferral is cancelled for the whole stack, with a warning.
+Tonemapping and display encoding resolve per stack too. A buffer is never
+encoded before it is tonemapped, so when the stack shape would force that,
+tonemap deferral is cancelled for the whole stack, with a warning.
 
 ## What this fixes
 
 - The display encoder now takes its source gamut from the camera that
-  tone-mapped the stack. A `Tonemapping::None` overlay over a
+  tonemapped the stack. A `Tonemapping::None` overlay over a
   `Tonemapping::GranTurismo7` camera used to expand Rec.709 to Rec.2020 twice on
   a PQ target, oversaturating the image.
 
@@ -27,7 +27,7 @@ tone-map deferral is cancelled for the whole stack, with a warning.
   linear value that read as full-peak nits. They now show the clear color,
   encoded for the resolved transfer, gamut, and paper white.
 
-- A default-tone-mapped 3D camera and an `Hdr` 2D overlay on one target used to
+- A default-tonemapped 3D camera and an `Hdr` 2D overlay on one target used to
   blit over each other with a replacing blend. The overlay now composites over
   the base.
 

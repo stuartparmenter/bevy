@@ -11,7 +11,7 @@ use bevy_diagnostic::FrameCount;
 use bevy_ecs::{
     error::BevyError,
     prelude::{Component, Entity, ReflectComponent},
-    query::With,
+    query::{Has, With},
     resource::Resource,
     schedule::IntoScheduleConfigs,
     system::{Commands, Query, Res, ResMut},
@@ -20,7 +20,7 @@ use bevy_image::ToExtents;
 use bevy_math::vec2;
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
 use bevy_render::{
-    camera::{ExtractedCamera, MipBias, TemporalJitter},
+    camera::{ExtractedCamera, MipBias, TemporalJitter, TonemapInShader},
     diagnostic::RecordDiagnostics,
     render_resource::{
         binding_types::{sampler, texture_2d, texture_depth_2d},
@@ -452,18 +452,20 @@ fn prepare_taa_pipelines(
         &TemporalAntiAliasing,
         Option<&Tonemapping>,
         &ViewDisplayTarget,
+        Has<TonemapInShader>,
     )>,
 ) -> Result<(), BevyError> {
-    for (entity, camera, view, taa_settings, tonemapping, display_target) in &cameras {
+    for (entity, camera, view, taa_settings, tonemapping, display_target, tonemap_in_shader) in
+        &cameras
+    {
         let mut pipeline_key = TaaPipelineKey {
             target_format: view.target_format,
-            // The reversible tonemapper (`TONEMAP` def) is needed whenever the main
-            // texture holds unbounded scene-referred values at TAA time, so history
-            // blending and neighborhood clamping work on a compressed range. TAA runs
-            // before the tonemapping node, and an HDR-transfer display target keeps an
-            // fp16 main texture even with `Tonemapping::None`.
+            // TAA runs before the tonemapping pass, so the main texture still holds the
+            // scene-referred values the reversible tonemapper needs. A `TonemapInShader`
+            // view is already tonemapped and needs no reversible pass. An HDR-transfer
+            // display target keeps an fp16 main texture even with `Tonemapping::None`.
             tonemap: camera.hdr
-                || tonemapping.is_some_and(Tonemapping::is_enabled)
+                || (tonemapping.is_some_and(Tonemapping::is_enabled) && !tonemap_in_shader)
                 || display_target.is_hdr_transfer(),
             reset: taa_settings.reset,
         };

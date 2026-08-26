@@ -58,7 +58,7 @@ fn rec709_to_rec2020(color: vec3<f32>) -> vec3<f32> {
 
 // Converts a linear Rec.2020 working-space color to linear Rec.709.
 // Colors outside the Rec.709 gamut come out with negative components. Callers
-// feeding Rec.709-fit consumers (tone mapping operators, LUTs) must clamp.
+// feeding Rec.709-fit consumers (tonemapping methods, LUTs) must clamp.
 fn rec2020_to_rec709(color: vec3<f32>) -> vec3<f32> {
     return REC2020_TO_REC709 * color;
 }

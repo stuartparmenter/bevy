@@ -1,6 +1,6 @@
-//! CPU side of the Gran Turismo 7 tone-mapping operator.
+//! CPU side of the Gran Turismo 7 tonemapping method.
 //!
-//! The operator runs in `gt7.wesl`. This module prepares the per-view constants
+//! The method runs in `gt7.wesl`. This module prepares the per-view constants
 //! it consumes ([`Gt7ParamsUniform`]). Under `cfg(test)` it also carries a port
 //! of Polyphony Digital's reference implementation (`gt7_tone_mapping.cpp`, MIT
 //! License, Copyright (c) 2025 Polyphony Digital Inc., published with the
@@ -8,10 +8,10 @@
 //! the shader's parity oracle. The math is `f32` throughout so the fixtures
 //! from the C++ harness hold.
 //!
-//! The operator works on linear Rec.2020 RGB "frame buffer values" where `1.0`
+//! The method works on linear Rec.2020 RGB "frame buffer values" where `1.0`
 //! corresponds to [`REFERENCE_LUMINANCE`] (100 cd/m²):
 //!
-//! - In SDR mode it tone-maps against Gran Turismo's 250-nit SDR paper white
+//! - In SDR mode it tonemaps against Gran Turismo's 250-nit SDR paper white
 //!   ([`GRAN_TURISMO_SDR_PAPER_WHITE`]) and rescales the result into `[0, 1]`
 //!   for the sRGB OETF.
 //! - In HDR mode the output range is `[0, peak_nits / paper_white_nits]`, ready
@@ -42,27 +42,27 @@ use crate::camera_stack::{StackRole, ViewStackContract};
 /// Physical luminance in cd/m² of a linear frame-buffer value of `1.0`.
 pub const REFERENCE_LUMINANCE: f32 = 100.0;
 
-/// SDR reference (paper) white for Gran Turismo's tone mapping, in cd/m². This
+/// SDR reference (paper) white for Gran Turismo's tonemapping, in cd/m². This
 /// is Polyphony's artistic calibration, not sRGB's 80/100 nits.
 pub const GRAN_TURISMO_SDR_PAPER_WHITE: f32 = 250.0;
 
-/// Lowest HDR peak luminance, in nits, the GT7 operator supports. The curve
+/// Lowest HDR peak luminance, in nits, the GT7 method supports. The curve
 /// parameters assume a 250-nit SDR paper white. The reference implementation
 /// documents this bound but does not enforce it.
 const GT7_MIN_HDR_PEAK_NITS: f32 = 250.0;
 
-/// Highest HDR peak luminance, in nits, the GT7 operator supports: the PQ
+/// Highest HDR peak luminance, in nits, the GT7 method supports: the PQ
 /// ceiling.
 const GT7_MAX_HDR_PEAK_NITS: f32 = 10000.0;
 
-/// Per-camera parameters for the [`Tonemapping::GranTurismo7`] operator.
+/// Per-camera parameters for the [`Tonemapping::GranTurismo7`] method.
 ///
 /// Defaults match Polyphony Digital's reference implementation.
 ///
 /// Without this component a GT7 camera keeps the shader's baked SDR defaults on
 /// an SDR target, and uses [`Self::default`] on an HDR-transfer target.
 ///
-/// The component requires [`TonemappingPass`] because the in-shader SDR fold
+/// The component requires [`TonemappingPass`] because the in-shader path
 /// cannot bind the params uniform and would silently run the baked defaults.
 ///
 /// [`Tonemapping::GranTurismo7`]: crate::tonemapping::Tonemapping::GranTurismo7
@@ -72,7 +72,7 @@ const GT7_MAX_HDR_PEAK_NITS: f32 = 10000.0;
 #[extract_app(RenderApp)]
 #[require(TonemappingPass)]
 pub struct GranTurismo7Params {
-    /// Mix between the per-channel tone-mapped color and the hue-preserving
+    /// Mix between the per-channel tonemapped color and the hue-preserving
     /// UCS (`ICtCp`) color. `0.0` is fully per-channel ("camera-like" skew),
     /// `1.0` is fully UCS (hue-stable). Clamped to `[0, 1]`. Default: `0.6`.
     pub blend_ratio: f32,
@@ -225,7 +225,7 @@ fn rgb_to_ictcp(rgb: [f32; 3]) -> [f32; 3] {
     ]
 }
 
-/// GPU uniform feeding the GT7 operator's `Gt7Params` WGSL struct (see
+/// GPU uniform feeding the GT7 method's `Gt7Params` WGSL struct (see
 /// `gt7.wesl`; field order and meaning must stay identical).
 ///
 /// [`Self::from_params`] computes the derived curve constants (`k_a`, `k_b`,
@@ -236,7 +236,7 @@ pub struct Gt7ParamsUniform {
     pub peak: f32,
     /// Shoulder asymptote of the tone curve,
     /// `shoulder(x) = k_a + k_b * exp(x * k_c)`. At the default parameters it
-    /// sits about 18% above `peak`, which the operator's peak clamp keeps out
+    /// sits about 18% above `peak`, which the method's peak clamp keeps out
     /// of the output.
     pub k_a: f32,
     /// Shoulder scale (negative).
@@ -261,8 +261,8 @@ pub struct Gt7ParamsUniform {
     pub fade_end: f32,
     /// Post-clamp output scale. In SDR mode it is `1 / 2.5`, Polyphony's
     /// rescale of the 250-nit-referred result into `[0, 1]`. In HDR mode it is
-    /// `100 / paper_white_nits`, the renormalization at the operator/encoder
-    /// seam that makes `1.0` at the operator output mean paper white.
+    /// `100 / paper_white_nits`, the renormalization at the tonemap/encoder
+    /// seam that makes `1.0` at the tonemap output mean paper white.
     pub sdr_correction_factor: f32,
 }
 
@@ -296,7 +296,7 @@ impl Gt7ParamsUniform {
         }
     }
 
-    /// Whether every constant the operator evaluates with is finite.
+    /// Whether every constant the method evaluates with is finite.
     ///
     /// [`GranTurismo7Params::sanitized`] bounds each parameter on its own, but
     /// combinations can still overflow the closed-form shoulder and toe math. A
@@ -325,7 +325,7 @@ impl Gt7ParamsUniform {
             return uniform;
         }
         warn_once!(
-            "GranTurismo7Params produce tone-mapping curve constants that overflow \
+            "GranTurismo7Params produce tonemapping curve constants that overflow \
              f32 (the closed-form shoulder/toe math is not finite for this \
              combination); falling back to the default parameters"
         );
@@ -345,7 +345,7 @@ impl Gt7ParamsUniform {
     /// target, clamped to `[250, 10000]` nits and to at least paper white, and
     /// [`Self::sdr_correction_factor`] becomes `100 / paper_white`. The same
     /// HDR predicate pushes the `TONEMAP_OUTPUT_REC2020` shader def, so the
-    /// operator's output stays unclamped and in native Rec.2020 primaries.
+    /// method's output stays unclamped and in native Rec.2020 primaries.
     ///
     /// Any other target selects SDR mode, at peak 2.5 frame-buffer units (Gran
     /// Turismo's 250-nit paper white). That matches the shader's baked defaults
@@ -438,13 +438,13 @@ pub fn queue_gt7_params_uniforms(
     >,
 ) {
     for (entity, tonemapping, params, view_display_target, contract, has_uniform) in &views {
-        // Cameras stacked on a shared main texture tone-map once, on the
+        // Cameras stacked on a shared main texture tonemap once, on the
         // stack's finalizer. The deferred members never run the pass.
         let deferred =
             contract.is_some_and(|contract| matches!(contract.tonemap, StackRole::Deferred(_)));
         let active = !deferred
             && gt7_params_uniform_active(
-                resolve_tonemapping(tonemapping, view_display_target).operator,
+                resolve_tonemapping(tonemapping, view_display_target).method,
                 params.is_some(),
                 view_display_target.is_hdr_transfer(),
             );
@@ -466,7 +466,7 @@ pub fn queue_gt7_params_uniforms(
     }
 }
 
-/// CPU port of the operator `gt7.wesl` evaluates per pixel, driven by the same
+/// CPU port of the method `gt7.wesl` evaluates per pixel, driven by the same
 /// [`Gt7ParamsUniform`] the shader binds. The shader needs only the constants
 /// in that uniform, so this port is test-only.
 #[cfg(test)]
@@ -554,7 +554,7 @@ mod cpu_reference {
         }
     }
 
-    /// Applies the full tone-mapping pipeline (curve plus the hue-preserving
+    /// Applies the full tonemapping pipeline (curve plus the hue-preserving
     /// `ICtCp` branch) to a linear Rec.2020 frame-buffer color in native GT7
     /// units, where `1.0` = 100 nits.
     pub(super) fn apply(params: &Gt7ParamsUniform, rgb: [f32; 3]) -> [f32; 3] {

@@ -6,7 +6,7 @@ pull_requests: []
 
 Bevy can now present high-dynamic-range output. Set the window's
 `DisplayTarget` to an HDR transfer and give the camera an HDR-aware
-tone-mapping operator:
+tonemapping method:
 
 ```rust
 fn enable_hdr_output(
@@ -55,7 +55,7 @@ calibration and swaps only the transfer. Read the outcome from the window's
 
 Windows and macOS advertise HDR color spaces even on an SDR display, so the
 request succeeds there and the compositor clips. `WindowDisplayState` carries
-the live tone-map headroom when you need to tell.
+the live tonemap headroom when you need to tell.
 
 Changing `DisplayTarget::transfer` at runtime reconfigures the surface and
 renegotiates, as does a `DisplayTarget::gamut` change under `ExtendedSrgb`.
@@ -63,7 +63,7 @@ Paper white, peak, and other gamut changes take effect without reconfiguring.
 
 ## The display-encoding pass
 
-A per-view pass turns the tone-mapped image into the signal the display
+A per-view pass turns the tonemapped image into the signal the display
 expects, with no per-camera setup: it converts the operator's output primaries
 to the display's, then applies the transfer function. The encode functions are
 importable in WGSL as `bevy_render::transfer_functions`, mirrored in a Rust
@@ -92,9 +92,9 @@ HDR display targets.
 Views on an SDR display target, including the default
 `DisplayTarget::SDR_SRGB`, never run the encoding pass, and their sRGB encode
 is unchanged from 0.19. An HDR transfer does move a camera off the in-shader
-tone-mapping fast path and its 8-bit main texture onto a scene-linear
-`Rgba16Float` intermediate. See the migration guide "Tone mapping render path:
-node-based tone mapping and the `Rgba16Float` intermediate".
+tonemapping path and its 8-bit main texture onto a scene-linear
+`Rgba16Float` intermediate. See the migration guide "Camera stacks tonemap
+once".
 
 ## Screenshots
 

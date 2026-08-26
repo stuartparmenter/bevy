@@ -22,9 +22,8 @@ import bevy_render::color_operations::{oklab_to_linear_rgb, linear_rgb_to_oklab}
 fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     let hdr_color = textureSample(hdr_texture, hdr_sampler, in.uv);
 
-    // When the view composites in an encoded space, main pass shaders encode their
-    // scene-linear output, so blending happens in the encoded space and the upscaling
-    // blit decodes on the way out. This pass does the same: decode, tone map, re-encode.
+    // When the view composites in an encoded space, the main pass writes encoded
+    // values, so decode before tonemapping and re-encode after.
 @if(COMPOSITING_SPACE_SRGB)
     var output_rgb = tone_mapping(vec4(srgb_to_linear(hdr_color.rgb), hdr_color.a), view.color_grading).rgb;
 @elif(COMPOSITING_SPACE_OKLAB)

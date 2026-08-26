@@ -18,7 +18,7 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
 
 /// Describes the display device that a [`Window`](crate::Window) (or other
 /// render target) is presented on, so the renderer can produce a correctly
-/// tone-mapped, gamut-mapped, and transfer-encoded signal for it.
+/// tonemapped, gamut-mapped, and transfer-encoded signal for it.
 ///
 /// This component is user-authoritative: Bevy never overwrites values you set,
 /// even when the window moves to a different monitor. A move retargets the
@@ -50,7 +50,7 @@ pub struct DisplayTarget {
     /// surface. Emissive highlights may go brighter, up to
     /// [`peak_luminance_nits`].
     ///
-    /// Tone-mapping output is renormalized at the encoder seam so that `1.0`
+    /// Tonemapping output is renormalized at the encoder seam so that `1.0`
     /// corresponds to this luminance. On SDR displays it is signal-level
     /// white, nominally `100.0` nits. HDR values run 100-300 nits depending on
     /// viewing environment; ITU-R BT.2408 recommends 203 nits for HDR
@@ -60,7 +60,7 @@ pub struct DisplayTarget {
     pub paper_white_nits: f32,
     /// The maximum luminance, in nits, that the display can show.
     ///
-    /// Peak-aware tone-mapping operators compress scene highlights into
+    /// Peak-aware tonemapping methods compress scene highlights into
     /// `[0, peak_luminance_nits]` rather than clipping them. On SDR displays
     /// peak and paper white coincide (nominally `100.0` nits); on HDR displays
     /// the peak is higher (commonly 400-4000 nits), leaving headroom above
@@ -159,7 +159,7 @@ impl DisplayTarget {
     /// Valid values are returned bit-for-bit unchanged.
     ///
     /// Every renderer stage that folds `paper_white_nits` into its math must go
-    /// through this method, so the tone-map seam renormalization and the
+    /// through this method, so the tonemap seam renormalization and the
     /// display encoder's scale factor cancel exactly. This method is pure;
     /// callers warn about the fallback.
     pub fn sanitized_paper_white_nits(&self) -> f32 {
@@ -211,7 +211,7 @@ pub enum DisplayGamut {
 
 /// The transfer function used to encode the final signal for a display target.
 ///
-/// The last stage of the display pipeline: it converts tone-mapped,
+/// The last stage of the display pipeline: it converts tonemapped,
 /// gamut-mapped display-linear color into the signal values the display
 /// expects.
 ///
@@ -292,7 +292,7 @@ pub enum DisplayTransfer {
     /// - [`DisplayGamut::DisplayP3`] -> wgpu `ExtendedDisplayP3` (Metal
     ///   `kCGColorSpaceExtendedDisplayP3`, browser WebGPU `display-p3` canvas +
     ///   `toneMapping: "extended"`); the encoder converts Rec.709/Rec.2020
-    ///   tone-map output into P3 primaries before the OETF.
+    ///   tonemap output into P3 primaries before the OETF.
     /// - [`DisplayGamut::Rec2020`] has no encoded-extended surface and is
     ///   coerced to Rec.709.
     ExtendedSrgb,

@@ -50,7 +50,7 @@ fn srgb_oetf_extended(linear: vec3<f32>) -> vec3<f32> {
 const SCRGB_REFERENCE_WHITE_NITS: f32 = 80.0;
 
 // Encodes paper-white-relative display-linear color (1.0 = paper white at the
-// tone-map operator output) as an scRGB-linear signal, where 1.0 = 80 nits:
+// tonemap output) as an scRGB-linear signal, where 1.0 = 80 nits:
 //
 //   V = L * paper_white_nits / 80
 //
