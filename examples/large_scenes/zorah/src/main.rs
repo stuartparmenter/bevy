@@ -35,6 +35,7 @@ use bevy::{
         mesh::Indices,
         render_resource::{Face, PrimitiveTopology, TextureUsages},
         renderer::RenderDevice,
+        view::screenshot::{save_to_disk, Screenshot},
         working_color_space::WorkingColorSpace,
         RenderPlugin,
     },
@@ -281,6 +282,11 @@ struct Args {
     /// initial states; digit keys toggle layers while running)
     #[argh(option)]
     data_layers: Option<String>,
+
+    /// comma-separated substrings; actors whose label, class or mesh path
+    /// contains one are not spawned (a way to find what an on-screen object is)
+    #[argh(option)]
+    hide_actors: Option<String>,
 }
 
 #[derive(Resource)]
@@ -1162,9 +1168,33 @@ fn load_converted_world(
     let post_process = active_unbound_post_process(&scene.actors)
         .cloned()
         .or_else(|| legacy_zorah_post_process(&scene.level));
+    let mut actors = scene.actors;
+    if let Some(patterns) = args.hide_actors.as_deref() {
+        let patterns: Vec<&str> = patterns
+            .split(',')
+            .map(str::trim)
+            .filter(|pattern| !pattern.is_empty())
+            .collect();
+        let mut hidden = 0usize;
+        for actor in actors.iter_mut().filter(|actor| !actor.hidden) {
+            let matches = patterns.iter().any(|pattern| {
+                actor._label.as_deref().is_some_and(|label| label.contains(pattern))
+                    || actor.kind.contains(pattern)
+                    || actor
+                        .components
+                        .iter()
+                        .any(|component| component.mesh.as_deref().is_some_and(|mesh| mesh.contains(pattern)))
+            });
+            if matches {
+                actor.hidden = true;
+                hidden += 1;
+            }
+        }
+        eprintln!("--hide-actors {patterns:?} hid {hidden} actors");
+    }
     ConvertedWorld {
         level: scene.level,
-        actors: scene.actors,
+        actors,
         data_layers: scene.data_layers,
         post_process,
         geometry,
@@ -2131,6 +2161,7 @@ fn main() {
         Update,
         (toggle_data_layers_by_key, apply_data_layers).chain(),
     )
+    .add_systems(Update, dump_camera_and_screenshot)
     .run();
 }
 
@@ -4111,6 +4142,53 @@ fn spawn_partitions_when_ready(
 
 fn raytracing_scene_ready(snapshot: &RaytracingSceneStatusSnapshot, expected_blas: usize) -> bool {
     snapshot.is_settled_for(expected_blas)
+}
+
+/// `P` logs the current view as the command-line fragment that reproduces it,
+/// data layers included; `F12` saves the frame next to the executable.
+fn dump_camera_and_screenshot(
+    keys: Res<ButtonInput<KeyCode>>,
+    camera: Single<&Transform, With<ZorahCamera>>,
+    converted: Res<ConvertedWorld>,
+    data_layers: Res<DataLayers>,
+    mut commands: Commands,
+) {
+    if keys.just_pressed(KeyCode::KeyP) {
+        let position = camera.translation;
+        // Any point along the view direction reproduces the look; a few metres
+        // out keeps the printed target readable and away from the position.
+        let target = position + camera.forward() * 5.0;
+        let layers: Vec<&str> = data_layers
+            .toggleable()
+            .filter(|(_, layer)| layer.active)
+            .map(|(_, layer)| layer.name.as_str())
+            .collect();
+        let mut fragment = format!(
+            "--scene scenes/{}.json --camera-position {:.3},{:.3},{:.3} --camera-target {:.3},{:.3},{:.3}",
+            converted.level,
+            position.x,
+            position.y,
+            position.z,
+            target.x,
+            target.y,
+            target.z
+        );
+        if data_layers.toggleable().next().is_some() {
+            fragment.push_str(" --data-layers ");
+            fragment.push_str(&layers.join(","));
+        }
+        info!("camera: {fragment}");
+    }
+    if keys.just_pressed(KeyCode::F12) {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs());
+        let path = format!("zorah-{}-{stamp}.png", converted.level);
+        commands
+            .spawn(Screenshot::primary_window())
+            .observe(save_to_disk(path.clone()));
+        info!(path, "saving screenshot");
+    }
 }
 
 fn report_data_layers(converted: Res<ConvertedWorld>, data_layers: Res<DataLayers>) {

@@ -264,6 +264,13 @@ debugging with Bevy-space coordinates:
 cargo +1.96.1 run --release -p zorah -- --camera-position 0,4.5,48 --camera-target 0,4,40
 ```
 
+Press `P` while running to log the current view as exactly that fragment
+(`--scene`, `--camera-position`, `--camera-target` and the active
+`--data-layers`), ready to paste back for a reproducible start; `F12` saves the
+frame as `zorah-<level>-<unix time>.png` in the working directory. To find out
+what an on-screen object is, `--hide-actors Eaves,LightCap` skips every actor
+whose label, class or mesh path contains one of the substrings.
+
 The target machine is an RTX 5090. DLSS frame generation can be integrated
 later without changing the conversion format.
 
