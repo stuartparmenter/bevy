@@ -1782,6 +1782,12 @@ static class ZorahConvert
                     $"rotation={Format(rootTransform.Rotation)} " +
                     $"scale={Format(rootTransform.Scale)}"
                 );
+                var attach = AttachParentOutsideActor(rootComponent);
+                Console.WriteLine(
+                    $"ZORAH_ACTOR_ATTACH actor={obj.Name} " +
+                    $"parent_actor={attach?.Actor ?? "None"} " +
+                    $"parent_component={attach?.Component ?? "None"}"
+                );
             }
             if (obj is UStaticMesh mesh)
             {
@@ -2208,6 +2214,7 @@ static class ZorahConvert
         var referencedDecalMaterials = new HashSet<string>(StringComparer.Ordinal);
         var referencedNiagaraMaterials = new HashSet<string>(StringComparer.Ordinal);
         var missingNiagaraAssets = new HashSet<string>(StringComparer.Ordinal);
+        var pendingAttachments = new Dictionary<int, PendingAttachment>();
         var declaredDataLayers = new Dictionary<string, DataLayerRecord>(StringComparer.Ordinal);
         var dataLayerActorCounts = new Dictionary<string, int>(StringComparer.Ordinal);
         var dataLayerAssets = new Dictionary<string, string>(StringComparer.Ordinal);
@@ -2342,6 +2349,25 @@ static class ZorahConvert
                         }
                     }
 
+                    var attachParent = AttachParentOutsideActor(rootComponent);
+                    if (rootComponent is not null && attachParent is not null)
+                    {
+                        pendingAttachments[actors.Count] = new PendingAttachment(
+                            ParentActor: attachParent.Value.Actor,
+                            ParentComponent: attachParent.Value.Component,
+                            Relative: ConvertObjectTransform(rootComponent),
+                            AbsoluteLocation: rootComponent.GetOrDefault(
+                                "bAbsoluteLocation",
+                                false
+                            ),
+                            AbsoluteRotation: rootComponent.GetOrDefault(
+                                "bAbsoluteRotation",
+                                false
+                            ),
+                            AbsoluteScale: rootComponent.GetOrDefault("bAbsoluteScale", false)
+                        );
+                    }
+
                     var dataLayerPaths = ReadActorDataLayers(actor);
                     foreach (var path in dataLayerPaths)
                     {
@@ -2371,6 +2397,7 @@ static class ZorahConvert
                         Type: actor.ExportType,
                         Class: actor.Class?.GetPathName(),
                         Transform: ConvertObjectTransform(rootComponent),
+                        AttachParent: attachParent?.Actor,
                         Hidden: actor.GetOrDefault("bHidden", false),
                         DataLayers: dataLayerPaths.Length == 0
                             ? null
@@ -2404,6 +2431,8 @@ static class ZorahConvert
                 );
             }
         }
+
+        ResolveAttachedActors(provider, level, actors, pendingAttachments);
 
         // A layer an actor claims but WorldDataLayers never declares still gets
         // an entry so the runtime can see it; its state stays unknown.
@@ -2482,6 +2511,9 @@ static class ZorahConvert
             throw;
         }
 
+        Console.WriteLine(
+            $"ZORAH_LEVEL_ATTACHED_ACTORS level={level} count={pendingAttachments.Count}"
+        );
         Console.WriteLine(
             $"ZORAH_LEVEL_DATA_LAYERS level={level} layers=" +
             string.Join(",", manifest.DataLayers.Select(layer =>
@@ -2601,6 +2633,174 @@ static class ZorahConvert
                 StringComparison.Ordinal
             ))
             ?? (owned.Length == 1 ? owned[0] : null);
+    }
+
+    /// The actor and component an actor root is attached to outside its own package.
+    ///
+    /// Such an AttachParent is an import that resolves through the persistent
+    /// level - /Game/Levels/Level.Level:PersistentLevel.Actor.Component - so the
+    /// parent's own external actor package is not named here. Attachments inside
+    /// the actor are exports and stay with ComponentArchetypes.
+    private static (string Actor, string Component)? AttachParentOutsideActor(
+        UObject? component
+    )
+    {
+        if (component is null ||
+            GetTaggedValue(component, "AttachParent") is not FPackageIndex index ||
+            !index.IsImport)
+        {
+            return null;
+        }
+        var resolved = index.ResolvedObject;
+        var actor = resolved?.Outer?.Name.Text;
+        return actor is null ? null : (actor, resolved!.Name.Text);
+    }
+
+    private sealed record PendingAttachment(
+        string ParentActor,
+        string ParentComponent,
+        TransformRecord Relative,
+        bool AbsoluteLocation,
+        bool AbsoluteRotation,
+        bool AbsoluteScale
+    );
+
+    /// Rewrite attached actors' transforms from parent-relative to world space.
+    ///
+    /// An actor root attached to another actor's component serializes its
+    /// transform relative to that component, but the manifest stores actor
+    /// transforms in world space. The parent sits in its own external actor
+    /// package, so this only resolves once the whole level is read. A parent may
+    /// itself be attached, hence the recursion. Anything unresolvable keeps the
+    /// relative transform and is reported rather than throwing: one misplaced
+    /// actor beats no manifest.
+    private static void ResolveAttachedActors(
+        DefaultFileProvider provider,
+        string level,
+        List<ActorRecord> actors,
+        Dictionary<int, PendingAttachment> pending
+    )
+    {
+        var actorIndex = new Dictionary<string, int>(StringComparer.Ordinal);
+        for (var index = 0; index < actors.Count; index++)
+        {
+            actorIndex.TryAdd(actors[index].Name, index);
+        }
+        var offsets = new Dictionary<string, TransformRecord?>(StringComparer.Ordinal);
+        var world = new Dictionary<int, TransformRecord>();
+        var resolving = new HashSet<int>();
+
+        TransformRecord? ComponentOffset(ActorRecord parent, string component)
+        {
+            var key = string.Join('\0', parent.Package, parent.Name, component);
+            if (offsets.TryGetValue(key, out var cached))
+            {
+                return cached;
+            }
+            TransformRecord? offset = null;
+            try
+            {
+                var objects = provider.LoadPackage(parent.Package).GetExports().ToArray();
+                if (objects.FirstOrDefault(obj => obj.Name == parent.Name) is UObject owner)
+                {
+                    var owned = OwnedComponents(owner, objects);
+                    if (owned.FirstOrDefault(obj => obj.Name == component) is UObject target)
+                    {
+                        offset = new ComponentArchetypes(
+                            owner,
+                            FindRootComponent(owner, objects),
+                            owned,
+                            LoadBlueprintComponentTemplates(provider, owner.Class?.GetPathName())
+                        ).TransformRelativeToActor(target);
+                    }
+                }
+            }
+            catch (Exception error)
+            {
+                Console.Error.WriteLine(
+                    $"ZORAH_ATTACH_UNRESOLVED level={level} parent={parent.Name} " +
+                    $"component={component} reason={error.GetType().Name}"
+                );
+            }
+            offsets[key] = offset;
+            return offset;
+        }
+
+        TransformRecord Resolve(int index)
+        {
+            if (world.TryGetValue(index, out var cached))
+            {
+                return cached;
+            }
+            if (!pending.TryGetValue(index, out var attachment))
+            {
+                world[index] = actors[index].Transform;
+                return actors[index].Transform;
+            }
+            var transform = attachment.Relative;
+            if (!resolving.Add(index))
+            {
+                Console.Error.WriteLine(
+                    $"ZORAH_ATTACH_UNRESOLVED level={level} actor={actors[index].Name} " +
+                    $"parent={attachment.ParentActor} reason=cycle"
+                );
+                return transform;
+            }
+            try
+            {
+                if (!actorIndex.TryGetValue(attachment.ParentActor, out var parent))
+                {
+                    Console.Error.WriteLine(
+                        $"ZORAH_ATTACH_UNRESOLVED level={level} actor={actors[index].Name} " +
+                        $"parent={attachment.ParentActor} reason=missing-actor"
+                    );
+                }
+                else if (ComponentOffset(actors[parent], attachment.ParentComponent)
+                    is not TransformRecord offset)
+                {
+                    Console.Error.WriteLine(
+                        $"ZORAH_ATTACH_UNRESOLVED level={level} actor={actors[index].Name} " +
+                        $"parent={attachment.ParentActor} " +
+                        $"component={attachment.ParentComponent} reason=missing-component"
+                    );
+                }
+                else
+                {
+                    transform = ComposeTransforms(
+                        ComposeTransforms(Resolve(parent), offset),
+                        attachment.Relative
+                    );
+                    // An absolute flag keeps the child's own value in world space
+                    // rather than composing it onto the parent.
+                    if (attachment.AbsoluteLocation)
+                    {
+                        transform = transform with
+                        {
+                            Translation = attachment.Relative.Translation,
+                        };
+                    }
+                    if (attachment.AbsoluteRotation)
+                    {
+                        transform = transform with { Rotation = attachment.Relative.Rotation };
+                    }
+                    if (attachment.AbsoluteScale)
+                    {
+                        transform = transform with { Scale = attachment.Relative.Scale };
+                    }
+                }
+            }
+            finally
+            {
+                resolving.Remove(index);
+            }
+            world[index] = transform;
+            return transform;
+        }
+
+        foreach (var index in pending.Keys.Order())
+        {
+            actors[index] = actors[index] with { Transform = Resolve(index) };
+        }
     }
 
     private static StaticMeshComponentRecord ConvertComponent(
@@ -3746,6 +3946,8 @@ sealed record ActorRecord(
     string Type,
     string? Class,
     TransformRecord Transform,
+    // The actor this one's root is attached to, when that is another actor.
+    string? AttachParent,
     bool Hidden,
     string[]? DataLayers,
     StaticMeshComponentRecord[] Components,
