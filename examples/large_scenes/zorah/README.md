@@ -271,6 +271,12 @@ frame as `zorah-<level>-<unix time>.png` in the working directory. To find out
 what an on-screen object is, `--hide-actors Eaves,LightCap` skips every actor
 whose label, class or mesh path contains one of the substrings.
 
+For a lit-versus-unlit pair, take the Solari frame first, press `P`, then rerun
+with the printed fragment plus `--raster-only --unlit-textures`: every surface
+shows its base-colour texture with no lighting, normal maps, emission, bloom or
+tone curve, so the two frames differ only by what Solari adds. Add
+`--missing-materials grey` if the magenta stand-ins would distract.
+
 Slots UE itself cannot texture - the engine's unassigned-slot fallback and the
 four vegetation materials the download omits - render magenta so they are
 impossible to miss. `--missing-materials grey` renders them as UE's own

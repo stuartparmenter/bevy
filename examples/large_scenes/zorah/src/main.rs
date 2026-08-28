@@ -3576,7 +3576,21 @@ fn setup(
     let camera_target = options.camera_target.unwrap_or(preset_target);
     let exposure_ev100 =
         resolved_exposure_ev100(options.exposure_ev100, converted.post_process.as_ref());
-    let bloom = resolved_bloom(converted.post_process.as_ref());
+    // An albedo capture wants the texture values themselves on screen, so the
+    // unlit view skips the filmic curve and the glare that would reshape them.
+    let bloom = if options.unlit_textures {
+        Bloom {
+            intensity: 0.0,
+            ..resolved_bloom(converted.post_process.as_ref())
+        }
+    } else {
+        resolved_bloom(converted.post_process.as_ref())
+    };
+    let tonemapping = if options.unlit_textures {
+        Tonemapping::None
+    } else {
+        Tonemapping::GranTurismo7
+    };
     let queued_partitions = pending.len();
     let mut seen_bundle_roots = HashSet::new();
     let bundle_roots = pending
@@ -3645,7 +3659,7 @@ fn setup(
         // the one peak-luminance-aware filmic operator; the authored Film*
         // parameters ride along in the manifest so the choice can be revisited
         // if Bevy grows a parameterizable ACES curve.
-        Tonemapping::GranTurismo7,
+        tonemapping,
         GranTurismo7Params::default(),
         bloom,
         ZorahCamera,
