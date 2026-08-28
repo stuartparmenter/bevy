@@ -55,12 +55,13 @@ struct AutoExposure {
     awb_anchor: f32,
     // Non-zero when auto white balance is enabled for this view.
     awb_enabled: u32,
+    // The adapted exposure correction is clamped to this range, in EV.
+    correction_min: f32,
+    correction_max: f32,
     // Tail padding to 80 bytes. WGSL rounds a uniform struct's size up to a
     // multiple of 16 anyway; spelling it out keeps this struct field-for-field
     // identical to its CPU mirror, which has to pad explicitly.
     pad_0: u32,
-    pad_1: u32,
-    pad_2: u32,
 }
 
 // The per-view adaptation state, persisted on the GPU from frame to frame.
@@ -484,6 +485,10 @@ fn compute_average(@builtin(local_invocation_index) local_index: u32) {
             long_term + settings.long_term_bound_up,
         );
     }
+
+    // The configured correction range bounds the result last, so neither the
+    // smoothing nor the physiological envelope can carry it outside.
+    exposure = clamp(exposure, settings.correction_min, settings.correction_max);
 
     state.exposure = exposure;
     state.long_term = long_term;

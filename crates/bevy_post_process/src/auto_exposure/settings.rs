@@ -101,6 +101,15 @@ pub struct AutoExposure {
     /// The default value is 0.0, which leaves the metered value untouched.
     pub metering_bias: f32,
 
+    /// The range the adapted exposure correction is clamped to, in EV relative to the
+    /// camera's [`Exposure`](bevy_camera::Exposure): a correction of `+1.0` brightens the
+    /// frame by one stop over that base. A narrow range limits how far metering can move
+    /// the exposure, and an empty one (`0.0..=0.0`) pins it; this is the equivalent of
+    /// a minimum and maximum EV100 on a physical camera.
+    ///
+    /// The default value is unbounded.
+    pub correction_range: RangeInclusive<f32>,
+
     /// Optional two-stage "physiological" adaptation, layering a slow long-term adaptation
     /// envelope on top of the regular short-term smoothing. See [`PhysiologicalAdaptation`]
     /// for details.
@@ -120,6 +129,7 @@ impl Default for AutoExposure {
             metering_mask: default(),
             compensation_curve: default(),
             metering_bias: 0.0,
+            correction_range: f32::MIN..=f32::MAX,
             physiological: None,
         }
     }

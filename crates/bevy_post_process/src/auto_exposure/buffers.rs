@@ -177,6 +177,19 @@ pub(super) fn build_uniform(
         .map(PhysiologicalAdaptation::sanitized)
         .unwrap_or_default();
 
+    let (correction_min, correction_max) = settings.correction_range.clone().into_inner();
+    let (correction_min, correction_max) = if correction_min <= correction_max
+        && !correction_min.is_nan()
+        && !correction_max.is_nan()
+    {
+        (correction_min, correction_max)
+    } else {
+        once!(warn!(
+            "AutoExposure::correction_range must be an ordered, non-NaN range; ignoring the configured value"
+        ));
+        (f32::MIN, f32::MAX)
+    };
+
     let white_balance = white_balance.map(AutoWhiteBalance::sanitized);
 
     AutoExposureUniform {
@@ -197,9 +210,9 @@ pub(super) fn build_uniform(
         awb_speed: white_balance.map_or(0.0, |wb| wb.speed),
         awb_anchor: white_balance.map_or(0.0, |wb| wb.virtual_light_anchor),
         awb_enabled: white_balance.is_some() as u32,
+        correction_min,
+        correction_max,
         pad_0: 0,
-        pad_1: 0,
-        pad_2: 0,
     }
 }
 
@@ -210,7 +223,14 @@ pub(super) fn build_uniform(
 /// white-balance chromaticity always starts at the neutral D65 white point.
 pub(super) fn initial_state(settings: &AutoExposure) -> AutoExposureState {
     let (min_log_lum, max_log_lum) = settings.range.clone().into_inner();
-    let exposure = 0.0f32.clamp(min_log_lum, max_log_lum);
+    let (correction_min, correction_max) = settings.correction_range.clone().into_inner();
+    let exposure = if correction_min <= correction_max {
+        0.0f32
+            .clamp(min_log_lum, max_log_lum)
+            .clamp(correction_min, correction_max)
+    } else {
+        0.0f32.clamp(min_log_lum, max_log_lum)
+    };
 
     AutoExposureState {
         exposure,

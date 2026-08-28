@@ -122,8 +122,8 @@ fn target_sequence(step: usize) -> f32 {
 fn gpu_struct_layouts_match_the_wgsl_structs() {
     use bevy_render::render_resource::ShaderType;
 
-    // naga computes span=80 for the WGSL `AutoExposure` uniform struct (17 sequential
-    // 4-byte scalars plus three words of tail padding) and span=16 for
+    // naga computes span=80 for the WGSL `AutoExposure` uniform struct (19 sequential
+    // 4-byte scalars plus one word of tail padding) and span=16 for
     // `AutoExposureState`; the encase layouts must agree.
     assert_eq!(AutoExposureUniform::min_size().get(), 80);
     assert_eq!(AutoExposureState::min_size().get(), 16);
