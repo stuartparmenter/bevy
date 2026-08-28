@@ -180,6 +180,26 @@ def require_atmosphere_and_height_fog(scene: dict) -> None:
             raise ValueError(f"scene {scene['level']} lost height-fog override {field}")
 
 
+def scene_mesh_objects(scene: dict) -> set[str]:
+    """Every mesh a scene places, through a component or a Niagara renderer.
+
+    A mesh renderer reaches its mesh through the particle system rather than a
+    component property - GreenHouse's butterfly, ThroneRoom's nebula spheres -
+    so a component-only walk calls those meshes unused wherever they land.
+    """
+    meshes: set[str] = set()
+    for actor in scene.get("actors", []):
+        for component in actor.get("components", []):
+            if component.get("mesh"):
+                meshes.add(component["mesh"])
+        for component in actor.get("niagara", []):
+            for renderer in component.get("mesh_renderers", []):
+                for entry in renderer.get("meshes", []):
+                    if entry.get("mesh"):
+                        meshes.add(entry["mesh"])
+    return meshes
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("asset_root", type=Path)
@@ -251,10 +271,7 @@ def main() -> int:
 
     for scene in scenes:
         scene_meshes = {
-            component.get("mesh")
-            for actor in scene.get("actors", [])
-            for component in actor.get("components", [])
-            if component.get("mesh") in meshes_by_object
+            mesh for mesh in scene_mesh_objects(scene) if mesh in meshes_by_object
         }
         scene_geometry_bundles = {
             split_reference(partition[key])[0]

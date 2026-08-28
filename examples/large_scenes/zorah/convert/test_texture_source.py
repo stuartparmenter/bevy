@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import io
 import struct
 import tempfile
+import types
 import unittest
 import zlib
 from collections.abc import Collection
+from contextlib import contextmanager
 from pathlib import Path
 
 from PIL import Image
@@ -32,14 +35,82 @@ def png_with_iend_bytes_in_idat() -> bytes:
     )
 
 
-def texture_record(output: str, size: tuple[int, int]) -> dict[str, object]:
+def png_payload(color: tuple[int, int, int, int], size: tuple[int, int]) -> bytes:
+    """The bytes UE embeds for a TSCF_PNG source, in the file's own order."""
+    buffer = io.BytesIO()
+    Image.new("RGBA", size, color).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def png_source_record(
+    pixel_format: str, size: tuple[int, int], payload: bytes
+) -> dict[str, object]:
+    return {
+        "object": "/Game/Test.Test",
+        "package": "Test.uasset",
+        "output": "texture.png",
+        "width": size[0],
+        "height": size[1],
+        "pixel_format": pixel_format,
+        "source_compression": "TSCF_PNG",
+        "srgb": True,
+        "normal_map": False,
+        "payload_size": len(payload),
+        "blocks": [
+            {
+                "block_x": 0,
+                "block_y": 0,
+                "width": size[0],
+                "height": size[1],
+                "payload_offset": 0,
+                "payload_size": len(payload),
+            }
+        ],
+    }
+
+
+class FakeOodleReader:
+    """Stand in for the package trailer reader with a payload held in memory."""
+
+    def __init__(self, payload: bytes):
+        self.payload = payload
+        self.raw_position = 0
+        self.info = types.SimpleNamespace(raw_size=len(payload))
+        self.recovered_blocks: list[int] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exception):
+        return False
+
+    def read_exact(self, count: int) -> bytes:
+        self.raw_position += count
+        return self.payload[:count]
+
+
+@contextmanager
+def stub_oodle(payload: bytes):
+    original = texture_source.OodleBlockReader
+    texture_source.OodleBlockReader = (
+        lambda source, recover_bad_blocks=None: FakeOodleReader(payload)
+    )
+    try:
+        yield
+    finally:
+        texture_source.OodleBlockReader = original
+
+
+def texture_record(
+    output: str, size: tuple[int, int], pixel_format: str = "TSF_RGBA8"
+) -> dict[str, object]:
     return {
         "object": "/Game/Test.Test",
         "package": "Test.uasset",
         "output": output,
         "width": size[0],
         "height": size[1],
-        "pixel_format": "TSF_BGRA8",
+        "pixel_format": pixel_format,
         "source_compression": "TSCF_PNG",
         "srgb": True,
         "normal_map": False,
@@ -145,6 +216,137 @@ class AtlasLayoutTests(unittest.TestCase):
         self.assertTrue(texture_source.atlas_layout_matters(10, 3, 30))
 
 
+class ChannelOrderTests(unittest.TestCase):
+    """UE writes a BGRA8 source's embedded PNG from the raw BGRA byte order."""
+
+    def test_bgra8_png_source_swaps_red_and_blue(self):
+        # Stored as a PNG the file calls (10, 20, 200); UE means B, G, R.
+        payload = png_payload((10, 20, 200, 255), (4, 4))
+        record = png_source_record("TSF_BGRA8", (4, 4), payload)
+        image, *_ = texture_source.decode_texture_blocks(payload, record)
+        self.assertEqual(image.getpixel((0, 0)), (200, 20, 10, 255))
+
+    def test_rgba8_png_source_keeps_its_channel_order(self):
+        payload = png_payload((10, 20, 200, 255), (4, 4))
+        record = png_source_record("TSF_RGBA8", (4, 4), payload)
+        image, *_ = texture_source.decode_texture_blocks(payload, record)
+        self.assertEqual(image.getpixel((0, 0)), (10, 20, 200, 255))
+
+    def test_only_bgra8_png_sources_are_swapped(self):
+        for pixel_format, compression, swapped in (
+            ("TSF_BGRA8", "TSCF_PNG", True),
+            ("TSF_BGRA8", "TSCF_None", False),
+            ("TSF_RGBA8", "TSCF_PNG", False),
+            ("TSF_RGBA16", "TSCF_PNG", False),
+            ("TSF_G8", "TSCF_PNG", False),
+        ):
+            record = {"pixel_format": pixel_format, "source_compression": compression}
+            with self.subTest(pixel_format=pixel_format, compression=compression):
+                self.assertEqual(
+                    texture_source.png_channels_are_swapped(record), swapped
+                )
+                self.assertEqual(
+                    texture_source.channel_order_version(record),
+                    texture_source.CHANNEL_ORDER_VERSION if swapped else None,
+                )
+
+    def test_swapping_leaves_alpha_and_single_channel_images_alone(self):
+        rgba = Image.new("RGBA", (2, 2), (1, 2, 3, 4))
+        self.assertEqual(
+            texture_source.swap_red_blue(rgba).getpixel((0, 0)), (3, 2, 1, 4)
+        )
+        grey = Image.new("L", (2, 2), 7)
+        self.assertEqual(texture_source.swap_red_blue(grey).getpixel((0, 0)), 7)
+
+    def test_stale_channel_order_re_exports_only_the_swapped_records(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            destination = root / "texture.png"
+            Image.new("RGBA", (4, 4), (1, 2, 3, 255)).save(destination)
+            destination.with_name("texture.png.meta").write_text(
+                texture_source.image_meta(True, False), encoding="utf-8"
+            )
+            payload = png_payload((10, 20, 200, 255), (4, 4))
+            for pixel_format, reusable in (
+                ("TSF_BGRA8", False),
+                ("TSF_RGBA8", True),
+            ):
+                source = png_source_record(pixel_format, (4, 4), payload)
+                # The shape a pre-fix manifest has: no stamp at all.
+                exported = {
+                    "object": source["object"],
+                    "source": source["package"],
+                    "source_size": [4, 4],
+                    "output": source["output"],
+                    "output_size": [4, 4],
+                    "source_format": pixel_format,
+                    "source_compression": "TSCF_PNG",
+                    "srgb": True,
+                    "normal_map": False,
+                    "source_block_count": 1,
+                    "source_grid_columns": 1,
+                    "source_grid_rows": 1,
+                    "source_payload_size": len(payload),
+                    "output_bit_depth": 8,
+                    "output_file_size": destination.stat().st_size,
+                }
+                with self.subTest(pixel_format=pixel_format):
+                    reused = texture_source.reusable_texture(
+                        root, source, exported, 8192
+                    )
+                    self.assertEqual(reused is not None, reusable)
+                    # Stamping it makes the swapped record current again.
+                    exported["channel_order_version"] = (
+                        texture_source.channel_order_version(source)
+                    )
+                    self.assertIsNotNone(
+                        texture_source.reusable_texture(root, source, exported, 8192)
+                    )
+
+    def test_a_fresh_export_writes_swapped_pixels_and_a_reusable_record(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            payload = png_payload((10, 20, 200, 255), (4, 4))
+            record = png_source_record("TSF_BGRA8", (4, 4), payload)
+            with stub_oodle(payload):
+                exported = texture_source.export_texture(root, root, record, 0)
+            # A 4x4 single-block PNG is exactly the shape the byte-for-byte
+            # passthrough used to claim, so this also pins that BGRA8 no longer
+            # takes it.
+            with Image.open(root / "texture.png") as image:
+                self.assertEqual(image.convert("RGB").getpixel((0, 0)), (200, 20, 10))
+            self.assertEqual(
+                exported["channel_order_version"],
+                texture_source.CHANNEL_ORDER_VERSION,
+            )
+            # The record a real export writes has to satisfy the reuse key, or
+            # every exported texture re-exports on the next run forever.
+            self.assertEqual(exported["source"], record["package"])
+            self.assertIsNotNone(
+                texture_source.reusable_texture(root, record, exported, 0)
+            )
+
+    def test_an_orphaned_swapped_export_is_never_adopted(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            destination = root / "texture.png"
+            Image.new("RGBA", (4, 4), (1, 2, 3, 255)).save(destination)
+            destination.with_name("texture.png.meta").write_text(
+                texture_source.image_meta(True, False), encoding="utf-8"
+            )
+            payload = png_payload((10, 20, 200, 255), (4, 4))
+            self.assertIsNone(
+                texture_source.existing_texture(
+                    root, png_source_record("TSF_BGRA8", (4, 4), payload), 8192
+                )
+            )
+            self.assertIsNotNone(
+                texture_source.existing_texture(
+                    root, png_source_record("TSF_RGBA8", (4, 4), payload), 8192
+                )
+            )
+
+
 class TextureResumeTests(unittest.TestCase):
     def test_normal_map_correction_is_exact_not_name_based(self):
         corrected = next(iter(texture_source.NORMAL_MAP_SOURCE_CORRECTIONS))
@@ -204,6 +406,7 @@ class TextureResumeTests(unittest.TestCase):
                 "source_grid_columns": 1,
                 "source_grid_rows": 1,
                 "source_payload_size": 64,
+                "channel_order_version": texture_source.CHANNEL_ORDER_VERSION,
                 "output_bit_depth": 8,
                 "output_file_size": destination.stat().st_size,
             }
@@ -237,6 +440,7 @@ class TextureResumeTests(unittest.TestCase):
             "source_grid_columns": 1,
             "source_grid_rows": 1,
             "source_payload_size": 64,
+            "channel_order_version": texture_source.channel_order_version(source),
             "output_bit_depth": 8,
             "output_file_size": destination.stat().st_size,
         }

@@ -10,6 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import convert
+import verify_bundles
 import verify_conversion
 
 
@@ -754,6 +755,32 @@ class IncrementalConversionTests(unittest.TestCase):
             ]
             write_json(manifest, undeclared)
             self.assertFalse(convert.scene_manifest_is_current(manifest))
+
+    def test_niagara_renderer_meshes_belong_to_the_scene_that_places_them(self):
+        # GreenHouse's butterfly reaches the scene through the particle system,
+        # never through a component, so a component-only walk called it unused
+        # and failed the shard check wherever the resharder put it.
+        scene = {
+            "level": "GreenHouse_Level",
+            "actors": [
+                {"components": [{"mesh": "/Game/A.A"}], "niagara": []},
+                {
+                    "components": [],
+                    "niagara": [
+                        {
+                            "mesh_renderers": [
+                                {"meshes": [{"mesh": "/Game/ButterflyFX.ButterflyFX"}]}
+                            ]
+                        }
+                    ],
+                },
+            ],
+        }
+        self.assertEqual(
+            verify_bundles.scene_mesh_objects(scene),
+            {"/Game/A.A", "/Game/ButterflyFX.ButterflyFX"},
+        )
+        self.assertEqual(verify_bundles.scene_mesh_objects({}), set())
 
     def test_undeclared_data_layers_still_count_their_actors(self):
         counts = convert.scene_data_layer_actor_counts(

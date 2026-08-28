@@ -45,6 +45,12 @@ PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 # Bump this whenever either rule changes; resume re-exports the textures the
 # change can reach.
 ATLAS_LAYOUT_VERSION = 2
+# A TSF_BGRA8 source's embedded PNG is written straight from UE's BGRA byte
+# order, so its red channel holds UE's blue and vice versa. Exports before this
+# stamp passed that order through: albedos blue-shifted, ORM occlusion and
+# metallic swapped, normal map X and Z swapped. Only BGRA8 PNG sources carry
+# the stamp, so raising it re-exports exactly those and nothing else.
+CHANNEL_ORDER_VERSION = 1
 ATLAS_FILL_COLOR = (128, 128, 128, 255)
 ATLAS_FILL_NORMAL = (128, 128, 255, 255)
 # Occlusion 1, roughness 0.5, metallic 0. A zeroed ORM cell instead reads as an
@@ -163,6 +169,28 @@ def is_srgb(record: dict[str, object]) -> bool:
     return bool(record.get("srgb")) and not is_normal_map(record)
 
 
+def png_channels_are_swapped(record: dict[str, object]) -> bool:
+    """Whether the record's embedded PNG holds UE's BGRA byte order."""
+    return (
+        str(record.get("source_compression") or "TSCF_None") == "TSCF_PNG"
+        and str(record.get("pixel_format")) == "TSF_BGRA8"
+    )
+
+
+def channel_order_version(record: dict[str, object]) -> int | None:
+    """Export stamp, carried only by the records whose channel order is fixed."""
+    return CHANNEL_ORDER_VERSION if png_channels_are_swapped(record) else None
+
+
+def swap_red_blue(image):
+    """Reorder a BGRA-ordered decode into RGBA, leaving alpha alone."""
+    if image.mode not in {"RGB", "RGBA"}:
+        return image
+    bands = list(image.split())
+    bands[0], bands[2] = bands[2], bands[0]
+    return Image.merge(image.mode, bands)
+
+
 def source_grid(record: dict[str, object]) -> tuple[int, int, int]:
     blocks = list(record.get("blocks") or [])
     if not blocks:
@@ -256,6 +284,8 @@ def decode_image(
         with Image.open(io.BytesIO(encoded)) as source:
             source.load()
             image = source.copy()
+        if source_format == "TSF_BGRA8":
+            image = swap_red_blue(image)
         return image, len(encoded), offset, bit_depth
     if source_compression not in {"TSCF_None", "None", ""}:
         raise ValueError(f"unsupported Zorah source compression {source_compression}")
@@ -429,6 +459,7 @@ def export_texture(
         blocks = list(record.get("blocks") or [])
         if (
             source_compression == "TSCF_PNG"
+            and not png_channels_are_swapped(record)
             and max_size == 0
             and len(blocks) <= 1
             and width % BLOCK_COMPRESSION_ALIGNMENT == 0
@@ -473,8 +504,11 @@ def export_texture(
         raise
     grid_columns, grid_rows, block_count = source_grid(record)
     return {
+        # The package path, not the absolute source file: reusable_texture
+        # compares this against the manifest record, and an absolute path there
+        # never matches, so every freshly exported texture re-exported forever.
         "object": record["object"],
-        "source": str(source),
+        "source": str(record["package"]),
         "source_size": list(source_size),
         "output": str(record["output"]),
         "output_size": list(output_size),
@@ -491,6 +525,7 @@ def export_texture(
         "source_grid_columns": grid_columns,
         "source_grid_rows": grid_rows,
         "atlas_layout_version": ATLAS_LAYOUT_VERSION,
+        "channel_order_version": channel_order_version(record),
         "output_bit_depth": output_bit_depth,
         "output_file_size": destination.stat().st_size,
     }
@@ -512,6 +547,10 @@ def existing_texture(
     if atlas_layout_matters(grid_columns, grid_rows, block_count):
         # An orphaned image carries no record of the layout that assembled it,
         # and the pixels alone cannot prove which row order was used.
+        return None
+    if png_channels_are_swapped(record):
+        # Same reasoning for channel order: a warm stone and a blue-shifted one
+        # are both plausible images.
         return None
     with Image.open(destination) as source:
         source.load()
@@ -552,6 +591,7 @@ def existing_texture(
         "source_grid_columns": grid_columns,
         "source_grid_rows": grid_rows,
         "atlas_layout_version": ATLAS_LAYOUT_VERSION,
+        "channel_order_version": channel_order_version(record),
         "source_payload_size": int(record["payload_size"]),
         "source_consumed_bytes": None,
         "source_payload_prefix_bytes": None,
@@ -597,6 +637,7 @@ def reusable_texture(
         "source_block_count": block_count,
         "source_grid_columns": grid_columns,
         "source_grid_rows": grid_rows,
+        "channel_order_version": channel_order_version(source),
         "source_payload_size": int(source["payload_size"]),
     }
     if any(exported.get(key) != value for key, value in expected.items()):
