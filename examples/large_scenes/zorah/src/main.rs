@@ -299,6 +299,11 @@ struct Args {
     #[argh(switch)]
     no_auto_exposure: bool,
 
+    /// extra exposure compensation in EV on top of the volume's, positive
+    /// brighter (default 0; applies to fixed and histogram metering alike)
+    #[argh(option, default = "0.0")]
+    exposure_bias: f32,
+
     /// share of a real-time SkyLight capture that is the sun- and sky-lit
     /// scene rather than sky, 0-1 (default 0.7; 0 leaves only the sky)
     #[argh(option, default = "0.7")]
@@ -401,6 +406,7 @@ struct RuntimeOptions {
     ue_editor_camera: bool,
     exposure_ev100: Option<f32>,
     auto_exposure: bool,
+    exposure_bias: f32,
     sky_capture: SkyCaptureEstimate,
 }
 
@@ -2244,6 +2250,11 @@ fn main() {
             ue_editor_camera: args.ue_editor_camera,
             exposure_ev100: args.exposure_ev100,
             auto_exposure: !args.no_auto_exposure,
+            exposure_bias: if args.exposure_bias.is_finite() {
+                args.exposure_bias
+            } else {
+                0.0
+            },
             sky_capture: SkyCaptureEstimate {
                 scene_fraction: args.sky_capture_scene,
                 sunlit_fraction: args.sky_capture_sunlit,
@@ -3571,10 +3582,15 @@ fn ue_auto_exposure_bias(post_process: &PostProcessRecord) -> f32 {
 /// volume, or an authored non-histogram method.
 ///
 /// UE's `AEM_Histogram` defaults match Bevy's: the 10%-90% band of the
-/// histogram, 3 EV/s brightening, 1 EV/s darkening. Both meter the scene to
-/// unit exposed luminance and add the compensation, so UE's bias maps to
-/// Bevy's `metering_bias` with the sign flipped: positive UE bias brightens,
-/// positive metering bias makes the meter read brighter and darkens. UE clamps
+/// histogram, 3 EV/s brightening, 1 EV/s darkening. UE's bias maps to Bevy's
+/// `metering_bias` with the sign flipped: positive UE bias brightens, positive
+/// metering bias makes the meter read brighter and darkens. The calibration
+/// deliberately differs: `PostProcessEyeAdaptation.usf` divides the metered
+/// luminance by 0.18 before the compensation, so UE lands the exposed average
+/// at `0.18 * 2^bias`, while Bevy's histogram lands it at `2^-metering_bias`.
+/// Restir's -2.5 EV under UE's rule would put the average near 3%, two and a
+/// half stops under NVIDIA's own frames of the level, so the unit-average
+/// calibration is kept and `--exposure-bias` trims from there. UE clamps
 /// the metered EV100 to the volume's range before adding the bias, so the
 /// correction range is that clamp restated around `base_ev100`, shifted by the
 /// bias; ThroneRoom's 8..8 pins it and GreenHouse's 4..5 leaves one stop.
@@ -3689,8 +3705,10 @@ fn setup(
             )),
         ));
     }
+    // `--exposure-bias` brightens for positive values, so it lowers the EV100.
     let exposure_ev100 =
-        resolved_exposure_ev100(options.exposure_ev100, converted.post_process.as_ref());
+        resolved_exposure_ev100(options.exposure_ev100, converted.post_process.as_ref())
+            - options.exposure_bias;
     let mut default_material = StandardMaterial {
         base_color: if options.unlit_textures {
             Color::srgb(1.0, 0.0, 1.0)
@@ -3948,7 +3966,11 @@ fn setup(
         ),
         None => "fixed".to_string(),
     };
-    if let Some(auto_exposure) = auto_exposure {
+    if let Some(mut auto_exposure) = auto_exposure {
+        // The metered target is independent of the base, so the extra bias has
+        // to enter the meter as well; positive brightens, so it lowers the
+        // metering bias.
+        auto_exposure.metering_bias -= options.exposure_bias;
         camera.insert(auto_exposure);
     }
     if has_atmosphere {

@@ -271,7 +271,8 @@ the metered EV100 to the volume's range. Restir leaves UE's open range with a
 -2.5 EV compensation, so its shade brightness tracks what is on screen;
 GreenHouse allows 4-5 EV100 and ThroneRoom pins 8-8, which is a fixed exposure
 in effect. `--no-auto-exposure` meters every level fixed at the middle of its
-range, and `--exposure-ev100` fixes any level by hand.
+range, `--exposure-bias -0.5` trims either metering by half a stop (positive
+brightens), and `--exposure-ev100` fixes any level by hand.
 
 Each level's SkyLight is a real-time capture taken from inside the courtyard a
 couple of metres up, so in UE it is mostly a cubemap of the scene's own sun-
