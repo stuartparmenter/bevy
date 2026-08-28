@@ -45,13 +45,11 @@ struct PartialDerivatives {
     ndc_double_area: f32,
 }
 
-// Clip w is the positive view depth for anything in front of the near plane, and the
-// interpolated 1/w and the NDC determinant are non-zero for any triangle that actually
-// rasterized. All three can still reach zero for a triangle straddling the eye (the
-// resolve reprojects unclipped world positions) or one that rasterized degenerately, and
-// the resulting inf/NaN propagates into the deferred G-buffer as pure black. Floor them
-// well below anything a well-formed triangle produces so healthy fragments are unchanged.
-const CLIP_W_EPSILON: f32 = 1e-6;
+// A triangle that rasterized has a non-zero homogeneous area, and a pixel inside it has
+// non-zero homogeneous weights. Both still reach zero for a triangle rasterized
+// degenerately or one whose plane passes through the eye, and the resulting inf/NaN
+// propagates into the deferred G-buffer as pure black. Floor the divisor well below
+// anything a well-formed triangle produces so healthy fragments are unchanged.
 const RECIPROCAL_EPSILON: f32 = 1e-20;
 
 fn safe_inverse(x: f32) -> f32 {
@@ -59,9 +57,23 @@ fn safe_inverse(x: f32) -> f32 {
     return select(-1.0, 1.0, x >= 0.0) / max(abs(x), RECIPROCAL_EPSILON);
 }
 
-// https://github.com/ConfettiFX/The-Forge/blob/9d43e69141a9cd0ce2ce2d2db5122234d3a2d5b5/Common_3/Renderer/VisibilityBuffer2/Shaders/FSL/vb_shading_utilities.h.fsl#L90-L150
-// two_over_screen_size (The Forge's twoOverWindowSize) converts the per-NDC
-// derivatives to per-pixel: one pixel spans 2/viewport NDC units.
+// Perspective-correct barycentrics of the pixel at `ndc` on a triangle given by its
+// clip-space (x, y, w) vertices, in 2D homogeneous coordinates (Olano & Greer, "Triangle
+// Scan Conversion using 2D Homogeneous Coordinates"). The clip position of any point on
+// the triangle is the same barycentric mix of the vertex clip positions, so its screen
+// position matches the pixel exactly when `dot(b, x - ndc.x * w) == 0` and
+// `dot(b, y - ndc.y * w) == 0`; the cross product of those two rows solves for `b` up to
+// scale, and the scale is fixed by `dot(b, 1) == 1`. Nothing here divides by a vertex
+// `w`, so a triangle with vertices behind the eye resolves as exactly as one in front:
+// the resolve reprojects unclipped world positions, and any ground plane the camera
+// stands on has vertices behind it.
+fn homogeneous_barycentrics(clip_x: vec3<f32>, clip_y: vec3<f32>, clip_w: vec3<f32>, ndc: vec2<f32>) -> vec3<f32> {
+    let weights = cross(clip_x - ndc.x * clip_w, clip_y - ndc.y * clip_w);
+    return weights * safe_inverse(dot(weights, vec3(1.0)));
+}
+
+// two_over_screen_size converts the per-NDC derivatives to per-pixel: one pixel spans
+// 2/viewport NDC units. NDC y points up the screen, so the y derivative steps down.
 fn compute_partial_derivatives(vertex_world_positions: array<vec4<f32>, 3>, ndc_uv: vec2<f32>, two_over_screen_size: vec2<f32>) -> PartialDerivatives {
     var result: PartialDerivatives;
 
@@ -69,43 +81,28 @@ fn compute_partial_derivatives(vertex_world_positions: array<vec4<f32>, 3>, ndc_
     let vertex_clip_position_1 = position_world_to_clip(vertex_world_positions[1].xyz);
     let vertex_clip_position_2 = position_world_to_clip(vertex_world_positions[2].xyz);
 
+    let clip_x = vec3(vertex_clip_position_0.x, vertex_clip_position_1.x, vertex_clip_position_2.x);
+    let clip_y = vec3(vertex_clip_position_0.y, vertex_clip_position_1.y, vertex_clip_position_2.y);
     let clip_w = vec3(vertex_clip_position_0.w, vertex_clip_position_1.w, vertex_clip_position_2.w);
-    let inv_w = 1.0 / max(clip_w, vec3(CLIP_W_EPSILON));
-    let ndc_0 = vertex_clip_position_0.xy * inv_w[0];
-    let ndc_1 = vertex_clip_position_1.xy * inv_w[1];
-    let ndc_2 = vertex_clip_position_2.xy * inv_w[2];
 
-    result.ndc_double_area = determinant(mat2x2(ndc_2 - ndc_1, ndc_0 - ndc_1));
-    let inv_det = safe_inverse(result.ndc_double_area);
-    result.ddx = vec3(ndc_1.y - ndc_2.y, ndc_2.y - ndc_0.y, ndc_0.y - ndc_1.y) * inv_det * inv_w;
-    result.ddy = vec3(ndc_2.x - ndc_1.x, ndc_0.x - ndc_2.x, ndc_1.x - ndc_0.x) * inv_det * inv_w;
+    // The homogeneous determinant carries the screen winding of the rasterized part of the
+    // triangle whatever the sign of each vertex's w; with every vertex in front of the eye
+    // it is the NDC double area scaled by the product of the three positive w.
+    result.ndc_double_area = determinant(mat3x3(
+        vertex_clip_position_0.xyw,
+        vertex_clip_position_1.xyw,
+        vertex_clip_position_2.xyw,
+    ));
 
-    var ddx_sum = dot(result.ddx, vec3(1.0));
-    var ddy_sum = dot(result.ddy, vec3(1.0));
-
-    let delta_v = ndc_uv - ndc_0;
-    let interp_inv_w = inv_w.x + delta_v.x * ddx_sum + delta_v.y * ddy_sum;
-    let interp_w = safe_inverse(interp_inv_w);
-
-    result.barycentrics = vec3(
-        interp_w * (inv_w[0] + delta_v.x * result.ddx.x + delta_v.y * result.ddy.x),
-        interp_w * (delta_v.x * result.ddx.y + delta_v.y * result.ddy.y),
-        interp_w * (delta_v.x * result.ddx.z + delta_v.y * result.ddy.z),
+    result.barycentrics = homogeneous_barycentrics(clip_x, clip_y, clip_w, ndc_uv);
+    let barycentrics_ddx = homogeneous_barycentrics(
+        clip_x, clip_y, clip_w, ndc_uv + vec2(two_over_screen_size.x, 0.0),
     );
-
-    result.ddx *= two_over_screen_size.x;
-    result.ddy *= two_over_screen_size.y;
-    ddx_sum *= two_over_screen_size.x;
-    ddy_sum *= two_over_screen_size.y;
-
-    result.ddy *= -1.0;
-    ddy_sum *= -1.0;
-
-    let interp_ddx_w = safe_inverse(interp_inv_w + ddx_sum);
-    let interp_ddy_w = safe_inverse(interp_inv_w + ddy_sum);
-
-    result.ddx = interp_ddx_w * (result.barycentrics * interp_inv_w + result.ddx) - result.barycentrics;
-    result.ddy = interp_ddy_w * (result.barycentrics * interp_inv_w + result.ddy) - result.barycentrics;
+    let barycentrics_ddy = homogeneous_barycentrics(
+        clip_x, clip_y, clip_w, ndc_uv - vec2(0.0, two_over_screen_size.y),
+    );
+    result.ddx = barycentrics_ddx - result.barycentrics;
+    result.ddy = barycentrics_ddy - result.barycentrics;
     return result;
 }
 
