@@ -264,6 +264,11 @@ debugging with Bevy-space coordinates:
 cargo +1.96.1 run --release -p zorah -- --camera-position 0,4.5,48 --camera-target 0,4,40
 ```
 
+`--ue-editor-camera` starts instead from the perspective viewport each map was
+last saved with in the UE editor (the download places no PlayerStart or camera
+actor, so this is the nearest thing to an authored view; `ZorahConvert inspect
+Levels/<level>.umap` prints it as `ZORAH_EDITOR_VIEW`).
+
 Press `P` while running to log the current view as exactly that fragment
 (`--scene`, `--camera-position`, `--camera-target` and the active
 `--data-layers`), ready to paste back for a reproducible start; `F12` saves the

@@ -284,6 +284,11 @@ struct Args {
     #[argh(option)]
     camera_target: Option<String>,
 
+    /// start from the level's saved UE editor perspective viewport instead of
+    /// the example's own preset (explicit --camera-position/--camera-target still win)
+    #[argh(switch)]
+    ue_editor_camera: bool,
+
     /// fixed camera exposure in EV100 (overrides the selected level's UE post-process volume)
     #[argh(option)]
     exposure_ev100: Option<f32>,
@@ -378,6 +383,7 @@ struct RuntimeOptions {
     candle_lights: bool,
     camera_position: Option<Vec3>,
     camera_target: Option<Vec3>,
+    ue_editor_camera: bool,
     exposure_ev100: Option<f32>,
 }
 
@@ -1321,6 +1327,32 @@ fn parse_vec3_arg(name: &str, value: Option<&str>) -> Option<Vec3> {
     ))
 }
 
+/// The perspective editor viewport each map was last saved with
+/// (`UWorld::EditorViews[3]`, read with `ZorahConvert inspect`), as the closest
+/// thing the download has to an authored camera: no level places a PlayerStart
+/// or a camera actor, and the one bookmark is a template shared by all three
+/// maps. Positions are Bevy metres; targets sit 5 m along the saved rotation.
+fn ue_editor_camera(level: &str) -> Option<(Vec3, Vec3)> {
+    match level {
+        // UE (-1018.34, -74.97, 176.64) cm, pitch -3.4, yaw 7.0.
+        "Restir_Level" => Some((
+            Vec3::new(-0.750, 1.766, 10.183),
+            Vec3::new(-0.141, 1.470, 5.229),
+        )),
+        // UE (35.87, 733.94, 280.79) cm, pitch -2.2, yaw 265.7.
+        "GreenHouse_Level" => Some((
+            Vec3::new(7.339, 2.808, -0.359),
+            Vec3::new(2.357, 2.616, 0.013),
+        )),
+        // UE (-3259.63, 132.17, 407.85) cm, pitch 1.15, yaw 187.7.
+        "ThroneRoom_Level" => Some((
+            Vec3::new(1.322, 4.078, 32.596),
+            Vec3::new(0.648, 4.179, 37.550),
+        )),
+        _ => None,
+    }
+}
+
 fn level_camera_placement(level: &str, center: Vec3, extent: f32) -> (Vec3, Vec3) {
     match level {
         // These presets face the authored light groups from unobstructed,
@@ -2192,6 +2224,7 @@ fn main() {
             candle_lights: !args.no_candle_lights,
             camera_position,
             camera_target,
+            ue_editor_camera: args.ue_editor_camera,
             exposure_ev100: args.exposure_ev100,
         })
         .insert_resource(converted_world)
@@ -3651,7 +3684,11 @@ fn setup(
     } else {
         10.0
     };
-    let (preset_position, preset_target) = level_camera_placement(&converted.level, center, extent);
+    let (preset_position, preset_target) = options
+        .ue_editor_camera
+        .then(|| ue_editor_camera(&converted.level))
+        .flatten()
+        .unwrap_or_else(|| level_camera_placement(&converted.level, center, extent));
     let camera_position = options.camera_position.unwrap_or(preset_position);
     let camera_target = options.camera_target.unwrap_or(preset_target);
     // An albedo capture wants the texture values themselves on screen, so the

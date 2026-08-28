@@ -1762,6 +1762,7 @@ static class ZorahConvert
 
         var package = provider.LoadPackage(candidates[0]);
         var objects = package.GetExports().ToArray();
+        var levelName = Path.GetFileNameWithoutExtension(candidates[0]);
         Console.WriteLine($"ZORAH_LOAD package={candidates[0]} objects={objects.Length}");
         foreach (var obj in objects)
         {
@@ -1974,6 +1975,51 @@ static class ZorahConvert
                         $"translation={Format(record.Transform.Translation)} " +
                         $"rotation={Format(record.Transform.Rotation)} " +
                         $"scale={Format(record.Transform.Scale)}"
+                    );
+                }
+            }
+            // A map's editor cameras: UE 5 keeps the cached viewports on the
+            // world as EditorViews - index 0 is the perspective one, 1..3 the
+            // orthos - and the level's bookmarks on its WorldSettings actor.
+            // ULevel::Serialize writes legacy copies natively, but both of these
+            // are ordinary tagged properties.
+            if (obj.ExportType == "World")
+            {
+                var viewIndex = 0;
+                foreach (var entry in ReadArrayValues(GetTaggedValue(obj, "EditorViews")))
+                {
+                    var view = ReadStructFields(entry);
+                    Console.WriteLine(
+                        $"ZORAH_EDITOR_VIEW level={levelName} index={viewIndex} " +
+                        $"position={FormatVectorValue(view.GetValueOrDefault("CamPosition"))} " +
+                        $"rotation={FormatRotatorValue(view.GetValueOrDefault("CamRotation"))} " +
+                        $"ortho_zoom={ToNullableDouble(view.GetValueOrDefault("CamOrthoZoom")) ?? 0:R}"
+                    );
+                    viewIndex++;
+                }
+            }
+            if (obj.ExportType == "WorldSettings")
+            {
+                var entries = ReadArrayValues(GetTaggedValue(obj, "BookmarkArray"));
+                if (entries.Length == 0)
+                {
+                    entries = ReadArrayValues(GetTaggedValue(obj, "BookmarkArrayCompat"));
+                }
+                var bookmarks = entries.Length == 0
+                    ? objects.Where(export => export.ExportType == "BookMark").ToArray()
+                    : entries.Select(entry => ResolveExport(entry, objects)).ToArray();
+                for (var index = 0; index < bookmarks.Length; index++)
+                {
+                    if (bookmarks[index] is not UObject bookmark)
+                    {
+                        continue;
+                    }
+                    var description = bookmark.GetOrDefault("Description", string.Empty);
+                    Console.WriteLine(
+                        $"ZORAH_BOOKMARK level={levelName} index={index} " +
+                        $"position={FormatVectorValue(GetTaggedValue(bookmark, "Location"))} " +
+                        $"rotation={FormatRotatorValue(GetTaggedValue(bookmark, "Rotation"))} " +
+                        $"description={(string.IsNullOrEmpty(description) ? "None" : description)}"
                     );
                 }
             }
@@ -3740,6 +3786,22 @@ static class ZorahConvert
     {
         counts.TryGetValue(key, out var count);
         counts[key] = count + 1;
+    }
+
+    private static string FormatVectorValue(object? value)
+    {
+        var vector = StructValue(value);
+        return $"({ToNullableDouble(GetPublicMember(vector, "X")) ?? 0:R}," +
+            $"{ToNullableDouble(GetPublicMember(vector, "Y")) ?? 0:R}," +
+            $"{ToNullableDouble(GetPublicMember(vector, "Z")) ?? 0:R})";
+    }
+
+    private static string FormatRotatorValue(object? value)
+    {
+        var rotator = StructValue(value);
+        return $"({ToNullableDouble(GetPublicMember(rotator, "Pitch")) ?? 0:R}," +
+            $"{ToNullableDouble(GetPublicMember(rotator, "Yaw")) ?? 0:R}," +
+            $"{ToNullableDouble(GetPublicMember(rotator, "Roll")) ?? 0:R})";
     }
 
     private static string Format(Vec3Record value) =>
