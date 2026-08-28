@@ -287,6 +287,41 @@ struct Args {
     /// contains one are not spawned (a way to find what an on-screen object is)
     #[argh(option)]
     hide_actors: Option<String>,
+
+    /// how slots with no usable material render: `magenta` (default) makes them
+    /// unmistakable, `grey` mimics UE's own WorldGridMaterial fallback
+    #[argh(option, default = "MissingMaterialStyle::Magenta", from_str_fn(parse_missing_material_style))]
+    missing_materials: MissingMaterialStyle,
+}
+
+/// What renders where UE has nothing to render: a slot left on the engine's
+/// unassigned-slot fallback, or a material whose package the download omits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MissingMaterialStyle {
+    Magenta,
+    /// UE's `WorldGridMaterial` without its grid lines: a rough mid grey.
+    Grey,
+}
+
+fn parse_missing_material_style(value: &str) -> Result<MissingMaterialStyle, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "magenta" => Ok(MissingMaterialStyle::Magenta),
+        "grey" | "gray" | "ue" => Ok(MissingMaterialStyle::Grey),
+        other => Err(format!("expected `magenta` or `grey`, got `{other}`")),
+    }
+}
+
+fn missing_material(style: MissingMaterialStyle, unlit: bool) -> StandardMaterial {
+    let base_color = match style {
+        MissingMaterialStyle::Magenta => Color::srgb(1.0, 0.0, 1.0),
+        MissingMaterialStyle::Grey => Color::srgb(0.5, 0.5, 0.5),
+    };
+    StandardMaterial {
+        base_color,
+        perceptual_roughness: if style == MissingMaterialStyle::Grey { 0.8 } else { 1.0 },
+        unlit,
+        ..default()
+    }
 }
 
 #[derive(Resource)]
@@ -294,6 +329,7 @@ struct RuntimeOptions {
     raster_only: bool,
     preserve_alpha: bool,
     unlit_textures: bool,
+    missing_materials: MissingMaterialStyle,
     candle_lights: bool,
     camera_position: Option<Vec3>,
     camera_target: Option<Vec3>,
@@ -1776,6 +1812,7 @@ fn build_material_handles(
     materials: &mut Assets<StandardMaterial>,
     preserve_alpha: bool,
     unlit_textures: bool,
+    missing_materials: MissingMaterialStyle,
     failed_texture_bundles: &HashSet<String>,
 ) -> (HashMap<String, Handle<StandardMaterial>>, PanningWater) {
     let mut result = HashMap::new();
@@ -1827,8 +1864,17 @@ fn build_material_handles(
             warn!(
                 material = %object,
                 requested_by = %requesters.join(", "),
-                "{reason}; rendering the magenta diagnostic material"
+                style = ?missing_materials,
+                "{reason}; rendering the missing-material stand-in"
             );
+            // Never substitute a scene material whose name merely resembles the
+            // authored slot name: the slot's assignment really is the engine
+            // fallback, and engine content is not part of the download.
+            result.insert(
+                object,
+                materials.add(missing_material(missing_materials, unlit_textures)),
+            );
+            continue;
         }
         if object == UE_BLACK_UNLIT_MATERIAL {
             result.insert(
@@ -1836,21 +1882,6 @@ fn build_material_handles(
                 materials.add(StandardMaterial {
                     base_color: Color::BLACK,
                     unlit: true,
-                    ..default()
-                }),
-            );
-            continue;
-        }
-        if object == UE_WORLD_GRID_MATERIAL {
-            // Never substitute a scene material whose name merely resembles the
-            // authored slot name: the slot's assignment really is the engine
-            // fallback, and engine content is not part of the download.
-            result.insert(
-                object,
-                materials.add(StandardMaterial {
-                    base_color: Color::srgb(1.0, 0.0, 1.0),
-                    perceptual_roughness: 1.0,
-                    unlit: unlit_textures,
                     ..default()
                 }),
             );
@@ -2087,6 +2118,7 @@ fn main() {
             raster_only,
             preserve_alpha: args.preserve_alpha,
             unlit_textures: args.unlit_textures,
+            missing_materials: args.missing_materials,
             candle_lights: !args.no_candle_lights,
             camera_position,
             camera_target,
@@ -3435,6 +3467,7 @@ fn setup(
         &mut materials,
         options.preserve_alpha,
         options.unlit_textures,
+        options.missing_materials,
         &failed_texture_bundles.0,
     );
     commands.insert_resource(panning_water);

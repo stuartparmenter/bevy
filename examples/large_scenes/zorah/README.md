@@ -271,6 +271,11 @@ frame as `zorah-<level>-<unix time>.png` in the working directory. To find out
 what an on-screen object is, `--hide-actors Eaves,LightCap` skips every actor
 whose label, class or mesh path contains one of the substrings.
 
+Slots UE itself cannot texture - the engine's unassigned-slot fallback and the
+four vegetation materials the download omits - render magenta so they are
+impossible to miss. `--missing-materials grey` renders them as UE's own
+`WorldGridMaterial` fallback would instead, a rough mid grey, for screenshots.
+
 The target machine is an RTX 5090. DLSS frame generation can be integrated
 later without changing the conversion format.
 
