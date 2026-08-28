@@ -279,7 +279,11 @@ tone curve, so the two frames differ only by what Solari adds. Add
 complementary view is `--clay`, which keeps Solari and every lighting input but
 paints all surfaces a rough 50% grey (normal maps and emissive lights kept), so
 the frame is the illumination alone; it stands on its own or pairs with the
-textured Solari frame.
+textured Solari frame. `--solari-albedo` is the albedo view rendered by Solari's
+own path rather than the raster one: every surface emits its base-colour
+texture at the camera's exposure and reflects nothing, so the traced frame is
+the texture values themselves. It costs an emissive light source per surface,
+so it is a screenshot mode, not a way to play.
 
 Slots UE itself cannot texture - the engine's unassigned-slot fallback and the
 four vegetation materials the download omits - render magenta so they are

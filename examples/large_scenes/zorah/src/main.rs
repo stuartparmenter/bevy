@@ -266,6 +266,12 @@ struct Args {
     #[argh(switch)]
     clay: bool,
 
+    /// show base colour through the traced path: every surface emits its
+    /// base-colour texture at the camera's exposure and reflects nothing, so
+    /// Solari's frame is the albedo itself (no shader changes involved)
+    #[argh(switch)]
+    solari_albedo: bool,
+
     /// omit the Niagara candle flames, geometry and light alike, which are on by default
     #[argh(switch)]
     no_candle_lights: bool,
@@ -297,6 +303,33 @@ struct Args {
     /// unmistakable, `grey` mimics UE's own WorldGridMaterial fallback
     #[argh(option, default = "MissingMaterialStyle::Magenta", from_str_fn(parse_missing_material_style))]
     missing_materials: MissingMaterialStyle,
+}
+
+/// `--solari-albedo`: the traced path has no unlit flag, but it does carry
+/// emission straight to the frame. Move the base colour into emission, scaled so
+/// the camera's exposure maps it back to its own value, and reflect nothing, so
+/// what Solari renders is the albedo. Every surface becomes an emissive light
+/// source in the process; the black base colour stops any of it bouncing.
+fn emit_base_color(material: &mut StandardMaterial, scale: f32) {
+    let tint = material.base_color.to_linear();
+    material.emissive = LinearRgba::rgb(tint.red * scale, tint.green * scale, tint.blue * scale);
+    material.emissive_texture = material.base_color_texture.take();
+    // Solari applies the camera exposure to emission unconditionally; a full
+    // weight makes the raster preview agree with it.
+    material.emissive_exposure_weight = 1.0;
+    material.base_color = Color::BLACK;
+    material.normal_map_texture = None;
+    material.metallic_roughness_texture = None;
+    material.occlusion_texture = None;
+    material.metallic = 0.0;
+    material.perceptual_roughness = 1.0;
+    material.unlit = false;
+}
+
+/// The radiance an emitter needs so that the camera's exposure maps it back to
+/// unit output: the inverse of Bevy's `Exposure::exposure`.
+fn albedo_emission_scale(ev100: f32) -> f32 {
+    1.2 * ops::exp2(ev100)
 }
 
 /// `--clay`: a rough 50% grey (0.5 linear reflectance), the conventional
@@ -340,6 +373,7 @@ struct RuntimeOptions {
     preserve_alpha: bool,
     unlit_textures: bool,
     clay: bool,
+    solari_albedo: bool,
     missing_materials: MissingMaterialStyle,
     candle_lights: bool,
     camera_position: Option<Vec3>,
@@ -1824,6 +1858,7 @@ fn build_material_handles(
     preserve_alpha: bool,
     unlit_textures: bool,
     clay: bool,
+    albedo_emission: Option<f32>,
     missing_materials: MissingMaterialStyle,
     failed_texture_bundles: &HashSet<String>,
 ) -> (HashMap<String, Handle<StandardMaterial>>, PanningWater) {
@@ -1889,10 +1924,11 @@ fn build_material_handles(
             // Never substitute a scene material whose name merely resembles the
             // authored slot name: the slot's assignment really is the engine
             // fallback, and engine content is not part of the download.
-            result.insert(
-                object,
-                materials.add(missing_material(missing_materials, unlit_textures)),
-            );
+            let mut stand_in = missing_material(missing_materials, unlit_textures);
+            if let Some(scale) = albedo_emission {
+                emit_base_color(&mut stand_in, scale);
+            }
+            result.insert(object, materials.add(stand_in));
             continue;
         }
         if object == UE_BLACK_UNLIT_MATERIAL {
@@ -2048,6 +2084,10 @@ fn build_material_handles(
             cull_mode: render_properties.cull_mode,
             ..default()
         };
+        let mut material = material;
+        if let Some(scale) = albedo_emission {
+            emit_base_color(&mut material, scale);
+        }
         let handle = materials.add(material);
         if let Some(wave) = wave.filter(|wave| wave.speed != 0.0) {
             panning_water.0.push((handle.clone(), wave.speed));
@@ -2147,6 +2187,7 @@ fn main() {
             preserve_alpha: args.preserve_alpha,
             unlit_textures: args.unlit_textures,
             clay: args.clay,
+            solari_albedo: args.solari_albedo,
             missing_materials: args.missing_materials,
             candle_lights: !args.no_candle_lights,
             camera_position,
@@ -3479,7 +3520,9 @@ fn setup(
             )),
         ));
     }
-    let default_material = materials.add(StandardMaterial {
+    let exposure_ev100 =
+        resolved_exposure_ev100(options.exposure_ev100, converted.post_process.as_ref());
+    let mut default_material = StandardMaterial {
         base_color: if options.unlit_textures {
             Color::srgb(1.0, 0.0, 1.0)
         } else {
@@ -3488,7 +3531,11 @@ fn setup(
         perceptual_roughness: 0.65,
         unlit: options.unlit_textures,
         ..default()
-    });
+    };
+    if options.solari_albedo {
+        emit_base_color(&mut default_material, albedo_emission_scale(exposure_ev100));
+    }
+    let default_material = materials.add(default_material);
     let occluder_material = materials.add(occluder_material());
     let (material_handles, panning_water) = build_material_handles(
         &converted,
@@ -3497,6 +3544,9 @@ fn setup(
         options.preserve_alpha,
         options.unlit_textures,
         options.clay,
+        options
+            .solari_albedo
+            .then(|| albedo_emission_scale(exposure_ev100)),
         options.missing_materials,
         &failed_texture_bundles.0,
     );
@@ -3604,11 +3654,10 @@ fn setup(
     let (preset_position, preset_target) = level_camera_placement(&converted.level, center, extent);
     let camera_position = options.camera_position.unwrap_or(preset_position);
     let camera_target = options.camera_target.unwrap_or(preset_target);
-    let exposure_ev100 =
-        resolved_exposure_ev100(options.exposure_ev100, converted.post_process.as_ref());
     // An albedo capture wants the texture values themselves on screen, so the
-    // unlit view skips the filmic curve and the glare that would reshape them.
-    let bloom = if options.unlit_textures {
+    // albedo views skip the filmic curve and the glare that would reshape them.
+    let albedo_view = options.unlit_textures || options.solari_albedo;
+    let bloom = if albedo_view {
         Bloom {
             intensity: 0.0,
             ..resolved_bloom(converted.post_process.as_ref())
@@ -3616,7 +3665,7 @@ fn setup(
     } else {
         resolved_bloom(converted.post_process.as_ref())
     };
-    let tonemapping = if options.unlit_textures {
+    let tonemapping = if albedo_view {
         Tonemapping::None
     } else {
         Tonemapping::GranTurismo7
