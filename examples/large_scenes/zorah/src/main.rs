@@ -14,6 +14,7 @@ use std::{
 use argh::FromArgs;
 use bevy::{
     asset::{LoadState, RenderAssetUsages},
+    ecs::query::QueryItem,
     camera::{CameraMainTextureUsages, Exposure, Hdr},
     camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
     core_pipeline::{
@@ -274,6 +275,12 @@ struct Args {
     /// fixed camera exposure in EV100 (overrides the selected level's UE post-process volume)
     #[argh(option)]
     exposure_ev100: Option<f32>,
+
+    /// comma-separated runtime data layers to start active, e.g.
+    /// DL_Lighting_Night,DL_Lighting_Candles (overrides the level's authored
+    /// initial states; digit keys toggle layers while running)
+    #[argh(option)]
+    data_layers: Option<String>,
 }
 
 #[derive(Resource)]
@@ -291,6 +298,7 @@ struct RuntimeOptions {
 struct ConvertedWorld {
     level: String,
     actors: Vec<ActorRecord>,
+    data_layers: Vec<DataLayerRecord>,
     post_process: Option<PostProcessRecord>,
     geometry: HashMap<String, ConvertedMesh>,
     materials: HashMap<String, MaterialRecord>,
@@ -349,6 +357,7 @@ struct PendingPartition {
     blas_achieved_error: f32,
     raytracing_only: bool,
     cast_shadow: bool,
+    layers: DataLayerMember,
     spawned: bool,
 }
 
@@ -386,6 +395,172 @@ struct ZorahCamera;
 struct SceneManifest {
     level: String,
     actors: Vec<ActorRecord>,
+    /// The level's `WorldDataLayers` instances. Older manifests predate the
+    /// export and carry none, which leaves every actor in the always-on set.
+    #[serde(default)]
+    data_layers: Vec<DataLayerRecord>,
+}
+
+/// One UE World Partition data layer as the level's `WorldDataLayers` actor
+/// configures it. Zorah uses them as lighting scenarios (`DL_Lighting_Day`,
+/// `DL_Lighting_Night`, `DL_Lighting_Candles`, ...).
+#[derive(Clone, Deserialize)]
+struct DataLayerRecord {
+    name: String,
+    /// `Runtime` layers follow `initial_runtime_state` in a packaged game;
+    /// `Editor` layers only organise the editor outliner and always render.
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+    /// `Activated`, `Loaded` or `Unloaded`. Only `Activated` layers render.
+    #[serde(default)]
+    initial_runtime_state: Option<String>,
+}
+
+/// The level's data layers with their current runtime state.
+#[derive(Resource)]
+struct DataLayers {
+    layers: Vec<DataLayer>,
+    by_name: HashMap<String, u16>,
+}
+
+struct DataLayer {
+    name: String,
+    /// Whether the layer's actors currently render. Editor layers are always
+    /// active and never listed as toggleable.
+    active: bool,
+    toggleable: bool,
+    /// Actors the manifest assigns to this layer, for the status readout.
+    actors: usize,
+}
+
+impl DataLayers {
+    /// Layers as authored, with `--data-layers` overriding which runtime
+    /// layers start active.
+    fn from_manifest(
+        records: &[DataLayerRecord],
+        actors: &[ActorRecord],
+        override_active: Option<&[String]>,
+    ) -> Self {
+        let mut layers: Vec<DataLayer> = records
+            .iter()
+            .map(|record| {
+                let editor = record
+                    .kind
+                    .as_deref()
+                    .is_some_and(|kind| ue_enum_value(kind).eq_ignore_ascii_case("Editor"));
+                let activated = record
+                    .initial_runtime_state
+                    .as_deref()
+                    .is_none_or(|state| ue_enum_value(state).eq_ignore_ascii_case("Activated"));
+                DataLayer {
+                    name: record.name.clone(),
+                    active: editor || activated,
+                    toggleable: !editor,
+                    actors: 0,
+                }
+            })
+            .collect();
+        // Layers the actors name without a `WorldDataLayers` entry behave as
+        // activated runtime layers so nothing authored silently disappears.
+        for actor in actors {
+            for name in &actor.data_layers {
+                if !layers.iter().any(|layer| &layer.name == name) {
+                    layers.push(DataLayer {
+                        name: name.clone(),
+                        active: true,
+                        toggleable: true,
+                        actors: 0,
+                    });
+                }
+            }
+        }
+        let by_name: HashMap<String, u16> = layers
+            .iter()
+            .enumerate()
+            .map(|(index, layer)| (layer.name.clone(), index as u16))
+            .collect();
+        for actor in actors {
+            for name in &actor.data_layers {
+                layers[by_name[name] as usize].actors += 1;
+            }
+        }
+        if let Some(active) = override_active {
+            for layer in layers.iter_mut().filter(|layer| layer.toggleable) {
+                layer.active = active.iter().any(|name| name == &layer.name);
+            }
+            for name in active {
+                if !by_name.contains_key(name) {
+                    warn!(layer = %name, "--data-layers names a layer this level does not have");
+                }
+            }
+        }
+        Self { layers, by_name }
+    }
+
+    /// Layer indices for an actor, or an empty list for the always-on set.
+    fn member(&self, actor: &ActorRecord) -> DataLayerMember {
+        DataLayerMember(
+            actor
+                .data_layers
+                .iter()
+                .filter_map(|name| self.by_name.get(name).copied())
+                .collect(),
+        )
+    }
+
+    /// UE renders an actor when any of its layers is activated.
+    fn is_active(&self, member: &DataLayerMember) -> bool {
+        member.0.is_empty()
+            || member
+                .0
+                .iter()
+                .any(|&index| self.layers[index as usize].active)
+    }
+
+    fn is_actor_active(&self, actor: &ActorRecord) -> bool {
+        self.is_active(&self.member(actor))
+    }
+
+    /// Runtime layers in digit-key order.
+    fn toggleable(&self) -> impl Iterator<Item = (usize, &DataLayer)> {
+        self.layers
+            .iter()
+            .enumerate()
+            .filter(|(_, layer)| layer.toggleable)
+    }
+
+    fn status_line(&self) -> String {
+        let mut parts = Vec::new();
+        for (key, (_, layer)) in (1..).zip(self.toggleable()) {
+            parts.push(format!(
+                "[{key}] {} {} ({} actors)",
+                layer.name,
+                if layer.active { "on" } else { "off" },
+                layer.actors
+            ));
+        }
+        if parts.is_empty() {
+            "no runtime data layers".to_string()
+        } else {
+            parts.join("  ")
+        }
+    }
+}
+
+/// The data layers an entity was spawned from; empty means always visible.
+#[derive(Component, Clone)]
+struct DataLayerMember(Vec<u16>);
+
+/// Renderer-facing components taken off an entity while its data layer is
+/// inactive, so activating the layer again restores exactly what it had. The
+/// meshlet and Solari extractors read every tagged entity regardless of
+/// `Visibility`, so hiding is not enough for them.
+#[derive(Component, Default)]
+struct DormantLayerParts {
+    raytracing: Option<RaytracingMesh3d>,
+    meshlet: Option<MeshletMesh3d>,
+    environment: Option<SolariEnvironmentLight>,
+    decal: Option<ClusteredDecal>,
 }
 
 #[derive(Deserialize)]
@@ -399,6 +574,9 @@ struct ActorRecord {
     transform: UeTransform,
     #[serde(default)]
     hidden: bool,
+    /// Short names of the data layers the actor belongs to.
+    #[serde(default)]
+    data_layers: Vec<String>,
     components: Vec<ComponentRecord>,
     #[serde(default)]
     niagara: Vec<NiagaraRecord>,
@@ -987,6 +1165,7 @@ fn load_converted_world(
     ConvertedWorld {
         level: scene.level,
         actors: scene.actors,
+        data_layers: scene.data_layers,
         post_process,
         geometry,
         materials,
@@ -1852,6 +2031,18 @@ fn main() {
     let base_path = asset_base_path();
     let asset_root = base_path.join(ASSET_ROOT);
     let converted_world = load_converted_world(&args, &|path| fs::read(asset_root.join(path)));
+    let requested_layers: Option<Vec<String>> = args.data_layers.as_deref().map(|list| {
+        list.split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .collect()
+    });
+    let data_layers = DataLayers::from_manifest(
+        &converted_world.data_layers,
+        &converted_world.actors,
+        requested_layers.as_deref(),
+    );
 
     let mut app = App::new();
     // DLSS configures Vulkan instance/device creation, so its project ID must
@@ -1872,6 +2063,7 @@ fn main() {
             exposure_ev100: args.exposure_ev100,
         })
         .insert_resource(converted_world)
+        .insert_resource(data_layers)
         .init_resource::<FailedTextureBundles>()
         .add_plugins((
             // Unprocessed on purpose: the converter already emits
@@ -1909,7 +2101,7 @@ fn main() {
         ));
     }
     app.init_state::<ZorahState>();
-    app.add_systems(Startup, setup_hdr_calibration);
+    app.add_systems(Startup, (setup_hdr_calibration, report_data_layers));
     app.add_systems(
         OnEnter(ZorahState::LoadingTextureBundles),
         begin_texture_bundle_preload,
@@ -1934,6 +2126,10 @@ fn main() {
     .add_systems(
         Update,
         pan_water_surfaces.run_if(resource_exists::<PanningWater>),
+    )
+    .add_systems(
+        Update,
+        (toggle_data_layers_by_key, apply_data_layers).chain(),
     )
     .run();
 }
@@ -2213,12 +2409,16 @@ fn candle_flame_surface_area(mesh: &Mesh) -> f32 {
 fn spawn_exported_lights(
     commands: &mut Commands,
     converted: &ConvertedWorld,
+    data_layers: &DataLayers,
     point_proxy_mesh: &Handle<Mesh>,
     spot_proxy_mesh: &Handle<Mesh>,
     materials: &mut Assets<StandardMaterial>,
     ambient_light: &mut GlobalAmbientLight,
 ) -> Vec<PendingRaytracingInstance> {
-    let has_atmosphere = has_sky_atmosphere(converted);
+    let has_atmosphere = has_sky_atmosphere(converted, data_layers);
+    let captured_sky = has_atmosphere
+        .then(|| captured_sky_light(converted, data_layers))
+        .flatten();
     let mut raytracing_instances = Vec::new();
     let mut point_count = 0usize;
     let mut spot_count = 0usize;
@@ -2234,6 +2434,7 @@ fn spawn_exported_lights(
             continue;
         }
         let actor_matrix = ue_matrix(&actor.transform);
+        let layers = data_layers.member(actor);
         let has_concrete_lights = actor
             .lights
             .iter()
@@ -2293,6 +2494,7 @@ fn spawn_exported_lights(
                             intensity: 1.0,
                         },
                         world_transform,
+                        layers.clone(),
                     ));
                 }
                 "point" | "spot" => {
@@ -2313,6 +2515,7 @@ fn spawn_exported_lights(
                                 ..default()
                             },
                             world_transform,
+                            layers.clone(),
                         ));
                     } else {
                         spot_count += 1;
@@ -2329,6 +2532,7 @@ fn spawn_exported_lights(
                                 ..default()
                             },
                             world_transform,
+                            layers.clone(),
                         ));
                     }
 
@@ -2379,6 +2583,7 @@ fn spawn_exported_lights(
                             Name::new(format!("{} Solari emitter", light.name)),
                             MeshMaterial3d(material),
                             proxy_transform,
+                            layers.clone(),
                         ))
                         .id();
                     raytracing_instances.push(PendingRaytracingInstance {
@@ -2389,16 +2594,34 @@ fn spawn_exported_lights(
                 }
                 "sky" => {
                     sky_count += 1;
-                    let illuminance = ue_sky_light_illuminance(light.intensity);
+                    // A real-time-capture SkyLight is a capture of the
+                    // SkyAtmosphere, so its brightness follows the sun rather
+                    // than the fixed source-unit bridge. Solari sees no
+                    // environment map, so the capture becomes its uniform sky.
+                    let (color, illuminance) = match captured_sky {
+                        Some(sky) if light.real_time_capture => (
+                            LinearRgba::rgb(
+                                color.red * sky.tint.red,
+                                color.green * sky.tint.green,
+                                color.blue * sky.tint.blue,
+                            ),
+                            sky.illuminance * light.intensity.max(0.0),
+                        ),
+                        _ => (color, ue_sky_light_illuminance(light.intensity)),
+                    };
                     sky_brightness += illuminance;
                     commands.spawn((
                         Name::new(format!("{} Solari environment", light.name)),
                         SolariEnvironmentLight { color, illuminance },
+                        layers.clone(),
                     ));
                     environment_count += 1;
-                    if light.real_time_capture {
-                        debug!(light = %light.name, "approximating UE real-time SkyLight as raster ambient light");
-                    }
+                    info!(
+                        light = %light.name,
+                        real_time_capture = light.real_time_capture,
+                        illuminance,
+                        "Zorah sky light as a uniform Solari environment"
+                    );
                 }
                 kind => warn!(light = %light.name, %kind, "unsupported Zorah light component"),
             }
@@ -2494,6 +2717,7 @@ fn candle_flame_anchor(partitions: &[PartitionRecord]) -> Option<Vec3> {
 fn spawn_candle_flames(
     commands: &mut Commands,
     converted: &ConvertedWorld,
+    data_layers: &DataLayers,
     meshes: &mut Assets<Mesh>,
     meshlet_meshes: &mut Assets<MeshletMesh>,
     materials: &mut Assets<StandardMaterial>,
@@ -2539,6 +2763,7 @@ fn spawn_candle_flames(
             continue;
         }
         let actor_matrix = ue_matrix(&actor.transform);
+        let layers = data_layers.member(actor);
         for component in &actor.components {
             if !component.visible || component.hidden_in_game {
                 continue;
@@ -2569,6 +2794,7 @@ fn spawn_candle_flames(
                     // carries every instance unconditionally.
                     NotShadowCaster,
                     Transform::from_translation(world.transform_point(anchor)),
+                    layers.clone(),
                 ))
                 .id();
             raytracing_instances.push(PendingRaytracingInstance {
@@ -2606,6 +2832,7 @@ fn decal_transform(actor_matrix: Mat4, decal: &DecalRecord) -> Transform {
 fn spawn_exported_decals(
     commands: &mut Commands,
     converted: &ConvertedWorld,
+    data_layers: &DataLayers,
     asset_server: &AssetServer,
     failed_texture_bundles: &HashSet<String>,
 ) {
@@ -2671,6 +2898,7 @@ fn spawn_exported_decals(
             Name::new(decal.name.clone()),
             prototype.clone(),
             decal_transform(ue_matrix(&actor.transform), decal),
+            data_layers.member(actor),
         ));
         spawned += 1;
     }
@@ -2688,22 +2916,23 @@ fn spawn_exported_decals(
     );
 }
 
-fn has_sky_atmosphere(converted: &ConvertedWorld) -> bool {
-    converted.actors.iter().any(|actor| {
-        !actor.hidden
-            && actor.kind == "SkyAtmosphere"
-            && actor
-                .atmosphere
-                .as_ref()
-                .is_none_or(|atmosphere| atmosphere.visible && !atmosphere.hidden_in_game)
-    })
+// The atmosphere, fog and sky capture are chosen once from the data layers
+// active at startup: Bevy renders one `Atmosphere`, so a layer toggle changes
+// lights, emitters, geometry and decals but keeps the sky it launched with.
+fn has_sky_atmosphere(converted: &ConvertedWorld, data_layers: &DataLayers) -> bool {
+    active_sky_atmosphere_actor(converted, data_layers).is_some()
 }
 
-fn active_sky_atmosphere_actor(converted: &ConvertedWorld) -> Option<&ActorRecord> {
+fn active_sky_atmosphere_actor<'a>(
+    converted: &'a ConvertedWorld,
+    data_layers: &DataLayers,
+) -> Option<&'a ActorRecord> {
     converted
         .actors
         .iter()
-        .filter(|actor| !actor.hidden && actor.kind == "SkyAtmosphere")
+        .filter(|actor| {
+            !actor.hidden && actor.kind == "SkyAtmosphere" && data_layers.is_actor_active(actor)
+        })
         .find(|actor| {
             actor
                 .atmosphere
@@ -2712,13 +2941,95 @@ fn active_sky_atmosphere_actor(converted: &ConvertedWorld) -> Option<&ActorRecor
         })
 }
 
-fn active_height_fog(converted: &ConvertedWorld) -> Option<&HeightFogRecord> {
+fn active_height_fog<'a>(
+    converted: &'a ConvertedWorld,
+    data_layers: &DataLayers,
+) -> Option<&'a HeightFogRecord> {
     converted
         .actors
         .iter()
-        .filter(|actor| !actor.hidden && actor.kind == "ExponentialHeightFog")
+        .filter(|actor| {
+            !actor.hidden
+                && actor.kind == "ExponentialHeightFog"
+                && data_layers.is_actor_active(actor)
+        })
         .filter_map(|actor| actor.height_fog.as_ref())
         .find(|fog| fog.visible && !fog.hidden_in_game)
+}
+
+/// What a real-time-capture UE SkyLight sees: the SkyAtmosphere lit by the
+/// level's brightest active sun.
+#[derive(Clone, Copy)]
+struct CapturedSkyLight {
+    /// Diffuse horizontal illuminance from the whole sky dome, in lux.
+    illuminance: f32,
+    /// Chromaticity of the captured sky, normalised to unit luminance.
+    tint: LinearRgba,
+}
+
+/// Correlated colour temperature of a clear blue sky away from the sun; the
+/// CIE places it between 9,000 K and 12,000 K.
+const CLEAR_SKY_TEMPERATURE: f32 = 10_000.0;
+const REC709_LUMINANCE: Vec3 = Vec3::new(0.2126, 0.7152, 0.0722);
+
+/// Clear-sky diffuse horizontal illuminance as a fraction of the sun's
+/// perpendicular illuminance, from the CIE/Krochmann clear-sky fit
+/// `E_d = 800 + 15,500 sqrt(sin h)` lux against a 100,000 lux sun. Scaling by
+/// the authored sun rather than a real one keeps the sun-to-shade ratio the
+/// atmosphere would capture (about two stops at 56 degrees) whatever brightness
+/// the artist chose for the sun.
+fn clear_sky_diffuse_fraction(sun_elevation: f32) -> f32 {
+    0.008 + 0.155 * ops::sin(sun_elevation).max(0.0).sqrt()
+}
+
+fn captured_sky_light(
+    converted: &ConvertedWorld,
+    data_layers: &DataLayers,
+) -> Option<CapturedSkyLight> {
+    let mut sun: Option<(f32, f32)> = None;
+    for actor in &converted.actors {
+        if actor.hidden || !data_layers.is_actor_active(actor) {
+            continue;
+        }
+        let actor_matrix = ue_matrix(&actor.transform);
+        for light in &actor.lights {
+            if light.kind != "directional"
+                || !light.visible
+                || light.hidden_in_game
+                || !light.affects_world
+                || light.intensity <= 0.0
+            {
+                continue;
+            }
+            let transform = ue_world_to_bevy(actor_matrix * ue_matrix(&light.transform));
+            // A directional light shines down its -Z; the sun sits the other way.
+            let elevation = ops::asin((-transform.forward().y).clamp(-1.0, 1.0));
+            if sun.is_none_or(|(illuminance, _)| light.intensity > illuminance) {
+                sun = Some((light.intensity, elevation));
+            }
+        }
+    }
+    let (sun_illuminance, sun_elevation) = sun?;
+    let sky_luminance_scale = active_sky_atmosphere_actor(converted, data_layers)
+        .and_then(|actor| actor.atmosphere.as_ref())
+        .and_then(|atmosphere| {
+            atmosphere
+                .sky_luminance_factor
+                .or(atmosphere.sky_and_aerial_perspective_luminance_factor)
+        })
+        .map(ue_linear_rgb)
+        .map(|factor| factor.max(Vec3::ZERO).element_sum() / 3.0)
+        .filter(|value| value.is_finite())
+        .unwrap_or(1.0);
+    let illuminance =
+        sun_illuminance * clear_sky_diffuse_fraction(sun_elevation) * sky_luminance_scale;
+    let sky = blackbody_srgb(CLEAR_SKY_TEMPERATURE).to_linear();
+    let tint = Vec3::new(sky.red, sky.green, sky.blue);
+    let tint = tint / tint.dot(REC709_LUMINANCE).max(1e-6);
+    Some(CapturedSkyLight {
+        illuminance,
+        tint: LinearRgba::rgb(tint.x, tint.y, tint.z),
+    })
 }
 
 fn ue_linear_rgb(color: UeLinearColor) -> Vec3 {
@@ -2757,6 +3068,35 @@ fn atmosphere_planet_center(actor: Option<&ActorRecord>, inner_radius: f32) -> V
     }
 }
 
+// USkyAtmosphereComponent constructor defaults (UE 5.4). Scales are per
+// kilometre; the colours are unitless tints multiplied into them.
+const UE_DEFAULT_RAYLEIGH_SCATTERING_SCALE: f32 = 0.0331;
+const UE_DEFAULT_RAYLEIGH_SCATTERING: Vec3 = Vec3::new(0.175287, 0.409607, 1.0);
+const UE_DEFAULT_MIE_SCATTERING_SCALE: f32 = 0.003996;
+const UE_DEFAULT_MIE_ABSORPTION_SCALE: f32 = 0.000444;
+const UE_DEFAULT_OTHER_ABSORPTION_SCALE: f32 = 0.000544;
+const UE_DEFAULT_OTHER_ABSORPTION: Vec3 = Vec3::new(0.345561, 1.0, 0.045189);
+
+/// A UE atmosphere coefficient in Bevy's per-metre units: the authored scale
+/// (per kilometre) times the authored tint, each replaced by UE's default when
+/// the export left it at the default.
+fn ue_atmosphere_coefficient(
+    scale: Option<f32>,
+    default_scale: f32,
+    tint: Option<UeLinearColor>,
+    default_tint: Vec3,
+) -> Vec3 {
+    let scale = scale
+        .filter(|value| value.is_finite())
+        .unwrap_or(default_scale)
+        .max(0.0);
+    let tint = tint
+        .map(ue_linear_rgb)
+        .unwrap_or(default_tint)
+        .max(Vec3::ZERO);
+    tint * scale * 0.001
+}
+
 fn configured_atmosphere(
     record: Option<&SkyAtmosphereRecord>,
     height_fog: Option<&HeightFogRecord>,
@@ -2775,15 +3115,17 @@ fn configured_atmosphere(
     let mut medium = ScatteringMedium::earth(256, 256).with_label("zorah_ue_atmosphere");
 
     if let Some(record) = record {
-        let rayleigh_scale = record
-            .rayleigh_scattering_scale
-            .filter(|value| value.is_finite())
-            .unwrap_or(1.0)
-            .max(0.0);
-        if let Some(scattering) = record.rayleigh_scattering_per_km {
-            medium.terms[0].scattering = ue_linear_rgb(scattering).max(Vec3::ZERO) * 0.001;
-        }
-        medium.terms[0].scattering *= rayleigh_scale;
+        // UE splits every coefficient into a unitless tint colour and a
+        // per-kilometre scale, and the extractor only writes the properties an
+        // artist changed. Each half therefore falls back to UE's own default,
+        // never to 1.0: Restir's authored Rayleigh tint with a default scale
+        // is otherwise thirty times too dense and the sky turns dark red.
+        medium.terms[0].scattering = ue_atmosphere_coefficient(
+            record.rayleigh_scattering_scale,
+            UE_DEFAULT_RAYLEIGH_SCATTERING_SCALE,
+            record.rayleigh_scattering_per_km,
+            UE_DEFAULT_RAYLEIGH_SCATTERING,
+        );
         if let Some(height_km) = record
             .rayleigh_exponential_distribution_km
             .filter(|value| value.is_finite() && *value > 0.0)
@@ -2793,25 +3135,18 @@ fn configured_atmosphere(
             };
         }
 
-        let mie_scattering_scale = record
-            .mie_scattering_scale
-            .filter(|value| value.is_finite())
-            .unwrap_or(1.0)
-            .max(0.0);
-        if let Some(scattering) = record.mie_scattering_per_km {
-            medium.terms[1].scattering = ue_linear_rgb(scattering).max(Vec3::ZERO) * 0.001;
-        }
-        medium.terms[1].scattering *= mie_scattering_scale;
-
-        let mie_absorption_scale = record
-            .mie_absorption_scale
-            .filter(|value| value.is_finite())
-            .unwrap_or(1.0)
-            .max(0.0);
-        if let Some(absorption) = record.mie_absorption_per_km {
-            medium.terms[1].absorption = ue_linear_rgb(absorption).max(Vec3::ZERO) * 0.001;
-        }
-        medium.terms[1].absorption *= mie_absorption_scale;
+        medium.terms[1].scattering = ue_atmosphere_coefficient(
+            record.mie_scattering_scale,
+            UE_DEFAULT_MIE_SCATTERING_SCALE,
+            record.mie_scattering_per_km,
+            Vec3::ONE,
+        );
+        medium.terms[1].absorption = ue_atmosphere_coefficient(
+            record.mie_absorption_scale,
+            UE_DEFAULT_MIE_ABSORPTION_SCALE,
+            record.mie_absorption_per_km,
+            Vec3::ONE,
+        );
         if let Some(asymmetry) = record.mie_anisotropy.filter(|value| value.is_finite()) {
             medium.terms[1].phase = PhaseFunction::Mie {
                 asymmetry: asymmetry.clamp(-0.999, 0.999),
@@ -2826,15 +3161,12 @@ fn configured_atmosphere(
             };
         }
 
-        let other_absorption_scale = record
-            .other_absorption_scale
-            .filter(|value| value.is_finite())
-            .unwrap_or(1.0)
-            .max(0.0);
-        if let Some(absorption) = record.other_absorption_per_km {
-            medium.terms[2].absorption = ue_linear_rgb(absorption).max(Vec3::ZERO) * 0.001;
-        }
-        medium.terms[2].absorption *= other_absorption_scale;
+        medium.terms[2].absorption = ue_atmosphere_coefficient(
+            record.other_absorption_scale,
+            UE_DEFAULT_OTHER_ABSORPTION_SCALE,
+            record.other_absorption_per_km,
+            UE_DEFAULT_OTHER_ABSORPTION,
+        );
     }
 
     if let Some(fog) = height_fog {
@@ -3026,17 +3358,21 @@ fn setup(
     mut ambient_light: ResMut<GlobalAmbientLight>,
     options: Res<RuntimeOptions>,
     failed_texture_bundles: Res<FailedTextureBundles>,
+    data_layers: Res<DataLayers>,
 ) {
-    let has_atmosphere = has_sky_atmosphere(&converted);
+    let has_atmosphere = has_sky_atmosphere(&converted, &data_layers);
     let mut atmosphere_environment_intensity = 1.0;
     if has_atmosphere {
         // Zorah authors a UE SkyAtmosphere in every shipped level. Apply its
         // serialized coefficient overrides on top of the common Earth preset;
         // old manifests without component data retain the UE defaults.
-        let atmosphere_actor = active_sky_atmosphere_actor(&converted);
+        let atmosphere_actor = active_sky_atmosphere_actor(&converted, &data_layers);
         let atmosphere_record = atmosphere_actor.and_then(|actor| actor.atmosphere.as_ref());
         let (medium, inner_radius, outer_radius, ground_albedo, environment_intensity) =
-            configured_atmosphere(atmosphere_record, active_height_fog(&converted));
+            configured_atmosphere(
+                atmosphere_record,
+                active_height_fog(&converted, &data_layers),
+            );
         atmosphere_environment_intensity = environment_intensity;
         commands.spawn((
             Atmosphere {
@@ -3081,6 +3417,7 @@ fn setup(
             continue;
         }
         let actor_matrix = ue_matrix(&actor.transform);
+        let layers = data_layers.member(actor);
         for component in &actor.components {
             if !component.visible || component.hidden_in_game {
                 continue;
@@ -3110,6 +3447,7 @@ fn setup(
                             &mut world_max,
                             is_lightblocker_mesh(mesh_name),
                             component.cast_shadow,
+                            &layers,
                         );
                     }
                 }
@@ -3126,6 +3464,7 @@ fn setup(
                     &mut world_max,
                     is_lightblocker_mesh(mesh_name),
                     component.cast_shadow,
+                    &layers,
                 ),
             }
         }
@@ -3134,6 +3473,7 @@ fn setup(
     let mut raytracing_light_instances = spawn_exported_lights(
         &mut commands,
         &converted,
+        &data_layers,
         &point_proxy_mesh,
         &spot_proxy_mesh,
         &mut materials,
@@ -3143,6 +3483,7 @@ fn setup(
         raytracing_light_instances.extend(spawn_candle_flames(
             &mut commands,
             &converted,
+            &data_layers,
             &mut meshes,
             &mut meshlet_meshes,
             &mut materials,
@@ -3151,6 +3492,7 @@ fn setup(
     spawn_exported_decals(
         &mut commands,
         &converted,
+        &data_layers,
         &asset_server,
         &failed_texture_bundles.0,
     );
@@ -3315,6 +3657,7 @@ fn queue_partitions(
     world_max: &mut Vec3,
     raytracing_only: bool,
     cast_shadow: bool,
+    layers: &DataLayerMember,
 ) {
     let transform = ue_world_to_bevy(ue_world);
     *world_min = world_min.min(transform.translation);
@@ -3349,6 +3692,7 @@ fn queue_partitions(
             blas_achieved_error: partition.blas_achieved_error,
             raytracing_only,
             cast_shadow,
+            layers: layers.clone(),
             spawned: false,
         });
     }
@@ -3636,13 +3980,15 @@ fn spawn_partitions_when_ready(
             continue;
         }
         let entity = if partition.raytracing_only {
-            commands
-                .spawn((
-                    Name::new(format!("{} (raytracing-only)", partition.geometry)),
-                    MeshMaterial3d(partition.material.clone()),
-                    partition.transform,
-                ))
-                .id()
+            let mut entity = commands.spawn((
+                Name::new(format!("{} (raytracing-only)", partition.geometry)),
+                MeshMaterial3d(partition.material.clone()),
+                partition.transform,
+            ));
+            if !partition.layers.0.is_empty() {
+                entity.insert(partition.layers.clone());
+            }
+            entity.id()
         } else {
             let mesh_raster = materials
                 .get(&partition.material)
@@ -3661,6 +4007,9 @@ fn spawn_partitions_when_ready(
                     partition.transform,
                 ))
             };
+            if !partition.layers.0.is_empty() {
+                entity.insert(partition.layers.clone());
+            }
             // UE hides several surfaces from the shadow pass, most visibly the
             // GreenHouse pond, whose own shadow otherwise darkens the bed it
             // reflects. Only raster reads this: Solari shadows come from the
@@ -3762,6 +4111,152 @@ fn spawn_partitions_when_ready(
 
 fn raytracing_scene_ready(snapshot: &RaytracingSceneStatusSnapshot, expected_blas: usize) -> bool {
     snapshot.is_settled_for(expected_blas)
+}
+
+fn report_data_layers(converted: Res<ConvertedWorld>, data_layers: Res<DataLayers>) {
+    info!(
+        level = %converted.level,
+        "data layers: {} (digit keys toggle, L prints)",
+        data_layers.status_line()
+    );
+}
+
+/// Digit keys toggle the level's runtime data layers in the order the
+/// manifest lists them; `L` prints the current state.
+fn toggle_data_layers_by_key(keys: Res<ButtonInput<KeyCode>>, mut data_layers: ResMut<DataLayers>) {
+    const DIGITS: [KeyCode; 9] = [
+        KeyCode::Digit1,
+        KeyCode::Digit2,
+        KeyCode::Digit3,
+        KeyCode::Digit4,
+        KeyCode::Digit5,
+        KeyCode::Digit6,
+        KeyCode::Digit7,
+        KeyCode::Digit8,
+        KeyCode::Digit9,
+    ];
+    let mut changed = false;
+    for (key, index) in DIGITS
+        .iter()
+        .zip(data_layers.toggleable().map(|(index, _)| index).collect::<Vec<_>>())
+    {
+        if keys.just_pressed(*key) {
+            let layer = &mut data_layers.layers[index];
+            layer.active = !layer.active;
+            changed = true;
+        }
+    }
+    if changed || keys.just_pressed(KeyCode::KeyL) {
+        info!("data layers: {}", data_layers.status_line());
+    }
+}
+
+type DataLayerParts<'w> = (
+    Entity,
+    &'w DataLayerMember,
+    Option<&'w RaytracingMesh3d>,
+    Option<&'w MeshletMesh3d>,
+    Option<&'w SolariEnvironmentLight>,
+    Option<&'w ClusteredDecal>,
+    Option<&'w mut DormantLayerParts>,
+    Option<&'w mut Visibility>,
+);
+
+type FreshDataLayerParts = Or<(
+    Added<DataLayerMember>,
+    Added<RaytracingMesh3d>,
+    Added<MeshletMesh3d>,
+)>;
+
+/// Applies the data layer state to every tagged entity when a layer toggles,
+/// and to entities that have just gained a renderer-facing component (the
+/// scene spawns over many frames and `warm_up_raytracing` attaches
+/// `RaytracingMesh3d` later still).
+fn apply_data_layers(
+    mut commands: Commands,
+    data_layers: Res<DataLayers>,
+    mut parts: Query<DataLayerParts>,
+    fresh: Query<Entity, FreshDataLayerParts>,
+) {
+    if data_layers.is_changed() {
+        for item in &mut parts {
+            apply_data_layer_state(&mut commands, &data_layers, item);
+        }
+    } else {
+        for entity in &fresh {
+            if let Ok(item) = parts.get_mut(entity) {
+                apply_data_layer_state(&mut commands, &data_layers, item);
+            }
+        }
+    }
+}
+
+fn apply_data_layer_state(
+    commands: &mut Commands,
+    data_layers: &DataLayers,
+    (entity, member, raytracing, meshlet, environment, decal, dormant, visibility): QueryItem<
+        DataLayerParts,
+    >,
+) {
+    let mut entity_commands = commands.entity(entity);
+    if data_layers.is_active(member) {
+        if let Some(mut dormant) = dormant {
+            let dormant = std::mem::take(&mut *dormant);
+            entity_commands.remove::<DormantLayerParts>();
+            if let Some(part) = dormant.raytracing {
+                entity_commands.insert(part);
+            }
+            if let Some(part) = dormant.meshlet {
+                entity_commands.insert(part);
+            }
+            if let Some(part) = dormant.environment {
+                entity_commands.insert(part);
+            }
+            if let Some(part) = dormant.decal {
+                entity_commands.insert(part);
+            }
+        }
+        if let Some(mut visibility) = visibility
+            && *visibility == Visibility::Hidden
+        {
+            *visibility = Visibility::Inherited;
+        }
+        return;
+    }
+    let mut parts = DormantLayerParts::default();
+    if let Some(raytracing) = raytracing {
+        parts.raytracing = Some(raytracing.clone());
+        entity_commands.remove::<RaytracingMesh3d>();
+    }
+    if let Some(meshlet) = meshlet {
+        parts.meshlet = Some(meshlet.clone());
+        entity_commands.remove::<MeshletMesh3d>();
+    }
+    if let Some(environment) = environment {
+        parts.environment = Some(*environment);
+        entity_commands.remove::<SolariEnvironmentLight>();
+    }
+    if let Some(decal) = decal {
+        parts.decal = Some(decal.clone());
+        entity_commands.remove::<ClusteredDecal>();
+    }
+    match dormant {
+        Some(mut dormant) => {
+            // A part attached after the layer went dormant joins the stash.
+            dormant.raytracing = parts.raytracing.or(dormant.raytracing.take());
+            dormant.meshlet = parts.meshlet.or(dormant.meshlet.take());
+            dormant.environment = parts.environment.or(dormant.environment.take());
+            dormant.decal = parts.decal.or(dormant.decal.take());
+        }
+        None => {
+            entity_commands.insert(parts);
+        }
+    }
+    if let Some(mut visibility) = visibility
+        && *visibility != Visibility::Hidden
+    {
+        *visibility = Visibility::Hidden;
+    }
 }
 
 fn warm_up_raytracing(
@@ -3908,6 +4403,7 @@ mod tests {
             kind: "SkyAtmosphere".into(),
             transform,
             hidden: false,
+            data_layers: vec![],
             components: vec![],
             niagara: vec![],
             lights: vec![],
@@ -4040,6 +4536,7 @@ mod tests {
             kind: kind.into(),
             transform: test_transform(),
             hidden: false,
+            data_layers: vec![],
             components: mesh
                 .map(|mesh| ComponentRecord {
                     mesh: Some(mesh.into()),
@@ -4269,6 +4766,7 @@ mod tests {
         let mut converted = ConvertedWorld {
             level: "ThroneRoom_Level".into(),
             actors: vec![candle],
+            data_layers: vec![],
             post_process: None,
             geometry: HashMap::new(),
             materials: HashMap::new(),
@@ -4360,6 +4858,7 @@ mod tests {
                 &mut world_max,
                 raytracing_only,
                 true,
+                &DataLayerMember(vec![]),
             );
             pending.remove(0).material
         };
@@ -4461,6 +4960,7 @@ mod tests {
         let unused_name = "/Game/Test/T_Unused".to_string();
         let converted = ConvertedWorld {
             level: "Test".into(),
+            data_layers: vec![],
             post_process: None,
             actors: vec![ActorRecord {
                 _name: "actor".into(),
@@ -4468,6 +4968,7 @@ mod tests {
                 kind: "StaticMeshActor".into(),
                 transform: test_transform(),
                 hidden: false,
+                data_layers: vec![],
                 components: vec![ComponentRecord {
                     mesh: Some(mesh_name.clone()),
                     transform: test_transform(),
@@ -4762,6 +5263,142 @@ mod tests {
             Falloff::Exponential { scale } if (scale - 0.04).abs() < 1e-6
         ));
         assert_eq!(environment_intensity, 2.0);
+    }
+
+    fn test_layer_actor(name: &str, layers: &[&str]) -> ActorRecord {
+        ActorRecord {
+            _name: name.into(),
+            _label: None,
+            kind: "StaticMeshActor".into(),
+            transform: test_transform(),
+            hidden: false,
+            data_layers: layers.iter().map(|layer| (*layer).to_string()).collect(),
+            components: Vec::new(),
+            niagara: Vec::new(),
+            lights: Vec::new(),
+            decals: Vec::new(),
+            atmosphere: None,
+            height_fog: None,
+            post_process: None,
+        }
+    }
+
+    fn test_layer_record(name: &str, kind: &str, state: Option<&str>) -> DataLayerRecord {
+        DataLayerRecord {
+            name: name.into(),
+            kind: Some(kind.into()),
+            initial_runtime_state: state.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn data_layers_follow_the_authored_initial_runtime_state() {
+        let records = [
+            test_layer_record("DL_Lighting_Night", "Runtime", Some("EDataLayerRuntimeState::Activated")),
+            test_layer_record("DL_Lighting_Orb", "Runtime", Some("Unloaded")),
+            test_layer_record("DL_Outliner", "EDataLayerType::Editor", Some("Unloaded")),
+        ];
+        let actors = [
+            test_layer_actor("night_sun", &["DL_Lighting_Night"]),
+            test_layer_actor("orb", &["DL_Lighting_Orb"]),
+            test_layer_actor("both", &["DL_Lighting_Orb", "DL_Lighting_Night"]),
+            test_layer_actor("organised", &["DL_Outliner"]),
+            test_layer_actor("stray", &["DL_Unlisted"]),
+            test_layer_actor("plain", &[]),
+        ];
+        let layers = DataLayers::from_manifest(&records, &actors, None);
+
+        let active: Vec<bool> = actors
+            .iter()
+            .map(|actor| layers.is_actor_active(actor))
+            .collect();
+        // UE renders an actor when any of its layers is activated; editor
+        // layers never hide anything; unlisted layers stay visible.
+        assert_eq!(active, [true, false, true, true, true, true]);
+        let toggleable: Vec<&str> = layers
+            .toggleable()
+            .map(|(_, layer)| layer.name.as_str())
+            .collect();
+        assert_eq!(
+            toggleable,
+            ["DL_Lighting_Night", "DL_Lighting_Orb", "DL_Unlisted"]
+        );
+        assert_eq!(layers.layers[1].actors, 2);
+        assert_eq!(layers.member(&actors[2]).0, vec![1, 0]);
+    }
+
+    #[test]
+    fn data_layers_override_replaces_the_runtime_set_only() {
+        let records = [
+            test_layer_record("DL_Lighting_Night", "Runtime", Some("Activated")),
+            test_layer_record("DL_Lighting_Orb", "Runtime", Some("Unloaded")),
+            test_layer_record("DL_Outliner", "Editor", None),
+        ];
+        let requested = ["DL_Lighting_Orb".to_string()];
+        let layers = DataLayers::from_manifest(&records, &[], Some(&requested));
+        let active: Vec<bool> = layers.layers.iter().map(|layer| layer.active).collect();
+        assert_eq!(active, [false, true, true]);
+    }
+
+    #[test]
+    fn captured_sky_light_scales_with_the_active_sun() {
+        // A 25,000 lux sun at 56 degrees, as Restir authors it: the clear-sky
+        // dome delivers about two stops less than the sunlit floor.
+        let fraction = clear_sky_diffuse_fraction(56.0f32.to_radians());
+        assert!((fraction - 0.149).abs() < 0.002, "{fraction}");
+        let floor = 25_000.0 * 56.0f32.to_radians().sin();
+        let stops = (floor / (25_000.0 * fraction)).log2();
+        assert!((2.0..3.0).contains(&stops), "{stops}");
+        // A sun on the horizon still leaves the residual skylight.
+        assert!((clear_sky_diffuse_fraction(0.0) - 0.008).abs() < 1e-6);
+        assert!((clear_sky_diffuse_fraction(-0.5) - 0.008).abs() < 1e-6);
+    }
+
+    #[test]
+    fn ue_atmosphere_tint_without_a_scale_keeps_the_default_scale() {
+        // Restir's authored SkyAtmosphere: a retinted Rayleigh colour with the
+        // scale left at the UE default, so the export carries no scale at all.
+        let record = SkyAtmosphereRecord {
+            _name: "atmosphere".into(),
+            rayleigh_scattering_per_km: Some(UeLinearColor {
+                r: 0.23,
+                g: 0.4487749934196472,
+                b: 1.0,
+                _a: 30.21147918701172,
+            }),
+            ..default()
+        };
+        let (medium, _, _, _, _) = configured_atmosphere(Some(&record), None);
+
+        // Earth-like density (blue 33.1e-6 per metre), not thirty times it.
+        assert!(medium.terms[0].scattering.abs_diff_eq(
+            Vec3::new(0.23, 0.4487749934196472, 1.0) * 0.0331e-3,
+            1e-9
+        ));
+        assert!((medium.terms[0].scattering.z - 33.1e-6).abs() < 1e-9);
+        // Untouched terms keep UE's defaults rather than a unit scale.
+        assert!(medium.terms[1]
+            .scattering
+            .abs_diff_eq(Vec3::splat(3.996e-6), 1e-9));
+        assert!(medium.terms[1]
+            .absorption
+            .abs_diff_eq(Vec3::splat(0.444e-6), 1e-9));
+        assert!(medium.terms[2]
+            .absorption
+            .abs_diff_eq(Vec3::new(0.345561, 1.0, 0.045189) * 0.544e-6, 1e-9));
+    }
+
+    #[test]
+    fn ue_atmosphere_scale_without_a_tint_keeps_the_default_tint() {
+        let record = SkyAtmosphereRecord {
+            _name: "atmosphere".into(),
+            rayleigh_scattering_scale: Some(0.0662),
+            ..default()
+        };
+        let (medium, _, _, _, _) = configured_atmosphere(Some(&record), None);
+        assert!(medium.terms[0]
+            .scattering
+            .abs_diff_eq(Vec3::new(0.175287, 0.409607, 1.0) * 0.0662e-3, 1e-9));
     }
 
     #[test]

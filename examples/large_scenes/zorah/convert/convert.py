@@ -35,6 +35,10 @@ EXPECTED_POST_PROCESS_BLOOM = {
 # referenced_meshes counts Niagara mesh-renderer meshes as well as component
 # ones: the butterfly mesh in GreenHouse, and the two nebula spheres in
 # ThroneRoom. Restir's one Niagara system renders no mesh.
+#
+# data_layers counts actors, not packages: the level's WorldDataLayers actor
+# names every layer without belonging to any, and DL_Lighting_Day_Support is a
+# substring hit on DL_Lighting_Day, so a grep over __ExternalActors__ runs high.
 EXPECTED_SCENE_INVENTORY = {
     "GreenHouse_Level": {
         "actors": 1788,
@@ -43,6 +47,12 @@ EXPECTED_SCENE_INVENTORY = {
         "referenced_meshes": 300,
         "decal_components": 232,
         "niagara_components": 2,
+        "data_layers": {
+            "DL_Lighting_Sunset": 5,
+            "DL_Lighting_Sunset_Clouds": 0,
+            "DL_Lighting_Sunset_Support": 0,
+            "DL_VFX": 2,
+        },
     },
     "Restir_Level": {
         "actors": 1924,
@@ -51,6 +61,7 @@ EXPECTED_SCENE_INVENTORY = {
         "referenced_meshes": 271,
         "decal_components": 323,
         "niagara_components": 1,
+        "data_layers": {"DL_Lighting_Day": 5, "DL_Lighting_Day_Support": 1},
     },
     "ThroneRoom_Level": {
         "actors": 6773,
@@ -59,6 +70,11 @@ EXPECTED_SCENE_INVENTORY = {
         "referenced_meshes": 115,
         "decal_components": 17,
         "niagara_components": 14,
+        "data_layers": {
+            "DL_Lighting_Candles": 6443,
+            "DL_Lighting_Night": 10,
+            "DL_Lighting_Orb": 3,
+        },
     },
 }
 CONVERT_DIRECTORY = Path(__file__).resolve().parent
@@ -320,6 +336,19 @@ def refresh_texture_inventory(
     shutil.rmtree(staging)
 
 
+def scene_data_layer_actor_counts(document: dict) -> dict[str, int]:
+    """Actors per data layer, including layers the level declares but nothing uses.
+
+    A layer an actor names without a WorldDataLayers entry still counts, so a
+    dropped declaration and a dropped membership both show up here.
+    """
+    counts = {layer["name"]: 0 for layer in document.get("data_layers", [])}
+    for actor in document.get("actors", []):
+        for name in actor.get("data_layers", []):
+            counts[name] = counts.get(name, 0) + 1
+    return counts
+
+
 def scene_manifest_is_current(path: Path) -> bool:
     if not path.is_file():
         return False
@@ -333,7 +362,7 @@ def scene_manifest_is_current(path: Path) -> bool:
             and actor["post_process"].get("unbound", False)
             and float(actor["post_process"].get("blend_weight", 1.0)) > 0.0
         ]
-        if document.get("format") != "zorah-scene-manifest-v5" or len(records) != 1:
+        if document.get("format") != "zorah-scene-manifest-v6" or len(records) != 1:
             return False
         level = document.get("level")
         inventory = EXPECTED_SCENE_INVENTORY.get(level)
@@ -351,6 +380,7 @@ def scene_manifest_is_current(path: Path) -> bool:
             != inventory["decal_components"]
             or int(document.get("niagara_components", -1))
             != inventory["niagara_components"]
+            or scene_data_layer_actor_counts(document) != inventory["data_layers"]
         ):
             return False
         record = records[0]
@@ -660,7 +690,7 @@ def reconcile_geometry_cache(
         write_json_if_changed(
             delta_scene,
             {
-                "format": "zorah-scene-manifest-v5",
+                "format": "zorah-scene-manifest-v6",
                 "level": "GeometryDelta",
                 "actors": [],
                 "referenced_meshes": rebuild,

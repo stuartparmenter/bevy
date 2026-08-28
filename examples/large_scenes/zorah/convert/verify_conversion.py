@@ -717,7 +717,7 @@ def main() -> int:
     scenes = []
     for scene_path in sorted((root / "scenes").glob("*.json")):
         scene = load(scene_path)
-        if scene.get("format") != "zorah-scene-manifest-v5":
+        if scene.get("format") != "zorah-scene-manifest-v6":
             raise ValueError(f"stale scene manifest without decal data: {scene_path}")
         scenes.append(scene)
         levels.add(scene["level"])

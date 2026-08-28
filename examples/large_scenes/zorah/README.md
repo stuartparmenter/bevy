@@ -267,6 +267,25 @@ cargo +1.96.1 run --release -p zorah -- --camera-position 0,4.5,48 --camera-targ
 The target machine is an RTX 5090. DLSS frame generation can be integrated
 later without changing the conversion format.
 
+### Lighting data layers
+
+Zorah authors its lighting scenarios as World Partition data layers
+(`DL_Lighting_Day`, `DL_Lighting_Night`, `DL_Lighting_Orb`,
+`DL_Lighting_Candles`, ...). The scene manifest records each actor's layers and
+the level's `WorldDataLayers` initial states, and the runtime starts with the
+layers UE would activate. While running, digit keys `1`-`9` toggle the level's
+runtime layers in manifest order and `L` prints their state to the log; a toggle
+covers lights, Solari emitters, geometry and decals, while the sky atmosphere,
+fog and exposure stay as chosen at launch. The authored states are: Restir
+`Day` + `Day_Support` on; GreenHouse `Sunset` + `Sunset_Support` on,
+`Sunset_Clouds` off; ThroneRoom `Night` + `Orb` on and `Candles` off (the
+6,443 candle actors carry no `InitialRuntimeState`, which is UE's `Unloaded`),
+so ThroneRoom's candles need a keypress. Start from a different set with:
+
+```powershell
+cargo +1.96.1 run --release -p zorah -- --scene scenes/ThroneRoom_Level.json --data-layers DL_Lighting_Night,DL_Lighting_Candles
+```
+
 ## Advanced phase debugging
 
 The normal entry point is preferred. Its component scripts remain usable for

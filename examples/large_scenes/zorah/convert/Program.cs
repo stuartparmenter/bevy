@@ -798,6 +798,162 @@ static class ZorahConvert
         .FirstOrDefault(property => property.Name.Text == name)
         ?.Tag?.GenericValue;
 
+    /// The asset name of an object path, without package path or object suffix.
+    private static string ShortObjectName(string path)
+    {
+        var name = path;
+        var dot = name.LastIndexOf('.');
+        if (dot >= 0)
+        {
+            name = name[(dot + 1)..];
+        }
+        var slash = name.LastIndexOf('/');
+        return slash >= 0 ? name[(slash + 1)..] : name;
+    }
+
+    private static string? NameText(object? value) => GetPublicMember(value, "Text") as string;
+
+    /// An enum tag's value without its type prefix: EDataLayerType::Runtime is Runtime.
+    private static string? EnumValueName(object? value)
+    {
+        var text = NameText(value) ?? value as string ?? value?.ToString();
+        if (string.IsNullOrEmpty(text) || text == "None")
+        {
+            return null;
+        }
+        var separator = text.LastIndexOf("::", StringComparison.Ordinal);
+        return separator >= 0 ? text[(separator + 2)..] : text;
+    }
+
+    // A TSoftObjectPtr serializes as an FSoftObjectPath; a hard reference to the
+    // same asset arrives as an FPackageIndex instead.
+    private static string? ObjectReferencePath(object? value)
+    {
+        if (PackageReferencePath(value) is string reference)
+        {
+            return reference;
+        }
+        var soft = StructValue(value);
+        if (soft is null)
+        {
+            return null;
+        }
+        var assetPath = GetPublicMember(soft, "AssetPath");
+        var packageName = NameText(GetPublicMember(assetPath, "PackageName"));
+        var assetName = NameText(GetPublicMember(assetPath, "AssetName"));
+        if (!string.IsNullOrEmpty(packageName) && !string.IsNullOrEmpty(assetName))
+        {
+            return $"{packageName}.{assetName}";
+        }
+        var path = NameText(GetPublicMember(soft, "AssetPathName"))
+            ?? (soft.GetType().Name.Contains("SoftObjectPath", StringComparison.Ordinal)
+                ? soft.ToString()
+                : soft as string);
+        return string.IsNullOrEmpty(path) || path == "None" ? null : path;
+    }
+
+    /// The data layer assets an actor belongs to, as object paths.
+    ///
+    /// World Partition actors reference layer assets through DataLayerAssets;
+    /// pre-5.0 actors carry bare FActorDataLayer names in DataLayers instead, so
+    /// an entry is not always a path.
+    private static string[] ReadActorDataLayers(UObject actor)
+    {
+        var layers = new List<string>();
+        foreach (var entry in ReadArrayValues(GetTaggedValue(actor, "DataLayerAssets")))
+        {
+            if (ObjectReferencePath(entry) is string path)
+            {
+                layers.Add(path);
+            }
+        }
+        foreach (var entry in ReadArrayValues(GetTaggedValue(actor, "DataLayers")))
+        {
+            var name = NameText(ReadStructFields(entry).GetValueOrDefault("Name"));
+            if (!string.IsNullOrEmpty(name) && name != "None")
+            {
+                layers.Add(name);
+            }
+        }
+        return layers.Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray();
+    }
+
+    private static UObject? ResolveExport(object? value, UObject[] packageObjects)
+    {
+        if (value is not FPackageIndex index)
+        {
+            return null;
+        }
+        var name = index.ResolvedObject?.Name.Text;
+        if (name is not null &&
+            packageObjects.FirstOrDefault(export => export.Name == name) is UObject named)
+        {
+            return named;
+        }
+        return index.Index > 0 && index.Index <= packageObjects.Length
+            ? packageObjects[index.Index - 1]
+            : null;
+    }
+
+    /// The layer definitions a level's WorldDataLayers actor declares, by short name.
+    ///
+    /// A UDataLayerInstance leaves InitialRuntimeState and the editor flags
+    /// untagged while they hold their class default, so an absent tag means the
+    /// UE default - Unloaded, visible, loaded - not an unknown value.
+    private static Dictionary<string, DataLayerRecord> ReadWorldDataLayers(
+        DefaultFileProvider provider,
+        UObject worldDataLayers,
+        UObject[] packageObjects
+    )
+    {
+        var records = new Dictionary<string, DataLayerRecord>(StringComparer.Ordinal);
+        foreach (var entry in ReadArrayValues(
+            GetTaggedValue(worldDataLayers, "DataLayerInstances")
+        ))
+        {
+            if (ResolveExport(entry, packageObjects) is not UObject instance)
+            {
+                continue;
+            }
+            var asset = ObjectReferencePath(GetTaggedValue(instance, "DataLayerAsset"));
+            var name = asset is null ? instance.Name : ShortObjectName(asset);
+            records[name] = new DataLayerRecord(
+                Name: name,
+                Asset: asset,
+                Type: ReadDataLayerType(provider, asset),
+                InitialRuntimeState: EnumValueName(GetTaggedValue(instance, "InitialRuntimeState"))
+                    ?? "Unloaded",
+                InitiallyVisible: instance.GetOrDefault("bIsInitiallyVisible", true),
+                InitiallyLoadedInEditor: instance.GetOrDefault("bIsInitiallyLoadedInEditor", true)
+            );
+        }
+        return records;
+    }
+
+    private static string ReadDataLayerType(DefaultFileProvider provider, string? assetPath)
+    {
+        if (assetPath is null || !assetPath.Contains('/'))
+        {
+            return "Unknown";
+        }
+        var key = ObjectPathToPackageKey(assetPath);
+        if (!provider.Files.ContainsKey(key))
+        {
+            return "Unknown";
+        }
+        try
+        {
+            var asset = provider.LoadPackage(key).GetExports()
+                .FirstOrDefault(export => export.ExportType == "DataLayerAsset");
+            return (asset is null ? null : EnumValueName(GetTaggedValue(asset, "DataLayerType")))
+                ?? "Unknown";
+        }
+        catch
+        {
+            return "Unknown";
+        }
+    }
+
     private static MaterialParameterRecord[] ReadMaterialParameters(UObject material, string name)
     {
         var array = GetTaggedValue(material, name);
@@ -1832,6 +1988,36 @@ static class ZorahConvert
                     );
                 }
             }
+            // A WorldDataLayers actor, its DataLayerInstance subobjects and the
+            // UDataLayerAsset packages they point at are plain tagged UObjects,
+            // so dump every tag and let the caller read the layer definitions.
+            // Any other actor gets only its layer membership dumped.
+            var dataLayerObject = obj.ExportType.Contains("DataLayer", StringComparison.Ordinal);
+            foreach (var property in obj.Properties)
+            {
+                if (!dataLayerObject &&
+                    property.Name.Text is not ("DataLayerAssets" or "DataLayers"))
+                {
+                    continue;
+                }
+                Console.WriteLine(
+                    $"ZORAH_DATA_LAYER_PROPERTY object={obj.Name} type={obj.ExportType} " +
+                    $"name={property.Name.Text} value={Describe(property.Tag?.GenericValue)}"
+                );
+                DumpNested(
+                    $"data_layer.{obj.Name}.{property.Name.Text}",
+                    property.Tag?.GenericValue,
+                    3,
+                    new HashSet<object>(ReferenceEqualityComparer.Instance)
+                );
+            }
+            if (IsExternalActorRoot(obj))
+            {
+                Console.WriteLine(
+                    $"ZORAH_ACTOR_DATA_LAYERS actor={obj.Name} " +
+                    $"layers={string.Join(",", ReadActorDataLayers(obj))}"
+                );
+            }
             if (obj is USceneComponent sceneComponent)
             {
                 var transform = ConvertTransform(sceneComponent.GetRelativeTransform());
@@ -2022,6 +2208,9 @@ static class ZorahConvert
         var referencedDecalMaterials = new HashSet<string>(StringComparer.Ordinal);
         var referencedNiagaraMaterials = new HashSet<string>(StringComparer.Ordinal);
         var missingNiagaraAssets = new HashSet<string>(StringComparer.Ordinal);
+        var declaredDataLayers = new Dictionary<string, DataLayerRecord>(StringComparer.Ordinal);
+        var dataLayerActorCounts = new Dictionary<string, int>(StringComparer.Ordinal);
+        var dataLayerAssets = new Dictionary<string, string>(StringComparer.Ordinal);
         // Placed instances of the same system are common - ThroneRoom has 6,421
         // candles fed by one - and reading a system means loading and walking a
         // package with hundreds of exports.
@@ -2153,6 +2342,28 @@ static class ZorahConvert
                         }
                     }
 
+                    var dataLayerPaths = ReadActorDataLayers(actor);
+                    foreach (var path in dataLayerPaths)
+                    {
+                        var layer = ShortObjectName(path);
+                        Increment(dataLayerActorCounts, layer);
+                        if (path.Contains('/'))
+                        {
+                            dataLayerAssets.TryAdd(layer, path);
+                        }
+                    }
+                    if (actor.ExportType == "WorldDataLayers")
+                    {
+                        foreach (var (name, record) in ReadWorldDataLayers(
+                            provider,
+                            actor,
+                            objects
+                        ))
+                        {
+                            declaredDataLayers[name] = record;
+                        }
+                    }
+
                     actors.Add(new ActorRecord(
                         Package: packagePath,
                         Name: actor.Name,
@@ -2161,6 +2372,9 @@ static class ZorahConvert
                         Class: actor.Class?.GetPathName(),
                         Transform: ConvertObjectTransform(rootComponent),
                         Hidden: actor.GetOrDefault("bHidden", false),
+                        DataLayers: dataLayerPaths.Length == 0
+                            ? null
+                            : dataLayerPaths.Select(ShortObjectName).ToArray(),
                         Components: components,
                         Niagara: niagara,
                         Lights: lights,
@@ -2191,14 +2405,33 @@ static class ZorahConvert
             }
         }
 
+        // A layer an actor claims but WorldDataLayers never declares still gets
+        // an entry so the runtime can see it; its state stays unknown.
+        var dataLayers = declaredDataLayers.Keys
+            .Concat(dataLayerActorCounts.Keys)
+            .Distinct(StringComparer.Ordinal)
+            .Order(StringComparer.Ordinal)
+            .Select(name => declaredDataLayers.TryGetValue(name, out var declared)
+                ? declared
+                : new DataLayerRecord(
+                    Name: name,
+                    Asset: dataLayerAssets.GetValueOrDefault(name),
+                    Type: ReadDataLayerType(provider, dataLayerAssets.GetValueOrDefault(name)),
+                    InitialRuntimeState: null,
+                    InitiallyVisible: null,
+                    InitiallyLoadedInEditor: null
+                ))
+            .ToArray();
+
         var manifest = new SceneManifest(
-            Format: "zorah-scene-manifest-v5",
+            Format: "zorah-scene-manifest-v6",
             EngineVersion: "5.4",
             Level: level,
             SourceMap: $"Levels/{level}.umap",
             ExternalActorPrefix: prefix,
             ActorPackageCount: packagePaths.Length,
             PackagesWithoutActors: packagesWithoutActors,
+            DataLayers: dataLayers,
             ActorTypeCounts: actorTypes.OrderBy(pair => pair.Key, StringComparer.Ordinal)
                 .ToDictionary(),
             StaticMeshComponentTypeCounts: componentTypes
@@ -2249,6 +2482,13 @@ static class ZorahConvert
             throw;
         }
 
+        Console.WriteLine(
+            $"ZORAH_LEVEL_DATA_LAYERS level={level} layers=" +
+            string.Join(",", manifest.DataLayers.Select(layer =>
+                $"{layer.Name}:{layer.InitialRuntimeState ?? "None"}:" +
+                dataLayerActorCounts.GetValueOrDefault(layer.Name)
+            ))
+        );
         Console.WriteLine(
             $"ZORAH_LEVEL_DONE level={level} actors={manifest.Actors.Length} " +
             $"lights={manifest.Actors.Sum(actor => actor.Lights.Length)} " +
@@ -3445,6 +3685,7 @@ sealed record SceneManifest(
     string ExternalActorPrefix,
     int ActorPackageCount,
     int PackagesWithoutActors,
+    DataLayerRecord[] DataLayers,
     Dictionary<string, int> ActorTypeCounts,
     Dictionary<string, int> StaticMeshComponentTypeCounts,
     int UnresolvedStaticMeshComponents,
@@ -3458,6 +3699,17 @@ sealed record SceneManifest(
     string[] MissingNiagaraAssets,
     ActorRecord[] Actors,
     FailureRecord[] Failures
+);
+
+sealed record DataLayerRecord(
+    string Name,
+    // Always emitted, null included: the runtime distinguishes a layer with no
+    // known definition from one that simply defaults.
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? Asset,
+    string Type,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? InitialRuntimeState,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.Never)] bool? InitiallyVisible,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.Never)] bool? InitiallyLoadedInEditor
 );
 
 sealed record MeshMaterialManifest(
@@ -3495,6 +3747,7 @@ sealed record ActorRecord(
     string? Class,
     TransformRecord Transform,
     bool Hidden,
+    string[]? DataLayers,
     StaticMeshComponentRecord[] Components,
     NiagaraComponentRecord[] Niagara,
     LightComponentRecord[] Lights,

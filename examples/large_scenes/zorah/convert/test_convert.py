@@ -108,7 +108,7 @@ class GeometryCache:
         write_json(
             self.scene,
             {
-                "format": "zorah-scene-manifest-v5",
+                "format": "zorah-scene-manifest-v6",
                 "level": "GreenHouse_Level",
                 "actors": [],
                 "referenced_meshes": meshes,
@@ -150,6 +150,33 @@ class GeometryCache:
                 "failures": [],
             },
         )
+
+
+def current_scene_manifest(level: str, volume: dict) -> dict:
+    """A manifest matching the level's fixed inventory in every checked field."""
+    inventory = convert.EXPECTED_SCENE_INVENTORY[level]
+    members = [
+        {"data_layers": [name]}
+        for name, count in inventory["data_layers"].items()
+        for _ in range(count)
+    ]
+    return {
+        "format": "zorah-scene-manifest-v6",
+        "level": level,
+        "actor_package_count": inventory["actor_packages"],
+        "unresolved_static_mesh_components": inventory["unresolved_mesh_components"],
+        "referenced_meshes": ["mesh"] * inventory["referenced_meshes"],
+        "decal_components": inventory["decal_components"],
+        "niagara_components": inventory["niagara_components"],
+        "data_layers": [
+            {"name": name, "type": "Runtime", "initial_runtime_state": "Activated"}
+            for name in inventory["data_layers"]
+        ],
+        "actors": [{"post_process": volume}]
+        + members
+        + [{}] * (inventory["actors"] - 1 - len(members)),
+        "failures": [],
+    }
 
 
 @contextmanager
@@ -671,18 +698,7 @@ class IncrementalConversionTests(unittest.TestCase):
             "auto_exposure_max_ev100": maximum,
             "auto_exposure_bias": bias,
         }
-        document = {
-            "format": "zorah-scene-manifest-v5",
-            "level": level,
-            "actor_package_count": inventory["actor_packages"],
-            "unresolved_static_mesh_components": inventory["unresolved_mesh_components"],
-            "referenced_meshes": ["mesh"] * inventory["referenced_meshes"],
-            "decal_components": inventory["decal_components"],
-            "niagara_components": inventory["niagara_components"],
-            "actors": [{"post_process": volume}]
-            + [{}] * (inventory["actors"] - 1),
-            "failures": [],
-        }
+        document = current_scene_manifest(level, volume)
         with tempfile.TemporaryDirectory() as directory:
             manifest = Path(directory) / f"{level}.json"
             write_json(manifest, document)
@@ -693,6 +709,66 @@ class IncrementalConversionTests(unittest.TestCase):
             document.pop("decal_components")
             write_json(manifest, document)
             self.assertFalse(convert.scene_manifest_is_current(manifest))
+
+    def test_missing_data_layers_invalidate_a_cached_scene_manifest(self):
+        level = "GreenHouse_Level"
+        minimum, maximum, bias = convert.EXPECTED_POST_PROCESS_EXPOSURE[level]
+        volume = {
+            "enabled": True,
+            "unbound": True,
+            "blend_weight": 1.0,
+            "auto_exposure_method": "AEM_Histogram",
+            "auto_exposure_min_ev100": minimum,
+            "auto_exposure_max_ev100": maximum,
+            "auto_exposure_bias": bias,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / f"{level}.json"
+            write_json(manifest, current_scene_manifest(level, volume))
+            self.assertTrue(convert.scene_manifest_is_current(manifest))
+
+            # The shape a v5 manifest has: no layers anywhere, every other
+            # count still matching.
+            stale = current_scene_manifest(level, volume)
+            stale.pop("data_layers")
+            for actor in stale["actors"]:
+                actor.pop("data_layers", None)
+            write_json(manifest, stale)
+            self.assertFalse(convert.scene_manifest_is_current(manifest))
+
+            # A layer declared but no longer placed on any actor.
+            dropped = current_scene_manifest(level, volume)
+            for actor in dropped["actors"]:
+                if actor.get("data_layers") == ["DL_VFX"]:
+                    actor.pop("data_layers")
+            write_json(manifest, dropped)
+            self.assertFalse(convert.scene_manifest_is_current(manifest))
+
+            # A layer the WorldDataLayers actor no longer declares, which the
+            # actor memberships alone still account for.
+            undeclared = current_scene_manifest(level, volume)
+            undeclared["data_layers"] = [
+                layer
+                for layer in undeclared["data_layers"]
+                if layer["name"] != "DL_Lighting_Sunset_Clouds"
+            ]
+            write_json(manifest, undeclared)
+            self.assertFalse(convert.scene_manifest_is_current(manifest))
+
+    def test_undeclared_data_layers_still_count_their_actors(self):
+        counts = convert.scene_data_layer_actor_counts(
+            {
+                "data_layers": [{"name": "DL_Lighting_Day"}, {"name": "DL_Unused"}],
+                "actors": [
+                    {"data_layers": ["DL_Lighting_Day", "DL_Orphan"]},
+                    {"data_layers": ["DL_Orphan"]},
+                    {},
+                ],
+            }
+        )
+        self.assertEqual(
+            counts, {"DL_Lighting_Day": 1, "DL_Unused": 0, "DL_Orphan": 2}
+        )
 
     def test_blueprint_archetype_lights_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
