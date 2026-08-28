@@ -3665,8 +3665,11 @@ fn setup(
     } else {
         resolved_bloom(converted.post_process.as_ref())
     };
+    // `Linear` rather than `None`: the working space is Rec.2020, and only the
+    // tonemapping pass converts it back to the display gamut. `None` skips the
+    // pass and would present Rec.2020 coordinates as if they were Rec.709.
     let tonemapping = if albedo_view {
-        Tonemapping::None
+        Tonemapping::Linear
     } else {
         Tonemapping::GranTurismo7
     };
