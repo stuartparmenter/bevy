@@ -275,7 +275,11 @@ For a lit-versus-unlit pair, take the Solari frame first, press `P`, then rerun
 with the printed fragment plus `--raster-only --unlit-textures`: every surface
 shows its base-colour texture with no lighting, normal maps, emission, bloom or
 tone curve, so the two frames differ only by what Solari adds. Add
-`--missing-materials grey` if the magenta stand-ins would distract.
+`--missing-materials grey` if the magenta stand-ins would distract. The
+complementary view is `--clay`, which keeps Solari and every lighting input but
+paints all surfaces a rough 50% grey (normal maps and emissive lights kept), so
+the frame is the illumination alone; it stands on its own or pairs with the
+textured Solari frame.
 
 Slots UE itself cannot texture - the engine's unassigned-slot fallback and the
 four vegetation materials the download omits - render magenta so they are

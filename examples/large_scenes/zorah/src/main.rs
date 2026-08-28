@@ -261,6 +261,11 @@ struct Args {
     #[argh(switch)]
     unlit_textures: bool,
 
+    /// render every surface as flat grey clay (normal maps and emission kept),
+    /// so a frame shows the lighting alone; works with Solari
+    #[argh(switch)]
+    clay: bool,
+
     /// omit the Niagara candle flames, geometry and light alike, which are on by default
     #[argh(switch)]
     no_candle_lights: bool,
@@ -293,6 +298,11 @@ struct Args {
     #[argh(option, default = "MissingMaterialStyle::Magenta", from_str_fn(parse_missing_material_style))]
     missing_materials: MissingMaterialStyle,
 }
+
+/// `--clay`: a rough 50% grey (0.5 linear reflectance), the conventional
+/// lighting-check material.
+const CLAY_BASE_COLOR: Color = Color::LinearRgba(LinearRgba::rgb(0.5, 0.5, 0.5));
+const CLAY_ROUGHNESS: f32 = 0.9;
 
 /// What renders where UE has nothing to render: a slot left on the engine's
 /// unassigned-slot fallback, or a material whose package the download omits.
@@ -329,6 +339,7 @@ struct RuntimeOptions {
     raster_only: bool,
     preserve_alpha: bool,
     unlit_textures: bool,
+    clay: bool,
     missing_materials: MissingMaterialStyle,
     candle_lights: bool,
     camera_position: Option<Vec3>,
@@ -1812,10 +1823,18 @@ fn build_material_handles(
     materials: &mut Assets<StandardMaterial>,
     preserve_alpha: bool,
     unlit_textures: bool,
+    clay: bool,
     missing_materials: MissingMaterialStyle,
     failed_texture_bundles: &HashSet<String>,
 ) -> (HashMap<String, Handle<StandardMaterial>>, PanningWater) {
     let mut result = HashMap::new();
+    // A stand-in for a missing material would be the one coloured surface in a
+    // clay frame, so it takes the clay grey too.
+    let missing_materials = if clay {
+        MissingMaterialStyle::Grey
+    } else {
+        missing_materials
+    };
     let mut panning_water = PanningWater::default();
     let mut cache = HashMap::new();
     let used = used_material_objects(converted);
@@ -1980,13 +1999,18 @@ fn build_material_handles(
             SourceBlendMode::Masked => masked_materials += 1,
             SourceBlendMode::Translucent => translucent_materials += 1,
         }
+        // Clay keeps every lighting input except colour: normal maps for the
+        // surface detail, emission because the lights are emissive proxies, and
+        // a rough non-metal so the frame reads as illumination alone.
         let material = StandardMaterial {
             base_color: if unlit_textures {
                 Color::WHITE
+            } else if clay {
+                CLAY_BASE_COLOR
             } else {
                 material_base_color(&effective)
             },
-            base_color_texture,
+            base_color_texture: (!clay).then_some(base_color_texture).flatten(),
             normal_map_texture: (!unlit_textures).then_some(normal_map_texture).flatten(),
             // Unreal normal maps use the DirectX convention.
             flip_normal_map_y: true,
@@ -1996,11 +2020,15 @@ fn build_material_handles(
                 emissive
             },
             emissive_texture: (!unlit_textures).then_some(emissive_texture).flatten(),
-            metallic_roughness_texture: (!unlit_textures).then_some(orm.clone()).flatten(),
-            occlusion_texture: (!unlit_textures).then_some(orm).flatten(),
-            metallic: if unlit_textures { 0.0 } else { metallic },
+            metallic_roughness_texture: (!unlit_textures && !clay)
+                .then_some(orm.clone())
+                .flatten(),
+            occlusion_texture: (!unlit_textures && !clay).then_some(orm).flatten(),
+            metallic: if unlit_textures || clay { 0.0 } else { metallic },
             perceptual_roughness: if unlit_textures {
                 1.0
+            } else if clay {
+                CLAY_ROUGHNESS
             } else {
                 perceptual_roughness
             },
@@ -2118,6 +2146,7 @@ fn main() {
             raster_only,
             preserve_alpha: args.preserve_alpha,
             unlit_textures: args.unlit_textures,
+            clay: args.clay,
             missing_materials: args.missing_materials,
             candle_lights: !args.no_candle_lights,
             camera_position,
@@ -3467,6 +3496,7 @@ fn setup(
         &mut materials,
         options.preserve_alpha,
         options.unlit_textures,
+        options.clay,
         options.missing_materials,
         &failed_texture_bundles.0,
     );
