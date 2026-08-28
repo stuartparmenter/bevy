@@ -273,6 +273,16 @@ GreenHouse allows 4-5 EV100 and ThroneRoom pins 8-8, which is a fixed exposure
 in effect. `--no-auto-exposure` meters every level fixed at the middle of its
 range, and `--exposure-ev100` fixes any level by hand.
 
+Each level's SkyLight is a real-time capture taken from inside the courtyard a
+couple of metres up, so in UE it is mostly a cubemap of the scene's own sun-
+and sky-lit stone, applied as a warm ambient everywhere. Solari has no
+environment map, so its uniform sky is an estimate of that capture: the clear
+sky the atmosphere would show, blended with the average radiance of pale stone
+under the sun and sky. `--sky-capture-scene` (default 0.7) is the share of the
+capture that is scene rather than sky and `--sky-capture-sunlit` (default 0.4)
+the share of that scene in direct sun; `--sky-capture-scene 0` keeps the sky
+alone.
+
 `--ue-editor-camera` starts instead from the perspective viewport each map was
 last saved with in the UE editor (the download places no PlayerStart or camera
 actor, so this is the nearest thing to an authored view; `ZorahConvert inspect

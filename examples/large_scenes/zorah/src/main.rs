@@ -299,6 +299,15 @@ struct Args {
     #[argh(switch)]
     no_auto_exposure: bool,
 
+    /// share of a real-time SkyLight capture that is the sun- and sky-lit
+    /// scene rather than sky, 0-1 (default 0.7; 0 leaves only the sky)
+    #[argh(option, default = "0.7")]
+    sky_capture_scene: f32,
+
+    /// share of that captured scene in direct sun, 0-1 (default 0.4)
+    #[argh(option, default = "0.4")]
+    sky_capture_sunlit: f32,
+
     /// comma-separated runtime data layers to start active, e.g.
     /// DL_Lighting_Night,DL_Lighting_Candles (overrides the level's authored
     /// initial states; digit keys toggle layers while running)
@@ -392,6 +401,7 @@ struct RuntimeOptions {
     ue_editor_camera: bool,
     exposure_ev100: Option<f32>,
     auto_exposure: bool,
+    sky_capture: SkyCaptureEstimate,
 }
 
 #[derive(Resource)]
@@ -2234,6 +2244,10 @@ fn main() {
             ue_editor_camera: args.ue_editor_camera,
             exposure_ev100: args.exposure_ev100,
             auto_exposure: !args.no_auto_exposure,
+            sky_capture: SkyCaptureEstimate {
+                scene_fraction: args.sky_capture_scene,
+                sunlit_fraction: args.sky_capture_sunlit,
+            },
         })
         .insert_resource(converted_world)
         .insert_resource(data_layers)
@@ -2589,10 +2603,11 @@ fn spawn_exported_lights(
     spot_proxy_mesh: &Handle<Mesh>,
     materials: &mut Assets<StandardMaterial>,
     ambient_light: &mut GlobalAmbientLight,
+    sky_capture: SkyCaptureEstimate,
 ) -> Vec<PendingRaytracingInstance> {
     let has_atmosphere = has_sky_atmosphere(converted, data_layers);
     let captured_sky = has_atmosphere
-        .then(|| captured_sky_light(converted, data_layers))
+        .then(|| captured_sky_light(converted, data_layers, sky_capture))
         .flatten();
     let mut raytracing_instances = Vec::new();
     let mut point_count = 0usize;
@@ -3157,11 +3172,37 @@ fn clear_sky_diffuse_fraction(sun_elevation: f32) -> f32 {
     0.008 + 0.155 * ops::sin(sun_elevation).max(0.0).sqrt()
 }
 
+/// What a real-time-capture SkyLight sees besides the sky. Zorah's captures sit
+/// inside the courtyards a couple of metres up, so most of the cubemap is the
+/// scene's own sun- and sky-lit stone, and UE applies that warm average as
+/// ambient everywhere. `scene_fraction` is the share of the capture that is
+/// scene rather than sky; `sunlit_fraction` the share of that scene in direct
+/// sun. Both are estimates of a capture the runtime never renders.
+#[derive(Clone, Copy)]
+struct SkyCaptureEstimate {
+    scene_fraction: f32,
+    sunlit_fraction: f32,
+}
+
+impl Default for SkyCaptureEstimate {
+    fn default() -> Self {
+        Self {
+            scene_fraction: 0.7,
+            sunlit_fraction: 0.4,
+        }
+    }
+}
+
+/// Linear albedo of the pale limestone the captures mostly see (sRGB about
+/// (0.72, 0.65, 0.55), read off the baked wall and floor textures).
+const CAPTURED_SCENE_ALBEDO: Vec3 = Vec3::new(0.48, 0.38, 0.26);
+
 fn captured_sky_light(
     converted: &ConvertedWorld,
     data_layers: &DataLayers,
+    capture: SkyCaptureEstimate,
 ) -> Option<CapturedSkyLight> {
-    let mut sun: Option<(f32, f32)> = None;
+    let mut sun: Option<(f32, f32, Vec3)> = None;
     for actor in &converted.actors {
         if actor.hidden || !data_layers.is_actor_active(actor) {
             continue;
@@ -3179,12 +3220,17 @@ fn captured_sky_light(
             let transform = ue_world_to_bevy(actor_matrix * ue_matrix(&light.transform));
             // A directional light shines down its -Z; the sun sits the other way.
             let elevation = ops::asin((-transform.forward().y).clamp(-1.0, 1.0));
-            if sun.is_none_or(|(illuminance, _)| light.intensity > illuminance) {
-                sun = Some((light.intensity, elevation));
+            if sun.is_none_or(|(illuminance, _, _)| light.intensity > illuminance) {
+                let color = light_color(light);
+                let color = Vec3::new(color.red, color.green, color.blue);
+                // `light_color` is a tint at unit peak; normalise its luminance
+                // so the illuminance stays the authored lux.
+                let color = color / color.dot(REC709_LUMINANCE).max(1e-6);
+                sun = Some((light.intensity, elevation, color));
             }
         }
     }
-    let (sun_illuminance, sun_elevation) = sun?;
+    let (sun_illuminance, sun_elevation, sun_color) = sun?;
     let sky_luminance_scale = active_sky_atmosphere_actor(converted, data_layers)
         .and_then(|actor| actor.atmosphere.as_ref())
         .and_then(|atmosphere| {
@@ -3196,11 +3242,28 @@ fn captured_sky_light(
         .map(|factor| factor.max(Vec3::ZERO).element_sum() / 3.0)
         .filter(|value| value.is_finite())
         .unwrap_or(1.0);
-    let illuminance =
+    let sky_illuminance =
         sun_illuminance * clear_sky_diffuse_fraction(sun_elevation) * sky_luminance_scale;
     let sky = blackbody_srgb(CLEAR_SKY_TEMPERATURE).to_linear();
-    let tint = Vec3::new(sky.red, sky.green, sky.blue);
-    let tint = tint / tint.dot(REC709_LUMINANCE).max(1e-6);
+    let sky_tint = Vec3::new(sky.red, sky.green, sky.blue);
+    let sky_tint = sky_tint / sky_tint.dot(REC709_LUMINANCE).max(1e-6);
+    let sky_flux = sky_tint * sky_illuminance;
+
+    // The scene half of the capture: stone lit by the sun over part of it and
+    // by the sky everywhere, seen as an average radiance `rho * E / pi`, and
+    // restated as the illuminance a uniform hemisphere of that radiance
+    // delivers (`pi * L`), which is what `SolariEnvironmentLight` takes.
+    let scene_fraction = capture.scene_fraction.clamp(0.0, 1.0);
+    let sunlit_fraction = capture.sunlit_fraction.clamp(0.0, 1.0);
+    let scene_flux = CAPTURED_SCENE_ALBEDO
+        * (sun_color * (sun_illuminance * sunlit_fraction) + sky_flux)
+        * scene_fraction;
+    let flux = sky_flux * (1.0 - scene_fraction) + scene_flux;
+    let illuminance = flux.dot(REC709_LUMINANCE);
+    if illuminance.is_nan() || illuminance <= 0.0 {
+        return None;
+    }
+    let tint = flux / illuminance;
     Some(CapturedSkyLight {
         illuminance,
         tint: LinearRgba::rgb(tint.x, tint.y, tint.z),
@@ -3728,6 +3791,7 @@ fn setup(
         &spot_proxy_mesh,
         &mut materials,
         &mut ambient_light,
+        options.sky_capture,
     );
     if options.candle_lights {
         raytracing_light_instances.extend(spawn_candle_flames(
@@ -5695,6 +5759,58 @@ mod tests {
         // A sun on the horizon still leaves the residual skylight.
         assert!((clear_sky_diffuse_fraction(0.0) - 0.008).abs() < 1e-6);
         assert!((clear_sky_diffuse_fraction(-0.5) - 0.008).abs() < 1e-6);
+    }
+
+    fn test_sun_actor(lux: f32) -> ActorRecord {
+        let mut actor = test_layer_actor("sun", &[]);
+        // Pitched up 45 degrees about UE's Y axis so the sun sits above the horizon.
+        actor.lights = vec![serde_json::from_value(serde_json::json!({
+            "name": "LightComponent0",
+            "type": "directional",
+            "transform": {
+                "translation": {"x": 0.0, "y": 0.0, "z": 0.0},
+                "rotation": {"x": 0.0, "y": 0.3826834, "z": 0.0, "w": 0.9238795},
+                "scale": {"x": 1.0, "y": 1.0, "z": 1.0}
+            },
+            "intensity": lux,
+            "intensity_units": "Lux",
+            "color": {"r": 255, "g": 255, "b": 255, "a": 255}
+        }))
+        .unwrap()];
+        actor
+    }
+
+    #[test]
+    fn sky_capture_blends_the_sky_with_the_lit_scene() {
+        let converted = ConvertedWorld {
+            level: "Restir_Level".into(),
+            actors: vec![test_sun_actor(25_000.0)],
+            data_layers: vec![],
+            post_process: None,
+            geometry: HashMap::new(),
+            materials: HashMap::new(),
+            textures: HashMap::new(),
+        };
+        let layers = DataLayers::from_manifest(&[], &converted.actors, None);
+        let sky_only = captured_sky_light(
+            &converted,
+            &layers,
+            SkyCaptureEstimate {
+                scene_fraction: 0.0,
+                sunlit_fraction: 0.0,
+            },
+        )
+        .unwrap();
+        let blended = captured_sky_light(&converted, &layers, SkyCaptureEstimate::default()).unwrap();
+        // The sky alone is blue; the captured stone pulls the average warm and
+        // brighter, and both tints stay at unit luminance.
+        assert!(sky_only.tint.blue > sky_only.tint.red);
+        assert!(blended.tint.red > sky_only.tint.red);
+        assert!(blended.illuminance > sky_only.illuminance);
+        for tint in [sky_only.tint, blended.tint] {
+            let luminance = Vec3::new(tint.red, tint.green, tint.blue).dot(REC709_LUMINANCE);
+            assert!((luminance - 1.0).abs() < 1e-4, "{luminance}");
+        }
     }
 
     #[test]
