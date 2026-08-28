@@ -29,6 +29,7 @@ use bevy::{
     math::{ops, primitives::Measured2d, Affine2},
     pbr::experimental::meshlet::{MeshletMesh, MeshletMesh3d, MeshletPlugin},
     pbr::{AtmosphereSettings, DefaultOpaqueRendererMethod, MeshMaterial3d},
+    post_process::auto_exposure::{AutoExposure, AutoExposurePlugin},
     post_process::bloom::{Bloom, BloomScatterModel},
     prelude::*,
     render::{
@@ -293,6 +294,11 @@ struct Args {
     #[argh(option)]
     exposure_ev100: Option<f32>,
 
+    /// meter a fixed exposure from the post-process volume's EV100 range instead
+    /// of running its histogram auto-exposure
+    #[argh(switch)]
+    no_auto_exposure: bool,
+
     /// comma-separated runtime data layers to start active, e.g.
     /// DL_Lighting_Night,DL_Lighting_Candles (overrides the level's authored
     /// initial states; digit keys toggle layers while running)
@@ -385,6 +391,7 @@ struct RuntimeOptions {
     camera_target: Option<Vec3>,
     ue_editor_camera: bool,
     exposure_ev100: Option<f32>,
+    auto_exposure: bool,
 }
 
 #[derive(Resource)]
@@ -2226,6 +2233,7 @@ fn main() {
             camera_target,
             ue_editor_camera: args.ue_editor_camera,
             exposure_ev100: args.exposure_ev100,
+            auto_exposure: !args.no_auto_exposure,
         })
         .insert_resource(converted_world)
         .insert_resource(data_layers)
@@ -2252,6 +2260,7 @@ fn main() {
             },
             FreeCameraPlugin,
             ZorahBundlePlugin,
+            AutoExposurePlugin,
         ));
     // Solari builds a BLAS for every compatible extracted `Mesh` asset, not for
     // entities carrying `RaytracingMesh3d`. Omitting its plugins is the only way
@@ -3473,11 +3482,75 @@ fn resolved_exposure_ev100(
     // UE exposure compensation is additive brightness in stops. Bevy's
     // physical exposure runs in the opposite direction: lowering EV100 makes
     // the result brighter.
-    let compensation = post_process
+    let compensation = ue_auto_exposure_bias(post_process);
+    (metered_ev100 - compensation).clamp(-16.0, 32.0)
+}
+
+/// `r.DefaultFeature.AutoExposure.Bias`, the compensation a volume inherits
+/// when it does not override `AutoExposureBias`. The project's ini leaves the
+/// CVar at the engine default.
+const UE_DEFAULT_AUTO_EXPOSURE_BIAS: f32 = 1.0;
+/// `AutoExposureMinBrightness` / `AutoExposureMaxBrightness` defaults under
+/// `r.DefaultFeature.AutoExposure.ExtendDefaultLuminanceRange`, which the
+/// project enables: an open range, in EV100.
+const UE_DEFAULT_AUTO_EXPOSURE_MIN_EV100: f32 = -10.0;
+const UE_DEFAULT_AUTO_EXPOSURE_MAX_EV100: f32 = 20.0;
+
+fn ue_auto_exposure_bias(post_process: &PostProcessRecord) -> f32 {
+    post_process
         .auto_exposure_bias
         .filter(|value| value.is_finite())
-        .unwrap_or(0.0);
-    (metered_ev100 - compensation).clamp(-16.0, 32.0)
+        .unwrap_or(UE_DEFAULT_AUTO_EXPOSURE_BIAS)
+}
+
+/// The histogram auto-exposure a volume asks for, in Bevy's terms, or `None`
+/// where a fixed exposure is the faithful reading: an explicit override, no
+/// volume, or an authored non-histogram method.
+///
+/// UE's `AEM_Histogram` defaults match Bevy's: the 10%-90% band of the
+/// histogram, 3 EV/s brightening, 1 EV/s darkening. Both meter the scene to
+/// unit exposed luminance and add the compensation, so UE's bias maps to
+/// Bevy's `metering_bias` with the sign flipped: positive UE bias brightens,
+/// positive metering bias makes the meter read brighter and darkens. UE clamps
+/// the metered EV100 to the volume's range before adding the bias, so the
+/// correction range is that clamp restated around `base_ev100`, shifted by the
+/// bias; ThroneRoom's 8..8 pins it and GreenHouse's 4..5 leaves one stop.
+fn histogram_auto_exposure(
+    exposure_override: Option<f32>,
+    post_process: Option<&PostProcessRecord>,
+    base_ev100: f32,
+) -> Option<AutoExposure> {
+    if exposure_override.is_some_and(f32::is_finite) {
+        return None;
+    }
+    let post_process = post_process?;
+    if post_process
+        ._auto_exposure_method
+        .as_deref()
+        .is_some_and(|method| !ue_enum_value(method).eq_ignore_ascii_case("AEM_Histogram"))
+    {
+        return None;
+    }
+    let bias = ue_auto_exposure_bias(post_process);
+    let min_ev100 = post_process
+        .auto_exposure_min_ev100
+        .filter(|value| value.is_finite())
+        .unwrap_or(UE_DEFAULT_AUTO_EXPOSURE_MIN_EV100);
+    let max_ev100 = post_process
+        .auto_exposure_max_ev100
+        .filter(|value| value.is_finite())
+        .unwrap_or(UE_DEFAULT_AUTO_EXPOSURE_MAX_EV100)
+        .max(min_ev100);
+    // A correction of +c brightens by c stops, i.e. an effective EV100 of
+    // `base - c`; metered EV100 in [min, max] is therefore c in
+    // [base - max, base - min], and the bias rides on top of the metered value.
+    let correction_min = base_ev100 - max_ev100 + bias;
+    let correction_max = base_ev100 - min_ev100 + bias;
+    Some(AutoExposure {
+        metering_bias: -bias,
+        correction_range: correction_min..=correction_max,
+        ..default()
+    })
 }
 
 fn resolved_bloom(post_process: Option<&PostProcessRecord>) -> Bloom {
@@ -3789,6 +3862,31 @@ fn setup(
         },
         Transform::from_translation(camera_position).looking_at(camera_target, Vec3::Y),
     ));
+    // The fixed `Exposure` above stays as the base the traced radiance is
+    // packed against; the histogram adds its correction in the tonemapping
+    // pass, so Solari's light-tile precision is unaffected by adaptation.
+    let auto_exposure = options
+        .auto_exposure
+        .then(|| {
+            histogram_auto_exposure(
+                options.exposure_ev100,
+                converted.post_process.as_ref(),
+                exposure_ev100,
+            )
+        })
+        .flatten();
+    let exposure_mode = match &auto_exposure {
+        Some(auto) => format!(
+            "histogram (metering bias {:+.2} EV, correction {:+.2}..{:+.2} EV)",
+            auto.metering_bias,
+            auto.correction_range.start(),
+            auto.correction_range.end()
+        ),
+        None => "fixed".to_string(),
+    };
+    if let Some(auto_exposure) = auto_exposure {
+        camera.insert(auto_exposure);
+    }
     if has_atmosphere {
         camera.insert((
             AtmosphereSettings {
@@ -3807,13 +3905,14 @@ fn setup(
         ));
     }
     info!(
-        "queued Zorah level={} partitions={} skipped_components_without_converted_geometry={} camera_position={} camera_target={} exposure_ev100={}",
+        "queued Zorah level={} partitions={} skipped_components_without_converted_geometry={} camera_position={} camera_target={} exposure_ev100={} exposure_mode={}",
         converted.level,
         queued_partitions,
         skipped_components,
         camera_position,
         camera_target,
         exposure_ev100,
+        exposure_mode,
     );
 }
 
@@ -5596,6 +5695,43 @@ mod tests {
         // A sun on the horizon still leaves the residual skylight.
         assert!((clear_sky_diffuse_fraction(0.0) - 0.008).abs() < 1e-6);
         assert!((clear_sky_diffuse_fraction(-0.5) - 0.008).abs() < 1e-6);
+    }
+
+    #[test]
+    fn histogram_auto_exposure_follows_the_volume() {
+        let restir = PostProcessRecord {
+            _auto_exposure_method: Some("AEM_Histogram".into()),
+            auto_exposure_bias: Some(-2.5),
+            ..legacy_zorah_post_process("Restir_Level").unwrap()
+        };
+        let base = resolved_exposure_ev100(None, Some(&restir));
+        let auto = histogram_auto_exposure(None, Some(&restir), base).expect("Restir meters");
+        assert!((auto.metering_bias - 2.5).abs() < 1e-6);
+        // UE's open -10..20 EV100 range restated around the base exposure.
+        assert!((auto.correction_range.start() - (base - 20.0 - 2.5)).abs() < 1e-5);
+        assert!((auto.correction_range.end() - (base + 10.0 - 2.5)).abs() < 1e-5);
+        // An explicit override is a fixed exposure.
+        assert!(histogram_auto_exposure(Some(11.0), Some(&restir), 11.0).is_none());
+        // ThroneRoom's 8..8 pins the correction at zero: effectively fixed.
+        let throne = legacy_zorah_post_process("ThroneRoom_Level").unwrap();
+        let base = resolved_exposure_ev100(None, Some(&throne));
+        let auto = histogram_auto_exposure(None, Some(&throne), base).unwrap();
+        assert!(auto.correction_range.start().abs() < 1e-5);
+        assert!(auto.correction_range.end().abs() < 1e-5);
+        // GreenHouse's 4..5 leaves half a stop either side of its midpoint.
+        let greenhouse = legacy_zorah_post_process("GreenHouse_Level").unwrap();
+        let base = resolved_exposure_ev100(None, Some(&greenhouse));
+        let auto = histogram_auto_exposure(None, Some(&greenhouse), base).unwrap();
+        assert!((auto.correction_range.start() + 0.5).abs() < 1e-5);
+        assert!((auto.correction_range.end() - 0.5).abs() < 1e-5);
+        // Manual metering is not a histogram.
+        let manual = PostProcessRecord {
+            _auto_exposure_method: Some("EAutoExposureMethod::AEM_Manual".into()),
+            ..restir
+        };
+        assert!(histogram_auto_exposure(None, Some(&manual), 0.0).is_none());
+        // No volume at all means nothing asked for metering.
+        assert!(histogram_auto_exposure(None, None, 0.0).is_none());
     }
 
     #[test]

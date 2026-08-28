@@ -264,6 +264,15 @@ debugging with Bevy-space coordinates:
 cargo +1.96.1 run --release -p zorah -- --camera-position 0,4.5,48 --camera-target 0,4,40
 ```
 
+Exposure follows the level's post-process volume: every level authors
+histogram auto-exposure, so the camera meters the frame the way UE does
+(10%-90% band, 3 EV/s up, 1 EV/s down, the volume's compensation) and clamps
+the metered EV100 to the volume's range. Restir leaves UE's open range with a
+-2.5 EV compensation, so its shade brightness tracks what is on screen;
+GreenHouse allows 4-5 EV100 and ThroneRoom pins 8-8, which is a fixed exposure
+in effect. `--no-auto-exposure` meters every level fixed at the middle of its
+range, and `--exposure-ev100` fixes any level by hand.
+
 `--ue-editor-camera` starts instead from the perspective viewport each map was
 last saved with in the UE editor (the download places no PlayerStart or camera
 actor, so this is the nearest thing to an authored view; `ZorahConvert inspect
