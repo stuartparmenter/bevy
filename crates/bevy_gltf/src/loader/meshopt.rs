@@ -59,7 +59,7 @@ enum Filter {
 /// length and stride is checked against the buffers before any call crosses
 /// into C, so a malformed file fails with [`GltfError::MeshoptCompression`]
 /// instead of reading or writing out of bounds.
-pub(super) fn decode_buffer_views(
+pub fn decode_buffer_views(
     document: &gltf::Document,
     buffer_data: &mut [Vec<u8>],
 ) -> Result<(), GltfError> {

@@ -167,6 +167,16 @@ pub use {assets::*, label::GltfAssetLabel, loader::*, material::GltfMaterial};
 /// Re-exports for GLTF
 pub use gltf;
 
+/// `EXT_meshopt_compression` decoding for code that reads a glTF with the
+/// [`gltf`] crate directly instead of through the asset server. The loader
+/// registers every image of a file as a dependency, so a bake that wants
+/// only the geometry of a texture-heavy file has to bypass it and decode the
+/// buffer views itself.
+#[cfg(feature = "meshopt")]
+pub mod meshopt {
+    pub use crate::loader::meshopt::decode_buffer_views;
+}
+
 // Has to store an Arc<Mutex<...>> as there is no other way to mutate fields of asset loaders.
 /// Stores default [`ImageSamplerDescriptor`] in main world.
 #[derive(Resource)]

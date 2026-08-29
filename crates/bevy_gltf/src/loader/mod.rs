@@ -1,7 +1,7 @@
 pub mod extensions;
 pub mod gltf_ext;
 #[cfg(feature = "meshopt")]
-mod meshopt;
+pub(crate) mod meshopt;
 
 use alloc::sync::Arc;
 use async_lock::RwLock;
