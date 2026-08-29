@@ -473,6 +473,9 @@ struct PendingPartition {
     blas_achieved_error: f32,
     raytracing_only: bool,
     cast_shadow: bool,
+    /// A translucent overlay on a coplanar surface; rasterized with a depth
+    /// bias and never traced.
+    mesh_decal: bool,
     layers: DataLayerMember,
     spawned: bool,
 }
@@ -1097,6 +1100,8 @@ struct EffectiveMaterial {
     shading_model: SourceShadingModel,
     two_sided: bool,
     opacity_mask_clip_value: f32,
+    /// Short name of the master `Material` at the root of the instance chain.
+    master: Option<String>,
 }
 
 impl Default for EffectiveMaterial {
@@ -1110,9 +1115,27 @@ impl Default for EffectiveMaterial {
             shading_model: SourceShadingModel::DefaultLit,
             two_sided: false,
             opacity_mask_clip_value: 0.3333,
+            master: None,
         }
     }
 }
+
+/// UE renders the `M_LS_Decal_*` family as mesh decals: translucent dirt
+/// overlays modelled as thin meshes lying on the surface they stain. Drawn
+/// opaque they hide the surface and z-fight with it (ThroneRoom's door arches
+/// flickered), so they keep their blend and a depth bias whatever the alpha
+/// policy, and stay out of the traced scene the way DBuffer decals do.
+fn is_mesh_decal(material: &EffectiveMaterial) -> bool {
+    material.blend_mode == SourceBlendMode::Translucent
+        && material
+            .master
+            .as_deref()
+            .is_some_and(|master| master.starts_with("M_LS_Decal"))
+}
+
+/// Depth units (`wgpu::DepthBiasState::constant`) that lift a mesh decal off
+/// the coplanar surface it lies on.
+const MESH_DECAL_DEPTH_BIAS: f32 = 8.0;
 
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 enum SourceBlendMode {
@@ -1499,6 +1522,9 @@ fn resolve_effective_material(
             resolve_effective_material(parent, records, cache, stack)
         });
     merge_effective(&mut result, record);
+    if record.parent.is_none() {
+        result.master = Some(object.rsplit('.').next().unwrap_or(object).to_string());
+    }
     stack.pop();
     cache.insert(object.to_string(), result.clone());
     result
@@ -1916,8 +1942,14 @@ fn build_material_handles(
     albedo_emission: Option<f32>,
     missing_materials: MissingMaterialStyle,
     failed_texture_bundles: &HashSet<String>,
-) -> (HashMap<String, Handle<StandardMaterial>>, PanningWater) {
+) -> (
+    HashMap<String, Handle<StandardMaterial>>,
+    PanningWater,
+    HashSet<AssetId<StandardMaterial>>,
+) {
     let mut result = HashMap::new();
+    let mut mesh_decals = HashSet::new();
+    let mut mesh_decal_materials = 0usize;
     // A stand-in for a missing material would be the one coloured surface in a
     // clay frame, so it takes the clay grey too.
     let missing_materials = if clay {
@@ -2085,6 +2117,8 @@ fn build_material_handles(
         // keeps Bevy's 0.5 default, which is 4% reflectance.
         let reflectance = finite_scalar(&effective, SPECULAR_NAMES, 0.5);
         let render_properties = source_material_render_properties(&effective);
+        let mesh_decal = is_mesh_decal(&effective);
+        mesh_decal_materials += usize::from(mesh_decal);
         match effective.blend_mode {
             SourceBlendMode::Opaque => {}
             SourceBlendMode::Masked => masked_materials += 1,
@@ -2130,11 +2164,14 @@ fn build_material_handles(
             // masked partitions spawn as `Mesh3d` rather than meshlets. Solari
             // still traces every instance opaque, so the two renderers disagree
             // about the cutout until it gains alpha-tested ray queries.
-            alpha_mode: if unlit_textures {
+            alpha_mode: if mesh_decal {
+                AlphaMode::Blend
+            } else if unlit_textures {
                 AlphaMode::Opaque
             } else {
                 runtime_alpha_mode(&effective, preserve_alpha)
             },
+            depth_bias: if mesh_decal { MESH_DECAL_DEPTH_BIAS } else { 0.0 },
             double_sided: render_properties.double_sided,
             cull_mode: render_properties.cull_mode,
             ..default()
@@ -2144,6 +2181,9 @@ fn build_material_handles(
             emit_base_color(&mut material, scale);
         }
         let handle = materials.add(material);
+        if mesh_decal {
+            mesh_decals.insert(handle.id());
+        }
         if let Some(wave) = wave.filter(|wave| wave.speed != 0.0) {
             panning_water.0.push((handle.clone(), wave.speed));
         }
@@ -2177,7 +2217,13 @@ fn build_material_handles(
             );
         }
     }
-    (result, panning_water)
+    if mesh_decal_materials != 0 {
+        info!(
+            mesh_decal_materials,
+            "mesh decals blend over their surfaces with a depth bias and stay out of the traced scene"
+        );
+    }
+    (result, panning_water, mesh_decals)
 }
 
 /// The water materials whose wave normal pans, with its authored speed.
@@ -3724,7 +3770,7 @@ fn setup(
     }
     let default_material = materials.add(default_material);
     let occluder_material = materials.add(occluder_material());
-    let (material_handles, panning_water) = build_material_handles(
+    let (material_handles, panning_water, mesh_decals) = build_material_handles(
         &converted,
         &asset_server,
         &mut materials,
@@ -3779,6 +3825,7 @@ fn setup(
                             is_lightblocker_mesh(mesh_name),
                             component.cast_shadow,
                             &layers,
+                            &mesh_decals,
                         );
                     }
                 }
@@ -3796,6 +3843,7 @@ fn setup(
                     is_lightblocker_mesh(mesh_name),
                     component.cast_shadow,
                     &layers,
+                    &mesh_decals,
                 ),
             }
         }
@@ -4040,6 +4088,7 @@ fn queue_partitions(
     raytracing_only: bool,
     cast_shadow: bool,
     layers: &DataLayerMember,
+    mesh_decals: &HashSet<AssetId<StandardMaterial>>,
 ) {
     let transform = ue_world_to_bevy(ue_world);
     *world_min = world_min.min(transform.translation);
@@ -4074,6 +4123,7 @@ fn queue_partitions(
             blas_achieved_error: partition.blas_achieved_error,
             raytracing_only,
             cast_shadow,
+            mesh_decal: mesh_decals.contains(&material.id()),
             layers: layers.clone(),
             spawned: false,
         });
@@ -4396,16 +4446,20 @@ fn spawn_partitions_when_ready(
             // GreenHouse pond, whose own shadow otherwise darkens the bed it
             // reflects. Only raster reads this: Solari shadows come from the
             // TLAS, which carries every instance unconditionally.
-            if !partition.cast_shadow {
+            if !partition.cast_shadow || partition.mesh_decal {
                 entity.insert(NotShadowCaster);
             }
             entity.id()
         };
-        raytracing_instances.push(PendingRaytracingInstance {
-            entity,
-            mesh: assets.mesh.clone(),
-            geometry_error: partition.blas_achieved_error,
-        });
+        // A mesh decal is a film on a surface the TLAS already holds; tracing
+        // it too would only give rays a coplanar second hit.
+        if !partition.mesh_decal {
+            raytracing_instances.push(PendingRaytracingInstance {
+                entity,
+                mesh: assets.mesh.clone(),
+                geometry_error: partition.blas_achieved_error,
+            });
+        }
         if is_new_geometry {
             prepared_meshes.insert(assets.mesh.id());
             geometry_vertices = geometry_vertices.saturating_add(partition_vertices);
@@ -5288,6 +5342,7 @@ mod tests {
                 raytracing_only,
                 true,
                 &DataLayerMember(vec![]),
+                &HashSet::new(),
             );
             pending.remove(0).material
         };
@@ -5833,6 +5888,42 @@ mod tests {
             let luminance = Vec3::new(tint.red, tint.green, tint.blue).dot(REC709_LUMINANCE);
             assert!((luminance - 1.0).abs() < 1e-4, "{luminance}");
         }
+    }
+
+    #[test]
+    fn mesh_decals_are_the_translucent_decal_masters_only() {
+        let records: HashMap<String, MaterialRecord> = [
+            (
+                "/Game/M_LS_Decal_FullPass_VT.M_LS_Decal_FullPass_VT",
+                r#"{"object": "/Game/M_LS_Decal_FullPass_VT.M_LS_Decal_FullPass_VT", "parent": null}"#,
+            ),
+            (
+                "/Game/MI_Dirt.MI_Dirt",
+                r#"{"object": "/Game/MI_Dirt.MI_Dirt", "parent": "/Game/M_LS_Decal_FullPass_VT.M_LS_Decal_FullPass_VT", "base_overrides": {"BlendMode": "BLEND_Translucent"}}"#,
+            ),
+            (
+                "/Game/MI_Opaque.MI_Opaque",
+                r#"{"object": "/Game/MI_Opaque.MI_Opaque", "parent": "/Game/M_LS_Decal_FullPass_VT.M_LS_Decal_FullPass_VT"}"#,
+            ),
+            (
+                "/Game/MI_Water.MI_Water",
+                r#"{"object": "/Game/MI_Water.MI_Water", "parent": null, "base_overrides": {"BlendMode": "BLEND_Translucent"}}"#,
+            ),
+        ]
+        .into_iter()
+        .map(|(object, json)| (object.to_string(), serde_json::from_str(json).unwrap()))
+        .collect();
+        let mut cache = HashMap::new();
+        let mut resolve = |object: &str| {
+            resolve_effective_material(object, &records, &mut cache, &mut Vec::new())
+        };
+        let dirt = resolve("/Game/MI_Dirt.MI_Dirt");
+        assert_eq!(dirt.master.as_deref(), Some("M_LS_Decal_FullPass_VT"));
+        assert!(is_mesh_decal(&dirt));
+        // The same master drawn opaque is not an overlay.
+        assert!(!is_mesh_decal(&resolve("/Game/MI_Opaque.MI_Opaque")));
+        // Translucency alone is not a decal either.
+        assert!(!is_mesh_decal(&resolve("/Game/MI_Water.MI_Water")));
     }
 
     #[test]
