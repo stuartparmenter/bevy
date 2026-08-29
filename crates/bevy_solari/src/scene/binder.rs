@@ -163,11 +163,7 @@ pub fn prepare_raytracing_scene_bindings(
             perceptual_roughness: material.perceptual_roughness,
             emissive: material.emissive.to_vec3(),
             metallic: material.metallic,
-            flags: if material.flip_normal_map_y {
-                MATERIAL_FLAGS_FLIP_NORMAL_MAP_Y
-            } else {
-                0
-            },
+            flags: material_flags(material, &texture_assets),
             reflectance: material.reflectance,
             _padding_a: 0,
             _padding_b: 0,
@@ -569,9 +565,9 @@ struct GpuSceneParameters {
 #[cfg(test)]
 mod tests {
     use super::{
-        emissive_light_source_budget, emissive_triangle_chunks, GpuDirectionalLight, GpuLightSource,
-        RaytracingSceneBindings, MATERIAL_FLAGS_FLIP_NORMAL_MAP_Y, MAX_LIGHT_SOURCES,
-        MIN_SUN_DISK_ANGULAR_SIZE,
+        emissive_light_source_budget, emissive_triangle_chunks, GpuDirectionalLight,
+        GpuLightSource, RaytracingSceneBindings, MATERIAL_FLAGS_FLIP_NORMAL_MAP_Y,
+        MATERIAL_FLAGS_METALLIC_ROUGHNESS_RG, MAX_LIGHT_SOURCES, MIN_SUN_DISK_ANGULAR_SIZE,
     };
     use crate::scene::SolariEnvironmentLight;
     use bevy_color::LinearRgba;
@@ -684,6 +680,9 @@ mod tests {
         assert!(shader.contains(&format!(
             "const MATERIAL_FLAGS_FLIP_NORMAL_MAP_Y = {MATERIAL_FLAGS_FLIP_NORMAL_MAP_Y}u;"
         )));
+        assert!(shader.contains(&format!(
+            "const MATERIAL_FLAGS_METALLIC_ROUGHNESS_RG = {MATERIAL_FLAGS_METALLIC_ROUGHNESS_RG}u;"
+        )));
     }
 
     #[test]
@@ -739,6 +738,35 @@ struct GpuMaterial {
 
 /// Matches `MATERIAL_FLAGS_FLIP_NORMAL_MAP_Y` in `raytracing_scene_bindings.wgsl`.
 const MATERIAL_FLAGS_FLIP_NORMAL_MAP_Y: u32 = 1;
+/// Matches `MATERIAL_FLAGS_METALLIC_ROUGHNESS_RG` in `raytracing_scene_bindings.wgsl`.
+const MATERIAL_FLAGS_METALLIC_ROUGHNESS_RG: u32 = 2;
+
+/// Same decisions as `StandardMaterial::as_bind_group_shader_type`, so a surface shades the same
+/// whether a raster pass or a ray resolves it. The caller skips any material whose textures are
+/// not all `GpuImage`s yet, so a missing metallic-roughness texture here means there is none.
+fn material_flags(material: &StandardMaterial, texture_assets: &RenderAssets<GpuImage>) -> u32 {
+    let mut flags = 0;
+    if material.flip_normal_map_y {
+        flags |= MATERIAL_FLAGS_FLIP_NORMAL_MAP_Y;
+    }
+    let metallic_roughness_format = material
+        .metallic_roughness_texture
+        .as_ref()
+        .and_then(|handle| texture_assets.get(handle.id()))
+        .map(|texture| texture.texture_descriptor.format);
+    if matches!(
+        metallic_roughness_format,
+        Some(
+            TextureFormat::Rg8Unorm
+                | TextureFormat::Rg16Unorm
+                | TextureFormat::Bc5RgUnorm
+                | TextureFormat::EacRg11Unorm
+        )
+    ) {
+        flags |= MATERIAL_FLAGS_METALLIC_ROUGHNESS_RG;
+    }
+    flags
+}
 
 #[derive(ShaderType)]
 struct GpuLightSource {

@@ -86,6 +86,9 @@ const TEXTURE_MAP_NONE = 0xFFFFFFFFu;
 // Mirrors the behavior of StandardMaterialFlags::FLIP_NORMAL_MAP_Y in the raster path. The bit
 // value is Solari's own; binder.rs sets it from StandardMaterial::flip_normal_map_y.
 const MATERIAL_FLAGS_FLIP_NORMAL_MAP_Y = 1u;
+// Mirrors StandardMaterialFlags::METALLIC_ROUGHNESS_RG: the metallic-roughness texture is a
+// two-channel image packed R = roughness, G = metallic. binder.rs sets it from the format.
+const MATERIAL_FLAGS_METALLIC_ROUGHNESS_RG = 2u;
 
 const MIRROR_ROUGHNESS_THRESHOLD = 0.001f;
 
@@ -287,8 +290,13 @@ fn resolve_material(material: Material, uv: vec2<f32>) -> ResolvedMaterial {
     m.metallic = material.metallic;
     if material.metallic_roughness_texture_id != TEXTURE_MAP_NONE {
         let metallic_roughness = sample_texture(material.metallic_roughness_texture_id, uv);
-        m.perceptual_roughness *= metallic_roughness.g;
-        m.metallic *= metallic_roughness.b;
+        if (material.flags & MATERIAL_FLAGS_METALLIC_ROUGHNESS_RG) != 0u {
+            m.perceptual_roughness *= metallic_roughness.r;
+            m.metallic *= metallic_roughness.g;
+        } else {
+            m.perceptual_roughness *= metallic_roughness.g;
+            m.metallic *= metallic_roughness.b;
+        }
     }
 
     m.roughness = m.perceptual_roughness * m.perceptual_roughness;

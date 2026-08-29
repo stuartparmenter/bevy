@@ -424,9 +424,15 @@ pbr_input.material.uv_transform = uv_transform;
                     bias.mip_bias,
 #endif  // MESHLET_MESH_MATERIAL_PASS
                 );
-            // Sampling from GLTF standard channels for now
-            metallic *= metallic_roughness.b;
-            perceptual_roughness *= metallic_roughness.g;
+            if ((flags & pbr_types::STANDARD_MATERIAL_FLAGS_METALLIC_ROUGHNESS_RG_BIT) != 0u) {
+                // Two-channel formats pack roughness in R and metallic in G.
+                perceptual_roughness *= metallic_roughness.r;
+                metallic *= metallic_roughness.g;
+            } else {
+                // glTF layout: roughness in G, metallic in B.
+                perceptual_roughness *= metallic_roughness.g;
+                metallic *= metallic_roughness.b;
+            }
         }
 #endif
         pbr_input.material.metallic = metallic;
