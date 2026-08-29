@@ -2453,19 +2453,31 @@ fn preload_texture_bundles(
     if let Some((root, handle)) = preload.active.as_ref() {
         match asset_server.load_state(handle) {
             LoadState::Loaded => {
+                // `root` is the bundle's asset path (`bundles/<name>.zorah_bundle`);
+                // its images are the labeled paths under it.
                 let root = root.clone();
-                let prefix = format!("bundles/{root}.zorah_bundle#");
+                let prefix = format!("{root}#");
                 let pinned: Vec<Handle<Image>> = preload
                     .outputs
                     .iter()
                     .filter(|output| output.starts_with(&prefix))
                     .map(|output| asset_server.load::<Image>(output.clone()))
                     .collect();
-                info!(
-                    bundle = %root,
-                    pinned = pinned.len(),
-                    "loaded Zorah texture bundle; keeping the level's images and dropping the rest"
-                );
+                if pinned.is_empty() {
+                    // A root is only selected because some image in it is
+                    // referenced, so an empty pin set means the paths do not
+                    // line up and every material would reload the bundle.
+                    error!(
+                        bundle = %root,
+                        "no referenced image matched this texture bundle; check bundle_root against the texture outputs"
+                    );
+                } else {
+                    info!(
+                        bundle = %root,
+                        pinned = pinned.len(),
+                        "loaded Zorah texture bundle; keeping the level's images and dropping the rest"
+                    );
+                }
                 preload.pinned.extend(pinned);
                 preload.loaded += 1;
                 // Dropping the root here frees every image the level does not
@@ -5968,6 +5980,17 @@ mod tests {
         assert!(!is_mesh_decal("/Game/MI_Opaque.MI_Opaque", &resolve("/Game/MI_Opaque.MI_Opaque")));
         // Translucency alone is not a decal either.
         assert!(!is_mesh_decal("/Game/MI_Water.MI_Water", &resolve("/Game/MI_Water.MI_Water")));
+    }
+
+    #[test]
+    fn texture_bundle_roots_prefix_their_labeled_images() {
+        // The preload pins images by matching their labeled paths against the
+        // root the roots list carries, so the two spellings have to agree.
+        let output = "bundles/zorah-025.zorah_bundle#t/0045";
+        let root = bundle_root(output).unwrap();
+        assert_eq!(root, "bundles/zorah-025.zorah_bundle");
+        assert!(output.starts_with(&format!("{root}#")));
+        assert!(bundle_root("bundles/zorah-025.zorah_bundle").is_none());
     }
 
     #[test]
