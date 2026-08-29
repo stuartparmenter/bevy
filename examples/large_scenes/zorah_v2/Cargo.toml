@@ -1,0 +1,62 @@
+[package]
+name = "zorah_v2"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+argh = "0.1.12"
+bevy = { path = "../../..", default-features = false, features = [
+  "bevy_gltf",
+  # The export's every geometry buffer view is EXT_meshopt_compression.
+  "gltf_meshopt",
+  "bevy_solari",
+  "meshlet",
+  # The bake builds meshlet meshes at runtime, in the app's own process.
+  "meshlet_processor",
+  "bevy_camera_controller",
+  "free_camera",
+  "default_app",
+  "multi_threaded",
+  "ktx2",
+  "zstd_rust",
+  "png",
+  "std",
+  "3d_bevy_render",
+] }
+# Reads the root glTF and the per-mesh wrappers directly: the asset server's
+# glTF loader would pull every 4k texture in as a dependency.
+gltf = { version = "1.4", default-features = false, features = [
+  "extensions",
+  "names",
+  "utils",
+  "KHR_materials_transmission",
+  "KHR_materials_ior",
+  "KHR_materials_unlit",
+  "KHR_materials_specular",
+  "KHR_texture_transform",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+# Sizes the default bake worker count from the machine's total memory.
+sysinfo = "0.39"
+futures-io = "0.3"
+
+[features]
+# DLSS Ray Reconstruction denoises the Solari path. On by default (needs an
+# NVIDIA RTX GPU and the DLSS SDK to build); drop it with
+# `--no-default-features` to run Solari without DLSS.
+default = ["dlss"]
+dlss = ["bevy/dlss"]
+
+[target.'cfg(windows)'.dependencies]
+bevy = { path = "../../..", default-features = false, features = ["bevy_winit"] }
+
+[[bin]]
+name = "zorah_v2"
+path = "src/main.rs"
+
+[lints]
+workspace = true
