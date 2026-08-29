@@ -26,11 +26,17 @@ use super::{CompressedImageFormats, Image, TextureChannelLayout, TextureError, T
 ///
 /// Returns an error if the provided buffer contained invalid data, decompression fails, or transcoding
 /// of unsupported data formats fails.
+///
+/// `max_dimension` drops leading mip levels as described on
+/// [`ImageLoaderSettings::max_dimension`](crate::ImageLoaderSettings::max_dimension).
+/// Dropped levels are never decompressed or transcoded, so a supercompressed file
+/// costs only the levels that are kept.
 #[cfg(feature = "ktx2")]
 pub fn ktx2_buffer_to_image(
     buffer: &[u8],
     supported_compressed_formats: CompressedImageFormats,
     is_srgb: bool,
+    max_dimension: Option<u32>,
 ) -> Result<Image, TextureError> {
     let ktx2 = ktx2::Reader::new(buffer)
         .map_err(|err| TextureError::InvalidData(format!("Failed to parse ktx2 file: {err:?}")))?;
@@ -48,14 +54,39 @@ pub fn ktx2_buffer_to_image(
     let face_count = face_count.max(1);
     let depth = depth.max(1);
 
+    // Identify the format. Transcoding waits until the kept levels are in hand,
+    // but the block size is needed now to place the cut.
+    let texture_format = ktx2_get_texture_format(&ktx2, is_srgb);
+
+    // Every dimension halves per level and each level holds all of its layers,
+    // faces and slices, so cutting the chain is just starting at a later level with
+    // the header's extent shifted to match. Everything below then sees the kept
+    // chain as if the file had been authored at that size, except the texture's
+    // kind: a 2D strip whose height collapses to 1 or a 3D texture whose depth does
+    // must stay 2D or 3D, or the cap would change the binding type a shader sees.
+    let skip = crate::image::mip_levels_to_skip(
+        width,
+        height,
+        level_count,
+        ktx2_block_dimensions(&texture_format),
+        max_dimension,
+    );
+    let is_3d = depth > 1;
+    let is_2d = height > 1;
+    let width = (width >> skip).max(1);
+    let height = (height >> skip).max(1);
+    let depth = (depth >> skip).max(1);
+    let level_count = level_count - skip;
+    let kept_levels = || ktx2.levels().enumerate().skip(skip as usize);
+
     // Handle supercompression
     let mut levels: Vec<Vec<u8>>;
     if let Some(supercompression_scheme) = supercompression_scheme {
         match supercompression_scheme {
             #[cfg(feature = "flate2")]
             SupercompressionScheme::ZLIB => {
-                levels = Vec::with_capacity(ktx2.levels().len());
-                for (level_index, level) in ktx2.levels().enumerate() {
+                levels = Vec::with_capacity(level_count as usize);
+                for (level_index, level) in kept_levels() {
                     let mut decoder = flate2::bufread::ZlibDecoder::new(level.data);
                     let mut decompressed = Vec::new();
                     decoder.read_to_end(&mut decompressed).map_err(|err| {
@@ -68,8 +99,8 @@ pub fn ktx2_buffer_to_image(
             }
             #[cfg(all(feature = "zstd_rust", not(feature = "zstd_c")))]
             SupercompressionScheme::Zstandard => {
-                levels = Vec::with_capacity(ktx2.levels().len());
-                for (level_index, level) in ktx2.levels().enumerate() {
+                levels = Vec::with_capacity(level_count as usize);
+                for (level_index, level) in kept_levels() {
                     let mut cursor = std::io::Cursor::new(level.data);
                     let mut decoder = ruzstd::decoding::StreamingDecoder::new(&mut cursor)
                         .map_err(|err| TextureError::SuperDecompressionError(err.to_string()))?;
@@ -84,8 +115,8 @@ pub fn ktx2_buffer_to_image(
             }
             #[cfg(feature = "zstd_c")]
             SupercompressionScheme::Zstandard => {
-                levels = Vec::with_capacity(ktx2.levels().len());
-                for (level_index, level) in ktx2.levels().enumerate() {
+                levels = Vec::with_capacity(level_count as usize);
+                for (level_index, level) in kept_levels() {
                     levels.push(zstd::decode_all(level.data).map_err(|err| {
                         TextureError::SuperDecompressionError(format!(
                             "Failed to decompress {supercompression_scheme:?} for mip {level_index}: {err:?}",
@@ -100,11 +131,12 @@ pub fn ktx2_buffer_to_image(
             }
         }
     } else {
-        levels = ktx2.levels().map(|level| level.data.to_vec()).collect();
+        levels = kept_levels()
+            .map(|(_, level)| level.data.to_vec())
+            .collect();
     }
 
-    // Identify the format
-    let texture_format = ktx2_get_texture_format(&ktx2, is_srgb).or_else(|error| match error {
+    let texture_format = texture_format.or_else(|error| match error {
         // Transcode if needed and supported
         TextureError::FormatRequiresTranscodingError(transcode_format) => {
             let mut transcoded = vec![Vec::default(); levels.len()];
@@ -276,9 +308,9 @@ pub fn ktx2_buffer_to_image(
         .max(1),
     };
     image.texture_descriptor.mip_level_count = level_count;
-    image.texture_descriptor.dimension = if depth > 1 {
+    image.texture_descriptor.dimension = if is_3d {
         TextureDimension::D3
-    } else if image.is_compressed() || height > 1 {
+    } else if image.is_compressed() || is_2d {
         TextureDimension::D2
     } else {
         TextureDimension::D1
@@ -292,7 +324,7 @@ pub fn ktx2_buffer_to_image(
         });
     } else if layer_count > 1 {
         dimension = Some(TextureViewDimension::D2Array);
-    } else if depth > 1 {
+    } else if is_3d {
         dimension = Some(TextureViewDimension::D3);
     }
     if dimension.is_some() {
@@ -302,6 +334,20 @@ pub fn ktx2_buffer_to_image(
         });
     }
     Ok(image)
+}
+
+/// Texel block size of the format the file resolves to, so a cut mip chain never
+/// starts at a level smaller than one block. UASTC and ETC1S transcode to 4x4-block
+/// targets or to uncompressed formats, and 4x4 alignment is safe for both.
+#[cfg(feature = "ktx2")]
+fn ktx2_block_dimensions(texture_format: &Result<TextureFormat, TextureError>) -> (u32, u32) {
+    match texture_format {
+        Ok(format) => format.block_dimensions(),
+        Err(TextureError::FormatRequiresTranscodingError(
+            TranscodeFormat::Uastc(_) | TranscodeFormat::Etc1s,
+        )) => (4, 4),
+        Err(_) => (1, 1),
+    }
 }
 
 /// Determines an appropriate wgpu-compatible format based on compressed format support, and a
@@ -1582,7 +1628,268 @@ mod tests {
             0x4a,
         ];
         let supported_compressed_formats = CompressedImageFormats::empty();
-        let result = ktx2_buffer_to_image(&buffer, supported_compressed_formats, true);
+        let result = ktx2_buffer_to_image(&buffer, supported_compressed_formats, true, None);
         assert!(result.is_ok());
+    }
+
+    /// Builds a valid single-layer 2D KTX2 file with a full mip chain: `levels[i]` is
+    /// the stored bytes of level `i` (already supercompressed when `supercompression`
+    /// is not 0) paired with its uncompressed length. Levels are laid out in the file
+    /// smallest-first as the spec requires, so the index is what a reader must trust.
+    fn mip_chain_ktx2(
+        vk_format: u32,
+        width: u32,
+        height: u32,
+        bytes_per_texel: u8,
+        supercompression: u32,
+        levels: &[(Vec<u8>, u64)],
+    ) -> Vec<u8> {
+        let level_count = levels.len() as u32;
+        let dfd_offset = 80 + 24 * level_count;
+        let data_start = dfd_offset + 28;
+        let mut offsets = vec![0u64; levels.len()];
+        let mut cursor = data_start as u64;
+        for (index, (stored, _)) in levels.iter().enumerate().rev() {
+            offsets[index] = cursor;
+            cursor += stored.len().div_ceil(4) as u64 * 4;
+        }
+
+        let mut buffer = Vec::new();
+        buffer.extend_from_slice(&[
+            0xab, 0x4b, 0x54, 0x58, 0x20, 0x32, 0x30, 0xbb, 0x0d, 0x0a, 0x1a, 0x0a,
+        ]);
+        buffer.extend_from_slice(&vk_format.to_le_bytes());
+        buffer.extend_from_slice(&1u32.to_le_bytes()); // typeSize
+        buffer.extend_from_slice(&width.to_le_bytes());
+        buffer.extend_from_slice(&height.to_le_bytes());
+        buffer.extend_from_slice(&0u32.to_le_bytes()); // pixelDepth
+        buffer.extend_from_slice(&0u32.to_le_bytes()); // layerCount
+        buffer.extend_from_slice(&1u32.to_le_bytes()); // faceCount
+        buffer.extend_from_slice(&level_count.to_le_bytes());
+        buffer.extend_from_slice(&supercompression.to_le_bytes());
+        buffer.extend_from_slice(&dfd_offset.to_le_bytes());
+        buffer.extend_from_slice(&28u32.to_le_bytes()); // dfdByteLength
+        buffer.extend_from_slice(&0u32.to_le_bytes()); // kvdByteOffset
+        buffer.extend_from_slice(&0u32.to_le_bytes()); // kvdByteLength
+        buffer.extend_from_slice(&0u64.to_le_bytes()); // sgdByteOffset
+        buffer.extend_from_slice(&0u64.to_le_bytes()); // sgdByteLength
+        for (index, (stored, uncompressed_length)) in levels.iter().enumerate() {
+            buffer.extend_from_slice(&offsets[index].to_le_bytes());
+            buffer.extend_from_slice(&(stored.len() as u64).to_le_bytes());
+            buffer.extend_from_slice(&uncompressed_length.to_le_bytes());
+        }
+        assert_eq!(buffer.len() as u32, dfd_offset);
+        buffer.extend_from_slice(&28u32.to_le_bytes()); // dfdTotalSize
+        buffer.extend_from_slice(&0u32.to_le_bytes()); // vendorId | descriptorType (basic)
+        buffer.extend_from_slice(&2u16.to_le_bytes()); // versionNumber
+        buffer.extend_from_slice(&24u16.to_le_bytes()); // descriptorBlockSize (no samples)
+        buffer.push(1); // colorModel = RGBSDA
+        buffer.push(1); // colorPrimaries = BT709
+        buffer.push(1); // transferFunction = Linear
+        buffer.push(0); // flags
+        buffer.extend_from_slice(&[0, 0, 0, 0]); // texelBlockDimension (stored as n - 1)
+        buffer.extend_from_slice(&[bytes_per_texel, 0, 0, 0, 0, 0, 0, 0]); // bytesPlanes
+        assert_eq!(buffer.len() as u32, data_start);
+        for (index, (stored, _)) in levels.iter().enumerate().rev() {
+            assert_eq!(buffer.len() as u64, offsets[index]);
+            buffer.extend_from_slice(stored);
+            buffer.resize(buffer.len().div_ceil(4) * 4, 0);
+        }
+        buffer
+    }
+
+    /// An 8x8 R8 chain of four levels, each level filled with its own index.
+    fn r8_8x8_levels() -> Vec<(Vec<u8>, u64)> {
+        (0..4u32)
+            .map(|level| {
+                let texels = ((8 >> level) * (8 >> level)) as usize;
+                (vec![level as u8; texels], texels as u64)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn max_dimension_drops_leading_levels() {
+        let buffer = mip_chain_ktx2(/* R8_UNORM */ 9, 8, 8, 1, 0, &r8_8x8_levels());
+        let image =
+            ktx2_buffer_to_image(&buffer, CompressedImageFormats::empty(), false, Some(2)).unwrap();
+        let size = image.texture_descriptor.size;
+        assert_eq!(
+            (size.width, size.height, size.depth_or_array_layers),
+            (2, 2, 1)
+        );
+        assert_eq!(image.texture_descriptor.mip_level_count, 2);
+        // Level 2 (2x2) followed by level 3 (1x1), tightly packed.
+        assert_eq!(image.data.as_deref(), Some(&[2, 2, 2, 2, 3][..]));
+        assert_eq!(
+            image.texture_descriptor.format,
+            wgpu_types::TextureFormat::R8Unorm
+        );
+
+        // The transcoding path (R8 requested as sRGB) sees the same cut chain.
+        let image =
+            ktx2_buffer_to_image(&buffer, CompressedImageFormats::empty(), true, Some(2)).unwrap();
+        assert_eq!(image.texture_descriptor.size.width, 2);
+        assert_eq!(image.texture_descriptor.mip_level_count, 2);
+        assert_eq!(image.data.as_ref().map(Vec::len), Some(5));
+    }
+
+    #[test]
+    fn max_dimension_never_drops_the_smallest_level() {
+        let buffer = mip_chain_ktx2(/* R8_UNORM */ 9, 8, 8, 1, 0, &r8_8x8_levels());
+        for max_dimension in [0, 1] {
+            let image = ktx2_buffer_to_image(
+                &buffer,
+                CompressedImageFormats::empty(),
+                false,
+                Some(max_dimension),
+            )
+            .unwrap();
+            assert_eq!(image.texture_descriptor.size.width, 1);
+            assert_eq!(image.texture_descriptor.mip_level_count, 1);
+            assert_eq!(image.data.as_deref(), Some(&[3][..]));
+        }
+
+        // A bound the image already meets, or no bound at all, changes nothing.
+        for max_dimension in [Some(8), Some(4096), None] {
+            let image = ktx2_buffer_to_image(
+                &buffer,
+                CompressedImageFormats::empty(),
+                false,
+                max_dimension,
+            )
+            .unwrap();
+            assert_eq!(image.texture_descriptor.size.width, 8);
+            assert_eq!(image.texture_descriptor.mip_level_count, 4);
+            assert_eq!(image.data.as_ref().map(Vec::len), Some(64 + 16 + 4 + 1));
+        }
+
+        // A single-level image is untouched by any bound.
+        let single = mip_chain_ktx2(9, 8, 8, 1, 0, &r8_8x8_levels()[..1]);
+        let image =
+            ktx2_buffer_to_image(&single, CompressedImageFormats::empty(), false, Some(1)).unwrap();
+        assert_eq!(image.texture_descriptor.size.width, 8);
+        assert_eq!(image.texture_descriptor.mip_level_count, 1);
+    }
+
+    #[test]
+    fn max_dimension_keeps_block_compressed_base_block_aligned() {
+        // BC7 sRGB, 16x16 with a full chain down to 1x1; the two smallest levels are
+        // padded to one 4x4 block each. A bound of 1 cannot start the chain at 1x1
+        // because wgpu requires a block-aligned base, so it lands on 4x4.
+        let block = [0u8; 16];
+        let levels: Vec<(Vec<u8>, u64)> = [16u32, 8, 4, 2, 1]
+            .into_iter()
+            .map(|extent| {
+                let blocks = extent.div_ceil(4).pow(2) as usize;
+                (block.repeat(blocks), (blocks * 16) as u64)
+            })
+            .collect();
+        let buffer = mip_chain_ktx2(/* BC7_SRGB_BLOCK */ 146, 16, 16, 16, 0, &levels);
+        let image =
+            ktx2_buffer_to_image(&buffer, CompressedImageFormats::BC, true, Some(1)).unwrap();
+        assert_eq!(
+            image.texture_descriptor.format,
+            wgpu_types::TextureFormat::Bc7RgbaUnormSrgb
+        );
+        assert_eq!(image.texture_descriptor.size.width, 4);
+        assert_eq!(image.texture_descriptor.size.height, 4);
+        assert_eq!(image.texture_descriptor.mip_level_count, 3);
+        assert_eq!(image.data.as_ref().map(Vec::len), Some(3 * 16));
+    }
+
+    #[test]
+    fn max_dimension_keeps_texture_kind_when_an_axis_collapses() {
+        // R8 8x2 strip: the chain is 8x2, 4x1, 2x1, 1x1. A bound of 2 starts at 2x1,
+        // which must still bind as a 2D texture like the uncut file does.
+        let levels: Vec<(Vec<u8>, u64)> = [(8u32, 2u32), (4, 1), (2, 1), (1, 1)]
+            .into_iter()
+            .map(|(w, h)| (vec![7u8; (w * h) as usize], u64::from(w * h)))
+            .collect();
+        let buffer = mip_chain_ktx2(9, 8, 2, 1, 0, &levels);
+        let image =
+            ktx2_buffer_to_image(&buffer, CompressedImageFormats::empty(), false, Some(2)).unwrap();
+        assert_eq!(image.texture_descriptor.size.width, 2);
+        assert_eq!(image.texture_descriptor.size.height, 1);
+        assert_eq!(image.texture_descriptor.mip_level_count, 2);
+        assert_eq!(
+            image.texture_descriptor.dimension,
+            wgpu_types::TextureDimension::D2
+        );
+        assert!(image.texture_view_descriptor.is_none());
+        assert_eq!(image.data.as_ref().map(Vec::len), Some(2 + 1));
+    }
+
+    /// A zstd frame carrying `payload` as one raw (stored) block: a single-segment
+    /// frame header with a one-byte content size, then a last-block header of type
+    /// `Raw`. Any zstd decoder accepts it, and it needs no encoder to build.
+    #[cfg(feature = "zstd")]
+    fn zstd_stored_frame(payload: &[u8]) -> Vec<u8> {
+        assert!(payload.len() < 256);
+        let mut frame = vec![0x28, 0xb5, 0x2f, 0xfd, 0x20, payload.len() as u8];
+        let block_header = 1 | ((payload.len() as u32) << 3);
+        frame.extend_from_slice(&block_header.to_le_bytes()[..3]);
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn max_dimension_skips_decompressing_dropped_zstd_levels() {
+        // The two dropped levels hold bytes that are not a zstd frame at all; the load
+        // can only succeed if they are never handed to the decoder.
+        let levels: Vec<(Vec<u8>, u64)> = r8_8x8_levels()
+            .into_iter()
+            .enumerate()
+            .map(|(index, (texels, length))| {
+                if index < 2 {
+                    (vec![0xff; 7], length)
+                } else {
+                    (zstd_stored_frame(&texels), length)
+                }
+            })
+            .collect();
+        let buffer = mip_chain_ktx2(
+            /* R8_UNORM */ 9, 8, 8, 1, /* Zstandard */ 2, &levels,
+        );
+
+        assert!(
+            ktx2_buffer_to_image(&buffer, CompressedImageFormats::empty(), false, None).is_err(),
+            "a full load must hit the corrupt levels",
+        );
+        let image =
+            ktx2_buffer_to_image(&buffer, CompressedImageFormats::empty(), false, Some(2)).unwrap();
+        assert_eq!(image.texture_descriptor.size.width, 2);
+        assert_eq!(image.texture_descriptor.size.height, 2);
+        assert_eq!(image.texture_descriptor.mip_level_count, 2);
+        assert_eq!(image.data.as_deref(), Some(&[2, 2, 2, 2, 3][..]));
+    }
+
+    /// Loads a real 4096x4096, 13-level, BC7 sRGB, zstd-supercompressed KTX2 from
+    /// NVIDIA's Zorah texture set at 1024. Run with the file's path in
+    /// `BEVY_KTX2_MAX_DIMENSION_FIXTURE`; ignored because the fixture is not in tree.
+    #[cfg(feature = "zstd")]
+    #[test]
+    #[ignore = "needs a 4096x4096 BC7 zstd KTX2 fixture named by BEVY_KTX2_MAX_DIMENSION_FIXTURE"]
+    fn zorah_base_color_loads_at_1024() {
+        let path = std::env::var("BEVY_KTX2_MAX_DIMENSION_FIXTURE")
+            .expect("BEVY_KTX2_MAX_DIMENSION_FIXTURE must name the fixture");
+        let buffer = std::fs::read(&path).unwrap();
+        let image =
+            ktx2_buffer_to_image(&buffer, CompressedImageFormats::BC, true, Some(1024)).unwrap();
+        assert_eq!(
+            image.texture_descriptor.format,
+            wgpu_types::TextureFormat::Bc7RgbaUnormSrgb
+        );
+        let size = image.texture_descriptor.size;
+        assert_eq!(
+            (size.width, size.height, size.depth_or_array_layers),
+            (1024, 1024, 1)
+        );
+        assert_eq!(image.texture_descriptor.mip_level_count, 11);
+        let expected_len: usize = (0..11u32)
+            .map(|level| (1024u32 >> level).max(1).div_ceil(4).pow(2) as usize * 16)
+            .sum();
+        assert_eq!(image.data.as_ref().map(Vec::len), Some(expected_len));
     }
 }

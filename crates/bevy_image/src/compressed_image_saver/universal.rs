@@ -68,6 +68,7 @@ impl CompressedImageSaverUniversal {
             asset_usage: image.asset_usage,
             texture_format: None,
             array_layout: None,
+            max_dimension: None,
         })
     }
 }
