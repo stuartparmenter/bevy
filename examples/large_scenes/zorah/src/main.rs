@@ -497,7 +497,16 @@ struct TextureBundlePreload {
     roots: Vec<String>,
     cursor: usize,
     active: Option<(String, Handle<ZorahBundle>)>,
-    loaded: Vec<Handle<ZorahBundle>>,
+    loaded: usize,
+    /// The images the level will bind, as their labeled asset paths.
+    outputs: BTreeSet<String>,
+    /// Strong handles to those images, taken as each bundle finishes loading
+    /// so the bundle root - and with it every image the level does not use -
+    /// can be dropped before the next bundle is read. Peak GPU residency is
+    /// then the level's own textures plus one bundle, not the whole texture
+    /// set, which at 20 GB left ThroneRoom short of memory for its
+    /// render targets.
+    pinned: Vec<Handle<Image>>,
 }
 
 /// Texture bundle roots that failed to load. Materials referencing images inside
@@ -1804,7 +1813,21 @@ fn diagnostic_material_reason(
 }
 
 fn selected_texture_bundle_roots(converted: &ConvertedWorld) -> Vec<String> {
-    let mut roots = HashSet::new();
+    let mut roots: Vec<String> = selected_texture_outputs(converted)
+        .iter()
+        .filter_map(|output| bundle_root(output))
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    roots.sort();
+    roots
+}
+
+/// Every packed image the level's materials and decals will bind, as the asset
+/// paths they load: `bundles/<root>#<label>`.
+fn selected_texture_outputs(converted: &ConvertedWorld) -> BTreeSet<String> {
+    let mut outputs = BTreeSet::new();
     let mut effective_cache = HashMap::new();
     for object in used_material_objects(converted)
         .into_keys()
@@ -1826,18 +1849,12 @@ fn selected_texture_bundle_roots(converted: &ConvertedWorld) -> Vec<String> {
             references.push(select_texture(&effective, EMISSIVE_TEXTURE_NAMES));
         }
         for reference in references.into_iter().flatten() {
-            if let Some(root) = converted
-                .textures
-                .get(reference)
-                .and_then(|texture| bundle_root(&texture.output))
-            {
-                roots.insert(root.to_string());
+            if let Some(texture) = converted.textures.get(reference) {
+                outputs.insert(texture.output.clone());
             }
         }
     }
-    let mut roots: Vec<_> = roots.into_iter().collect();
-    roots.sort();
-    roots
+    outputs
 }
 
 fn extend_material_uv_bounds(
@@ -2421,7 +2438,9 @@ fn begin_texture_bundle_preload(
         roots,
         cursor: 0,
         active: None,
-        loaded: Vec::new(),
+        loaded: 0,
+        outputs: selected_texture_outputs(&converted),
+        pinned: Vec::new(),
     });
 }
 
@@ -2434,9 +2453,23 @@ fn preload_texture_bundles(
     if let Some((root, handle)) = preload.active.as_ref() {
         match asset_server.load_state(handle) {
             LoadState::Loaded => {
-                info!(bundle = %root, "loaded Zorah texture bundle");
-                let handle = handle.clone();
-                preload.loaded.push(handle);
+                let root = root.clone();
+                let prefix = format!("bundles/{root}.zorah_bundle#");
+                let pinned: Vec<Handle<Image>> = preload
+                    .outputs
+                    .iter()
+                    .filter(|output| output.starts_with(&prefix))
+                    .map(|output| asset_server.load::<Image>(output.clone()))
+                    .collect();
+                info!(
+                    bundle = %root,
+                    pinned = pinned.len(),
+                    "loaded Zorah texture bundle; keeping the level's images and dropping the rest"
+                );
+                preload.pinned.extend(pinned);
+                preload.loaded += 1;
+                // Dropping the root here frees every image the level does not
+                // reference before the next bundle is read.
                 preload.active = None;
             }
             LoadState::Failed(_) => {
@@ -2455,12 +2488,13 @@ fn preload_texture_bundles(
     }
     if failed.0.is_empty() {
         info!(
-            loaded = preload.loaded.len(),
+            loaded = preload.loaded,
+            pinned = preload.pinned.len(),
             "all Zorah texture bundles loaded; creating scene materials"
         );
     } else {
         error!(
-            loaded = preload.loaded.len(),
+            loaded = preload.loaded,
             failed = failed.0.len(),
             "some Zorah texture bundles failed; creating their materials untextured"
         );
@@ -2485,8 +2519,9 @@ fn release_unused_texture_bundles(
     // releases the rest of the preloaded texture set.
     if let Some(preload) = preload {
         info!(
-            bundles = preload.loaded.len(),
-            "releasing texture bundle roots; unreferenced images will be freed"
+            bundles = preload.loaded,
+            pinned = preload.pinned.len(),
+            "releasing the preload pins; the materials now hold every image they need"
         );
         commands.remove_resource::<TextureBundlePreload>();
         return;
