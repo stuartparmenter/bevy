@@ -73,10 +73,12 @@ so a 32 M-triangle mesh spreads over every worker instead of holding one for
 an hour. At most `workers + 1` decoded meshes are held at once; the largest
 here (32 M triangles across 12 primitives) is about 1 GiB decoded, and a part
 under construction adds its meshlet build on top. The default worker count
-is `clamp((total RAM - 8 GiB) / 2 GiB, 1, max(4, cores / 2))`: each part's
-simplification already fans out over bevy's compute pool, which the app
-sizes to a thread per core for exactly this (the default pool would cap it
-at four threads and every worker would queue behind them). Lower
+is `clamp((total RAM - 8 GiB) / 2 GiB, 1, cores)`. Each part's
+simplification fans out over bevy's compute pool, which the app sizes to a
+thread per core for exactly this (the default pool would cap it at four
+threads and every worker would queue behind them), but a part's clustering,
+partitioning and BVH build run on its worker, so fewer workers than cores
+leaves cores idle: sixteen on thirty-two measured seventeen busy. Lower
 `--bake-workers` if the machine runs short of memory. The `mimalloc`
 feature (on by default) replaces the system allocator, which on Windows
 serialises the bake's threads. Progress is logged every 5 s; a mesh whose

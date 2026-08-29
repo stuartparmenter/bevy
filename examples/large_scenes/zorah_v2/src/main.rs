@@ -86,7 +86,7 @@ struct Args {
     #[argh(option)]
     cache_dir: Option<PathBuf>,
 
-    /// threads building bake parts (or measuring them under --report-lod-budget) at once; each part's simplification also fans out over the compute pool, so the default is clamp((RAM - 8 GiB) / 2 GiB, 1, max(4, cores / 2))
+    /// threads building bake parts (or measuring them under --report-lod-budget) at once; default clamp((RAM - 8 GiB) / 2 GiB, 1, cores)
     #[argh(option)]
     bake_workers: Option<usize>,
 
@@ -309,18 +309,19 @@ fn single_gltf_in(dir: &Path) -> Option<PathBuf> {
     found.next().is_none().then_some(first)
 }
 
-/// One worker per 2 GiB beyond an 8 GiB floor for the app and the OS: the
-/// bake holds up to `workers + 1` decoded meshes, and the largest here run
-/// to tens of millions of triangles. Capped at half the cores, because each
-/// worker's meshlet build already fans its simplification out over the
-/// compute pool; more workers than that add memory, not throughput.
+/// One worker per 2 GiB beyond an 8 GiB floor for the app and the OS, up to
+/// one per core: the bake holds up to `workers + 1` decoded meshes, and the
+/// largest here run to tens of millions of triangles. A worker's meshlet
+/// build fans its simplification out over the compute pool, but its
+/// clustering, partitioning and BVH build run on the worker itself, and
+/// sixteen workers on thirty-two cores measured seventeen busy.
 fn default_bake_workers() -> usize {
     let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
     let mut system = sysinfo::System::new();
     system.refresh_memory();
     let total = system.total_memory();
     let spare = total.saturating_sub(8 << 30);
-    ((spare / (2 << 30)) as usize).clamp(1, (cores / 2).max(4).min(cores))
+    ((spare / (2 << 30)) as usize).clamp(1, cores)
 }
 
 /// The pools an `App` builds for the bake to run under. `MeshletMesh::from_mesh`
