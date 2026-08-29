@@ -1125,12 +1125,17 @@ impl Default for EffectiveMaterial {
 /// opaque they hide the surface and z-fight with it (ThroneRoom's door arches
 /// flickered), so they keep their blend and a depth bias whatever the alpha
 /// policy, and stay out of the traced scene the way DBuffer decals do.
-fn is_mesh_decal(material: &EffectiveMaterial) -> bool {
+fn is_mesh_decal(object: &str, material: &EffectiveMaterial) -> bool {
+    // The bake flattens instance chains, so the runtime manifest carries no
+    // master; every decal instance lives under `/MaterialLibrary/Decals/`, which
+    // survives the flattening, and the source-level chain still answers when
+    // the manifest is unbaked.
     material.blend_mode == SourceBlendMode::Translucent
-        && material
-            .master
-            .as_deref()
-            .is_some_and(|master| master.starts_with("M_LS_Decal"))
+        && (object.contains("/MaterialLibrary/Decals/")
+            || material
+                .master
+                .as_deref()
+                .is_some_and(|master| master.starts_with("M_LS_Decal")))
 }
 
 /// Depth units (`wgpu::DepthBiasState::constant`) that lift a mesh decal off
@@ -2117,7 +2122,7 @@ fn build_material_handles(
         // keeps Bevy's 0.5 default, which is 4% reflectance.
         let reflectance = finite_scalar(&effective, SPECULAR_NAMES, 0.5);
         let render_properties = source_material_render_properties(&effective);
-        let mesh_decal = is_mesh_decal(&effective);
+        let mesh_decal = is_mesh_decal(&object, &effective);
         mesh_decal_materials += usize::from(mesh_decal);
         match effective.blend_mode {
             SourceBlendMode::Opaque => {}
@@ -5919,11 +5924,15 @@ mod tests {
         };
         let dirt = resolve("/Game/MI_Dirt.MI_Dirt");
         assert_eq!(dirt.master.as_deref(), Some("M_LS_Decal_FullPass_VT"));
-        assert!(is_mesh_decal(&dirt));
+        assert!(is_mesh_decal("/Game/MI_Dirt.MI_Dirt", &dirt));
+        // A baked record loses its chain but keeps its library path.
+        let flat = EffectiveMaterial { blend_mode: SourceBlendMode::Translucent, ..default() };
+        assert!(is_mesh_decal("/Game/MaterialLibrary/Decals/Dirt/MI_X.MI_X", &flat));
+        assert!(!is_mesh_decal("/Game/Assets/MI_X.MI_X", &flat));
         // The same master drawn opaque is not an overlay.
-        assert!(!is_mesh_decal(&resolve("/Game/MI_Opaque.MI_Opaque")));
+        assert!(!is_mesh_decal("/Game/MI_Opaque.MI_Opaque", &resolve("/Game/MI_Opaque.MI_Opaque")));
         // Translucency alone is not a decal either.
-        assert!(!is_mesh_decal(&resolve("/Game/MI_Water.MI_Water")));
+        assert!(!is_mesh_decal("/Game/MI_Water.MI_Water", &resolve("/Game/MI_Water.MI_Water")));
     }
 
     #[test]
