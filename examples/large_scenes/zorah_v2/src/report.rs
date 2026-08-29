@@ -5,8 +5,9 @@
 //! step of the raster ladder and cut at each step of the BLAS ladder, and
 //! only the totals are kept, so the walk holds `--bake-workers` parts in
 //! memory at a time however large the cache is. A cache still being written
-//! is fine: a directory without a manifest, a manifest that does not parse,
-//! or a part that fails to open is counted and skipped.
+//! is fine: a directory without a manifest, a manifest that does not parse
+//! or was written under other bake settings, or a part that fails to open is
+//! counted and skipped.
 
 use std::{
     collections::{BTreeSet, HashMap},
@@ -19,8 +20,8 @@ use std::{
 use bevy::{pbr::experimental::meshlet::MeshletMesh, prelude::*};
 
 use crate::{
-    bake::{MeshJob, MeshManifest, MANIFEST_FILE},
-    lod::{human_bytes, MESHLET_MAX_PAGES, MESHLET_PAGE_BUDGET, MESHLET_PAGE_SIZE},
+    bake::{BakeStamp, MeshJob, MeshManifest},
+    lod::{fits_a_page, human_bytes, MESHLET_MAX_PAGES, MESHLET_PAGE_BUDGET, MESHLET_PAGE_SIZE},
 };
 
 /// Raster bounds in metres; 0 is the full-detail cache as loaded.
@@ -49,6 +50,10 @@ pub struct Totals {
     pub parts: usize,
     pub raster_bytes: Vec<u64>,
     pub raster_triangles: Vec<u64>,
+    /// The largest single part at each rung: what has to fit one page.
+    pub raster_largest: Vec<u64>,
+    /// Parts at each rung that no page can hold.
+    pub raster_oversized: Vec<usize>,
     pub blas_triangles: Vec<u64>,
     pub blas_vertices: Vec<u64>,
 }
@@ -59,6 +64,8 @@ impl Totals {
             parts: 0,
             raster_bytes: vec![0; raster_rungs],
             raster_triangles: vec![0; raster_rungs],
+            raster_largest: vec![0; raster_rungs],
+            raster_oversized: vec![0; raster_rungs],
             blas_triangles: vec![0; blas_rungs],
             blas_vertices: vec![0; blas_rungs],
         }
@@ -71,6 +78,10 @@ impl Totals {
         for (rung, &(bytes, triangles)) in sample.raster.iter().enumerate() {
             self.raster_bytes[rung] += bytes;
             self.raster_triangles[rung] += triangles;
+            self.raster_largest[rung] = self.raster_largest[rung].max(bytes);
+            if !fits_a_page(bytes) {
+                self.raster_oversized[rung] += 1;
+            }
         }
         for (rung, &(triangles, vertices)) in sample.blas.iter().enumerate() {
             self.blas_triangles[rung] += triangles;
@@ -115,9 +126,11 @@ pub fn measure_part(full: &MeshletMesh, raster: &[f32], blas: &[f32]) -> PartSam
 #[derive(Debug, Default)]
 struct WalkCounts {
     manifests: usize,
-    /// Directories without a parseable manifest: still baking, or stale.
+    /// Directories without a complete manifest: still baking, or half
+    /// written.
     incomplete: usize,
-    parts_failed: usize,
+    /// Manifests baked under other settings, which a run would rebake.
+    stale: usize,
     /// Triangles the complete manifests' sources held.
     source_triangles: u64,
     stems: BTreeSet<String>,
@@ -131,16 +144,22 @@ struct Shared {
 }
 
 /// Walks `cache_dir` on `workers` threads and logs the tables. `jobs` is the
-/// bake plan of the root glTF, for the coverage line.
-pub fn run(cache_dir: &Path, jobs: &[MeshJob], workers: usize) {
+/// bake plan of the root glTF, for the coverage line, and `stamp` the
+/// settings a manifest must have been baked under to count.
+pub fn run(cache_dir: &Path, stamp: &BakeStamp, jobs: &[MeshJob], workers: usize) {
     let started = Instant::now();
-    let (counts, work) = collect_work(cache_dir);
+    if !cache_dir.is_dir() {
+        info!("{} does not exist: nothing to measure", cache_dir.display());
+        return;
+    }
+    let (counts, work) = collect_work(cache_dir, stamp);
     info!(
-        "measuring {} parts of {} complete manifests in {} ({} directories skipped) on {} threads",
+        "measuring {} parts of {} complete manifests in {} ({} incomplete and {} stale directories skipped) on {} threads",
         work.len(),
         counts.manifests,
         cache_dir.display(),
         counts.incomplete,
+        counts.stale,
         workers
     );
     let shared = Arc::new(Shared {
@@ -204,7 +223,7 @@ pub fn run(cache_dir: &Path, jobs: &[MeshJob], workers: usize) {
             covered_triangles as f64 * 100.0 / total_triangles as f64
         },
         totals.parts,
-        failed.len() + counts.parts_failed,
+        failed.len(),
         started.elapsed()
     );
     info!(
@@ -220,10 +239,12 @@ pub fn run(cache_dir: &Path, jobs: &[MeshJob], workers: usize) {
     }
 }
 
-/// Every part file of every complete manifest, plus the counts of what was
-/// skipped. A directory is only entered through its manifest, so a mesh still
-/// baking (no manifest yet) is never half-read.
-fn collect_work(cache_dir: &Path) -> (WalkCounts, Vec<PathBuf>) {
+/// Every part file of every manifest a run under `stamp` would reuse, plus
+/// the counts of what was skipped. A directory is only entered through its
+/// manifest, so a mesh still baking (no manifest yet) is never half-read, and
+/// the reuse test is the bake's own, so a manifest from other settings is
+/// not measured as if it were current.
+fn collect_work(cache_dir: &Path, stamp: &BakeStamp) -> (WalkCounts, Vec<PathBuf>) {
     let mut counts = WalkCounts::default();
     let mut work = Vec::new();
     let Ok(entries) = fs::read_dir(cache_dir) else {
@@ -237,25 +258,23 @@ fn collect_work(cache_dir: &Path) -> (WalkCounts, Vec<PathBuf>) {
         .collect::<Vec<_>>();
     dirs.sort();
     for dir in dirs {
-        let manifest = fs::read(dir.join(MANIFEST_FILE))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<MeshManifest>(&bytes).ok());
-        let Some(manifest) = manifest else {
-            counts.incomplete += 1;
+        let Some(manifest) = MeshManifest::reusable(&dir, stamp) else {
+            if MeshManifest::stamped(&dir).is_some_and(|found| found != *stamp) {
+                counts.stale += 1;
+            } else {
+                counts.incomplete += 1;
+            }
             continue;
         };
         counts.manifests += 1;
         counts.source_triangles += manifest.source_triangles;
         counts.stems.insert(manifest.stem.clone());
-        for part in &manifest.parts {
-            let path = dir.join(&part.meshlet_file);
-            if path.is_file() {
-                work.push(path);
-            } else {
-                counts.parts_failed += 1;
-                warn!("{} is missing", path.display());
-            }
-        }
+        work.extend(
+            manifest
+                .parts
+                .iter()
+                .map(|part| dir.join(&part.meshlet_file)),
+        );
     }
     (counts, work)
 }
@@ -293,14 +312,16 @@ fn worker(shared: &Shared) {
 /// One line per raster rung: bytes against the page budget.
 pub fn raster_table(totals: &Totals, source_triangles: u64) -> Vec<String> {
     let mut lines = vec![format!(
-        "raster ladder over {} parts ({source_triangles} source triangles): error -> resident meshlet bytes, triangles across LODs, bytes/triangle, share of the page budget",
-        totals.parts
+        "raster ladder over {} parts ({source_triangles} source triangles): error -> resident meshlet bytes, triangles across LODs, bytes/triangle, share of the page budget (an upper bound: parts pack into {} pages without straddling), largest part, parts over a page",
+        totals.parts,
+        human_bytes(MESHLET_PAGE_SIZE)
     )];
     for (rung, error) in RASTER_LADDER.iter().enumerate() {
         let bytes = totals.raster_bytes[rung];
         let triangles = totals.raster_triangles[rung];
+        let oversized = totals.raster_oversized[rung];
         lines.push(format!(
-            "  --raster-error {error:<6} {:>12} {triangles:>14} tri {:>6.1} B/tri {:>7.1}% of budget{}",
+            "  --raster-error {error:<6} {:>12} {triangles:>14} tri {:>6.1} B/tri {:>7.1}% of budget{} largest {:>10} {oversized:>5} over{}",
             human_bytes(bytes),
             if triangles == 0 {
                 0.0
@@ -312,7 +333,9 @@ pub fn raster_table(totals: &Totals, source_triangles: u64) -> Vec<String> {
                 " (over)"
             } else {
                 ""
-            }
+            },
+            human_bytes(totals.raster_largest[rung]),
+            if oversized > 0 { " (never upload)" } else { "" }
         ));
     }
     lines
@@ -353,6 +376,17 @@ mod tests {
         assert_eq!(totals.parts, 2);
         assert_eq!(totals.raster_bytes, vec![150, 100]);
         assert_eq!(totals.raster_triangles, vec![15, 10]);
+        assert_eq!(totals.raster_largest, vec![100, 60]);
+        assert_eq!(totals.raster_oversized, vec![0, 0]);
+        totals.add(&PartSample {
+            raster: vec![(MESHLET_PAGE_SIZE + 1, 1), (MESHLET_PAGE_SIZE, 1)],
+            blas: vec![(0, 0), (0, 0)],
+        });
+        assert_eq!(
+            totals.raster_largest,
+            vec![MESHLET_PAGE_SIZE + 1, MESHLET_PAGE_SIZE]
+        );
+        assert_eq!(totals.raster_oversized, vec![1, 0]);
         assert_eq!(totals.blas_triangles, vec![5, 3]);
         assert_eq!(totals.blas_vertices, vec![9, 7]);
         assert_eq!(totals.blas_bytes(0), 9 * 32 + 5 * 3 * 4);
@@ -389,6 +423,8 @@ mod tests {
         let raster = raster_table(&totals, 2 * 128 * 64 * 2);
         assert_eq!(raster.len(), RASTER_LADDER.len() + 1);
         assert!(raster[1].contains("--raster-error 0 "));
+        assert!(raster[1].contains("largest"));
+        assert!(!raster[1].contains("never upload"));
         let blas = blas_table(&totals);
         assert_eq!(blas.len(), BLAS_LADDER.len() + 1);
         assert!(blas[1].contains("--raytracing-error 0.02"));

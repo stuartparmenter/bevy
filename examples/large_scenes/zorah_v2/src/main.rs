@@ -330,10 +330,17 @@ fn main() -> ExitCode {
         info!("{}", prepared.summary);
         report::run(
             &prepared.root.cache_dir,
+            &prepared.settings.stamp(),
             &prepared.jobs,
             prepared.settings.workers,
         );
         return ExitCode::SUCCESS;
+    }
+    // Only now, so the report leaves a scene without a cache untouched.
+    if let Err(message) = create_cache_dir(&prepared) {
+        init_plain_logging();
+        error!("{message}");
+        return ExitCode::FAILURE;
     }
     if args.bake_only {
         init_plain_logging();
@@ -346,6 +353,12 @@ fn main() -> ExitCode {
         };
     }
     run_app(&args, prepared)
+}
+
+fn create_cache_dir(prepared: &Prepared) -> Result<(), String> {
+    let cache_dir = &prepared.root.cache_dir;
+    std::fs::create_dir_all(cache_dir)
+        .map_err(|error| format!("creating {}: {error}", cache_dir.display()))
 }
 
 /// The subscriber for the paths that never build an `App`.
@@ -466,8 +479,6 @@ fn prepare(args: &Args) -> Result<Prepared, String> {
         lod.blas_error(),
         started.elapsed()
     );
-    std::fs::create_dir_all(&root.cache_dir)
-        .map_err(|error| format!("creating {}: {error}", root.cache_dir.display()))?;
     Ok(Prepared {
         root,
         settings,

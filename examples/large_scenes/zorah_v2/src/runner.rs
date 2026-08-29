@@ -30,7 +30,7 @@ use bevy::anti_alias::dlss::{
 
 use crate::{
     bake::{BakeEvent, BakeHandle, MeshManifest, PartManifest, MANIFEST_FILE},
-    lod::{human_bytes, PartStats, ZorahPart, MESHLET_PAGE_BUDGET},
+    lod::{fits_a_page, human_bytes, PartStats, ZorahPart, MESHLET_PAGE_BUDGET, MESHLET_PAGE_SIZE},
     materials::MaterialCache,
     scene::SceneInstance,
     setup::ZorahCamera,
@@ -125,6 +125,9 @@ pub struct PendingScene {
     meshlet_bytes: u64,
     /// Triangles across LODs of every distinct pruned part.
     meshlet_triangles: u64,
+    /// Distinct pruned parts larger than a page, which the manager rejects
+    /// however empty its pages are.
+    parts_oversized: usize,
     /// The largest BLAS error any part achieved.
     blas_error_max: f32,
     warmup_frames_remaining: u64,
@@ -150,6 +153,7 @@ impl PendingScene {
             blas_triangles: 0,
             meshlet_bytes: 0,
             meshlet_triangles: 0,
+            parts_oversized: 0,
             blas_error_max: 0.0,
             warmup_frames_remaining: 0,
             warmup_timeout_reported: false,
@@ -247,7 +251,11 @@ pub fn stream_scene(
 /// Logs what the pruned scene asks of the meshlet manager, once every part is
 /// in. Over the budget, the parts that did not fit have already failed to
 /// upload (the manager logs each) and are missing from the raster image;
-/// the fix is a coarser `--raster-error`.
+/// the fix is a coarser `--raster-error`. Under it, the sum is only an upper
+/// bound on fitting: parts pack best-fit into 64 MiB pages and cannot
+/// straddle one, so a total near the budget can still lose its last parts,
+/// and a part over a page (counted and warned about as it loads) never
+/// uploads.
 fn report_residency(pending: &PendingScene) {
     let share = pending.meshlet_bytes as f64 * 100.0 / MESHLET_PAGE_BUDGET as f64;
     if pending.meshlet_bytes > MESHLET_PAGE_BUDGET {
@@ -255,6 +263,14 @@ fn report_residency(pending: &PendingScene) {
             "pruned meshlet data is {} ({share:.0}% of the {} page budget): parts past the budget do not render; raise --raster-error",
             human_bytes(pending.meshlet_bytes),
             human_bytes(MESHLET_PAGE_BUDGET)
+        );
+    } else if pending.parts_oversized > 0 {
+        warn!(
+            "pruned meshlet data is {} ({share:.0}% of the {} page budget), but {} part(s) exceed the {} page and never render; raise --raster-error",
+            human_bytes(pending.meshlet_bytes),
+            human_bytes(MESHLET_PAGE_BUDGET),
+            pending.parts_oversized,
+            human_bytes(MESHLET_PAGE_SIZE)
         );
     } else {
         info!(
@@ -430,6 +446,16 @@ fn settle_loads(
             };
             pending.blas_triangles += part.stats.blas_triangles;
             pending.meshlet_bytes += part.stats.packed_bytes;
+            if !fits_a_page(part.stats.packed_bytes) {
+                pending.parts_oversized += 1;
+                warn!(
+                    "{}/{}: pruned to {}, more than the {} page an upload must fit in; it never renders. Raise --raster-error or lower --partition-triangles and rebake",
+                    loading.manifest.stem,
+                    loading.manifest.parts[part_index].meshlet_file,
+                    human_bytes(part.stats.packed_bytes),
+                    human_bytes(MESHLET_PAGE_SIZE)
+                );
+            }
             pending.meshlet_triangles += part.stats.raster_triangles;
             pending.blas_error_max = pending.blas_error_max.max(part.stats.blas_achieved_error);
             loaded.push(PartAssets {

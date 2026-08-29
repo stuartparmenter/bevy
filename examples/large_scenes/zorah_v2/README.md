@@ -92,7 +92,13 @@ error it achieved. Pruning at load rather than in the bake means one cache
 serves every bound: a new `--raster-error` costs a restart, not a rebake.
 
 Once the scene is in, the run logs the pruned meshlet bytes against the
-8 GiB budget, as a warning when over. Choosing values:
+8 GiB budget, as a warning when over. The budget is an upper bound on what
+fits, not a guarantee: the manager packs each part best-fit into one 64 MiB
+page and a part cannot straddle two, so the slack at the end of every page
+is lost and a total near the budget can still leave its last parts
+unrendered, and a part that prunes to more than a page is rejected however
+empty the pages are (each such part is warned about as it loads, and the
+residency line counts them). Choosing values:
 
 - `--raster-error` (default 4 mm) is the finest detail the raster image
   can show, however close the camera gets. Instancing costs nothing extra,
@@ -113,13 +119,17 @@ Once the scene is in, the run logs the pruned meshlet bytes against the
 the GPU: it decodes every part of every complete manifest on
 `--bake-workers` threads, prunes it at each of 0, 1, 2, 4, 8, 16 and 32 mm
 and cuts it at each of 2, 5, 10 and 20 cm, and logs one line per rung with
-the resident bytes and triangles across LODs, the BLAS triangles and an
+the resident bytes and triangles across LODs, the largest single part and
+the number of parts over a page, the BLAS triangles and an
 input-geometry estimate (32 B per vertex + 4 B per index, the buffers Solari
 reads; the acceleration structure the driver builds is extra), the page
 budget line and the cache coverage (geometry files and root meshes with a
 complete manifest, and the source triangles they hold). It reads a cache
-that is still being written: directories without a manifest and parts that
-fail to open are counted and skipped.
+that is still being written: directories without a manifest, manifests
+baked under other `--quantization` or `--partition-triangles` settings (a
+run would rebake them), and parts that fail to open are counted and
+skipped. A scene with no cache directory yet is reported as nothing to
+measure, and none is created.
 
 ## How a run proceeds
 

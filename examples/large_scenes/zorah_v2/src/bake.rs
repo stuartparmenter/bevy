@@ -256,11 +256,20 @@ pub struct PartManifest {
 }
 
 impl MeshManifest {
+    /// The stamp of `<dir>/manifest.json`, if one parses.
+    pub fn stamped(dir: &Path) -> Option<BakeStamp> {
+        Self::parse(dir).map(|manifest| manifest.stamp)
+    }
+
+    fn parse(dir: &Path) -> Option<MeshManifest> {
+        let bytes = fs::read(dir.join(MANIFEST_FILE)).ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+
     /// Reads `<dir>/manifest.json` if it exists, matches `stamp`, and every
     /// part file it lists is present.
     pub fn reusable(dir: &Path, stamp: &BakeStamp) -> Option<MeshManifest> {
-        let bytes = fs::read(dir.join(MANIFEST_FILE)).ok()?;
-        let manifest: MeshManifest = serde_json::from_slice(&bytes).ok()?;
+        let manifest = Self::parse(dir)?;
         if manifest.stamp != *stamp {
             return None;
         }

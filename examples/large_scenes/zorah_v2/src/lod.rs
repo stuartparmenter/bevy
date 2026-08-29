@@ -19,6 +19,7 @@ use bevy::{
     },
     prelude::*,
     render::render_resource::PrimitiveTopology,
+    tasks::AsyncComputeTaskPool,
 };
 use thiserror::Error;
 
@@ -26,9 +27,19 @@ use thiserror::Error;
 /// `MESHLET_PAGE_SIZE` and `MESHLET_MAX_PAGES`), which it does not export. An
 /// upload past the last free run fails with "the 128 meshlet data pages have
 /// no free run of N bytes" and the part never renders.
+///
+/// The budget is an upper bound on what fits, not a guarantee: a part is
+/// allocated best-fit within a single page and cannot straddle two, so the
+/// slack at the end of every page is lost, and a part larger than a page is
+/// rejected outright however empty the pages are.
 pub const MESHLET_PAGE_SIZE: u64 = 64 * 1024 * 1024;
 pub const MESHLET_MAX_PAGES: u64 = 128;
 pub const MESHLET_PAGE_BUDGET: u64 = MESHLET_PAGE_SIZE * MESHLET_MAX_PAGES;
+
+/// Whether a pruned part of `packed_bytes` can ever be uploaded.
+pub fn fits_a_page(packed_bytes: u64) -> bool {
+    packed_bytes <= MESHLET_PAGE_SIZE
+}
 
 /// The error bounds a run loads its parts under.
 #[derive(Clone, Copy, Debug)]
@@ -85,6 +96,10 @@ pub enum PartLoadError {
 /// Loads a cache part as a [`ZorahPart`]. It shares the `.meshlet_mesh`
 /// extension with bevy's own loader; the asset server picks this one by the
 /// requested asset type.
+///
+/// Only the file read happens on the IO pool, whose few threads the asset
+/// server also decodes textures on: the decode, prune and BLAS cut are CPU
+/// work and run as one `AsyncComputeTaskPool` task the load awaits.
 #[derive(TypePath)]
 pub struct ZorahPartLoader {
     pub settings: LodSettings,
@@ -103,10 +118,14 @@ impl AssetLoader for ZorahPartLoader {
     ) -> Result<ZorahPart, PartLoadError> {
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes).await?;
-        let full = MeshletMesh::read(&mut bytes.as_slice())?;
-        drop(bytes);
-        let (meshlet, blas, stats) = prepare_part(&full, &self.settings)?;
-        drop(full);
+        let settings = self.settings;
+        let (meshlet, blas, stats) = AsyncComputeTaskPool::get()
+            .spawn(async move {
+                let full = MeshletMesh::read(&mut bytes.as_slice())?;
+                drop(bytes);
+                prepare_part(&full, &settings)
+            })
+            .await?;
         Ok(ZorahPart {
             meshlet: load_context.add_labeled_asset("meshlet", meshlet),
             blas: load_context.add_labeled_asset("blas", blas),
@@ -177,11 +196,7 @@ pub fn human_bytes(bytes: u64) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use bevy::{
-        math::ops,
-        mesh::VertexAttributeValues,
-        tasks::{AsyncComputeTaskPool, TaskPool},
-    };
+    use bevy::{math::ops, mesh::VertexAttributeValues, tasks::TaskPool};
 
     /// A closed torus dense enough to simplify through several LODs.
     pub(crate) fn torus_meshlet_mesh() -> MeshletMesh {
