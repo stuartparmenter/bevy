@@ -1,4 +1,4 @@
-//! Bakes the export's meshes into meshlet meshes plus their BLAS companions.
+//! Bakes the export's meshes into full-detail meshlet meshes.
 //!
 //! The bake runs on plain std threads and knows nothing about a bevy `App`: a
 //! caller starts it, polls [`BakeHandle::progress`] and drains
@@ -44,14 +44,15 @@ use futures_io::AsyncWrite;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{
-    blas,
-    geometry::{partition_triangles, reindex, repair_inverted_winding, smooth_normals, Geometry},
+use crate::geometry::{
+    partition_triangles, reindex, repair_inverted_winding, smooth_normals, Geometry,
 };
 
 /// Bumped whenever the bake's own logic changes what it writes (partition
 /// rules, border locking, attribute synthesis, winding repair), so stale
-/// caches rebake.
+/// caches rebake. Dropping the `.zblas` companions did not bump it: a
+/// manifest that still lists them parses and its meshlet files are what the
+/// loader wants.
 pub const BAKE_PIPELINE_VERSION: u32 = 2;
 pub const MANIFEST_FILE: &str = "manifest.json";
 
@@ -68,8 +69,6 @@ pub struct BakeSettings {
     /// Primitives above this many triangles are cut into spatial partitions
     /// before the meshlet build, which is superlinear in triangle count.
     pub partition_triangles: usize,
-    /// Metres of geometric error the raytracing LOD cut may carry.
-    pub raytracing_error: f32,
     /// Meshlet vertex position quantization factor (`MeshletMesh::from_mesh`).
     pub quantization: u8,
 }
@@ -80,10 +79,8 @@ impl BakeSettings {
         BakeStamp {
             pipeline_version: BAKE_PIPELINE_VERSION,
             meshlet_asset_version: MESHLET_MESH_ASSET_VERSION,
-            blas_version: blas::ZBLAS_VERSION,
             quantization: self.quantization,
             partition_triangles: self.partition_triangles,
-            raytracing_error: self.raytracing_error,
         }
     }
 }
@@ -216,14 +213,16 @@ fn buffer_stem(document: &gltf::Document, accessor: &gltf::Accessor) -> Option<S
 }
 
 /// The settings a manifest was written under; any difference forces a rebake.
+///
+/// Manifests from before the load-time LOD cut also carry `blas_version` and
+/// `raytracing_error`; serde ignores them, so those caches stay reusable and
+/// `--raytracing-error` never rebakes anything.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BakeStamp {
     pub pipeline_version: u32,
     pub meshlet_asset_version: u64,
-    pub blas_version: u32,
     pub quantization: u8,
     pub partition_triangles: usize,
-    pub raytracing_error: f32,
 }
 
 /// The checkpoint of one baked mesh directory.
@@ -236,7 +235,8 @@ pub struct MeshManifest {
     pub parts: Vec<PartManifest>,
 }
 
-/// One meshlet mesh plus BLAS companion in a mesh directory.
+/// One meshlet mesh in a mesh directory. Older manifests also list a
+/// `.zblas` companion and its statistics; nothing reads them any more.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PartManifest {
     /// Primitive index within the mesh.
@@ -248,11 +248,7 @@ pub struct PartManifest {
     pub material: Option<usize>,
     /// `p<primitive>_<partition>.meshlet_mesh`, relative to the directory.
     pub meshlet_file: String,
-    /// `p<primitive>_<partition>.zblas`, relative to the directory.
-    pub blas_file: String,
     pub triangles: u64,
-    pub blas_triangles: u64,
-    pub blas_achieved_error: f32,
     pub aabb_min: [f32; 3],
     pub aabb_max: [f32; 3],
     pub locked_borders: bool,
@@ -268,9 +264,10 @@ impl MeshManifest {
         if manifest.stamp != *stamp {
             return None;
         }
-        let complete = manifest.parts.iter().all(|part| {
-            dir.join(&part.meshlet_file).is_file() && dir.join(&part.blas_file).is_file()
-        });
+        let complete = manifest
+            .parts
+            .iter()
+            .all(|part| dir.join(&part.meshlet_file).is_file());
         complete.then_some(manifest)
     }
 
@@ -300,8 +297,6 @@ pub enum BakeError {
     Meshopt(String),
     #[error("meshlet build: {0}")]
     Meshlet(String),
-    #[error(transparent)]
-    Blas(#[from] blas::ZblasError),
     #[error("{0}")]
     Invalid(String),
 }
@@ -710,8 +705,8 @@ struct PartSlot {
     winding_repaired: bool,
 }
 
-/// Builds one partition's meshlet mesh and BLAS cut and writes both files as
-/// `p<primitive>_<partition>.meshlet_mesh` / `.zblas` under `dir`.
+/// Builds one partition's meshlet mesh and writes it as
+/// `p<primitive>_<partition>.meshlet_mesh` under `dir`.
 fn bake_partition(
     settings: &BakeSettings,
     dir: &Path,
@@ -738,27 +733,17 @@ fn bake_partition(
     }
     .map_err(|error| BakeError::Meshlet(error.to_string()))?;
     drop(mesh);
-    let raytracing = meshlet.raytracing_geometry(settings.raytracing_error);
-    if raytracing.indices.is_empty() {
-        return Err(BakeError::Meshlet("the LOD cut has no triangles".into()));
-    }
-    let blas_bytes = blas::encode(&raytracing)?;
     let meshlet_bytes = encode_meshlet(&meshlet)?;
     drop(meshlet);
 
     let meshlet_file = format!("p{}_{}.meshlet_mesh", slot.primitive, slot.partition);
-    let blas_file = format!("p{}_{}.zblas", slot.primitive, slot.partition);
     fs::write(dir.join(&meshlet_file), meshlet_bytes)?;
-    fs::write(dir.join(&blas_file), blas_bytes)?;
     Ok(PartManifest {
         primitive: slot.primitive,
         partition: slot.partition,
         material: slot.material,
         meshlet_file,
-        blas_file,
         triangles,
-        blas_triangles: (raytracing.indices.len() / 3) as u64,
-        blas_achieved_error: raytracing.achieved_error,
         aabb_min: aabb_min.to_array(),
         aabb_max: aabb_max.to_array(),
         locked_borders: slot.locked_borders,
@@ -812,7 +797,6 @@ mod tests {
             cache_dir: dir.to_path_buf(),
             workers: 1,
             partition_triangles: 500_000,
-            raytracing_error: 0.02,
             quantization: 4,
         }
     }
@@ -828,10 +812,7 @@ mod tests {
                 partition: 0,
                 material: Some(3),
                 meshlet_file: "p0_0.meshlet_mesh".into(),
-                blas_file: "p0_0.zblas".into(),
                 triangles: 12,
-                blas_triangles: 8,
-                blas_achieved_error: 0.003,
                 aabb_min: [-1.0, 0.0, -1.0],
                 aabb_max: [1.0, 2.0, 1.0],
                 locked_borders: false,
@@ -862,10 +843,57 @@ mod tests {
         // Listed part files must exist before the manifest counts as a checkpoint.
         assert!(MeshManifest::reusable(&dir, &settings.stamp()).is_none());
         fs::write(dir.join("p0_0.meshlet_mesh"), b"").unwrap();
-        fs::write(dir.join("p0_0.zblas"), b"").unwrap();
         assert_eq!(
             MeshManifest::reusable(&dir, &settings.stamp()),
             Some(written)
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A manifest from before the load-time LOD cut, with its `.zblas`
+    /// companion and stamp fields, as the bake that is still running writes.
+    #[test]
+    fn manifest_with_blas_companions_is_still_reused() {
+        let dir = scratch_dir("legacy");
+        let settings = settings(&dir);
+        let legacy = format!(
+            r#"{{
+  "stamp": {{
+    "pipeline_version": {BAKE_PIPELINE_VERSION},
+    "meshlet_asset_version": {MESHLET_MESH_ASSET_VERSION},
+    "blas_version": 1,
+    "quantization": 4,
+    "partition_triangles": 500000,
+    "raytracing_error": 0.02
+  }},
+  "stem": "SM_Test_0123_4567",
+  "mesh_name": "SM_Test_0123",
+  "source_triangles": 12,
+  "parts": [
+    {{
+      "primitive": 0,
+      "partition": 0,
+      "material": 3,
+      "meshlet_file": "p0_0.meshlet_mesh",
+      "blas_file": "p0_0.zblas",
+      "triangles": 12,
+      "blas_triangles": 8,
+      "blas_achieved_error": 0.003,
+      "aabb_min": [-1.0, 0.0, -1.0],
+      "aabb_max": [1.0, 2.0, 1.0],
+      "locked_borders": false,
+      "winding_repaired": true
+    }}
+  ]
+}}
+"#
+        );
+        fs::write(dir.join(MANIFEST_FILE), legacy).unwrap();
+        fs::write(dir.join("p0_0.meshlet_mesh"), b"").unwrap();
+        // Only the meshlet file has to exist; the companion is not consulted.
+        assert_eq!(
+            MeshManifest::reusable(&dir, &settings.stamp()),
+            Some(manifest(settings.stamp()))
         );
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -876,15 +904,11 @@ mod tests {
         let settings = settings(&dir);
         manifest(settings.stamp()).write(&dir).unwrap();
         fs::write(dir.join("p0_0.meshlet_mesh"), b"").unwrap();
-        fs::write(dir.join("p0_0.zblas"), b"").unwrap();
         assert!(MeshManifest::reusable(&dir, &settings.stamp()).is_some());
 
         let mut quantized = settings.clone();
         quantized.quantization = 6;
         assert!(MeshManifest::reusable(&dir, &quantized.stamp()).is_none());
-        let mut coarser = settings.clone();
-        coarser.raytracing_error = 0.05;
-        assert!(MeshManifest::reusable(&dir, &coarser.stamp()).is_none());
         let mut split = settings.clone();
         split.partition_triangles = 100_000;
         assert!(MeshManifest::reusable(&dir, &split.stamp()).is_none());

@@ -4,8 +4,8 @@ This example renders NVIDIA's `zorah_textured_public.v1` glTF export of the
 Zorah sample directly: no Unreal project, no converter, no bundles. The root
 glTF (13,079 nodes, 2,812 meshes, 1,514 materials, 4,418 KTX2 textures,
 3.31 G unique triangles) is parsed with the `gltf` crate at startup; each
-mesh's geometry is baked into meshlet meshes plus BLAS cuts on first run and
-cached beside the export.
+mesh's geometry is baked into full-detail meshlet meshes on first run and
+cached beside the export, then pruned to an error bound as it loads.
 
 ```
 cargo run --release -p zorah_v2 -- --scene-root C:\path\to\zorah_textured_public.v1
@@ -37,12 +37,11 @@ fails with a message pointing here.
 
 Every referenced mesh is baked into `<cache>/<mesh stem>/`:
 
-- `p<primitive>_<partition>.meshlet_mesh`, bevy's `MeshletMesh` asset;
-- `p<primitive>_<partition>.zblas`, the meshlet LOD cut within
-  `--raytracing-error` of the surface, as plain triangles for Solari's BLAS;
+- `p<primitive>_<partition>.meshlet_mesh`, bevy's `MeshletMesh` asset at
+  full detail, every LOD;
 - `manifest.json`, written last through a temp file and rename. It lists
-  every part (primitive, material, triangle counts, achieved error, AABB)
-  and the settings stamp the directory was baked under.
+  every part (primitive, material, triangle count, AABB) and the settings
+  stamp the directory was baked under.
 
 The cache defaults to `<scene root>/.bevy_zorah_cache`; `--cache-dir` moves
 it. Meshes sharing a `.mesh.bin` (82 do) are baked once.
@@ -50,9 +49,10 @@ it. Meshes sharing a `.mesh.bin` (82 do) are baked once.
 The manifest is the checkpoint: an interrupted run resumes at mesh
 granularity, redoing only the mesh that was in flight. A manifest whose
 stamp disagrees with the current `--quantization`, `--partition-triangles`,
-`--raytracing-error`, meshlet asset version, ZBLAS version or bake pipeline
-version is rebaked. To reset, delete the cache directory (or one mesh's
-subdirectory).
+meshlet asset version or bake pipeline version is rebaked. To reset, delete
+the cache directory (or one mesh's subdirectory). Caches from before the
+load-time LOD cut also hold a `.zblas` BLAS cut per part; those manifests
+still load, and the `.zblas` files can be deleted.
 
 Primitives above `--partition-triangles` are cut into spatial partitions by
 median bisection on the longest axis of their triangle centroids. The
@@ -72,6 +72,55 @@ meshlet builder) is reported and skipped rather than aborting the bake.
 A part that is present but unreadable (a truncated file) fails to load at
 run time; its mesh's manifest is then deleted so the next run rebakes it.
 
+## Residency: the load-time LOD cut
+
+Full detail does not fit. Measured over 1,015 baked meshes, 676 M raster
+triangles took 16 GiB of meshlet data (25.4 bytes per triangle across all
+LODs), which projects to 78 GiB for the 3.31 G-triangle scene. The meshlet
+manager holds 128 pages of 64 MiB, 8 GiB, and an upload past the last free
+run fails ("the 128 meshlet data pages have no free run of N bytes") and
+that part never renders; this fork streams neither meshlets nor BLASes.
+
+So every part is cut as it loads, in memory, and the cache stays at full
+detail. `MeshletMesh::pruned(--raster-error)` drops every LOD finer than
+the bound; the meshlets that become the finest level are marked error-free
+so the runtime rasterizes them up close instead of culling them and
+leaving holes, and every coarser transition happens at the same distance
+as before. The BLAS cut is selected from the same data at
+`max(--raytracing-error, --raster-error)` and handed to Solari with the
+error it achieved. Pruning at load rather than in the bake means one cache
+serves every bound: a new `--raster-error` costs a restart, not a rebake.
+
+Once the scene is in, the run logs the pruned meshlet bytes against the
+8 GiB budget, as a warning when over. Choosing values:
+
+- `--raster-error` (default 4 mm) is the finest detail the raster image
+  can show, however close the camera gets. Instancing costs nothing extra,
+  since the bytes are per mesh. Take the smallest value whose report line
+  (below) fits the budget. Measured on half the cache (1,258 of 2,034
+  geometry files, 824 M source triangles): 16.8 GiB at full detail,
+  8.4 GiB at 1 mm, 6.2 at 2 mm, 5.1 at 4 mm, 4.5 at 8 mm, 3.9 at 32 mm.
+  The ladder flattens because the coarsest LODs, which locked partition
+  borders keep from simplifying further, are most of the bytes at 4 mm and
+  beyond; the bound mainly trades the fine end.
+- `--raytracing-error` (default 5 cm) is how far the surface Solari traces
+  against may sit from the rasterized one. Solari biases its rays by the
+  achieved error, so a larger value shows as light leaking at contact
+  points; a smaller one costs BLAS memory and build time. Values below
+  `--raster-error` are raised to it.
+
+`--report-lod-budget` measures a cache without opening a window or touching
+the GPU: it decodes every part of every complete manifest on
+`--bake-workers` threads, prunes it at each of 0, 1, 2, 4, 8, 16 and 32 mm
+and cuts it at each of 2, 5, 10 and 20 cm, and logs one line per rung with
+the resident bytes and triangles across LODs, the BLAS triangles and an
+input-geometry estimate (32 B per vertex + 4 B per index, the buffers Solari
+reads; the acceleration structure the driver builds is extra), the page
+budget line and the cache coverage (geometry files and root meshes with a
+complete manifest, and the source triangles they hold). It reads a cache
+that is still being written: directories without a manifest and parts that
+fail to open are counted and skipped.
+
 ## How a run proceeds
 
 The root glTF is parsed and its scene walked before the window opens; the
@@ -80,7 +129,8 @@ bake starts from the app's first frame and the states go `Baking` ->
 
 - While baking and loading, every mesh whose manifest is complete has its
   parts loaded from the `cache://` asset source (at most 32 new parts per
-  frame) and, once they are on the GPU, one entity per (instance, part) is
+  frame; each is pruned and its BLAS cut decoded on the IO pool as it
+  loads) and, once they are on the GPU, one entity per (instance, part) is
   spawned (at most 512 per frame): `MeshletMesh3d` normally, `Mesh3d` of the
   BLAS cut for alpha-tested materials under `--preserve-alpha`. Materials
   and their textures are created the first time a part uses them, so a
@@ -117,9 +167,11 @@ the throne room through its windows.
 | --- | --- | --- |
 | `--scene-root <dir or .gltf>` | `ZORAH_ROOT` | The export. |
 | `--cache-dir <dir>` | `<scene root>/.bevy_zorah_cache` | Bake output. |
-| `--bake-workers N` | `clamp((RAM - 8 GiB) / 2 GiB, 1, cores)` | Concurrent mesh bakes. |
+| `--bake-workers N` | `clamp((RAM - 8 GiB) / 2 GiB, 1, cores)` | Concurrent mesh bakes, or report threads. |
 | `--partition-triangles N` | `500000` | Cut larger primitives into spatial partitions. |
-| `--raytracing-error m` | `0.02` | Geometric error the BLAS LOD cut may carry. |
+| `--raster-error m` | `0.004` | Geometric error the finest resident meshlet LOD may carry; parts are pruned to it at load. |
+| `--raytracing-error m` | `0.05` | Geometric error the BLAS LOD cut may carry (never below `--raster-error`). |
+| `--report-lod-budget` | off | Measure the cache at a ladder of both errors without a window, then exit. |
 | `--quantization n` | `4` | Meshlet positions snap to 1/2^n cm. |
 | `--max-texture-size px` | `1024` | Drop KTX2 mips above this edge; `0` keeps 4k. |
 | `--limit-meshes N` | all | Dev: bake and spawn only the first N meshes by glTF index (fire proxies appear only for selected props). |

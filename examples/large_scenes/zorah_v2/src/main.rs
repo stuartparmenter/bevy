@@ -8,9 +8,10 @@
 )]
 
 mod bake;
-mod blas;
 mod geometry;
+mod lod;
 mod materials;
+mod report;
 mod runner;
 mod scene;
 mod setup;
@@ -44,7 +45,7 @@ use bevy::{
 use bevy::anti_alias::dlss::DlssProjectId;
 
 use bake::{BakeEvent, BakeSettings, MeshJob};
-use blas::ZblasLoader;
+use lod::{LodSettings, ZorahPart, ZorahPartLoader};
 use materials::{MaterialCache, MaterialOptions, MaterialSpec};
 use runner::{SceneData, SpawnOptions, ZorahState};
 use scene::SceneView;
@@ -74,11 +75,11 @@ struct Args {
     #[argh(option)]
     scene_root: Option<PathBuf>,
 
-    /// where baked meshlet meshes and BLAS cuts live (default <scene root>/.bevy_zorah_cache)
+    /// where baked meshlet meshes live (default <scene root>/.bevy_zorah_cache)
     #[argh(option)]
     cache_dir: Option<PathBuf>,
 
-    /// threads baking meshes at once (default clamp((RAM - 8 GiB) / 2 GiB, 1, cores))
+    /// threads baking meshes (or measuring them under --report-lod-budget) at once (default clamp((RAM - 8 GiB) / 2 GiB, 1, cores))
     #[argh(option)]
     bake_workers: Option<usize>,
 
@@ -86,9 +87,17 @@ struct Args {
     #[argh(option, default = "500_000")]
     partition_triangles: usize,
 
-    /// metres of geometric error the raytracing LOD cut may carry
-    #[argh(option, default = "0.02")]
+    /// metres of geometric error the finest meshlet LOD kept resident may carry; every part is pruned to it as it loads
+    #[argh(option, default = "0.004")]
+    raster_error: f32,
+
+    /// metres of geometric error the raytracing LOD cut may carry (never finer than --raster-error)
+    #[argh(option, default = "0.05")]
     raytracing_error: f32,
+
+    /// measure what the cache costs at a ladder of --raster-error and --raytracing-error values, then exit
+    #[argh(switch)]
+    report_lod_budget: bool,
 
     /// meshlet vertex position quantization factor (positions snap to 1/2^n cm)
     #[argh(option, default = "4")]
@@ -184,6 +193,18 @@ struct Args {
 }
 
 impl Args {
+    fn lod(&self) -> Result<LodSettings, String> {
+        let bound = |name: &str, value: f32| {
+            (value.is_finite() && value >= 0.0)
+                .then_some(value)
+                .ok_or_else(|| format!("{name}: {value} is not a finite non-negative distance"))
+        };
+        Ok(LodSettings {
+            raster_error: bound("--raster-error", self.raster_error)?,
+            raytracing_error: bound("--raytracing-error", self.raytracing_error)?,
+        })
+    }
+
     fn sky_color(&self) -> Result<Vec3, String> {
         parse_vec3(&self.sky_color).map_err(|error| format!("--sky-color: {error}"))
     }
@@ -304,6 +325,16 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if args.report_lod_budget {
+        init_plain_logging();
+        info!("{}", prepared.summary);
+        report::run(
+            &prepared.root.cache_dir,
+            &prepared.jobs,
+            prepared.settings.workers,
+        );
+        return ExitCode::SUCCESS;
+    }
     if args.bake_only {
         init_plain_logging();
         return match bake_headless(prepared) {
@@ -329,6 +360,7 @@ fn init_plain_logging() {
 struct Prepared {
     root: SceneRoot,
     settings: BakeSettings,
+    lod: LodSettings,
     jobs: Vec<MeshJob>,
     scene: SceneData,
     materials: Vec<MaterialSpec>,
@@ -345,6 +377,7 @@ struct Prepared {
 
 fn prepare(args: &Args) -> Result<Prepared, String> {
     // Validated up front so a typo fails before the bake, not after it.
+    let lod = args.lod()?;
     let sky_color = args.sky_color()?;
     let camera_position = args.camera_position()?;
     let camera_target = args.camera_target()?;
@@ -413,14 +446,14 @@ fn prepare(args: &Args) -> Result<Prepared, String> {
         cache_dir: root.cache_dir.clone(),
         workers,
         partition_triangles: args.partition_triangles.max(1),
-        raytracing_error: args.raytracing_error,
         quantization: args.quantization,
     };
     let triangles = jobs.iter().map(MeshJob::triangles).sum::<u64>();
     let summary = format!(
         "{}: {} nodes, {} meshes, {} materials, {placed} placed instances; \
          {} instances of {} selected meshes spawn; {} geometry files ({triangles} triangles) \
-         bake with {workers} workers into {}; parsed in {:.1?}",
+         bake with {workers} workers into {}; parts load pruned to {} m with BLAS cuts at {} m; \
+         parsed in {:.1?}",
         root.gltf.display(),
         document.nodes().count(),
         document.meshes().count(),
@@ -429,6 +462,8 @@ fn prepare(args: &Args) -> Result<Prepared, String> {
         selected.len(),
         jobs.len(),
         root.cache_dir.display(),
+        lod.raster_error,
+        lod.blas_error(),
         started.elapsed()
     );
     std::fs::create_dir_all(&root.cache_dir)
@@ -436,6 +471,7 @@ fn prepare(args: &Args) -> Result<Prepared, String> {
     Ok(Prepared {
         root,
         settings,
+        lod,
         jobs,
         scene: SceneData {
             instances,
@@ -513,6 +549,7 @@ fn run_app(args: &Args, prepared: Prepared) -> ExitCode {
     let Prepared {
         root,
         settings,
+        lod,
         jobs,
         scene,
         materials,
@@ -603,7 +640,11 @@ fn run_app(args: &Args, prepared: Prepared) -> ExitCode {
             AutoExposurePlugin,
             SolariPlugins,
         ))
-        .register_asset_loader(ZblasLoader);
+        // Cache parts load as `ZorahPart`s, pruned to the raster bound with
+        // their BLAS cut alongside; bevy's own `.meshlet_mesh` loader stays
+        // registered for the asset type it serves.
+        .init_asset::<ZorahPart>()
+        .register_asset_loader(ZorahPartLoader { settings: lod });
     if args.diagnostics {
         app.add_plugins((
             FrameTimeDiagnosticsPlugin::default(),

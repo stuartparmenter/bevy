@@ -30,12 +30,14 @@ use bevy::anti_alias::dlss::{
 
 use crate::{
     bake::{BakeEvent, BakeHandle, MeshManifest, PartManifest, MANIFEST_FILE},
+    lod::{human_bytes, PartStats, ZorahPart, MESHLET_PAGE_BUDGET},
     materials::MaterialCache,
     scene::SceneInstance,
     setup::ZorahCamera,
 };
 
-/// Part loads started per frame: each is a meshlet mesh plus its BLAS cut.
+/// Part loads started per frame: each decodes a full-detail meshlet mesh,
+/// prunes it and cuts its BLAS on the IO pool.
 const MAX_NEW_PART_LOADS_PER_FRAME: usize = 32;
 /// Entities spawned per frame, counting every part of every instance.
 const MAX_SPAWNED_INSTANCES_PER_FRAME: usize = 512;
@@ -82,13 +84,14 @@ struct PartAssets {
     manifest: PartManifest,
     meshlet: Handle<MeshletMesh>,
     blas: Handle<Mesh>,
+    stats: PartStats,
 }
 
 /// A manifest whose parts are being requested, then awaited.
 struct LoadingJob {
     job: usize,
     manifest: MeshManifest,
-    parts: Vec<PartAssets>,
+    parts: Vec<Handle<ZorahPart>>,
 }
 
 /// A job whose parts are on the GPU, being spawned across its instances.
@@ -117,6 +120,13 @@ pub struct PendingScene {
     expected_blas: usize,
     /// Triangles of every distinct BLAS cut, for the warm-up estimate.
     blas_triangles: u64,
+    /// Bytes the meshlet manager holds for every distinct pruned part, against
+    /// `MESHLET_PAGE_BUDGET`.
+    meshlet_bytes: u64,
+    /// Triangles across LODs of every distinct pruned part.
+    meshlet_triangles: u64,
+    /// The largest BLAS error any part achieved.
+    blas_error_max: f32,
     warmup_frames_remaining: u64,
     warmup_timeout_reported: bool,
     warmup_progress_log_frames_remaining: u64,
@@ -138,6 +148,9 @@ impl PendingScene {
             raytracing_cursor: 0,
             expected_blas: 0,
             blas_triangles: 0,
+            meshlet_bytes: 0,
+            meshlet_triangles: 0,
+            blas_error_max: 0.0,
             warmup_frames_remaining: 0,
             warmup_timeout_reported: false,
             warmup_progress_log_frames_remaining: 0,
@@ -155,6 +168,7 @@ pub fn stream_scene(
     asset_server: Res<AssetServer>,
     mut pending: ResMut<PendingScene>,
     scene: Res<SceneData>,
+    parts: Res<Assets<ZorahPart>>,
     mut material_cache: ResMut<MaterialCache>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     options: Res<SpawnOptions>,
@@ -165,7 +179,7 @@ pub fn stream_scene(
     let pending = &mut *pending;
     poll_bake(pending, &scene);
     request_part_loads(pending, &asset_server);
-    settle_loads(pending, &scene, &asset_server, &options);
+    settle_loads(pending, &scene, &asset_server, &parts, &options);
     spawn_instances(
         pending,
         &scene,
@@ -184,6 +198,7 @@ pub fn stream_scene(
     if !(bake_done && pending.loading.is_empty() && pending.spawning.is_empty()) {
         return;
     }
+    report_residency(pending);
 
     // Solari's plugins register nothing when the adapter lacks ray queries,
     // leaving the readiness counters at zero forever.
@@ -227,6 +242,30 @@ pub fn stream_scene(
         "Zorah raster scene submitted; waiting for measured BLAS readiness",
     );
     next_state.set(ZorahState::WarmingRaytracing);
+}
+
+/// Logs what the pruned scene asks of the meshlet manager, once every part is
+/// in. Over the budget, the parts that did not fit have already failed to
+/// upload (the manager logs each) and are missing from the raster image;
+/// the fix is a coarser `--raster-error`.
+fn report_residency(pending: &PendingScene) {
+    let share = pending.meshlet_bytes as f64 * 100.0 / MESHLET_PAGE_BUDGET as f64;
+    if pending.meshlet_bytes > MESHLET_PAGE_BUDGET {
+        warn!(
+            "pruned meshlet data is {} ({share:.0}% of the {} page budget): parts past the budget do not render; raise --raster-error",
+            human_bytes(pending.meshlet_bytes),
+            human_bytes(MESHLET_PAGE_BUDGET)
+        );
+    } else {
+        info!(
+            "pruned meshlet data is {} ({share:.0}% of the {} page budget), {} triangles across LODs; BLAS cuts total {} triangles, achieved error at most {:.4} m",
+            human_bytes(pending.meshlet_bytes),
+            human_bytes(MESHLET_PAGE_BUDGET),
+            pending.meshlet_triangles,
+            pending.blas_triangles,
+            pending.blas_error_max
+        );
+    }
 }
 
 /// Drains finished bake jobs into the load queue; drops the handle once the
@@ -310,11 +349,9 @@ fn request_part_loads(pending: &mut PendingScene, asset_server: &AssetServer) {
             }
             let part = &loading.manifest.parts[loading.parts.len()];
             let stem = &loading.manifest.stem;
-            loading.parts.push(PartAssets {
-                manifest: part.clone(),
-                meshlet: asset_server.load(format!("cache://{stem}/{}", part.meshlet_file)),
-                blas: asset_server.load(format!("cache://{stem}/{}", part.blas_file)),
-            });
+            loading
+                .parts
+                .push(asset_server.load(format!("cache://{stem}/{}", part.meshlet_file)));
             started += 1;
         }
     }
@@ -325,6 +362,7 @@ fn settle_loads(
     pending: &mut PendingScene,
     scene: &SceneData,
     asset_server: &AssetServer,
+    parts: &Assets<ZorahPart>,
     options: &SpawnOptions,
 ) {
     let mut index = 0;
@@ -333,25 +371,16 @@ fn settle_loads(
         let all_requested = loading.parts.len() == loading.manifest.parts.len();
         let mut all_settled = all_requested;
         let mut failed = Vec::new();
-        for (part_index, part) in loading.parts.iter().enumerate() {
-            let meshlet_state = asset_server.load_state(&part.meshlet);
-            let blas_state = asset_server.load_state(&part.blas);
-            match (&meshlet_state, &blas_state) {
-                (LoadState::Failed(error), _) => {
+        for (part_index, handle) in loading.parts.iter().enumerate() {
+            match asset_server.load_state(handle) {
+                LoadState::Failed(error) => {
                     error!(
                         "{}/{}: {error}",
-                        loading.manifest.stem, part.manifest.meshlet_file
+                        loading.manifest.stem, loading.manifest.parts[part_index].meshlet_file
                     );
                     failed.push(part_index);
                 }
-                (_, LoadState::Failed(error)) => {
-                    error!(
-                        "{}/{}: {error}",
-                        loading.manifest.stem, part.manifest.blas_file
-                    );
-                    failed.push(part_index);
-                }
-                (LoadState::Loaded, LoadState::Loaded) => {}
+                LoadState::Loaded => {}
                 _ => all_settled = false,
             }
         }
@@ -359,7 +388,7 @@ fn settle_loads(
             index += 1;
             continue;
         }
-        let Some(mut loading) = pending.loading.remove(index) else {
+        let Some(loading) = pending.loading.remove(index) else {
             break;
         };
         if !failed.is_empty() {
@@ -384,11 +413,31 @@ fn settle_loads(
             }
         }
         pending.parts_failed += failed.len();
-        for part_index in failed.into_iter().rev() {
-            loading.parts.remove(part_index);
-        }
-        for part in &loading.parts {
-            pending.blas_triangles += part.manifest.blas_triangles;
+        let mut loaded = Vec::with_capacity(loading.parts.len());
+        for (part_index, handle) in loading.parts.into_iter().enumerate() {
+            if failed.contains(&part_index) {
+                continue;
+            }
+            let Some(part) = parts.get(&handle) else {
+                // Loaded, so it is in the store; treat anything else as a
+                // failure rather than spawning a part with no geometry.
+                pending.parts_failed += 1;
+                error!(
+                    "{}/{}: loaded but absent from the asset store",
+                    loading.manifest.stem, loading.manifest.parts[part_index].meshlet_file
+                );
+                continue;
+            };
+            pending.blas_triangles += part.stats.blas_triangles;
+            pending.meshlet_bytes += part.stats.packed_bytes;
+            pending.meshlet_triangles += part.stats.raster_triangles;
+            pending.blas_error_max = pending.blas_error_max.max(part.stats.blas_achieved_error);
+            loaded.push(PartAssets {
+                manifest: loading.manifest.parts[part_index].clone(),
+                meshlet: part.meshlet.clone(),
+                blas: part.blas.clone(),
+                stats: part.stats,
+            });
         }
         let instances = scene
             .meshes_of_job
@@ -404,7 +453,7 @@ fn settle_loads(
             .unwrap_or_default();
         pending.spawning.push_back(SpawnJob {
             job: loading.job,
-            parts: loading.parts,
+            parts: loaded,
             instances,
             cursor: 0,
         });
@@ -497,7 +546,7 @@ fn spawn_instances(
                         .push(PendingRaytracingInstance {
                             entity,
                             mesh: part.blas.clone(),
-                            geometry_error: part.manifest.blas_achieved_error,
+                            geometry_error: part.stats.blas_achieved_error,
                         });
                 }
                 pending.spawned += 1;
