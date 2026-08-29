@@ -310,7 +310,7 @@ fn single_gltf_in(dir: &Path) -> Option<PathBuf> {
 }
 
 /// One worker per 2 GiB beyond an 8 GiB floor for the app and the OS, up to
-/// one per core: the bake holds up to `workers + 1` decoded meshes, and the
+/// one per core: the bake holds up to `workers` decoded meshes, and the
 /// largest here run to tens of millions of triangles. A worker's meshlet
 /// build fans its simplification out over the compute pool, but its
 /// clustering, partitioning and BVH build run on the worker itself, and

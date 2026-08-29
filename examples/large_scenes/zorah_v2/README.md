@@ -40,8 +40,9 @@ Every referenced mesh is baked into `<cache>/<mesh stem>/`:
 - `p<primitive>_<partition>.meshlet_mesh`, bevy's `MeshletMesh` asset at
   full detail, every LOD;
 - `manifest.json`, written last through a temp file and rename. It lists
-  every part (primitive, material, triangle count, AABB) and the settings
-  stamp the directory was baked under.
+  every part (primitive and partition index, material, triangle and vertex
+  counts, locked vertices, AABB, whether its winding was repaired) and the
+  settings stamp the directory was baked under.
 
 The cache defaults to `<scene root>/.bevy_zorah_cache`; `--cache-dir` moves
 it. Meshes sharing a `.mesh.bin` (82 do) are baked once.
@@ -51,8 +52,9 @@ granularity, redoing only the meshes that were in flight. A manifest whose
 stamp disagrees with the current `--quantization`, `--partition-triangles`,
 meshlet asset version or bake pipeline version is rebaked. To reset, delete
 the cache directory (or one mesh's subdirectory). Caches from bake pipeline
-versions 1 and 2 locked every open edge (see below) and are rebaked whole;
-their `.zblas` files can be deleted.
+versions 1 and 2 locked every open edge (see below), and version 3 matched
+seams by exact bits and so missed tile edges an ulp apart; all are rebaked
+whole, and the `.zblas` files of 1 and 2 can be deleted.
 
 Primitives above `--partition-triangles` are cut into spatial partitions by
 median bisection on the longest axis of their triangle centroids. Every part
@@ -70,11 +72,11 @@ Work is scheduled per part: `--bake-workers` threads take parts from a
 queue, and a worker that finds it empty opens the next mesh - decodes it,
 partitions it, finds its seams - and queues its parts, largest meshes first,
 so a 32 M-triangle mesh spreads over every worker instead of holding one for
-an hour. At most `workers + 1` decoded meshes are held at once; the largest
+an hour. At most `workers` decoded meshes are held at once; the largest
 here (32 M triangles across 12 primitives) is about 1 GiB decoded, and a part
 under construction adds its meshlet build on top. The default worker count
 is `clamp((total RAM - 8 GiB) / 2 GiB, 1, cores)`. Each part's
-simplification fans out over bevy's compute pool, which the app sizes to a
+simplification fans out over bevy's `AsyncComputeTaskPool`, which the app sizes to a
 thread per core for exactly this (the default pool would cap it at four
 threads and every worker would queue behind them), but a part's clustering,
 partitioning and BVH build run on its worker, so fewer workers than cores
@@ -193,7 +195,7 @@ the throne room through its windows.
 | --- | --- | --- |
 | `--scene-root <dir or .gltf>` | `ZORAH_ROOT` | The export. |
 | `--cache-dir <dir>` | `<scene root>/.bevy_zorah_cache` | Bake output. |
-| `--bake-workers N` | `clamp((RAM - 8 GiB) / 2 GiB, 1, cores)` | Concurrent mesh bakes, or report threads. |
+| `--bake-workers N` | `clamp((RAM - 8 GiB) / 2 GiB, 1, cores)` | Threads building bake parts, or report threads. |
 | `--partition-triangles N` | `500000` | Cut larger primitives into spatial partitions. |
 | `--raster-error m` | `0.004` | Geometric error the finest resident meshlet LOD may carry; parts are pruned to it at load. |
 | `--raytracing-error m` | `0.05` | Geometric error the BLAS LOD cut may carry (never below `--raster-error`). |

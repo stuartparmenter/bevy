@@ -50,9 +50,10 @@ use crate::geometry::{
 
 /// Bumped whenever the bake's own logic changes what it writes (partition
 /// rules, seam locking, attribute synthesis, winding repair), so stale
-/// caches rebake. Version 3 locks only shared seams instead of every open
-/// edge, which changes every meshlet file.
-pub const BAKE_PIPELINE_VERSION: u32 = 3;
+/// caches rebake. Version 3 locked only shared seams instead of every open
+/// edge; version 4 matches seams on the quantization grid rather than by
+/// exact bits, which locks the tile edges an ulp apart that 3 missed.
+pub const BAKE_PIPELINE_VERSION: u32 = 4;
 pub const MANIFEST_FILE: &str = "manifest.json";
 
 /// How the bake runs and where it writes.
@@ -63,7 +64,7 @@ pub struct BakeSettings {
     /// One subdirectory per mesh stem goes here.
     pub cache_dir: PathBuf,
     /// Threads building parts concurrently. Each builds one part at a time and
-    /// at most `workers + 1` decoded meshes are held between them.
+    /// at most `workers` decoded meshes are held between them.
     pub workers: usize,
     /// Primitives above this many triangles are cut into spatial partitions
     /// before the meshlet build, which is superlinear in triangle count.
@@ -414,7 +415,9 @@ impl Drop for BakeHandle {
 /// and queues every part, so a 32 M-triangle mesh spreads over every worker
 /// instead of holding one for an hour while the rest idle. Meshes open
 /// largest first, which keeps the tail short. A mesh is opened only when the
-/// queue is empty, so at most `workers + 1` decoded meshes are held at once.
+/// queue is empty, so at most `workers` decoded meshes are held at once: every
+/// mesh alive at the last claim was being opened or had a part in flight, one
+/// per worker.
 ///
 /// `MeshletMesh::from_mesh` spreads its simplification over bevy's
 /// `AsyncComputeTaskPool`, which is initialised here if no `App` has done so
@@ -511,7 +514,7 @@ struct OpenMesh {
     slots: Vec<PartSlot>,
     /// Positions (as f32 bit patterns) that more than one part uses: the
     /// partition cuts and the edges primitives share.
-    shared_positions: HashSet<[u32; 3]>,
+    shared_positions: HashSet<[i32; 3]>,
     remaining: AtomicUsize,
     parts: Mutex<Vec<Option<PartManifest>>>,
     failure: Mutex<Option<String>>,
@@ -721,7 +724,7 @@ fn open_mesh(
     }
     drop(buffers);
 
-    let shared_positions = shared_positions(&primitives, &slots);
+    let shared_positions = shared_positions(&primitives, &slots, settings.quantization);
     fs::create_dir_all(&dir)?;
     Ok(OpenMesh {
         job,
@@ -746,21 +749,31 @@ fn open_mesh(
 /// meets nothing and may simplify freely, which is what keeps this scene's
 /// tiled floors and loose ornaments from being pinned at full detail.
 ///
-/// Positions compare as their f32 bits (with -0.0 folded into 0.0): the parts
-/// of one primitive copy the same source vertices, and the tiles of one mesh
-/// were exported from one surface, so shared vertices are bit-identical.
-fn shared_positions(primitives: &[OpenPrimitive], slots: &[PartSlot]) -> HashSet<[u32; 3]> {
+/// Positions compare on the meshlet build's own quantization grid (1/2^q cm),
+/// which is where the build snaps every vertex anyway: the parts of one
+/// primitive copy the same source vertices, but this export's tiles carry
+/// nominally coincident coordinates that differ in their last bits, and a
+/// seam missed for an ulp would be a seam left unlocked.
+fn shared_positions(
+    primitives: &[OpenPrimitive],
+    slots: &[PartSlot],
+    quantization: u8,
+) -> HashSet<[i32; 3]> {
     if slots.len() < 2 {
         return HashSet::new();
     }
     const SHARED: u32 = u32::MAX;
-    let mut owner: HashMap<[u32; 3], u32> = HashMap::new();
+    let vertices = primitives
+        .iter()
+        .map(|primitive| primitive.geometry.positions.len())
+        .sum();
+    let mut owner: HashMap<[i32; 3], u32> = HashMap::with_capacity(vertices);
     for (part, slot) in slots.iter().enumerate() {
         let primitive = &primitives[slot.primitive];
         for triangle in &primitive.partitions[slot.partition] {
             let base = *triangle as usize * 3;
             for index in &primitive.geometry.indices[base..base + 3] {
-                let key = position_key(primitive.geometry.positions[*index as usize]);
+                let key = position_key(primitive.geometry.positions[*index as usize], quantization);
                 let entry = owner.entry(key).or_insert(part as u32);
                 if *entry != part as u32 {
                     *entry = SHARED;
@@ -774,8 +787,11 @@ fn shared_positions(primitives: &[OpenPrimitive], slots: &[PartSlot]) -> HashSet
         .collect()
 }
 
-fn position_key(position: [f32; 3]) -> [u32; 3] {
-    position.map(|component| if component == 0.0 { 0.0f32 } else { component }.to_bits())
+/// A position snapped to the meshlet quantization grid, as `MeshletMesh::from_mesh`
+/// snaps it (metres to centimetres, then 2^q steps per centimetre).
+fn position_key(position: [f32; 3], quantization: u8) -> [i32; 3] {
+    let scale = 100.0 * (1u32 << quantization) as f32;
+    position.map(|component| (component * scale).round() as i32)
 }
 
 /// Builds one part and, when it is the mesh's last, writes the manifest and
@@ -891,7 +907,10 @@ fn bake_part(
     } else {
         part.positions
             .iter()
-            .map(|position| mesh.shared_positions.contains(&position_key(*position)))
+            .map(|position| {
+                mesh.shared_positions
+                    .contains(&position_key(*position, settings.quantization))
+            })
             .collect()
     };
     let locked_vertices = locked.iter().filter(|flag| **flag).count() as u32;
@@ -1169,8 +1188,8 @@ mod seam_tests {
         }
     }
 
-    fn column(shared: &HashSet<[u32; 3]>, x: f32, n: u32) -> bool {
-        (0..=n).all(|z| shared.contains(&position_key([x, 0.0, z as f32])))
+    fn column(shared: &HashSet<[i32; 3]>, x: f32, n: u32) -> bool {
+        (0..=n).all(|z| shared.contains(&position_key([x, 0.0, z as f32], 4)))
     }
 
     #[test]
@@ -1194,11 +1213,11 @@ mod seam_tests {
                 partition: 1,
             },
         ];
-        let shared = shared_positions(&primitives, &slots);
+        let shared = shared_positions(&primitives, &slots, 4);
         assert_eq!(shared.len(), 5);
         assert!(column(&shared, 2.0, 4));
-        assert!(!shared.contains(&position_key([0.0, 0.0, 0.0])));
-        assert!(!shared.contains(&position_key([4.0, 0.0, 4.0])));
+        assert!(!shared.contains(&position_key([0.0, 0.0, 0.0], 4)));
+        assert!(!shared.contains(&position_key([4.0, 0.0, 4.0], 4)));
     }
 
     #[test]
@@ -1220,7 +1239,7 @@ mod seam_tests {
                 partition: 0,
             },
         ];
-        let shared = shared_positions(&primitives, &slots);
+        let shared = shared_positions(&primitives, &slots, 4);
         assert_eq!(shared.len(), 5);
         assert!(column(&shared, 2.0, 4));
     }
@@ -1234,15 +1253,23 @@ mod seam_tests {
             primitive: 0,
             partition: 0,
         }];
-        assert!(shared_positions(&primitives, &slots).is_empty());
+        assert!(shared_positions(&primitives, &slots, 4).is_empty());
     }
 
     #[test]
-    fn negative_zero_matches_zero() {
+    fn keys_match_within_the_quantization_step_and_differ_beyond_it() {
+        // q = 4: 1/16 cm steps. An ulp apart is the same key; 1 mm is not.
         assert_eq!(
-            position_key([-0.0, 1.0, -0.0]),
-            position_key([0.0, 1.0, 0.0])
+            position_key([-0.0, 1.0, -0.0], 4),
+            position_key([0.0, 1.0, 0.0], 4)
         );
-        assert_ne!(position_key([0.0, 1.0, 0.0]), position_key([0.0, 1.0, 1.0]));
+        assert_eq!(
+            position_key([3.9762273, 5.27106, 0.0], 4),
+            position_key([3.9762292, 5.2710595, 0.0], 4)
+        );
+        assert_ne!(
+            position_key([0.0, 1.0, 0.0], 4),
+            position_key([0.0, 1.0, 0.001], 4)
+        );
     }
 }
