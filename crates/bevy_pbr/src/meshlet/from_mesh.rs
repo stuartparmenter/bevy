@@ -141,11 +141,6 @@ impl MeshletMesh {
         // Generate a position-only vertex buffer for determining triangle/meshlet connectivity
         let position_only_vertex_remap = generate_position_remap(&vertices);
 
-        // Split the mesh into an initial list of meshlets (LOD 0)
-        let (mut meshlets, mut cull_data) =
-            compute_meshlets(&indices, &vertices, &position_only_vertex_remap, None);
-
-        let mut vertex_locks = vec![false; vertices.vertex_count];
         let border_locks = match locks {
             InputLocks::None => vec![false; vertices.vertex_count],
             InputLocks::OpenBorders => {
@@ -161,6 +156,12 @@ impl MeshletMesh {
                 position_locks(locked, &position_only_vertex_remap)
             }
         };
+
+        // Split the mesh into an initial list of meshlets (LOD 0)
+        let (mut meshlets, mut cull_data) =
+            compute_meshlets(&indices, &vertices, &position_only_vertex_remap, None);
+
+        let mut vertex_locks = vec![false; vertices.vertex_count];
 
         // Build further LODs
         let mut bvh = BvhBuilder::default();
@@ -1989,7 +1990,7 @@ mod tests {
     }
 
     /// An open grid with only one of its four borders locked: that edge must
-    /// survive to the coarsest LOD, the other three must be free to go, and
+    /// survive to the coarsest LOD, the opposite edge must lose vertices, and
     /// the whole must simplify far below what locking every open edge allows.
     #[test]
     fn explicit_locks_pin_only_the_named_seam() {
