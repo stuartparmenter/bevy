@@ -1269,6 +1269,33 @@ mod tests {
         render::render_resource::PrimitiveTopology,
     };
 
+    /// `ZORAH_MEASURE_GLB=a.glb,b.glb cargo test ... -- --ignored measure_border_locking`
+    /// prints how much locking the open borders grows each partition's
+    /// encoded meshlet mesh, for sizing a repack before running it.
+    #[test]
+    #[ignore]
+    fn measure_border_locking() {
+        let Some(paths) = std::env::var_os("ZORAH_MEASURE_GLB") else {
+            return;
+        };
+        bevy::tasks::AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
+        for path in paths.to_string_lossy().split(',') {
+            let bytes = fs::read(path).unwrap();
+            let mut mesh = mesh_from_converter_glb(&bytes, false).unwrap();
+            repair_inverted_winding(&mut mesh).unwrap();
+            let free = MeshletMesh::from_mesh(&mesh, 4).unwrap();
+            let locked = MeshletMesh::from_mesh_with_locked_borders(&mesh, 4).unwrap();
+            let free_bytes = encode_meshlet(&free).unwrap().len();
+            let locked_bytes = encode_meshlet(&locked).unwrap().len();
+            let free_blas = free.raytracing_geometry(0.02).indices.len() / 3;
+            let locked_blas = locked.raytracing_geometry(0.02).indices.len() / 3;
+            eprintln!(
+                "{path}: encoded {free_bytes} -> {locked_bytes} bytes ({:+.1}%), blas tris {free_blas} -> {locked_blas}",
+                (locked_bytes as f64 / free_bytes as f64 - 1.0) * 100.0
+            );
+        }
+    }
+
     #[test]
     fn meshlet_blas_payload_round_trips_compact_vertices() {
         let source = MeshletRaytracingGeometry {
