@@ -12,17 +12,6 @@ pub struct Geometry {
     pub indices: Vec<u32>,
 }
 
-impl Geometry {
-    pub fn empty() -> Self {
-        Self {
-            positions: Vec::new(),
-            normals: Vec::new(),
-            uvs: Vec::new(),
-            indices: Vec::new(),
-        }
-    }
-}
-
 /// Area-weighted vertex normals for a primitive that exports none.
 pub fn smooth_normals(positions: &[[f32; 3]], indices: &[u32]) -> Vec<[f32; 3]> {
     let mut sums = vec![Vec3::ZERO; positions.len()];

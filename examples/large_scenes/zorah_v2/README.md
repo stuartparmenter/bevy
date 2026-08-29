@@ -47,27 +47,41 @@ The cache defaults to `<scene root>/.bevy_zorah_cache`; `--cache-dir` moves
 it. Meshes sharing a `.mesh.bin` (82 do) are baked once.
 
 The manifest is the checkpoint: an interrupted run resumes at mesh
-granularity, redoing only the mesh that was in flight. A manifest whose
+granularity, redoing only the meshes that were in flight. A manifest whose
 stamp disagrees with the current `--quantization`, `--partition-triangles`,
 meshlet asset version or bake pipeline version is rebaked. To reset, delete
-the cache directory (or one mesh's subdirectory). Caches from before the
-load-time LOD cut also hold a `.zblas` BLAS cut per part; those manifests
-still load, and the `.zblas` files can be deleted.
+the cache directory (or one mesh's subdirectory). Caches from bake pipeline
+versions 1 and 2 locked every open edge (see below) and are rebaked whole;
+their `.zblas` files can be deleted.
 
 Primitives above `--partition-triangles` are cut into spatial partitions by
-median bisection on the longest axis of their triangle centroids. The
-partitions of one primitive, and the primitives of a multi-primitive mesh
-(the export's UDIM tiles meet edge to edge), are built with locked borders
-so coarser meshlet LODs cannot open cracks along the seams. The bake runs on
-`--bake-workers` threads while the window stays responsive. Each worker
-holds one whole decoded mesh (every attribute of every primitive, tangents
-included) plus the partition being built, so the default of
-`clamp((total RAM - 8 GiB) / 2 GiB, 1, cores)` assumes about 2 GiB per
-worker; that is a typical figure, not a bound, and the largest meshes
-(32 M triangles across 12 primitives) will hold several GiB at their peak.
-Lower `--bake-workers` if the machine runs short of memory during the full
-bake. Progress is logged every 5 s; a mesh that fails (or panics inside the
-meshlet builder) is reported and skipped rather than aborting the bake.
+median bisection on the longest axis of their triangle centroids. Every part
+- each partition, and each primitive of a multi-primitive mesh (the export's
+UDIM tiles) - builds its own LOD chain, so a vertex two parts share would
+drift apart as they simplify and open the seam. The bake therefore locks
+exactly the positions that occur in more than one part of the mesh: the
+partition cuts and the edges tiles share. Nothing else is locked; an edge
+that is open in the source mesh meets nothing and simplifies freely. (Locking
+every open edge, as the first bakes did, pinned this scene's tiled floors and
+loose ornaments at nearly full detail through every LOD.) The manifest
+records each part's `locked_vertices`.
+
+Work is scheduled per part: `--bake-workers` threads take parts from a
+queue, and a worker that finds it empty opens the next mesh - decodes it,
+partitions it, finds its seams - and queues its parts, largest meshes first,
+so a 32 M-triangle mesh spreads over every worker instead of holding one for
+an hour. At most `workers + 1` decoded meshes are held at once; the largest
+here (32 M triangles across 12 primitives) is about 1 GiB decoded, and a part
+under construction adds its meshlet build on top. The default worker count
+is `clamp((total RAM - 8 GiB) / 2 GiB, 1, max(4, cores / 2))`: each part's
+simplification already fans out over bevy's compute pool, which the app
+sizes to a thread per core for exactly this (the default pool would cap it
+at four threads and every worker would queue behind them). Lower
+`--bake-workers` if the machine runs short of memory. The `mimalloc`
+feature (on by default) replaces the system allocator, which on Windows
+serialises the bake's threads. Progress is logged every 5 s; a mesh whose
+part fails (or panics inside the meshlet builder) is reported and skipped
+rather than aborting the bake, and the rest of its parts still finish.
 
 A part that is present but unreadable (a truncated file) fails to load at
 run time; its mesh's manifest is then deleted so the next run rebakes it.
@@ -103,12 +117,12 @@ residency line counts them). Choosing values:
 - `--raster-error` (default 4 mm) is the finest detail the raster image
   can show, however close the camera gets. Instancing costs nothing extra,
   since the bytes are per mesh. Take the smallest value whose report line
-  (below) fits the budget. Measured on half the cache (1,258 of 2,034
-  geometry files, 824 M source triangles): 16.8 GiB at full detail,
-  8.4 GiB at 1 mm, 6.2 at 2 mm, 5.1 at 4 mm, 4.5 at 8 mm, 3.9 at 32 mm.
-  The ladder flattens because the coarsest LODs, which locked partition
-  borders keep from simplifying further, are most of the bytes at 4 mm and
-  beyond; the bound mainly trades the fine end.
+  (below) fits the budget. Measured on half a pipeline-version-2 cache
+  (1,258 of 2,034 geometry files, 824 M source triangles): 16.8 GiB at
+  full detail, 8.4 GiB at 1 mm, 6.2 at 2 mm, 5.1 at 4 mm, 4.5 at 8 mm, 3.9
+  at 32 mm. That ladder flattened because those bakes locked every open
+  edge, which kept the coarsest LODs near full detail; version 3 locks only
+  shared seams, so remeasure with `--report-lod-budget` before choosing.
 - `--raytracing-error` (default 5 cm) is how far the surface Solari traces
   against may sit from the rasterized one. Solari biases its rays by the
   achieved error, so a larger value shows as light leaking at contact

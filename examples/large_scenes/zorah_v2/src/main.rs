@@ -7,6 +7,12 @@
     reason = "an example binary always has std"
 )]
 
+// Windows' heap serialises the bake's threads, which allocate constantly
+// inside meshopt and metis; mimalloc keeps them off each other.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod bake;
 mod geometry;
 mod lod;
@@ -30,6 +36,7 @@ use std::{
 };
 
 use argh::FromArgs;
+use bevy::app::{TaskPoolOptions, TaskPoolPlugin};
 use bevy::{
     asset::{io::AssetSourceBuilder, AssetMetaCheck},
     camera_controller::free_camera::FreeCameraPlugin,
@@ -79,7 +86,7 @@ struct Args {
     #[argh(option)]
     cache_dir: Option<PathBuf>,
 
-    /// threads baking meshes (or measuring them under --report-lod-budget) at once (default clamp((RAM - 8 GiB) / 2 GiB, 1, cores))
+    /// threads building bake parts (or measuring them under --report-lod-budget) at once; each part's simplification also fans out over the compute pool, so the default is clamp((RAM - 8 GiB) / 2 GiB, 1, max(4, cores / 2))
     #[argh(option)]
     bake_workers: Option<usize>,
 
@@ -302,16 +309,37 @@ fn single_gltf_in(dir: &Path) -> Option<PathBuf> {
     found.next().is_none().then_some(first)
 }
 
-/// One worker per 2 GiB beyond an 8 GiB floor for the app and the OS: a
-/// worker holds a decoded mesh plus its meshlet build, and the largest
-/// meshes here run to tens of millions of triangles.
+/// One worker per 2 GiB beyond an 8 GiB floor for the app and the OS: the
+/// bake holds up to `workers + 1` decoded meshes, and the largest here run
+/// to tens of millions of triangles. Capped at half the cores, because each
+/// worker's meshlet build already fans its simplification out over the
+/// compute pool; more workers than that add memory, not throughput.
 fn default_bake_workers() -> usize {
     let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
     let mut system = sysinfo::System::new();
     system.refresh_memory();
     let total = system.total_memory();
     let spare = total.saturating_sub(8 << 30);
-    ((spare / (2 << 30)) as usize).clamp(1, cores)
+    ((spare / (2 << 30)) as usize).clamp(1, (cores / 2).max(4).min(cores))
+}
+
+/// The pools an `App` builds for the bake to run under. `MeshletMesh::from_mesh`
+/// simplifies each LOD's groups across `AsyncComputeTaskPool`, which
+/// `TaskPoolPlugin` sizes to a quarter of the cores capped at four; every bake
+/// worker would queue behind those four threads. The total is raised so that
+/// pool gets a thread per core while the compute pool the schedule runs on
+/// keeps its own full set; idle threads cost nothing.
+fn task_pool_plugin() -> TaskPoolPlugin {
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    let mut options = TaskPoolOptions::default();
+    options.min_total_threads = cores * 2 + 4;
+    options.max_total_threads = cores * 2 + 4;
+    options.async_compute.min_threads = cores;
+    options.async_compute.max_threads = cores;
+    options.async_compute.percent = 1.0;
+    TaskPoolPlugin {
+        task_pool_options: options,
+    }
 }
 
 fn main() -> ExitCode {
@@ -626,6 +654,7 @@ fn run_app(args: &Args, prepared: Prepared) -> ExitCode {
         )
         .add_plugins((
             DefaultPlugins
+                .set(task_pool_plugin())
                 .set(AssetPlugin {
                     // Textures load by the root glTF's own relative URIs.
                     file_path: root.dir.to_string_lossy().into_owned(),
