@@ -61,6 +61,21 @@ pub struct MeshletMesh {
     pub(crate) bvh_depth: u32,
 }
 
+impl MeshletMesh {
+    /// The number of meshlets in this mesh, across every LOD.
+    pub fn meshlet_count(&self) -> usize {
+        self.meshlets.len()
+    }
+
+    /// The bytes the meshlet manager uploads for this mesh: its seven packed streams laid out
+    /// back to back at the manager's section alignment, exactly as `pack_meshlet_mesh` in
+    /// `meshlet_mesh_manager.rs` sizes an allocation. A scene deciding what fits in the manager's
+    /// `MESHLET_MAX_PAGES` pages of `MESHLET_PAGE_SIZE` bytes budgets with this.
+    pub fn packed_byte_len(&self) -> usize {
+        super::meshlet_mesh_manager::packed_meshlet_mesh_len(self)
+    }
+}
+
 /// A fixed-error meshlet LOD decoded into hardware ray-tracing input geometry.
 ///
 /// Hardware acceleration structures cannot consume [`MeshletMesh`]'s variable-bit packed
