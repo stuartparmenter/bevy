@@ -67,6 +67,15 @@ impl MeshletMesh {
         self.meshlets.len()
     }
 
+    /// The number of triangles in this mesh across every LOD, which is what its meshlet data
+    /// scales with; the finest LOD alone is the source mesh's count.
+    pub fn triangle_count(&self) -> usize {
+        self.meshlets
+            .iter()
+            .map(|meshlet| meshlet.triangle_count as usize)
+            .sum()
+    }
+
     /// The bytes the meshlet manager uploads for this mesh: its seven packed streams laid out
     /// back to back at the manager's section alignment, exactly as `pack_meshlet_mesh` in
     /// `meshlet_mesh_manager.rs` sizes an allocation. A scene deciding what fits in the manager's
@@ -427,27 +436,36 @@ impl AssetLoader for MeshletMeshLoader {
         _settings: &(),
         _load_context: &mut LoadContext<'_>,
     ) -> Result<MeshletMesh, MeshletMeshSaveOrLoadError> {
-        // Load and check magic number
-        let magic = async_read_u64(reader).await?;
+        MeshletMesh::read(&mut AsyncReadSyncAdapter(reader))
+    }
+
+    fn extensions(&self) -> &[&str] {
+        &["meshlet_mesh"]
+    }
+}
+
+impl MeshletMesh {
+    /// Decodes a `.meshlet_mesh` file, as [`MeshletMeshLoader`] does, for a caller without an
+    /// asset server: a tool measuring a cache of them, or a loader wrapping the format in one of
+    /// its own.
+    pub fn read(reader: &mut dyn Read) -> Result<MeshletMesh, MeshletMeshSaveOrLoadError> {
+        let magic = read_u64(reader)?;
         if magic != MESHLET_MESH_ASSET_MAGIC {
             return Err(MeshletMeshSaveOrLoadError::WrongFileType);
         }
-
-        // Load and check asset version
-        let version = async_read_u64(reader).await?;
+        let version = read_u64(reader)?;
         if version != MESHLET_MESH_ASSET_VERSION {
             return Err(MeshletMeshSaveOrLoadError::WrongVersion { found: version });
         }
 
         let mut bytes = [0u8; size_of::<MeshletAabb>()];
-        reader.read_exact(&mut bytes).await?;
+        reader.read_exact(&mut bytes)?;
         let aabb = bytemuck::cast(bytes);
         let mut bytes = [0u8; size_of::<u32>()];
-        reader.read_exact(&mut bytes).await?;
+        reader.read_exact(&mut bytes)?;
         let bvh_depth = u32::from_le_bytes(bytes);
 
-        // Load and decompress asset data
-        let reader = &mut FrameDecoder::new(AsyncReadSyncAdapter(reader));
+        let reader = &mut FrameDecoder::new(reader);
         let vertex_positions = read_slice(reader)?;
         let vertex_normals = read_slice(reader)?;
         let vertex_uvs = read_slice(reader)?;
@@ -468,10 +486,6 @@ impl AssetLoader for MeshletMeshLoader {
             bvh_depth,
         })
     }
-
-    fn extensions(&self) -> &[&str] {
-        &["meshlet_mesh"]
-    }
 }
 
 #[derive(Error, Debug)]
@@ -484,12 +498,6 @@ pub enum MeshletMeshSaveOrLoadError {
     CompressionOrDecompression(#[from] lz4_flex::frame::Error),
     #[error(transparent)]
     Io(#[from] std::io::Error),
-}
-
-async fn async_read_u64(reader: &mut dyn Reader) -> Result<u64, std::io::Error> {
-    let mut bytes = [0u8; 8];
-    reader.read_exact(&mut bytes).await?;
-    Ok(u64::from_le_bytes(bytes))
 }
 
 fn read_u64(reader: &mut dyn Read) -> Result<u64, std::io::Error> {
