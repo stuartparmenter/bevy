@@ -67,9 +67,32 @@ fn safe_inverse(x: f32) -> f32 {
 // `w`, so a triangle with vertices behind the eye resolves as exactly as one in front:
 // the resolve reprojects unclipped world positions, and any ground plane the camera
 // stands on has vertices behind it.
-fn homogeneous_barycentrics(clip_x: vec3<f32>, clip_y: vec3<f32>, clip_w: vec3<f32>, ndc: vec2<f32>) -> vec3<f32> {
-    let weights = cross(clip_x - ndc.x * clip_w, clip_y - ndc.y * clip_w);
-    return weights * safe_inverse(dot(weights, vec3(1.0)));
+struct HomogeneousBarycentrics {
+    barycentrics: vec3<f32>,
+    // Derivatives of the barycentrics per NDC unit along x and y.
+    ddx: vec3<f32>,
+    ddy: vec3<f32>,
+}
+
+// The derivatives come from differentiating the same expression rather than
+// from a second solve one pixel over: on a triangle spanning tens of metres
+// the two solves agree to most of their bits, and their difference is noise
+// that flickers the mip selection. With `weights = cross(a, b)`, `a` and `b`
+// linear in the pixel position and `sum = dot(weights, 1)`, the quotient rule
+// gives the exact per-NDC derivative in closed form.
+fn homogeneous_barycentrics(clip_x: vec3<f32>, clip_y: vec3<f32>, clip_w: vec3<f32>, ndc: vec2<f32>) -> HomogeneousBarycentrics {
+    let a = clip_x - ndc.x * clip_w;
+    let b = clip_y - ndc.y * clip_w;
+    let weights = cross(a, b);
+    let sum = dot(weights, vec3(1.0));
+    let inverse_sum = safe_inverse(sum);
+    let barycentrics = weights * inverse_sum;
+    // d(cross(a, b))/dx with da/dx = -w, db/dx = 0; likewise for y.
+    let weights_dx = cross(-clip_w, b);
+    let weights_dy = cross(a, -clip_w);
+    let ddx = (weights_dx - barycentrics * dot(weights_dx, vec3(1.0))) * inverse_sum;
+    let ddy = (weights_dy - barycentrics * dot(weights_dy, vec3(1.0))) * inverse_sum;
+    return HomogeneousBarycentrics(barycentrics, ddx, ddy);
 }
 
 // two_over_screen_size converts the per-NDC derivatives to per-pixel: one pixel spans
@@ -94,15 +117,10 @@ fn compute_partial_derivatives(vertex_world_positions: array<vec4<f32>, 3>, ndc_
         vertex_clip_position_2.xyw,
     ));
 
-    result.barycentrics = homogeneous_barycentrics(clip_x, clip_y, clip_w, ndc_uv);
-    let barycentrics_ddx = homogeneous_barycentrics(
-        clip_x, clip_y, clip_w, ndc_uv + vec2(two_over_screen_size.x, 0.0),
-    );
-    let barycentrics_ddy = homogeneous_barycentrics(
-        clip_x, clip_y, clip_w, ndc_uv - vec2(0.0, two_over_screen_size.y),
-    );
-    result.ddx = barycentrics_ddx - result.barycentrics;
-    result.ddy = barycentrics_ddy - result.barycentrics;
+    let solved = homogeneous_barycentrics(clip_x, clip_y, clip_w, ndc_uv);
+    result.barycentrics = solved.barycentrics;
+    result.ddx = solved.ddx * two_over_screen_size.x;
+    result.ddy = -solved.ddy * two_over_screen_size.y;
     return result;
 }
 
