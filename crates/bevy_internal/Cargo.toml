@@ -333,6 +333,9 @@ meshlet = ["bevy_pbr?/meshlet"]
 # Enables processing meshes into meshlet meshes for bevy_pbr
 meshlet_processor = ["bevy_pbr?/meshlet_processor"]
 
+# Enables loading glTF files that use EXT_meshopt_compression
+gltf_meshopt = ["bevy_gltf?/meshopt"]
+
 # Provides a collection of developer tools
 bevy_dev_tools = ["dep:bevy_dev_tools"]
 
