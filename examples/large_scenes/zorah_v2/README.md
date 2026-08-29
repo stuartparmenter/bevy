@@ -51,10 +51,8 @@ The manifest is the checkpoint: an interrupted run resumes at mesh
 granularity, redoing only the meshes that were in flight. A manifest whose
 stamp disagrees with the current `--quantization`, `--partition-triangles`,
 meshlet asset version or bake pipeline version is rebaked. To reset, delete
-the cache directory (or one mesh's subdirectory). Caches from bake pipeline
-versions 1 and 2 locked every open edge (see below), and version 3 matched
-seams by exact bits and so missed tile edges an ulp apart; all are rebaked
-whole, and the `.zblas` files of 1 and 2 can be deleted.
+the cache directory (or one mesh's subdirectory). Older caches may also hold
+`.zblas` files, which nothing reads.
 
 Primitives above `--partition-triangles` are cut into spatial partitions by
 median bisection on the longest axis of their triangle centroids. Every part
@@ -62,11 +60,10 @@ median bisection on the longest axis of their triangle centroids. Every part
 UDIM tiles) - builds its own LOD chain, so a vertex two parts share would
 drift apart as they simplify and open the seam. The bake therefore locks
 exactly the positions that occur in more than one part of the mesh: the
-partition cuts and the edges tiles share. Nothing else is locked; an edge
-that is open in the source mesh meets nothing and simplifies freely. (Locking
-every open edge, as the first bakes did, pinned this scene's tiled floors and
-loose ornaments at nearly full detail through every LOD.) The manifest
-records each part's `locked_vertices`.
+partition cuts and the edges tiles share, matched on the meshlet build's own
+quantization grid since the export's tiles agree only to within a few ulps.
+Nothing else is locked; an edge that is open in the source mesh meets nothing
+and simplifies freely. The manifest records each part's `locked_vertices`.
 
 Work is scheduled per part: `--bake-workers` threads take parts from a
 queue, and a worker that finds it empty opens the next mesh - decodes it,
@@ -121,12 +118,8 @@ residency line counts them). Choosing values:
 - `--raster-error` (default 4 mm) is the finest detail the raster image
   can show, however close the camera gets. Instancing costs nothing extra,
   since the bytes are per mesh. Take the smallest value whose report line
-  (below) fits the budget. Measured on half a pipeline-version-2 cache
-  (1,258 of 2,034 geometry files, 824 M source triangles): 16.8 GiB at
-  full detail, 8.4 GiB at 1 mm, 6.2 at 2 mm, 5.1 at 4 mm, 4.5 at 8 mm, 3.9
-  at 32 mm. That ladder flattened because those bakes locked every open
-  edge, which kept the coarsest LODs near full detail; version 3 locks only
-  shared seams, so remeasure with `--report-lod-budget` before choosing.
+  (below) fits the budget; the ladder flattens towards the coarsest LODs,
+  which the bound cannot prune, so measure the cache rather than assume.
 - `--raytracing-error` (default 5 cm) is how far the surface Solari traces
   against may sit from the rasterized one. Solari biases its rays by the
   achieved error, so a larger value shows as light leaking at contact

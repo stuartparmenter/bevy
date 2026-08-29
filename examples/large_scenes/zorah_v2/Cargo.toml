@@ -49,8 +49,8 @@ mimalloc = { version = "0.1", default-features = false, optional = true }
 
 [features]
 # DLSS Ray Reconstruction denoises the Solari path. On by default (needs an
-# NVIDIA RTX GPU and the DLSS SDK to build); drop it with
-# `--no-default-features` to run Solari without DLSS.
+# NVIDIA RTX GPU and the DLSS SDK to build); build with
+# `--no-default-features --features mimalloc` to run Solari without DLSS.
 default = ["dlss", "mimalloc"]
 dlss = ["bevy/dlss"]
 mimalloc = ["dep:mimalloc"]

@@ -13,7 +13,7 @@
 //! reference their 4k textures.
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, VecDeque},
     fs,
     io::Write,
     panic::{self, AssertUnwindSafe},
@@ -22,7 +22,7 @@ use std::{
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{self, Receiver, Sender},
-        Arc, Condvar, Mutex,
+        Arc, Condvar, Mutex, MutexGuard, PoisonError,
     },
     task::{Context, Poll},
     thread::JoinHandle,
@@ -36,7 +36,10 @@ use bevy::{
     },
     math::Vec3,
     mesh::{Indices, Mesh},
-    pbr::experimental::meshlet::{MeshletMesh, MeshletMeshSaver, MESHLET_MESH_ASSET_VERSION},
+    pbr::experimental::meshlet::{
+        quantize_vertex_position, MeshletMesh, MeshletMeshSaver, MESHLET_MESH_ASSET_VERSION,
+    },
+    platform::collections::HashMap as FastHashMap,
     render::render_resource::PrimitiveTopology,
     tasks::{block_on, AsyncComputeTaskPool, TaskPool},
 };
@@ -50,9 +53,7 @@ use crate::geometry::{
 
 /// Bumped whenever the bake's own logic changes what it writes (partition
 /// rules, seam locking, attribute synthesis, winding repair), so stale
-/// caches rebake. Version 3 locked only shared seams instead of every open
-/// edge; version 4 matches seams on the quantization grid rather than by
-/// exact bits, which locks the tile edges an ulp apart that 3 missed.
+/// caches rebake.
 pub const BAKE_PIPELINE_VERSION: u32 = 4;
 pub const MANIFEST_FILE: &str = "manifest.json";
 
@@ -247,9 +248,9 @@ pub struct PartManifest {
     /// `p<primitive>_<partition>.meshlet_mesh`, relative to the directory.
     pub meshlet_file: String,
     pub triangles: u64,
-    pub vertices: u32,
     /// Vertices whose position another part of the mesh shares, held in place
-    /// at every LOD so the seam stays closed.
+    /// at every LOD so the seam stays closed. A diagnostic: nothing at run
+    /// time reads it.
     pub locked_vertices: u32,
     pub aabb_min: [f32; 3],
     pub aabb_max: [f32; 3],
@@ -355,26 +356,25 @@ struct Counters {
 /// The running bake. Dropping it lets the workers finish their current part
 /// and stop; they never outlive the process's interest in them for long.
 pub struct BakeHandle {
-    total: usize,
     started: Instant,
-    counters: Arc<Counters>,
-    scheduler: Arc<Scheduler>,
+    shared: Arc<Shared>,
     events: Mutex<Receiver<BakeEvent>>,
     workers: Vec<JoinHandle<()>>,
 }
 
 impl BakeHandle {
     pub fn progress(&self) -> BakeProgress {
-        let baked = self.counters.baked.load(Ordering::Acquire);
-        let reused = self.counters.reused.load(Ordering::Acquire);
-        let failed = self.counters.failed.load(Ordering::Acquire);
+        let counters = &self.shared.counters;
+        let baked = counters.baked.load(Ordering::Acquire);
+        let reused = counters.reused.load(Ordering::Acquire);
+        let failed = counters.failed.load(Ordering::Acquire);
         BakeProgress {
-            total: self.total,
+            total: self.shared.jobs.len(),
             finished: baked + reused + failed,
             baked,
             reused,
             failed,
-            partitions: self.counters.partitions.load(Ordering::Acquire),
+            partitions: counters.partitions.load(Ordering::Acquire),
             elapsed: self.started.elapsed(),
         }
     }
@@ -384,13 +384,13 @@ impl BakeHandle {
     /// `progress()` first and drains afterwards sees every event of the jobs
     /// that snapshot counted; draining first can leave the last one behind.
     pub fn try_recv(&self) -> Option<BakeEvent> {
-        self.events.lock().ok()?.try_recv().ok()
+        lock(&self.events).try_recv().ok()
     }
 
     /// Stops the workers after the parts they are on; the counters then stay
     /// short of `total`.
     pub fn cancel(&self) {
-        self.scheduler.cancel();
+        self.shared.scheduler.cancel();
     }
 
     /// Cancels and joins the workers.
@@ -410,47 +410,38 @@ impl Drop for BakeHandle {
 
 /// Starts baking `jobs` on `settings.workers` threads.
 ///
-/// Work is scheduled per part, not per mesh: a worker that finds nothing
-/// queued opens the next mesh - decodes it, partitions it, finds its seams -
-/// and queues every part, so a 32 M-triangle mesh spreads over every worker
-/// instead of holding one for an hour while the rest idle. Meshes open
-/// largest first, which keeps the tail short. A mesh is opened only when the
-/// queue is empty, so at most `workers` decoded meshes are held at once: every
-/// mesh alive at the last claim was being opened or had a part in flight, one
-/// per worker.
+/// Work is scheduled per part. A worker that finds nothing queued opens the
+/// next mesh, largest first, and queues its parts; since a mesh is opened
+/// only when the queue is empty, at most `workers` decoded meshes are live.
 ///
 /// `MeshletMesh::from_mesh` spreads its simplification over bevy's
 /// `AsyncComputeTaskPool`, which is initialised here if no `App` has done so
 /// yet (the call is a no-op otherwise).
 pub fn start(settings: BakeSettings, jobs: Vec<MeshJob>) -> BakeHandle {
     AsyncComputeTaskPool::get_or_init(TaskPool::default);
-    let total = jobs.len();
     let mut order: Vec<usize> = (0..jobs.len()).collect();
     order.sort_by_key(|&job| std::cmp::Reverse(jobs[job].triangles()));
     let shared = Arc::new(Shared {
         settings,
         jobs,
         order,
-        counters: Arc::new(Counters::default()),
+        counters: Counters::default(),
+        scheduler: Scheduler::default(),
     });
-    let scheduler = Arc::new(Scheduler::default());
     let (sender, events) = mpsc::channel();
     let workers = (0..shared.settings.workers.max(1))
         .map(|worker| {
             let shared = Arc::clone(&shared);
-            let scheduler = Arc::clone(&scheduler);
             let sender = sender.clone();
             std::thread::Builder::new()
                 .name(format!("zorah-bake-{worker}"))
-                .spawn(move || run_worker(&shared, &scheduler, &sender))
+                .spawn(move || run_worker(&shared, &sender))
                 .expect("spawning a bake worker thread")
         })
         .collect();
     BakeHandle {
-        total,
         started: Instant::now(),
-        counters: Arc::clone(&shared.counters),
-        scheduler,
+        shared,
         events: Mutex::new(events),
         workers,
     }
@@ -462,7 +453,12 @@ struct Shared {
     jobs: Vec<MeshJob>,
     /// Job indices, largest first.
     order: Vec<usize>,
-    counters: Arc<Counters>,
+    counters: Counters,
+    scheduler: Scheduler,
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// The part queue and the cursor into `Shared::order`.
@@ -484,147 +480,159 @@ struct SchedulerState {
     opening: usize,
 }
 
+enum Claim {
+    Part(PartTask),
+    Open(usize),
+}
+
 impl Scheduler {
-    fn cancel(&self) {
-        self.cancel.store(true, Ordering::Release);
-        let _guard = self.state.lock();
+    /// The next thing for a worker to do, waiting while another worker may
+    /// still queue parts; `None` once the bake is over or cancelled.
+    fn claim(&self, order: &[usize]) -> Option<Claim> {
+        let mut state = lock(&self.state);
+        loop {
+            if self.cancel.load(Ordering::Acquire) {
+                return None;
+            }
+            if let Some(task) = state.queue.pop_front() {
+                return Some(Claim::Part(task));
+            }
+            if let Some(&job) = order.get(state.next) {
+                state.next += 1;
+                state.opening += 1;
+                return Some(Claim::Open(job));
+            }
+            if state.opening == 0 {
+                return None;
+            }
+            state = self
+                .ready
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    /// Queues the parts of a mesh a `Claim::Open` produced (none, if it was
+    /// reused or failed).
+    fn opened(&self, tasks: Vec<PartTask>) {
+        let mut state = lock(&self.state);
+        state.opening -= 1;
+        state.queue.extend(tasks);
         self.ready.notify_all();
     }
 
-    fn cancelled(&self) -> bool {
-        self.cancel.load(Ordering::Acquire)
+    fn cancel(&self) {
+        self.cancel.store(true, Ordering::Release);
+        let _state = lock(&self.state);
+        self.ready.notify_all();
     }
 }
 
-/// One partition of one primitive of an open mesh.
+/// One partition of one primitive, holding what it needs to build itself.
+/// The primitive's geometry is freed once every task of it has reindexed.
 struct PartTask {
     mesh: Arc<OpenMesh>,
+    primitive: Arc<OpenPrimitive>,
+    /// Index into `MeshProgress::parts`.
     slot: usize,
+    partition: usize,
+    /// Triangle ids into the primitive.
+    triangles: Vec<u32>,
 }
 
-/// A mesh whose geometry is decoded and whose parts are queued or in flight.
-/// Dropped, with its geometry, when the last part reports.
+/// A mesh whose parts are queued or in flight.
 struct OpenMesh {
     job: usize,
     dir: PathBuf,
     stamp: BakeStamp,
     source_triangles: u64,
-    primitives: Vec<OpenPrimitive>,
-    /// Where each part slot sits.
-    slots: Vec<PartSlot>,
-    /// Positions (as f32 bit patterns) that more than one part uses: the
-    /// partition cuts and the edges primitives share.
-    shared_positions: HashSet<[i32; 3]>,
-    remaining: AtomicUsize,
-    parts: Mutex<Vec<Option<PartManifest>>>,
-    failure: Mutex<Option<String>>,
+    progress: Mutex<MeshProgress>,
+}
+
+/// Which parts of a mesh have reported; the last one in writes the manifest.
+struct MeshProgress {
+    remaining: usize,
+    parts: Vec<Option<PartManifest>>,
+    /// The first failure, which fails the mesh once every part is done.
+    failure: Option<String>,
+}
+
+impl MeshProgress {
+    fn new(parts: usize) -> Self {
+        Self {
+            remaining: parts,
+            parts: vec![None; parts],
+            failure: None,
+        }
+    }
+
+    /// Records a part; returns the mesh's outcome when it was the last.
+    fn record(
+        &mut self,
+        slot: usize,
+        outcome: Result<PartManifest, String>,
+    ) -> Option<Result<Vec<PartManifest>, String>> {
+        match outcome {
+            Ok(part) => self.parts[slot] = Some(part),
+            Err(error) => {
+                self.failure.get_or_insert(error);
+            }
+        }
+        self.remaining -= 1;
+        (self.remaining == 0).then(|| match self.failure.take() {
+            Some(error) => Err(error),
+            None => Ok(self
+                .parts
+                .iter_mut()
+                .map(|part| part.take().expect("every part reported"))
+                .collect()),
+        })
+    }
 }
 
 struct OpenPrimitive {
+    index: usize,
     geometry: Geometry,
+    /// One flag per vertex: its grid position is shared with another part
+    /// of the mesh. Empty when the mesh is a single part.
+    locked: Vec<bool>,
     material: Option<usize>,
     winding_repaired: bool,
-    /// Triangle ids per partition.
-    partitions: Vec<Vec<u32>>,
 }
 
-/// Where a partition sits in its mesh, for the manifest entry and file names.
-#[derive(Clone, Copy)]
-struct PartSlot {
-    primitive: usize,
-    partition: usize,
-}
-
-fn run_worker(shared: &Shared, scheduler: &Scheduler, sender: &Sender<BakeEvent>) {
-    let mut state = scheduler.state.lock().unwrap_or_else(|e| e.into_inner());
-    loop {
-        if scheduler.cancelled() {
-            return;
+fn run_worker(shared: &Shared, sender: &Sender<BakeEvent>) {
+    while let Some(claim) = shared.scheduler.claim(&shared.order) {
+        match claim {
+            Claim::Part(task) => run_part(shared, task, sender),
+            Claim::Open(job) => {
+                let tasks = open_job(shared, job, sender);
+                shared.scheduler.opened(tasks);
+            }
         }
-        if let Some(task) = state.queue.pop_front() {
-            drop(state);
-            run_part(shared, task, sender);
-            state = scheduler.state.lock().unwrap_or_else(|e| e.into_inner());
-            continue;
-        }
-        if let Some(&job) = shared.order.get(state.next) {
-            state.next += 1;
-            state.opening += 1;
-            drop(state);
-            let tasks = open_job(shared, job, sender);
-            state = scheduler.state.lock().unwrap_or_else(|e| e.into_inner());
-            state.opening -= 1;
-            state.queue.extend(tasks);
-            scheduler.ready.notify_all();
-            continue;
-        }
-        if state.opening == 0 {
-            return;
-        }
-        state = scheduler
-            .ready
-            .wait(state)
-            .unwrap_or_else(|e| e.into_inner());
     }
 }
 
 /// Reuses `job`'s manifest or decodes and partitions the mesh and returns
-/// its part tasks. A job that is reused, fails or panics reports here and
-/// yields no tasks.
+/// its part tasks. A job that is reused or fails reports here and yields no
+/// tasks.
 fn open_job(shared: &Shared, job: usize, sender: &Sender<BakeEvent>) -> Vec<PartTask> {
     let spec = &shared.jobs[job];
     let dir = shared.settings.cache_dir.join(&spec.stem);
     let stamp = shared.settings.stamp();
     if let Some(manifest) = MeshManifest::reusable(&dir, &stamp) {
-        report(
-            sender,
-            BakeEvent::Complete {
-                job,
-                manifest,
-                reused: true,
-            },
-            &shared.counters.reused,
-        );
+        let event = BakeEvent::Complete {
+            job,
+            manifest,
+            reused: true,
+        };
+        report(sender, event, &shared.counters.reused);
         return Vec::new();
     }
-    // The wrapper is parsed without validation (its required
-    // EXT_meshopt_compression would fail it), so a malformed index panics
-    // inside the gltf crate's readers rather than erroring. A panic has to
-    // count as this mesh's failure, or the counters never reach `total` and
-    // the caller waits on the bake forever.
-    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
-        open_mesh(&shared.settings, job, spec, dir, stamp)
-    }));
-    match outcome {
-        Ok(Ok(mesh)) => {
-            let mesh = Arc::new(mesh);
-            (0..mesh.slots.len())
-                .map(|slot| PartTask {
-                    mesh: Arc::clone(&mesh),
-                    slot,
-                })
-                .collect()
-        }
-        Ok(Err(error)) => {
-            report(
-                sender,
-                BakeEvent::Failed {
-                    job,
-                    error: error.to_string(),
-                },
-                &shared.counters.failed,
-            );
-            Vec::new()
-        }
-        Err(payload) => {
-            report(
-                sender,
-                BakeEvent::Failed {
-                    job,
-                    error: format!("panicked: {}", panic_message(payload.as_ref())),
-                },
-                &shared.counters.failed,
-            );
+    match caught(|| open_mesh(&shared.settings, job, spec, dir, stamp)) {
+        Ok(tasks) => tasks,
+        Err(error) => {
+            let event = BakeEvent::Failed { job, error };
+            report(sender, event, &shared.counters.failed);
             Vec::new()
         }
     }
@@ -635,6 +643,20 @@ fn report(sender: &Sender<BakeEvent>, event: BakeEvent, counter: &AtomicUsize) {
     // A closed receiver only means nobody is listening any more.
     let _ = sender.send(event);
     counter.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Runs a bake step, turning a panic into an error like any other.
+///
+/// The wrapper is parsed without validation (its required
+/// `EXT_meshopt_compression` would fail it), so a malformed index panics inside
+/// the gltf crate's readers, and the meshlet builder panics on degenerate
+/// input too. A panic has to count as a failure, or the counters never reach
+/// the total and the caller waits on the bake forever.
+fn caught<T>(step: impl FnOnce() -> Result<T, BakeError>) -> Result<T, String> {
+    match panic::catch_unwind(AssertUnwindSafe(step)) {
+        Ok(result) => result.map_err(|error| error.to_string()),
+        Err(payload) => Err(format!("panicked: {}", panic_message(payload.as_ref()))),
+    }
 }
 
 /// The `&str` or `String` a panic carried, as `std`'s hook prints it.
@@ -648,15 +670,15 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
-/// Decodes a mesh's wrapper, partitions its primitives and finds the
-/// positions its parts share.
+/// Decodes a mesh's wrapper, partitions its primitives, finds the vertices
+/// its parts share, and returns one task per part.
 fn open_mesh(
     settings: &BakeSettings,
     job: usize,
     spec: &MeshJob,
     dir: PathBuf,
     stamp: BakeStamp,
-) -> Result<OpenMesh, BakeError> {
+) -> Result<Vec<PartTask>, BakeError> {
     let meshes_dir = settings.scene_root.join("meshes");
     let wrapper_path = meshes_dir.join(format!("{}.mesh.gltf", spec.stem));
     let gltf = gltf::Gltf::from_slice_without_validation(&fs::read(&wrapper_path)?)?;
@@ -693,166 +715,222 @@ fn open_mesh(
         )));
     }
 
-    let mut primitives = Vec::with_capacity(wrapper_primitives.len());
-    let mut slots = Vec::new();
-    let mut source_triangles = 0;
-    for (primitive_index, (primitive, expected)) in
-        wrapper_primitives.iter().zip(&spec.primitives).enumerate()
-    {
-        let mut geometry = read_primitive(primitive, &buffers, expected)
-            .map_err(|error| BakeError::Invalid(format!("primitive {primitive_index}: {error}")))?;
-        let winding_repaired = repair_inverted_winding(&mut geometry);
-        let triangles = geometry.indices.len() / 3;
-        source_triangles += triangles as u64;
-        let partitions = if triangles > settings.partition_triangles {
-            partition_triangles(&geometry, settings.partition_triangles)
-        } else {
-            vec![(0..triangles as u32).collect()]
-        };
-        for partition in 0..partitions.len() {
-            slots.push(PartSlot {
-                primitive: primitive_index,
-                partition,
+    // Reading, winding repair and partitioning are per primitive and
+    // independent, and a 12-primitive mesh keeps every worker waiting on
+    // this one until its parts are queued.
+    let buffers = &buffers;
+    let threshold = settings.partition_triangles;
+    let read = AsyncComputeTaskPool::get().scope(|scope| {
+        for (primitive, expected) in wrapper_primitives.iter().zip(&spec.primitives) {
+            scope.spawn(async move {
+                let mut geometry = read_primitive(primitive, buffers, expected)?;
+                let winding_repaired = repair_inverted_winding(&mut geometry);
+                let triangles = geometry.indices.len() / 3;
+                let partitions = if triangles > threshold {
+                    partition_triangles(&geometry, threshold)
+                } else {
+                    vec![(0..triangles as u32).collect()]
+                };
+                Ok::<_, String>((geometry, winding_repaired, partitions))
             });
         }
-        primitives.push(OpenPrimitive {
-            geometry,
-            material: expected.material,
-            winding_repaired,
-            partitions,
-        });
+    });
+    let mut primitives = Vec::with_capacity(read.len());
+    for (index, result) in read.into_iter().enumerate() {
+        primitives.push(
+            result.map_err(|error| BakeError::Invalid(format!("primitive {index}: {error}")))?,
+        );
     }
-    drop(buffers);
 
-    let shared_positions = shared_positions(&primitives, &slots, settings.quantization);
+    let locks = seam_locks(&primitives, settings.quantization);
+    let source_triangles = primitives
+        .iter()
+        .map(|(geometry, ..)| (geometry.indices.len() / 3) as u64)
+        .sum();
+    let part_count = primitives
+        .iter()
+        .map(|(.., partitions)| partitions.len())
+        .sum();
     fs::create_dir_all(&dir)?;
-    Ok(OpenMesh {
+    let mesh = Arc::new(OpenMesh {
         job,
         dir,
         stamp,
         source_triangles,
-        remaining: AtomicUsize::new(slots.len()),
-        parts: Mutex::new(vec![None; slots.len()]),
-        failure: Mutex::new(None),
-        slots,
-        primitives,
-        shared_positions,
-    })
+        progress: Mutex::new(MeshProgress::new(part_count)),
+    });
+    let mut tasks = Vec::with_capacity(part_count);
+    for ((index, (geometry, winding_repaired, partitions)), (locked, expected)) in primitives
+        .into_iter()
+        .enumerate()
+        .zip(locks.into_iter().zip(&spec.primitives))
+    {
+        let primitive = Arc::new(OpenPrimitive {
+            index,
+            geometry,
+            locked,
+            material: expected.material,
+            winding_repaired,
+        });
+        for (partition, triangles) in partitions.into_iter().enumerate() {
+            tasks.push(PartTask {
+                mesh: Arc::clone(&mesh),
+                primitive: Arc::clone(&primitive),
+                slot: tasks.len(),
+                partition,
+                triangles,
+            });
+        }
+    }
+    Ok(tasks)
 }
 
-/// The positions more than one part of the mesh uses.
+/// A decoded primitive with its partitions (triangle ids), before it is
+/// shared out to its tasks.
+type ReadPrimitive = (Geometry, bool, Vec<Vec<u32>>);
+
+/// Per primitive, one flag per vertex: whether its position is used by more
+/// than one part of the mesh. Empty vectors when the mesh is a single part.
 ///
-/// Every part is built into its own LOD chain, so a position two parts share
-/// - along a partition cut, or where two primitives (the export's UDIM tiles)
-/// meet edge to edge - must stay put in both or the seam opens as they
-/// simplify. Nothing else is locked: an edge that is open in the source mesh
-/// meets nothing and may simplify freely, which is what keeps this scene's
-/// tiled floors and loose ornaments from being pinned at full detail.
+/// Every part builds its own LOD chain, so a position two parts share - along
+/// a partition cut, or where two primitives (the export's UDIM tiles) meet
+/// edge to edge - must stay put in both or the seam opens as they simplify.
+/// Nothing else is locked: an edge that is open in the source mesh meets
+/// nothing and may simplify freely.
 ///
-/// Positions compare on the meshlet build's own quantization grid (1/2^q cm),
-/// which is where the build snaps every vertex anyway: the parts of one
-/// primitive copy the same source vertices, but this export's tiles carry
-/// nominally coincident coordinates that differ in their last bits, and a
-/// seam missed for an ulp would be a seam left unlocked.
-fn shared_positions(
-    primitives: &[OpenPrimitive],
-    slots: &[PartSlot],
-    quantization: u8,
-) -> HashSet<[i32; 3]> {
-    if slots.len() < 2 {
-        return HashSet::new();
-    }
-    const SHARED: u32 = u32::MAX;
-    let vertices = primitives
+/// Positions compare on the meshlet build's own quantization grid, which is
+/// where the build snaps every vertex anyway: the parts of one primitive copy
+/// the same source vertices, but this export's tiles carry nominally
+/// coincident coordinates that differ in their last bits, and a seam missed
+/// for an ulp would be a seam left unlocked.
+fn seam_locks(primitives: &[ReadPrimitive], quantization: u8) -> Vec<Vec<bool>> {
+    const NONE: u32 = u32::MAX;
+    const SHARED: u32 = u32::MAX - 1;
+    let part_count: usize = primitives
         .iter()
-        .map(|primitive| primitive.geometry.positions.len())
+        .map(|(.., partitions)| partitions.len())
         .sum();
-    let mut owner: HashMap<[i32; 3], u32> = HashMap::with_capacity(vertices);
-    for (part, slot) in slots.iter().enumerate() {
-        let primitive = &primitives[slot.primitive];
-        for triangle in &primitive.partitions[slot.partition] {
-            let base = *triangle as usize * 3;
-            for index in &primitive.geometry.indices[base..base + 3] {
-                let key = position_key(primitive.geometry.positions[*index as usize], quantization);
-                let entry = owner.entry(key).or_insert(part as u32);
-                if *entry != part as u32 {
-                    *entry = SHARED;
+    if part_count < 2 {
+        return vec![Vec::new(); primitives.len()];
+    }
+    // Which part uses each vertex, by index: a vertex two partitions of one
+    // primitive both index is shared already.
+    let mut owners = Vec::with_capacity(primitives.len());
+    let mut part = 0;
+    for (geometry, _, partitions) in primitives {
+        let mut owner = vec![NONE; geometry.positions.len()];
+        for triangles in partitions {
+            for triangle in triangles {
+                let base = *triangle as usize * 3;
+                for index in &geometry.indices[base..base + 3] {
+                    let entry = &mut owner[*index as usize];
+                    if *entry == NONE {
+                        *entry = part;
+                    } else if *entry != part {
+                        *entry = SHARED;
+                    }
                 }
+            }
+            part += 1;
+        }
+        owners.push(owner);
+    }
+    // Then by position, which is what joins a tile to its neighbour and a
+    // vertex to its UV-split twins.
+    let vertex_count = primitives
+        .iter()
+        .map(|(geometry, ..)| geometry.positions.len())
+        .sum();
+    let mut by_position: FastHashMap<[i32; 3], u32> =
+        FastHashMap::with_capacity_and_hasher(vertex_count, Default::default());
+    for ((geometry, ..), owner) in primitives.iter().zip(&owners) {
+        for (position, owner) in geometry.positions.iter().zip(owner) {
+            if *owner == NONE {
+                continue;
+            }
+            let entry = by_position
+                .entry(position_key(*position, quantization))
+                .or_insert(*owner);
+            if *entry != *owner {
+                *entry = SHARED;
             }
         }
     }
-    owner
-        .into_iter()
-        .filter_map(|(key, part)| (part == SHARED).then_some(key))
+    primitives
+        .iter()
+        .map(|(geometry, ..)| {
+            geometry
+                .positions
+                .iter()
+                .map(|position| {
+                    by_position.get(&position_key(*position, quantization)) == Some(&SHARED)
+                })
+                .collect()
+        })
         .collect()
 }
 
-/// A position snapped to the meshlet quantization grid, as `MeshletMesh::from_mesh`
-/// snaps it (metres to centimetres, then 2^q steps per centimetre).
+/// A position on the meshlet build's quantization grid.
 fn position_key(position: [f32; 3], quantization: u8) -> [i32; 3] {
-    let scale = 100.0 * (1u32 << quantization) as f32;
-    position.map(|component| (component * scale).round() as i32)
+    quantize_vertex_position(Vec3::from(position), quantization).to_array()
 }
 
 /// Builds one part and, when it is the mesh's last, writes the manifest and
 /// reports the mesh.
 fn run_part(shared: &Shared, task: PartTask, sender: &Sender<BakeEvent>) {
-    let mesh = task.mesh;
-    let slot = mesh.slots[task.slot];
-    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
-        bake_part(&shared.settings, &mesh, slot)
-    }));
-    match outcome {
-        Ok(Ok(part)) => {
-            let mut parts = mesh.parts.lock().unwrap_or_else(|e| e.into_inner());
-            parts[task.slot] = Some(part);
-            shared.counters.partitions.fetch_add(1, Ordering::AcqRel);
-        }
-        Ok(Err(error)) => record_failure(&mesh, slot, error.to_string()),
-        Err(payload) => record_failure(
-            &mesh,
-            slot,
-            format!("panicked: {}", panic_message(payload.as_ref())),
-        ),
-    }
-    if mesh.remaining.fetch_sub(1, Ordering::AcqRel) != 1 {
-        return;
-    }
-    // Last part in: every other part has stored its result or failure.
-    let failure = mesh
-        .failure
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take();
-    if let Some(error) = failure {
-        report(
-            sender,
-            BakeEvent::Failed {
-                job: mesh.job,
-                error,
+    let PartTask {
+        mesh,
+        primitive,
+        slot,
+        partition,
+        triangles,
+    } = task;
+    let (primitive_index, material, winding_repaired) = (
+        primitive.index,
+        primitive.material,
+        primitive.winding_repaired,
+    );
+    let dir = mesh.dir.clone();
+    let outcome = caught(move || {
+        let (part, locked) = reindex_part(&primitive, &triangles);
+        // The primitive's geometry is freed with its last task's copy.
+        drop((primitive, triangles));
+        build_part(
+            &shared.settings,
+            &dir,
+            part,
+            locked,
+            PartSlot {
+                primitive: primitive_index,
+                partition,
+                material,
+                winding_repaired,
             },
-            &shared.counters.failed,
-        );
-        return;
+        )
+    })
+    .map_err(|error| format!("primitive {primitive_index} partition {partition}: {error}"));
+    if outcome.is_ok() {
+        shared.counters.partitions.fetch_add(1, Ordering::AcqRel);
     }
-    let parts = mesh
-        .parts
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter_mut()
-        .map(|part| part.take().expect("every part reported"))
-        .collect();
-    let spec = &shared.jobs[mesh.job];
-    let manifest = MeshManifest {
-        stamp: mesh.stamp.clone(),
-        stem: spec.stem.clone(),
-        mesh_name: spec.name.clone(),
-        source_triangles: mesh.source_triangles,
-        parts,
+    let Some(finished) = lock(&mesh.progress).record(slot, outcome) else {
+        return;
     };
-    match manifest.write(&mesh.dir) {
-        Ok(()) => report(
-            sender,
+    let spec = &shared.jobs[mesh.job];
+    let written = finished.and_then(|parts| {
+        let manifest = MeshManifest {
+            stamp: mesh.stamp.clone(),
+            stem: spec.stem.clone(),
+            mesh_name: spec.name.clone(),
+            source_triangles: mesh.source_triangles,
+            parts,
+        };
+        manifest
+            .write(&mesh.dir)
+            .map(|()| manifest)
+            .map_err(|error| format!("writing the manifest: {error}"))
+    });
+    let (event, counter) = match written {
+        Ok(manifest) => (
             BakeEvent::Complete {
                 job: mesh.job,
                 manifest,
@@ -860,41 +938,49 @@ fn run_part(shared: &Shared, task: PartTask, sender: &Sender<BakeEvent>) {
             },
             &shared.counters.baked,
         ),
-        Err(error) => report(
-            sender,
+        Err(error) => (
             BakeEvent::Failed {
                 job: mesh.job,
-                error: format!("writing the manifest: {error}"),
+                error,
             },
             &shared.counters.failed,
         ),
-    }
+    };
+    report(sender, event, counter);
 }
 
-fn record_failure(mesh: &OpenMesh, slot: PartSlot, error: String) {
-    let mut failure = mesh.failure.lock().unwrap_or_else(|e| e.into_inner());
-    if failure.is_none() {
-        *failure = Some(format!(
-            "primitive {} partition {}: {error}",
-            slot.primitive, slot.partition
-        ));
-    }
+/// The part's own vertices and, when the mesh has seams, their lock flags.
+fn reindex_part(primitive: &OpenPrimitive, triangles: &[u32]) -> (Geometry, Vec<bool>) {
+    let (part, sources) = reindex(&primitive.geometry, triangles);
+    let locked = if primitive.locked.is_empty() {
+        Vec::new()
+    } else {
+        sources
+            .iter()
+            .map(|source| primitive.locked[*source as usize])
+            .collect()
+    };
+    (part, locked)
+}
+
+/// Where a partition sits in its mesh, for the manifest entry and file name.
+struct PartSlot {
+    primitive: usize,
+    partition: usize,
+    material: Option<usize>,
+    winding_repaired: bool,
 }
 
 /// Builds one part's meshlet mesh and writes it as
-/// `p<primitive>_<partition>.meshlet_mesh` under the mesh directory.
-fn bake_part(
+/// `p<primitive>_<partition>.meshlet_mesh` under `dir`.
+fn build_part(
     settings: &BakeSettings,
-    mesh: &OpenMesh,
+    dir: &Path,
+    part: Geometry,
+    locked: Vec<bool>,
     slot: PartSlot,
 ) -> Result<PartManifest, BakeError> {
-    let primitive = &mesh.primitives[slot.primitive];
-    let triangle_ids = &primitive.partitions[slot.partition];
-    let mut remap = vec![u32::MAX; primitive.geometry.positions.len()];
-    let part = reindex(&primitive.geometry, triangle_ids, &mut remap);
-    drop(remap);
     let triangles = (part.indices.len() / 3) as u64;
-    let vertices = part.positions.len() as u32;
     let (aabb_min, aabb_max) = part.positions.iter().fold(
         (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY)),
         |(min, max), position| {
@@ -902,47 +988,36 @@ fn bake_part(
             (min.min(position), max.max(position))
         },
     );
-    let locked: Vec<bool> = if mesh.shared_positions.is_empty() {
-        Vec::new()
-    } else {
-        part.positions
-            .iter()
-            .map(|position| {
-                mesh.shared_positions
-                    .contains(&position_key(*position, settings.quantization))
-            })
-            .collect()
-    };
     let locked_vertices = locked.iter().filter(|flag| **flag).count() as u32;
-    let bevy_mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::all())
+    let mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::all())
         .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, part.positions)
         .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, part.normals)
         .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, part.uvs)
         .with_inserted_indices(Indices::U32(part.indices));
-    let meshlet = if locked_vertices == 0 {
-        MeshletMesh::from_mesh(&bevy_mesh, settings.quantization)
+    let meshlet = if locked.is_empty() {
+        MeshletMesh::from_mesh(&mesh, settings.quantization)
     } else {
-        MeshletMesh::from_mesh_with_locks(&bevy_mesh, settings.quantization, &locked)
+        MeshletMesh::from_mesh_with_locks(&mesh, settings.quantization, &locked)
     }
     .map_err(|error| BakeError::Meshlet(error.to_string()))?;
-    drop(bevy_mesh);
-    drop(locked);
+    // Both are the size of the whole part: freed before the encode holds a
+    // third copy.
+    drop(mesh);
     let meshlet_bytes = encode_meshlet(&meshlet)?;
     drop(meshlet);
 
     let meshlet_file = format!("p{}_{}.meshlet_mesh", slot.primitive, slot.partition);
-    fs::write(mesh.dir.join(&meshlet_file), meshlet_bytes)?;
+    fs::write(dir.join(&meshlet_file), meshlet_bytes)?;
     Ok(PartManifest {
         primitive: slot.primitive,
         partition: slot.partition,
-        material: primitive.material,
+        material: slot.material,
         meshlet_file,
         triangles,
-        vertices,
         locked_vertices,
         aabb_min: aabb_min.to_array(),
         aabb_max: aabb_max.to_array(),
-        winding_repaired: primitive.winding_repaired,
+        winding_repaired: slot.winding_repaired,
     })
 }
 
@@ -1090,7 +1165,6 @@ mod tests {
                 material: Some(3),
                 meshlet_file: "p0_0.meshlet_mesh".into(),
                 triangles: 12,
-                vertices: 9,
                 locked_vertices: 0,
                 aabb_min: [-1.0, 0.0, -1.0],
                 aabb_max: [1.0, 2.0, 1.0],
@@ -1152,44 +1226,18 @@ mod tests {
 #[cfg(test)]
 mod seam_tests {
     use super::*;
+    use crate::geometry::tests::grid;
 
-    /// A flat `n` by `n` grid of quads on the XZ plane, `x` first.
-    fn grid(n: u32, x_range: std::ops::Range<u32>) -> Geometry {
-        let columns = x_range.end - x_range.start + 1;
-        let mut positions = Vec::new();
-        for z in 0..=n {
-            for x in x_range.clone().chain(std::iter::once(x_range.end)) {
-                positions.push([x as f32, 0.0, z as f32]);
-            }
-        }
-        let mut indices = Vec::new();
-        for z in 0..n {
-            for x in 0..columns - 1 {
-                let a = z * columns + x;
-                let (b, c, d) = (a + 1, a + columns, a + columns + 1);
-                indices.extend_from_slice(&[a, c, b, b, c, d]);
-            }
-        }
-        let count = positions.len();
-        Geometry {
-            positions,
-            normals: vec![[0.0, 1.0, 0.0]; count],
-            uvs: vec![[0.0, 0.0]; count],
-            indices,
-        }
+    fn read(geometry: Geometry, partitions: Vec<Vec<u32>>) -> ReadPrimitive {
+        (geometry, false, partitions)
     }
 
-    fn primitive(geometry: Geometry, partitions: Vec<Vec<u32>>) -> OpenPrimitive {
-        OpenPrimitive {
-            geometry,
-            material: None,
-            winding_repaired: false,
-            partitions,
-        }
-    }
-
-    fn column(shared: &HashSet<[i32; 3]>, x: f32, n: u32) -> bool {
-        (0..=n).all(|z| shared.contains(&position_key([x, 0.0, z as f32], 4)))
+    fn column_locked(locked: &[bool], positions: &[[f32; 3]], x: f32) -> bool {
+        positions
+            .iter()
+            .zip(locked)
+            .filter(|(position, _)| position[0] == x)
+            .all(|(_, locked)| *locked)
     }
 
     #[test]
@@ -1202,67 +1250,52 @@ mod seam_tests {
             .flat_map(|quad| [quad * 2, quad * 2 + 1])
             .collect();
         let right: Vec<u32> = (0..32u32).filter(|t| !left.contains(t)).collect();
-        let primitives = vec![primitive(geometry, vec![left, right])];
-        let slots = vec![
-            PartSlot {
-                primitive: 0,
-                partition: 0,
-            },
-            PartSlot {
-                primitive: 0,
-                partition: 1,
-            },
-        ];
-        let shared = shared_positions(&primitives, &slots, 4);
-        assert_eq!(shared.len(), 5);
-        assert!(column(&shared, 2.0, 4));
-        assert!(!shared.contains(&position_key([0.0, 0.0, 0.0], 4)));
-        assert!(!shared.contains(&position_key([4.0, 0.0, 4.0], 4)));
+        let primitives = vec![read(geometry, vec![left, right])];
+        let locks = seam_locks(&primitives, 4);
+        let (positions, locked) = (&primitives[0].0.positions, &locks[0]);
+        assert_eq!(locked.iter().filter(|flag| **flag).count(), 5);
+        assert!(column_locked(locked, positions, 2.0));
     }
 
     #[test]
     fn two_primitives_share_only_the_edge_they_meet_on() {
         // Two tiles with their own vertices meeting along x = 2, as the
-        // export's UDIM primitives do.
+        // export's UDIM primitives do, one of them an ulp off.
         let a = grid(4, 0..2);
-        let b = grid(4, 2..4);
-        let all_a: Vec<u32> = (0..(a.indices.len() / 3) as u32).collect();
-        let all_b: Vec<u32> = (0..(b.indices.len() / 3) as u32).collect();
-        let primitives = vec![primitive(a, vec![all_a]), primitive(b, vec![all_b])];
-        let slots = vec![
-            PartSlot {
-                primitive: 0,
-                partition: 0,
-            },
-            PartSlot {
-                primitive: 1,
-                partition: 0,
-            },
+        let mut b = grid(4, 2..4);
+        for position in &mut b.positions {
+            position[0] = f32::from_bits(position[0].to_bits() + 1);
+        }
+        let all = |g: &Geometry| (0..(g.indices.len() / 3) as u32).collect::<Vec<_>>();
+        let primitives = vec![
+            read(a.clone_for_test(), vec![all(&a)]),
+            read(b.clone_for_test(), vec![all(&b)]),
         ];
-        let shared = shared_positions(&primitives, &slots, 4);
-        assert_eq!(shared.len(), 5);
-        assert!(column(&shared, 2.0, 4));
+        let locks = seam_locks(&primitives, 4);
+        for locked in &locks {
+            assert_eq!(locked.iter().filter(|flag| **flag).count(), 5);
+        }
+        assert!(column_locked(&locks[0], &primitives[0].0.positions, 2.0));
+        // Tile b's x = 2 column is one ulp past 2.0; the flags still land on it.
+        assert!(primitives[1]
+            .0
+            .positions
+            .iter()
+            .zip(&locks[1])
+            .all(|(position, locked)| *locked == (position[0] < 2.5)));
     }
 
     #[test]
     fn a_mesh_in_one_part_shares_nothing() {
         let geometry = grid(4, 0..4);
         let all: Vec<u32> = (0..32).collect();
-        let primitives = vec![primitive(geometry, vec![all])];
-        let slots = vec![PartSlot {
-            primitive: 0,
-            partition: 0,
-        }];
-        assert!(shared_positions(&primitives, &slots, 4).is_empty());
+        let primitives = vec![read(geometry, vec![all])];
+        assert!(seam_locks(&primitives, 4)[0].is_empty());
     }
 
     #[test]
     fn keys_match_within_the_quantization_step_and_differ_beyond_it() {
         // q = 4: 1/16 cm steps. An ulp apart is the same key; 1 mm is not.
-        assert_eq!(
-            position_key([-0.0, 1.0, -0.0], 4),
-            position_key([0.0, 1.0, 0.0], 4)
-        );
         assert_eq!(
             position_key([3.9762273, 5.27106, 0.0], 4),
             position_key([3.9762292, 5.2710595, 0.0], 4)

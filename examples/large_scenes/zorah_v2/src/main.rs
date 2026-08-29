@@ -36,8 +36,8 @@ use std::{
 };
 
 use argh::FromArgs;
-use bevy::app::{TaskPoolOptions, TaskPoolPlugin};
 use bevy::{
+    app::{TaskPoolOptions, TaskPoolPlugin},
     asset::{io::AssetSourceBuilder, AssetMetaCheck},
     camera_controller::free_camera::FreeCameraPlugin,
     diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin},
@@ -316,7 +316,7 @@ fn single_gltf_in(dir: &Path) -> Option<PathBuf> {
 /// clustering, partitioning and BVH build run on the worker itself, and
 /// sixteen workers on thirty-two cores measured seventeen busy.
 fn default_bake_workers() -> usize {
-    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    let cores = bevy::tasks::available_parallelism();
     let mut system = sysinfo::System::new();
     system.refresh_memory();
     let total = system.total_memory();
@@ -327,17 +327,14 @@ fn default_bake_workers() -> usize {
 /// The pools an `App` builds for the bake to run under. `MeshletMesh::from_mesh`
 /// simplifies each LOD's groups across `AsyncComputeTaskPool`, which
 /// `TaskPoolPlugin` sizes to a quarter of the cores capped at four; every bake
-/// worker would queue behind those four threads. The total is raised so that
-/// pool gets a thread per core while the compute pool the schedule runs on
-/// keeps its own full set; idle threads cost nothing.
+/// worker would queue behind those four threads. A pool's `min_threads` wins
+/// over the share it is offered, so that pool and the compute pool the
+/// schedule runs on each get a thread per core; idle threads cost nothing.
 fn task_pool_plugin() -> TaskPoolPlugin {
-    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    let cores = bevy::tasks::available_parallelism();
     let mut options = TaskPoolOptions::default();
-    options.min_total_threads = cores * 2 + 4;
-    options.max_total_threads = cores * 2 + 4;
     options.async_compute.min_threads = cores;
-    options.async_compute.max_threads = cores;
-    options.async_compute.percent = 1.0;
+    options.compute.min_threads = cores;
     TaskPoolPlugin {
         task_pool_options: options,
     }

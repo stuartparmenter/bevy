@@ -124,16 +124,17 @@ fn bisect(centroids: &[Vec3], mut triangles: Vec<u32>, threshold: usize, out: &m
     bisect(centroids, upper, threshold, out);
 }
 
-/// Extracts the vertices `triangle_ids` touch into a compact primitive.
-/// `remap` is scratch of one `u32::MAX` per source vertex, restored on return.
-pub fn reindex(geometry: &Geometry, triangle_ids: &[u32], remap: &mut [u32]) -> Geometry {
+/// Extracts the vertices `triangle_ids` touch into a compact primitive, with
+/// the source vertex index each compact vertex came from.
+pub fn reindex(geometry: &Geometry, triangle_ids: &[u32]) -> (Geometry, Vec<u32>) {
+    let mut remap = vec![u32::MAX; geometry.positions.len()];
     let mut part = Geometry {
         positions: Vec::new(),
         normals: Vec::new(),
         uvs: Vec::new(),
         indices: Vec::with_capacity(triangle_ids.len() * 3),
     };
-    let mut touched = Vec::new();
+    let mut sources = Vec::new();
     for id in triangle_ids {
         let base = *id as usize * 3;
         for index in &geometry.indices[base..base + 3] {
@@ -143,36 +144,33 @@ pub fn reindex(geometry: &Geometry, triangle_ids: &[u32], remap: &mut [u32]) -> 
                 part.positions.push(geometry.positions[source]);
                 part.normals.push(geometry.normals[source]);
                 part.uvs.push(geometry.uvs[source]);
-                touched.push(source);
+                sources.push(*index);
             }
             part.indices.push(remap[source]);
         }
     }
-    for source in touched {
-        remap[source] = u32::MAX;
-    }
-    part
+    (part, sources)
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    /// A flat grid of `n` by `n` quads, two triangles each, on the XZ plane.
-    fn grid(n: usize) -> Geometry {
+    /// A flat grid of `n` rows of quads on the XZ plane, two triangles each,
+    /// spanning the quad columns `x_range`; UVs are the vertex index.
+    pub(crate) fn grid(n: u32, x_range: std::ops::Range<u32>) -> Geometry {
+        let columns = x_range.end - x_range.start + 1;
         let mut positions = Vec::new();
         for z in 0..=n {
-            for x in 0..=n {
+            for x in x_range.start..=x_range.end {
                 positions.push([x as f32, 0.0, z as f32]);
             }
         }
         let mut indices = Vec::new();
         for z in 0..n {
-            for x in 0..n {
-                let a = (z * (n + 1) + x) as u32;
-                let b = a + 1;
-                let c = a + (n + 1) as u32;
-                let d = c + 1;
+            for x in 0..columns - 1 {
+                let a = z * columns + x;
+                let (b, c, d) = (a + 1, a + columns, a + columns + 1);
                 indices.extend_from_slice(&[a, c, b, b, c, d]);
             }
         }
@@ -185,9 +183,20 @@ mod tests {
         }
     }
 
+    impl Geometry {
+        pub(crate) fn clone_for_test(&self) -> Geometry {
+            Geometry {
+                positions: self.positions.clone(),
+                normals: self.normals.clone(),
+                uvs: self.uvs.clone(),
+                indices: self.indices.clone(),
+            }
+        }
+    }
+
     #[test]
     fn partitions_cover_every_triangle_once_under_the_threshold() {
-        let geometry = grid(20);
+        let geometry = grid(20, 0..20);
         let triangles = geometry.indices.len() / 3;
         let threshold = 37;
         let partitions = partition_triangles(&geometry, threshold);
@@ -195,10 +204,14 @@ mod tests {
         let mut seen = partitions.iter().flatten().copied().collect::<Vec<_>>();
         seen.sort_unstable();
         assert_eq!(seen, (0..triangles as u32).collect::<Vec<_>>());
-        let mut remap = vec![u32::MAX; geometry.positions.len()];
         for ids in &partitions {
             assert!(ids.len() <= threshold, "{} triangles", ids.len());
-            let part = reindex(&geometry, ids, &mut remap);
+            let (part, sources) = reindex(&geometry, ids);
+            assert_eq!(sources.len(), part.positions.len());
+            assert!(sources
+                .iter()
+                .zip(&part.positions)
+                .all(|(source, p)| geometry.positions[*source as usize] == *p));
             assert_eq!(part.indices.len(), ids.len() * 3);
             assert_eq!(part.positions.len(), part.normals.len());
             assert_eq!(part.positions.len(), part.uvs.len());
@@ -217,13 +230,12 @@ mod tests {
                     assert_eq!(part.uvs[*local as usize], geometry.uvs[*original as usize]);
                 }
             }
-            assert!(remap.iter().all(|entry| *entry == u32::MAX));
         }
     }
 
     #[test]
     fn small_primitives_stay_whole() {
-        let geometry = grid(3);
+        let geometry = grid(3, 0..3);
         let partitions = partition_triangles(&geometry, 1000);
         assert_eq!(partitions.len(), 1);
         assert_eq!(partitions[0].len(), 18);
@@ -231,7 +243,7 @@ mod tests {
 
     #[test]
     fn inverted_winding_is_repaired() {
-        let mut geometry = grid(4);
+        let mut geometry = grid(4, 0..4);
         let original = geometry.indices.clone();
         assert!(!repair_inverted_winding(&mut geometry));
         assert_eq!(geometry.indices, original);
