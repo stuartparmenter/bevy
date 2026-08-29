@@ -573,6 +573,9 @@ bevy_ci_testing = ["bevy_internal/bevy_ci_testing"]
 # Enable glTF animation loading
 gltf_animation = ["bevy_internal/gltf_animation"]
 
+# Enables loading glTF files that use EXT_meshopt_compression
+gltf_meshopt = ["bevy_internal/gltf_meshopt"]
+
 # Enables support for morph target weights in bevy_mesh
 morph = ["bevy_internal/morph"]
 

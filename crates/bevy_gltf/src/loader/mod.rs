@@ -1,5 +1,7 @@
 pub mod extensions;
 pub mod gltf_ext;
+#[cfg(feature = "meshopt")]
+pub(crate) mod meshopt;
 
 use alloc::sync::Arc;
 use async_lock::RwLock;
@@ -137,6 +139,50 @@ pub enum GltfError {
     /// Failed to load a file.
     #[error("failed to load file: {0}")]
     Io(#[from] Error),
+    /// The file requires `EXT_meshopt_compression` but the `meshopt` feature is off.
+    #[error(
+        "glTF requires EXT_meshopt_compression; enable the `meshopt` feature of bevy_gltf (`gltf_meshopt` on bevy)"
+    )]
+    MeshoptCompressionUnsupported,
+    /// A buffer view's `EXT_meshopt_compression` data is malformed.
+    #[error("invalid EXT_meshopt_compression data on buffer view {0}: {1}")]
+    #[from(ignore)]
+    MeshoptCompression(usize, String),
+}
+
+/// Name `EXT_meshopt_compression` registers under in `extensionsRequired` and
+/// in the per-object `extensions` maps.
+const EXT_MESHOPT_COMPRESSION: &str = "EXT_meshopt_compression";
+
+/// Runs the `gltf` crate's validation, letting a required
+/// `EXT_meshopt_compression` through when this crate decodes it itself.
+///
+/// The `gltf` crate rejects every required extension it does not know, and
+/// it does not know this one, so the loader validates the JSON directly and
+/// drops only that complaint. Everything else still fails as before.
+///
+/// Mirrors the crate-private `gltf::Document::validate` (gltf 1.4.1); keep
+/// the two in step when bumping the `gltf` dependency.
+fn validate_document(document: &gltf::Document) -> Result<(), GltfError> {
+    use gltf::json::validation::{Error as ValidationError, Validate};
+
+    let root = document.as_json();
+    let mut errors = Vec::new();
+    root.validate(root, gltf::json::Path::new, &mut |path, error| {
+        errors.push((path(), error));
+    });
+    if cfg!(feature = "meshopt") {
+        errors.retain(|(path, error)| {
+            !(*error == ValidationError::Unsupported
+                && path.as_str().starts_with("extensionsRequired")
+                && path.as_str().contains(EXT_MESHOPT_COMPRESSION))
+        });
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(gltf::Error::Validation(errors).into())
+    }
 }
 
 /// Loads glTF files with all of their data as their corresponding bevy representations.
@@ -256,11 +302,17 @@ impl GltfLoader {
         load_context: &'b mut LoadContext<'c>,
         settings: &'b GltfLoaderSettings,
     ) -> Result<Gltf, GltfError> {
-        let gltf = if settings.validate {
-            gltf::Gltf::from_slice(bytes)?
-        } else {
-            gltf::Gltf::from_slice_without_validation(bytes)?
-        };
+        let gltf = gltf::Gltf::from_slice_without_validation(bytes)?;
+        if !cfg!(feature = "meshopt")
+            && gltf
+                .extensions_required()
+                .any(|name| name == EXT_MESHOPT_COMPRESSION)
+        {
+            return Err(GltfError::MeshoptCompressionUnsupported);
+        }
+        if settings.validate {
+            validate_document(&gltf.document)?;
+        }
 
         // clone extensions to start with a fresh processing state
         let mut extensions = loader.extensions.read().await.clone();
@@ -281,7 +333,13 @@ impl GltfLoader {
                 "Gltf file name invalid",
             ))))?
             .to_string();
-        let buffer_data = load_buffers(&gltf, load_context).await?;
+        #[cfg_attr(
+            not(feature = "meshopt"),
+            expect(unused_mut, reason = "only meshopt decodes into the buffers")
+        )]
+        let mut buffer_data = load_buffers(&gltf, load_context).await?;
+        #[cfg(feature = "meshopt")]
+        meshopt::decode_buffer_views(&gltf.document, &mut buffer_data)?;
 
         let linear_textures = get_linear_textures(&gltf.document);
 
@@ -1949,8 +2007,17 @@ async fn load_buffers(
                 buffer_data.push(buffer_bytes);
             }
             gltf::buffer::Source::Bin => {
-                if let Some(blob) = gltf.blob.as_deref() {
+                // Only buffer 0 may refer to a GLB's BIN chunk; the `gltf`
+                // crate reports `Bin` for every buffer without a URI.
+                if let Some(blob) = gltf.blob.as_deref().filter(|_| buffer.index() == 0) {
                     buffer_data.push(blob.into());
+                } else if cfg!(feature = "meshopt")
+                    && buffer.extension_value(EXT_MESHOPT_COMPRESSION).is_some()
+                {
+                    // An `EXT_meshopt_compression` fallback buffer may omit
+                    // its URI (in a GLB it must, and sits at index 1 or
+                    // above); the decode pass fills it in afterwards.
+                    buffer_data.push(vec![0u8; buffer.length()]);
                 } else {
                     return Err(GltfError::MissingBlob);
                 }
@@ -2794,5 +2861,180 @@ mod test {
         assert_eq!(settings.default_sampler, default.default_sampler);
         assert_eq!(settings.override_sampler, default.override_sampler);
         assert_eq!(settings.validate, default.validate);
+    }
+
+    /// The smallest document that declares `EXT_meshopt_compression` as
+    /// required; the `gltf` crate's own validation rejects it outright.
+    const REQUIRES_MESHOPT: &str = r#"
+{
+    "asset": { "version": "2.0" },
+    "extensionsRequired": ["EXT_meshopt_compression"],
+    "extensionsUsed": ["EXT_meshopt_compression"]
+}
+"#;
+
+    #[cfg(feature = "meshopt")]
+    #[test]
+    fn required_meshopt_extension_passes_validation() {
+        // Panics on any load error.
+        let _app = load_gltf_into_app("meshopt.gltf", REQUIRES_MESHOPT);
+    }
+
+    /// A GLB keeps the compressed data in its BIN chunk as buffer 0 and, as
+    /// the extension requires, puts the URI-less fallback buffer at index 1;
+    /// only buffer 0 may be handed the BIN chunk.
+    #[cfg(feature = "meshopt")]
+    #[test]
+    fn loads_meshopt_glb() {
+        use super::meshopt::fixture::{fixture, indices, positions, triangles, Fixture};
+        use crate::GltfMesh;
+        use bevy_mesh::{Mesh, VertexAttributeValues};
+
+        let positions = positions(97);
+        let indices = indices(3 * 61, positions.len());
+        let Fixture {
+            mut json,
+            compressed,
+            ..
+        } = fixture(&positions, &indices);
+        json["buffers"][0].as_object_mut().unwrap().remove("uri");
+        let glb = gltf::binary::Glb {
+            header: gltf::binary::Header {
+                magic: *b"glTF",
+                version: 2,
+                length: 0,
+            },
+            json: serde_json::to_vec(&json).unwrap().into(),
+            bin: Some(compressed.into()),
+        }
+        .to_vec()
+        .unwrap();
+
+        let (mut app, dir) = test_app_custom_asset_source();
+        dir.insert_asset(Path::new("mesh.glb"), glb);
+
+        let asset_server = app.world().resource::<AssetServer>().clone();
+        let handle: Handle<Gltf> = asset_server.load("custom://mesh.glb");
+        run_app_until(&mut app, |_| match asset_server.load_state(&handle) {
+            LoadState::Loaded => Some(()),
+            LoadState::Failed(err) => panic!("{err}"),
+            _ => None,
+        });
+
+        let gltf = app.world().resource::<Assets<Gltf>>().get(&handle).unwrap();
+        let gltf_meshes = app.world().resource::<Assets<GltfMesh>>();
+        let meshes = app.world().resource::<Assets<Mesh>>();
+        let primitive = &gltf_meshes.get(&gltf.meshes[0]).unwrap().primitives[0];
+        let mesh = meshes.get(&primitive.mesh).unwrap();
+        let Some(VertexAttributeValues::Float32x3(loaded)) =
+            mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+        else {
+            panic!("positions missing");
+        };
+        // The fixture carries no normals, so the loader de-indexes the mesh
+        // to compute flat ones; recover each vertex's original index from
+        // its unique x coordinate and compare triangles.
+        assert_eq!(loaded.len(), indices.len());
+        let loaded: Vec<u32> = loaded
+            .iter()
+            .map(|p| {
+                let index = (p[0] * 2.0) as usize;
+                assert_eq!(positions.get(index), Some(p), "unknown vertex {p:?}");
+                index as u32
+            })
+            .collect();
+        assert_eq!(triangles(&loaded), triangles(&indices));
+    }
+
+    #[cfg(not(feature = "meshopt"))]
+    #[test]
+    fn required_meshopt_extension_is_a_clear_error() {
+        let (mut app, dir) = test_app_custom_asset_source();
+        dir.insert_asset_text(Path::new("meshopt.gltf"), REQUIRES_MESHOPT);
+
+        let asset_server = app.world().resource::<AssetServer>().clone();
+        let handle: Handle<Gltf> = asset_server.load("custom://meshopt.gltf");
+        run_app_until(&mut app, |_| match asset_server.load_state(&handle) {
+            LoadState::Failed(err) => {
+                let err = err.to_string();
+                assert!(
+                    err.contains("enable the `meshopt` feature"),
+                    "incorrect error message: {err}"
+                );
+                Some(())
+            }
+            LoadState::Loading => None,
+            state => panic!("Unexpected load state: {state:?}"),
+        });
+    }
+
+    /// Loads a real gltfpack export through the whole loader, so validation
+    /// and the fallback buffer are exercised too, and checks every primitive
+    /// came out with the vertex and index counts its accessors declare.
+    /// Materials and images are stripped first: they need image loaders the
+    /// test app does not have. Run with
+    /// `BEVY_GLTF_MESHOPT_GLTF=<path to .gltf> cargo test -p bevy_gltf --features meshopt -- --ignored`.
+    #[cfg(feature = "meshopt")]
+    #[test]
+    #[ignore = "needs a meshopt-compressed .gltf on disk"]
+    fn loads_real_meshopt_file() {
+        use crate::GltfMesh;
+        use bevy_mesh::Mesh;
+
+        let path = std::path::PathBuf::from(
+            std::env::var_os("BEVY_GLTF_MESHOPT_GLTF").expect("BEVY_GLTF_MESHOPT_GLTF unset"),
+        );
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let root = json.as_object_mut().unwrap();
+        for key in ["images", "textures", "samplers", "materials"] {
+            root.remove(key);
+        }
+        let accessors = root["accessors"].clone();
+        let accessor_count = |index: &serde_json::Value| {
+            accessors[index.as_u64().unwrap() as usize]["count"]
+                .as_u64()
+                .unwrap() as usize
+        };
+        let mut expected = Vec::new();
+        for mesh in root["meshes"].as_array_mut().unwrap() {
+            for primitive in mesh["primitives"].as_array_mut().unwrap() {
+                primitive.as_object_mut().unwrap().remove("material");
+                expected.push((
+                    accessor_count(&primitive["attributes"]["POSITION"]),
+                    accessor_count(&primitive["indices"]),
+                ));
+            }
+        }
+        let buffers = root["buffers"].clone();
+
+        let (mut app, dir) = test_app_custom_asset_source();
+        dir.insert_asset_text(Path::new("mesh.gltf"), &json.to_string());
+        for buffer in buffers.as_array().unwrap() {
+            if let Some(uri) = buffer["uri"].as_str() {
+                let bytes = std::fs::read(path.with_file_name(uri)).unwrap();
+                dir.insert_asset(Path::new(uri), bytes);
+            }
+        }
+
+        let asset_server = app.world().resource::<AssetServer>().clone();
+        let handle: Handle<Gltf> = asset_server.load("custom://mesh.gltf");
+        run_app_until(&mut app, |_| match asset_server.load_state(&handle) {
+            LoadState::Loaded => Some(()),
+            LoadState::Failed(err) => panic!("{err}"),
+            _ => None,
+        });
+
+        let gltf = app.world().resource::<Assets<Gltf>>().get(&handle).unwrap();
+        let gltf_meshes = app.world().resource::<Assets<GltfMesh>>();
+        let meshes = app.world().resource::<Assets<Mesh>>();
+        let mut actual = Vec::new();
+        for mesh in &gltf.meshes {
+            for primitive in &gltf_meshes.get(mesh).unwrap().primitives {
+                let mesh = meshes.get(&primitive.mesh).unwrap();
+                actual.push((mesh.count_vertices(), mesh.indices().unwrap().len()));
+            }
+        }
+        assert_eq!(actual, expected);
     }
 }

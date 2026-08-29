@@ -1,5 +1,7 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
-#![forbid(unsafe_code)]
+// The meshopt decoders reachable only over FFI live in `loader::meshopt`;
+// everything else stays unsafe-free.
+#![cfg_attr(not(feature = "meshopt"), forbid(unsafe_code))]
 #![doc(
     html_logo_url = "https://bevy.org/assets/icon.png",
     html_favicon_url = "https://bevy.org/assets/icon.png"
@@ -118,7 +120,7 @@
 //! | `KHR_texture_transform`           | ✅\**     |                                     |
 //! | `KHR_xmp_json_ld`                 | ❌        |                                     |
 //! | `EXT_mesh_gpu_instancing`         | ❌        |                                     |
-//! | `EXT_meshopt_compression`         | ❌        |                                     |
+//! | `EXT_meshopt_compression`         | ✅        | `meshopt`                           |
 //! | `EXT_texture_webp`                | ❌\*      |                                     |
 //!
 //! \*Bevy supports ktx2 and webp formats but doesn't support the extension's syntax, see [#19104](https://github.com/bevyengine/bevy/issues/19104).
@@ -164,6 +166,16 @@ pub use {assets::*, label::GltfAssetLabel, loader::*, material::GltfMaterial};
 
 /// Re-exports for GLTF
 pub use gltf;
+
+/// `EXT_meshopt_compression` decoding for code that reads a glTF with the
+/// [`gltf`] crate directly instead of through the asset server. The loader
+/// registers every image of a file as a dependency, so a bake that wants
+/// only the geometry of a texture-heavy file has to bypass it and decode the
+/// buffer views itself.
+#[cfg(feature = "meshopt")]
+pub mod meshopt {
+    pub use crate::loader::meshopt::decode_buffer_views;
+}
 
 // Has to store an Arc<Mutex<...>> as there is no other way to mutate fields of asset loaders.
 /// Stores default [`ImageSamplerDescriptor`] in main world.
