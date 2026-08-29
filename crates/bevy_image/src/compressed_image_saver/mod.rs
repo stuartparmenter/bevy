@@ -100,10 +100,10 @@ use wgpu_types::TextureFormat;
 /// # Settings
 ///
 /// Per-texture behavior is configured via [`CompressedImageSaverSettings`] (`is_normal_map`,
-/// `input_alpha_mode`, `output_alpha_mode`, `generate_mipmaps`). The defaults are tuned for color textures; you
-/// **must** review these for every texture you compress — `is_normal_map` must be set to true
-/// for normal maps, and the wrong alpha mode produces colored fringes at transparent
-/// edges. See the field docs for details.
+/// `input_alpha_mode`, `output_alpha_mode`, `generate_mipmaps`, `quality`). The defaults are
+/// tuned for color textures; you **must** review these for every texture you compress —
+/// `is_normal_map` must be set to true for normal maps, and the wrong alpha mode produces
+/// colored fringes at transparent edges. See the field docs for details.
 #[derive(TypePath, Default)]
 #[expect(clippy::doc_markdown, reason = "clippy does not like unquoted BCn")]
 pub struct CompressedImageSaver {
@@ -174,6 +174,9 @@ pub struct CompressedImageSaverSettings {
     /// Defaults to `true`. Mipmaps prevent aliasing when textures are minified and improve GPU
     /// cache locality, so they are almost always wanted for material textures.
     pub generate_mipmaps: bool,
+    /// Encoder search effort. Faster presets are useful for very large offline
+    /// batches while preserving the selected GPU block format and dimensions.
+    pub quality: ImageCompressorQuality,
 }
 
 impl Default for CompressedImageSaverSettings {
@@ -183,8 +186,27 @@ impl Default for CompressedImageSaverSettings {
             input_alpha_mode: ImageCompressorAlphaMode::Straight,
             output_alpha_mode: ImageCompressorAlphaMode::Premultiplied,
             generate_mipmaps: true,
+            quality: ImageCompressorQuality::Basic,
         }
     }
+}
+
+/// Encoder search effort used by [`CompressedImageSaver`].
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ImageCompressorQuality {
+    /// Minimum encoder search effort and maximum throughput.
+    UltraFast,
+    /// Very low search effort for large iterative asset batches.
+    VeryFast,
+    /// Low search effort with a stronger quality bias.
+    Fast,
+    /// Balanced search effort used by default.
+    #[default]
+    Basic,
+    /// High search effort for offline final-quality assets.
+    Slow,
+    /// Maximum search effort and lowest throughput.
+    VerySlow,
 }
 
 /// Alpha mode of an [`Image`] for use with [`CompressedImageSaver`].
