@@ -37,7 +37,8 @@ use bevy::{
     math::Vec3,
     mesh::{Indices, Mesh},
     pbr::experimental::meshlet::{
-        quantize_vertex_position, MeshletMesh, MeshletMeshSaver, MESHLET_MESH_ASSET_VERSION,
+        vertex_position_quantization_scale, MeshletMesh, MeshletMeshSaver,
+        MESHLET_MESH_ASSET_VERSION,
     },
     platform::collections::HashMap as FastHashMap,
     render::render_resource::PrimitiveTopology,
@@ -798,11 +799,13 @@ type ReadPrimitive = (Geometry, bool, Vec<Vec<u32>>);
 /// Nothing else is locked: an edge that is open in the source mesh meets
 /// nothing and may simplify freely.
 ///
-/// Positions compare on the meshlet build's own quantization grid, which is
-/// where the build snaps every vertex anyway: the parts of one primitive copy
-/// the same source vertices, but this export's tiles carry nominally
-/// coincident coordinates that differ in their last bits, and a seam missed
-/// for an ulp would be a seam left unlocked.
+/// Positions compare on a grid thirty-two times finer than the meshlet
+/// build's (see [`position_keys`]): the parts of one primitive copy the same
+/// source vertices, but this export's tiles carry nominally coincident
+/// coordinates that differ in their last bits, and a seam missed for an ulp
+/// would be a seam left unlocked. The build's own 1/16 cm grid is too coarse
+/// for the job: on dense ornament it also joins neighbours across a cut, and
+/// every lock is a vertex the coarsest LOD keeps.
 fn seam_locks(primitives: &[ReadPrimitive], quantization: u8) -> Vec<Vec<bool>> {
     const NONE: u32 = u32::MAX;
     const SHARED: u32 = u32::MAX - 1;
@@ -837,22 +840,22 @@ fn seam_locks(primitives: &[ReadPrimitive], quantization: u8) -> Vec<Vec<bool>> 
     }
     // Then by position, which is what joins a tile to its neighbour and a
     // vertex to its UV-split twins.
-    let vertex_count = primitives
+    let vertex_count: usize = primitives
         .iter()
         .map(|(geometry, ..)| geometry.positions.len())
         .sum();
-    let mut by_position: FastHashMap<[i32; 3], u32> =
-        FastHashMap::with_capacity_and_hasher(vertex_count, Default::default());
+    let mut by_position: FastHashMap<[i32; 4], u32> =
+        FastHashMap::with_capacity_and_hasher(vertex_count * 2, Default::default());
     for ((geometry, ..), owner) in primitives.iter().zip(&owners) {
         for (position, owner) in geometry.positions.iter().zip(owner) {
             if *owner == NONE {
                 continue;
             }
-            let entry = by_position
-                .entry(position_key(*position, quantization))
-                .or_insert(*owner);
-            if *entry != *owner {
-                *entry = SHARED;
+            for key in position_keys(*position, quantization) {
+                let entry = by_position.entry(key).or_insert(*owner);
+                if *entry != *owner {
+                    *entry = SHARED;
+                }
             }
         }
     }
@@ -863,17 +866,43 @@ fn seam_locks(primitives: &[ReadPrimitive], quantization: u8) -> Vec<Vec<bool>> 
                 .positions
                 .iter()
                 .map(|position| {
-                    by_position.get(&position_key(*position, quantization)) == Some(&SHARED)
+                    position_keys(*position, quantization)
+                        .iter()
+                        .any(|key| by_position.get(key) == Some(&SHARED))
                 })
                 .collect()
         })
         .collect()
 }
 
-/// A position on the meshlet build's quantization grid.
-fn position_key(position: [f32; 3], quantization: u8) -> [i32; 3] {
-    quantize_vertex_position(Vec3::from(position), quantization).to_array()
+/// A position on two grids 2^5 times finer than the meshlet build's, the
+/// second offset by half a cell. Two coordinates within half a cell (about
+/// 10 um at q = 4, a few f32 ulps at the scene's far end) share a key on at
+/// least one grid whatever cell boundary falls between them; coordinates a
+/// cell apart share none. The last element tells the grids apart in one map.
+fn position_keys(position: [f32; 3], quantization: u8) -> [[i32; 4]; 2] {
+    let scale = f64::from(vertex_position_quantization_scale(
+        quantization + SEAM_GRID_REFINEMENT,
+    ));
+    let cell = |component: f32, shift: f64| (f64::from(component) * scale + shift).round() as i32;
+    [
+        [
+            cell(position[0], 0.0),
+            cell(position[1], 0.0),
+            cell(position[2], 0.0),
+            0,
+        ],
+        [
+            cell(position[0], 0.5),
+            cell(position[1], 0.5),
+            cell(position[2], 0.5),
+            1,
+        ],
+    ]
 }
+
+/// Extra quantization bits for seam matching: at q = 4 the cell is 19.5 um.
+const SEAM_GRID_REFINEMENT: u8 = 5;
 
 /// Builds one part and, when it is the mesh's last, writes the manifest and
 /// reports the mesh.
@@ -1293,16 +1322,23 @@ mod seam_tests {
         assert!(seam_locks(&primitives, 4)[0].is_empty());
     }
 
+    fn matched(a: [f32; 3], b: [f32; 3]) -> bool {
+        let (a, b) = (position_keys(a, 4), position_keys(b, 4));
+        a.iter().zip(&b).any(|(a, b)| a == b)
+    }
+
     #[test]
-    fn keys_match_within_the_quantization_step_and_differ_beyond_it() {
-        // q = 4: 1/16 cm steps. An ulp apart is the same key; 1 mm is not.
-        assert_eq!(
-            position_key([3.9762273, 5.27106, 0.0], 4),
-            position_key([3.9762292, 5.2710595, 0.0], 4)
-        );
-        assert_ne!(
-            position_key([0.0, 1.0, 0.0], 4),
-            position_key([0.0, 1.0, 0.001], 4)
-        );
+    fn keys_match_within_a_few_ulps_and_differ_beyond_a_cell() {
+        // The export's tile bounds: a few ulps apart. Then no cell boundary
+        // near 2.0 may split a 1 um pair, and 0.1 mm must split.
+        assert!(matched(
+            [3.9762273, 5.27106, 0.0],
+            [3.9762292, 5.2710595, 0.0]
+        ));
+        for i in 0..64 {
+            let x = 2.0 + i as f32 * 1.0e-6;
+            assert!(matched([x, 0.0, 0.0], [x + 1.0e-6, 0.0, 0.0]), "{x}");
+        }
+        assert!(!matched([0.0, 1.0, 0.0], [0.0, 1.0, 0.0001]));
     }
 }
