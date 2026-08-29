@@ -68,7 +68,7 @@ impl MeshletMesh {
         mesh: &Mesh,
         vertex_position_quantization_factor: u8,
     ) -> Result<Self, MeshToMeshletMeshConversionError> {
-        Self::build(mesh, vertex_position_quantization_factor, false)
+        Self::build(mesh, vertex_position_quantization_factor, InputLocks::None)
     }
 
     /// Like [`Self::from_mesh`], but keeps every vertex on an open edge of the
@@ -80,20 +80,51 @@ impl MeshletMesh {
     /// or a tile that meets its neighbours edge to edge - has open borders that
     /// nothing else in the mesh shares, so coarser LODs move them and the seam
     /// with the adjacent piece opens into cracks. Locking the border pins the
-    /// seam at every LOD, at the cost of the border never simplifying; a mesh
-    /// that is mostly borders (foliage cards, ribbons) simplifies poorly under
-    /// it and should use [`Self::from_mesh`].
+    /// seam at every LOD, at the cost of the border never simplifying.
+    ///
+    /// Every open edge is locked, whether or not anything meets it. A closed
+    /// surface cut into partitions has open edges only along the cuts, so the
+    /// cost is small there; a mesh that is open everywhere - separate tiles,
+    /// loose shells, foliage cards, ribbons - is pinned nearly everywhere and
+    /// its coarse LODs stay close to full detail. Such a mesh should use
+    /// [`Self::from_mesh_with_locks`] with only the vertices it really shares.
     pub fn from_mesh_with_locked_borders(
         mesh: &Mesh,
         vertex_position_quantization_factor: u8,
     ) -> Result<Self, MeshToMeshletMeshConversionError> {
-        Self::build(mesh, vertex_position_quantization_factor, true)
+        Self::build(
+            mesh,
+            vertex_position_quantization_factor,
+            InputLocks::OpenBorders,
+        )
+    }
+
+    /// Like [`Self::from_mesh`], but keeps the vertices `locked` marks (one
+    /// entry per input vertex) where they are at every LOD.
+    ///
+    /// This is the precise form of [`Self::from_mesh_with_locked_borders`]:
+    /// the caller names the seam instead of every open edge. Locking a vertex
+    /// locks its position, so every vertex sharing that position (a UV or
+    /// normal seam) is held with it; a locked position persists into the
+    /// coarsest LOD and is never collapsed, so lock only what geometry built
+    /// separately depends on meeting - a partition cut, the edge a tile
+    /// shares with its neighbour - and nothing else.
+    pub fn from_mesh_with_locks(
+        mesh: &Mesh,
+        vertex_position_quantization_factor: u8,
+        locked: &[bool],
+    ) -> Result<Self, MeshToMeshletMeshConversionError> {
+        Self::build(
+            mesh,
+            vertex_position_quantization_factor,
+            InputLocks::Explicit(locked),
+        )
     }
 
     fn build(
         mesh: &Mesh,
         vertex_position_quantization_factor: u8,
-        lock_borders: bool,
+        locks: InputLocks<'_>,
     ) -> Result<Self, MeshToMeshletMeshConversionError> {
         let s = debug_span!("build meshlet mesh");
         let _e = s.enter();
@@ -115,10 +146,20 @@ impl MeshletMesh {
             compute_meshlets(&indices, &vertices, &position_only_vertex_remap, None);
 
         let mut vertex_locks = vec![false; vertices.vertex_count];
-        let border_locks = if lock_borders {
-            mesh_border_locks(&indices, &position_only_vertex_remap, vertices.vertex_count)
-        } else {
-            vec![false; vertices.vertex_count]
+        let border_locks = match locks {
+            InputLocks::None => vec![false; vertices.vertex_count],
+            InputLocks::OpenBorders => {
+                mesh_border_locks(&indices, &position_only_vertex_remap, vertices.vertex_count)
+            }
+            InputLocks::Explicit(locked) => {
+                if locked.len() != vertices.vertex_count {
+                    return Err(MeshToMeshletMeshConversionError::WrongLockCount {
+                        required: vertices.vertex_count,
+                        provided: locked.len(),
+                    });
+                }
+                position_locks(locked, &position_only_vertex_remap)
+            }
         };
 
         // Build further LODs
@@ -1473,6 +1514,33 @@ pub enum MeshToMeshletMeshConversionError {
     },
     #[error("Mesh has no indices")]
     MeshMissingIndices,
+    #[error("Mesh has {required} vertices, but {provided} lock flags were given")]
+    WrongLockCount { required: usize, provided: usize },
+}
+
+/// Which input vertices the simplifier must keep in place at every LOD, on
+/// top of the group borders it always locks.
+enum InputLocks<'a> {
+    None,
+    /// Every vertex on an edge only one triangle uses.
+    OpenBorders,
+    /// The caller's choice, one flag per vertex.
+    Explicit(&'a [bool]),
+}
+
+/// Spreads per-vertex lock flags over every vertex sharing a locked
+/// position, so a seam vertex split for its UVs or normals is held whole.
+fn position_locks(locked: &[bool], position_only_vertex_remap: &[u32]) -> Vec<bool> {
+    let mut locked_positions = vec![false; position_only_vertex_remap.len()];
+    for (vertex_id, flag) in locked.iter().enumerate() {
+        if *flag {
+            locked_positions[position_only_vertex_remap[vertex_id] as usize] = true;
+        }
+    }
+    position_only_vertex_remap
+        .iter()
+        .map(|position| locked_positions[*position as usize])
+        .collect()
 }
 
 #[cfg(test)]
@@ -1918,5 +1986,88 @@ mod tests {
                 "border vertex {p:?} moved or vanished"
             );
         }
+    }
+
+    /// An open grid with only one of its four borders locked: that edge must
+    /// survive to the coarsest LOD, the other three must be free to go, and
+    /// the whole must simplify far below what locking every open edge allows.
+    #[test]
+    fn explicit_locks_pin_only_the_named_seam() {
+        AsyncComputeTaskPool::get_or_init(bevy_tasks::TaskPool::default);
+        let n = 24u32;
+        let mut positions = Vec::new();
+        let mut normals = Vec::new();
+        let mut uvs = Vec::new();
+        for y in 0..=n {
+            for x in 0..=n {
+                positions.push([x as f32, 0.0, y as f32]);
+                normals.push([0.0, 1.0, 0.0]);
+                uvs.push([x as f32 / n as f32, y as f32 / n as f32]);
+            }
+        }
+        let mut indices = Vec::new();
+        for y in 0..n {
+            for x in 0..n {
+                let i = y * (n + 1) + x;
+                indices.extend_from_slice(&[i, i + n + 1, i + 1, i + 1, i + n + 1, i + n + 2]);
+            }
+        }
+        let mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::all())
+            .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions.clone())
+            .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+            .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+            .with_inserted_indices(Indices::U32(indices));
+        let seam = |i: usize| i as u32 % (n + 1) == 0;
+        let locked: Vec<bool> = (0..positions.len()).map(seam).collect();
+
+        assert!(matches!(
+            MeshletMesh::from_mesh_with_locks(&mesh, 4, &locked[1..]),
+            Err(MeshToMeshletMeshConversionError::WrongLockCount {
+                required,
+                provided
+            }) if required == positions.len() && provided == positions.len() - 1
+        ));
+
+        let free = MeshletMesh::from_mesh(&mesh, 4).unwrap();
+        let unlocked =
+            MeshletMesh::from_mesh_with_locks(&mesh, 4, &vec![false; positions.len()]).unwrap();
+        assert_eq!(unlocked.meshlets.len(), free.meshlets.len());
+        assert_eq!(
+            unlocked.raytracing_geometry(1.0e6).indices.len(),
+            free.raytracing_geometry(1.0e6).indices.len()
+        );
+
+        let pinned = MeshletMesh::from_mesh_with_locks(&mesh, 4, &locked).unwrap();
+        let bordered = MeshletMesh::from_mesh_with_locked_borders(&mesh, 4).unwrap();
+        let coarsest = pinned.raytracing_geometry(1.0e6);
+        let present = |p: &[f32; 3]| {
+            coarsest.positions.iter().any(|q| {
+                (q[0] - p[0]).abs() < 1e-3
+                    && (q[1] - p[1]).abs() < 1e-3
+                    && (q[2] - p[2]).abs() < 1e-3
+            })
+        };
+        for (i, p) in positions.iter().enumerate() {
+            if seam(i) {
+                assert!(present(p), "seam vertex {p:?} moved or vanished");
+            }
+        }
+        let far_edge_kept = positions
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i as u32 % (n + 1) == n)
+            .filter(|(_, p)| present(p))
+            .count();
+        assert!(
+            far_edge_kept < n as usize + 1,
+            "the unlocked border kept all {far_edge_kept} of its {} vertices",
+            n + 1
+        );
+        let pinned_triangles = coarsest.indices.len() / 3;
+        let bordered_triangles = bordered.raytracing_geometry(1.0e6).indices.len() / 3;
+        assert!(
+            pinned_triangles * 2 < bordered_triangles,
+            "one locked edge left {pinned_triangles} triangles, every open edge {bordered_triangles}"
+        );
     }
 }
