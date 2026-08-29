@@ -518,17 +518,24 @@ fn pack_geometry(
         let parent = manifest_path
             .parent()
             .ok_or("parts manifest has no parent")?;
-        for partition in manifest["partitions"]
+        let partitions = manifest["partitions"]
             .as_array()
-            .ok_or("parts manifest has no partitions")?
-        {
-            partition_sources.push(
-                parent.join(
+            .ok_or("parts manifest has no partitions")?;
+        // A mesh cut into partitions meets itself along their open edges, and
+        // each partition builds its LOD chain alone, so those edges are locked
+        // or coarser LODs open cracks along the seams (ThroneRoom's altar
+        // columns showed them as black bars at mid-height). A mesh in one piece
+        // keeps its open edges free, since nothing meets them.
+        let lock_borders = partitions.len() > 1;
+        for partition in partitions {
+            partition_sources.push(PartitionSource {
+                path: parent.join(
                     partition["meshlet"]
                         .as_str()
                         .ok_or("partition has no meshlet geometry")?,
                 ),
-            );
+                lock_borders,
+            });
         }
         plan.push(PlannedMesh {
             mesh_index,
@@ -560,14 +567,25 @@ fn pack_geometry(
     })
 }
 
+/// One partition's converter geometry and how to build its meshlets.
+struct PartitionSource {
+    path: PathBuf,
+    lock_borders: bool,
+}
+
 fn pack_partition(
-    meshlet_path: &Path,
+    source: &PartitionSource,
     raytracing_error: f32,
 ) -> Result<PackedPartition, Box<dyn std::error::Error>> {
+    let meshlet_path = source.path.as_path();
     let meshlet_source = fs::read(meshlet_path)?;
     let mut mesh = mesh_from_converter_glb(&meshlet_source, false)?;
     let winding_repaired = repair_inverted_winding(&mut mesh)?;
-    let meshlet = MeshletMesh::from_mesh(&mesh, 4)?;
+    let meshlet = if source.lock_borders {
+        MeshletMesh::from_mesh_with_locked_borders(&mesh, 4)?
+    } else {
+        MeshletMesh::from_mesh(&mesh, 4)?
+    };
     let raytracing = meshlet.raytracing_geometry(raytracing_error);
     if raytracing.indices.is_empty() {
         return Err(format!(

@@ -68,6 +68,33 @@ impl MeshletMesh {
         mesh: &Mesh,
         vertex_position_quantization_factor: u8,
     ) -> Result<Self, MeshToMeshletMeshConversionError> {
+        Self::build(mesh, vertex_position_quantization_factor, false)
+    }
+
+    /// Like [`Self::from_mesh`], but keeps every vertex on an open edge of the
+    /// mesh where it is at every LOD.
+    ///
+    /// Simplification only locks the vertices that neighbouring meshlet groups
+    /// share, which keeps a closed surface crack-free. A mesh that is one piece
+    /// of a larger surface - a partition of a mesh too large to build at once,
+    /// or a tile that meets its neighbours edge to edge - has open borders that
+    /// nothing else in the mesh shares, so coarser LODs move them and the seam
+    /// with the adjacent piece opens into cracks. Locking the border pins the
+    /// seam at every LOD, at the cost of the border never simplifying; a mesh
+    /// that is mostly borders (foliage cards, ribbons) simplifies poorly under
+    /// it and should use [`Self::from_mesh`].
+    pub fn from_mesh_with_locked_borders(
+        mesh: &Mesh,
+        vertex_position_quantization_factor: u8,
+    ) -> Result<Self, MeshToMeshletMeshConversionError> {
+        Self::build(mesh, vertex_position_quantization_factor, true)
+    }
+
+    fn build(
+        mesh: &Mesh,
+        vertex_position_quantization_factor: u8,
+        lock_borders: bool,
+    ) -> Result<Self, MeshToMeshletMeshConversionError> {
         let s = debug_span!("build meshlet mesh");
         let _e = s.enter();
 
@@ -88,6 +115,11 @@ impl MeshletMesh {
             compute_meshlets(&indices, &vertices, &position_only_vertex_remap, None);
 
         let mut vertex_locks = vec![false; vertices.vertex_count];
+        let border_locks = if lock_borders {
+            mesh_border_locks(&indices, &position_only_vertex_remap, vertices.vertex_count)
+        } else {
+            vec![false; vertices.vertex_count]
+        };
 
         // Build further LODs
         let mut bvh = BvhBuilder::default();
@@ -117,6 +149,7 @@ impl MeshletMesh {
             // Lock borders between groups to prevent cracks when simplifying
             lock_group_borders(
                 &mut vertex_locks,
+                &border_locks,
                 &groups,
                 &meshlets,
                 &position_only_vertex_remap,
@@ -495,8 +528,43 @@ fn group_meshlets(
     groups
 }
 
+/// Marks every vertex that lies on an open edge of the mesh - an edge used by
+/// exactly one triangle, in position-only terms - so a partition's seam with
+/// its neighbours stays put through simplification.
+fn mesh_border_locks(
+    indices: &[u32],
+    position_only_vertex_remap: &[u32],
+    vertex_count: usize,
+) -> Vec<bool> {
+    let mut edge_uses: HashMap<(u32, u32), u32> = HashMap::default();
+    for triangle in indices.chunks_exact(3) {
+        let corners = [
+            position_only_vertex_remap[triangle[0] as usize],
+            position_only_vertex_remap[triangle[1] as usize],
+            position_only_vertex_remap[triangle[2] as usize],
+        ];
+        for (a, b) in [(0, 1), (1, 2), (2, 0)] {
+            let edge = (corners[a].min(corners[b]), corners[a].max(corners[b]));
+            if edge.0 != edge.1 {
+                *edge_uses.entry(edge).or_default() += 1;
+            }
+        }
+    }
+    let mut border_positions = vec![false; position_only_vertex_remap.len()];
+    for (&(a, b), &uses) in &edge_uses {
+        if uses == 1 {
+            border_positions[a as usize] = true;
+            border_positions[b as usize] = true;
+        }
+    }
+    (0..vertex_count)
+        .map(|vertex_id| border_positions[position_only_vertex_remap[vertex_id] as usize])
+        .collect()
+}
+
 fn lock_group_borders(
     vertex_locks: &mut [bool],
+    border_locks: &[bool],
     groups: &[TempMeshletGroup],
     meshlets: &Meshlets,
     position_only_vertex_remap: &[u32],
@@ -523,10 +591,11 @@ fn lock_group_borders(
         }
     }
 
-    // Lock vertices used by more than 1 group
+    // Lock vertices used by more than 1 group, and the mesh's own open borders
+    // when the caller asked for them.
     for i in 0..vertex_locks.len() {
         let vertex_id = position_only_vertex_remap[i] as usize;
-        vertex_locks[i] = position_only_locks[vertex_id] == -2;
+        vertex_locks[i] = border_locks[i] || position_only_locks[vertex_id] == -2;
     }
 }
 
@@ -1221,5 +1290,63 @@ mod tests {
 
         // And a cut that does simplify never overstates the bound it was given.
         assert!(meshlet.raytracing_geometry(0.0).achieved_error <= 0.0);
+    }
+
+    #[test]
+    fn locked_borders_pin_a_partition_seam_through_every_lod() {
+        AsyncComputeTaskPool::get_or_init(bevy_tasks::TaskPool::default);
+        // A 24x24 grid of quads: open borders all round, as a partition of a
+        // larger surface has. Every interior vertex is free to move; the
+        // border must not.
+        let n = 24u32;
+        let mut positions = Vec::new();
+        let mut normals = Vec::new();
+        let mut uvs = Vec::new();
+        for y in 0..=n {
+            for x in 0..=n {
+                positions.push([x as f32, 0.0, y as f32]);
+                normals.push([0.0, 1.0, 0.0]);
+                uvs.push([x as f32 / n as f32, y as f32 / n as f32]);
+            }
+        }
+        let mut indices = Vec::new();
+        for y in 0..n {
+            for x in 0..n {
+                let i = y * (n + 1) + x;
+                indices.extend_from_slice(&[i, i + n + 1, i + 1, i + 1, i + n + 1, i + n + 2]);
+            }
+        }
+        let remap: Vec<u32> = (0..positions.len() as u32).collect();
+        let locks = mesh_border_locks(&indices, &remap, positions.len());
+        let border = |i: usize| {
+            let (x, y) = (i as u32 % (n + 1), i as u32 / (n + 1));
+            x == 0 || y == 0 || x == n || y == n
+        };
+        assert!((0..positions.len()).all(|i| locks[i] == border(i)));
+
+        let mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::all())
+            .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions.clone())
+            .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+            .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+            .with_inserted_indices(Indices::U32(indices));
+        let locked = MeshletMesh::from_mesh_with_locked_borders(&mesh, 4).unwrap();
+        // The coarsest cut of the locked build still contains every border
+        // position of the source, where the free build is allowed to lose them.
+        // The root of the LOD hierarchy carries an unbounded error, so any finite
+        // budget below it selects the coarsest cut.
+        let coarsest = locked.raytracing_geometry(1.0e6);
+        assert!(!coarsest.indices.is_empty());
+        let border_positions: Vec<[f32; 3]> = (0..positions.len())
+            .filter(|&i| border(i))
+            .map(|i| positions[i])
+            .collect();
+        for p in &border_positions {
+            assert!(
+                coarsest.positions.iter().any(|q| {
+                    (q[0] - p[0]).abs() < 1e-3 && (q[1] - p[1]).abs() < 1e-3 && (q[2] - p[2]).abs() < 1e-3
+                }),
+                "border vertex {p:?} moved or vanished"
+            );
+        }
     }
 }

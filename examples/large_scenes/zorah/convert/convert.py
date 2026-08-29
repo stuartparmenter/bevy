@@ -83,7 +83,10 @@ PROJECT = CONVERT_DIRECTORY / "ZorahConvert.csproj"
 ASSEMBLY = CONVERT_DIRECTORY / "bin" / "Release" / "net10.0" / "ZorahConvert.dll"
 REPOSITORY = CONVERT_DIRECTORY.parents[3]
 PACK_STATE_FORMAT = "zorah-pack-state-v1"
-PACK_PIPELINE_VERSION = 1
+# Bump when zorah_pack changes how it builds meshlets or bundles; it repacks
+# every partition and texture.
+# 2: partitions of a split mesh lock their open borders through every LOD.
+PACK_PIPELINE_VERSION = 2
 # Formats zorah_pack stamps into pack.json. Bump alongside ZORAH_BUNDLE_VERSION
 # (src/zorah_bundle.rs) and MESHLET_MESH_ASSET_VERSION
 # (crates/bevy_pbr/src/meshlet/asset.rs); a stale stamp invalidates every packed
