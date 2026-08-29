@@ -102,6 +102,8 @@ impl AssetSaver for ImageSaver {
             sampler: asset.sampler.clone(),
             asset_usage: asset.asset_usage,
             array_layout: None,
+            // The saved file is already at the size it was loaded at.
+            max_dimension: None,
         })
     }
 }

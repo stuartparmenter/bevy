@@ -1574,8 +1574,34 @@ impl Image {
     }
 
     /// Load a bytes buffer in a [`Image`], according to type `image_type`, using the `image`
-    /// crate
+    /// crate or the matching container decoder.
+    ///
+    /// Same as [`Image::from_buffer_with_max_dimension`] with no size cap.
     pub fn from_buffer(
+        buffer: &[u8],
+        image_type: ImageType,
+        supported_compressed_formats: CompressedImageFormats,
+        is_srgb: bool,
+        image_sampler: ImageSampler,
+        asset_usage: RenderAssetUsages,
+    ) -> Result<Image, TextureError> {
+        Self::from_buffer_with_max_dimension(
+            buffer,
+            image_type,
+            supported_compressed_formats,
+            is_srgb,
+            image_sampler,
+            asset_usage,
+            None,
+        )
+    }
+
+    /// [`Image::from_buffer`] with the mip chain cut down to `max_dimension`.
+    ///
+    /// See [`ImageLoaderSettings::max_dimension`](crate::ImageLoaderSettings::max_dimension)
+    /// for the exact semantics. Only KTX2 and DDS honor it; every other container
+    /// loads at full size with a one-time warning.
+    pub fn from_buffer_with_max_dimension(
         buffer: &[u8],
         image_type: ImageType,
         #[cfg_attr(
@@ -1586,6 +1612,7 @@ impl Image {
         is_srgb: bool,
         image_sampler: ImageSampler,
         asset_usage: RenderAssetUsages,
+        max_dimension: Option<u32>,
     ) -> Result<Image, TextureError> {
         let format = image_type.to_image_format()?;
 
@@ -1598,13 +1625,16 @@ impl Image {
         let mut image = match format {
             #[cfg(feature = "basis-universal")]
             ImageFormat::Basis => {
+                warn_max_dimension_ignored(format, max_dimension);
                 basis_buffer_to_image(buffer, supported_compressed_formats, is_srgb)?
             }
             #[cfg(feature = "dds")]
-            ImageFormat::Dds => dds_buffer_to_image(buffer, supported_compressed_formats, is_srgb)?,
+            ImageFormat::Dds => {
+                dds_buffer_to_image(buffer, supported_compressed_formats, is_srgb, max_dimension)?
+            }
             #[cfg(feature = "ktx2")]
             ImageFormat::Ktx2 => {
-                ktx2_buffer_to_image(buffer, supported_compressed_formats, is_srgb)?
+                ktx2_buffer_to_image(buffer, supported_compressed_formats, is_srgb, max_dimension)?
             }
             #[expect(
                 clippy::allow_attributes,
@@ -1615,6 +1645,7 @@ impl Image {
                 reason = "The wildcard pattern may be unreachable if only the specially-handled formats are enabled; however, the wildcard pattern is needed for any formats not specially handled"
             )]
             _ => {
+                warn_max_dimension_ignored(format, max_dimension);
                 let image_crate_format = format
                     .as_image_crate_format()
                     .ok_or_else(|| TextureError::UnsupportedTextureFormat(format!("{format:?}")))?;
@@ -2299,6 +2330,56 @@ pub enum TextureError {
     /// Only cubemaps with six faces are supported.
     #[error("only cubemaps with six faces are supported")]
     IncompleteCubemap,
+}
+
+/// Warns once per container format that `max_dimension` was requested but cannot be
+/// honored, so a mis-set loader option is not silently loading full-size textures.
+fn warn_max_dimension_ignored(format: ImageFormat, max_dimension: Option<u32>) {
+    if let Some(max_dimension) = max_dimension {
+        bevy_utils::once!(tracing::warn!(
+            "`max_dimension` ({max_dimension}) ignored: {format:?} images always load at full \
+            size; only KTX2 and DDS carry a mip chain that can be cut on load",
+        ));
+    }
+}
+
+/// How many leading mip levels to drop so the first kept level has both width and
+/// height `<= max_dimension`, given a chain of `level_count` levels starting at
+/// `width` x `height`.
+///
+/// The last level is always kept, so a single-level image never drops anything. For
+/// block-compressed formats the skip is pulled back until the first kept level is a
+/// whole number of `block_dimensions` blocks, because wgpu rejects a base level that
+/// is not; the 2x2 and 1x1 tail of a BC chain is therefore never promoted to level 0.
+#[cfg(any(feature = "dds", feature = "ktx2"))]
+pub(crate) fn mip_levels_to_skip(
+    width: u32,
+    height: u32,
+    level_count: u32,
+    block_dimensions: (u32, u32),
+    max_dimension: Option<u32>,
+) -> u32 {
+    let Some(max_dimension) = max_dimension else {
+        return 0;
+    };
+    let level_size = |level: u32| ((width >> level).max(1), (height >> level).max(1));
+    let mut skip = 0;
+    while skip + 1 < level_count {
+        let (level_width, level_height) = level_size(skip);
+        if level_width <= max_dimension && level_height <= max_dimension {
+            break;
+        }
+        skip += 1;
+    }
+    let (block_width, block_height) = block_dimensions;
+    while skip > 0 {
+        let (level_width, level_height) = level_size(skip);
+        if level_width % block_width == 0 && level_height % block_height == 0 {
+            break;
+        }
+        skip -= 1;
+    }
+    skip
 }
 
 /// The type of a raw image buffer.
