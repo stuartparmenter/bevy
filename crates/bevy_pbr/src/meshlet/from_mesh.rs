@@ -283,23 +283,30 @@ impl MeshletMesh {
     /// Drops every meshlet finer than `min_error` and rebuilds the mesh over the rest, so a scene
     /// can trade detail it cannot afford to keep resident for a bounded geometric error.
     ///
-    /// What is dropped: every LOD subtree whose BVH error is below `min_error`, which is exactly
-    /// what [`Self::raytracing_geometry`] skips for a cut at `min_error` or looser - those
+    /// What is dropped: every LOD subtree whose BVH error is strictly below `min_error` - those
     /// meshlets are only ever selected when the coarser meshlets that approximate them to within
-    /// that error are perceptibly wrong. Everything coarser survives with its packed vertex and
-    /// index data compacted, and the BVH is rebuilt over the survivors, so the result is a smaller
-    /// upload rather than a view of the original. `pruned(0.0)` keeps every meshlet; it still
-    /// shrinks a little, since compaction drops the padding meshopt leaves between index runs.
+    /// that error are perceptibly wrong. The rule is strict, unlike the `<=` of
+    /// [`Self::raytracing_geometry`], so that `pruned(0.0)` is an identity on any mesh, including
+    /// one whose simplification reached a zero-error level; the cost is that a subtree with an
+    /// error of exactly `min_error` survives here where the `min_error` cut would skip it, so
+    /// `pruned(e)` holds the geometry of the cut at the next float below `e` and can retain a
+    /// little more than the `e` cut. Everything coarser survives with its packed vertex and index
+    /// data compacted, and the BVH is rebuilt over the survivors, so the result is a smaller
+    /// upload rather than a view of the original. `pruned(0.0)` still shrinks a little, since
+    /// compaction drops the padding meshopt leaves between index runs.
     ///
     /// Error semantics afterwards: a surviving meshlet whose own error was below `min_error` has
     /// lost the finer children it would otherwise hand over to, so its error becomes `0.0` and
     /// the runtime treats it as full detail - `cull_clusters.wgsl` only rasterizes a meshlet whose
     /// own error is imperceptible, and a positive error would cull it up close and leave a hole
     /// where its children used to be. Its `lod_group_sphere` is kept; with an error of zero it no
-    /// longer affects the test. Every other meshlet and every BVH node keeps its error, so
-    /// `raytracing_geometry(e)` of the result is the unpruned mesh's cut for every
+    /// longer affects the test. Every other meshlet and every BVH node keeps its error, so the
+    /// geometry `raytracing_geometry(e)` selects from the result is the unpruned mesh's for every
     /// `e >= min_error`, while a tighter request can only reach the detail that survived and so
-    /// returns the `min_error` cut.
+    /// returns the geometry pruning kept. What that call reports as `achieved_error` is not
+    /// comparable, though: the rewritten zeros hide how far those meshlets sit from the true
+    /// surface, so a consumer that biases by it (a BLAS cut) should select from the unpruned
+    /// mesh.
     pub fn pruned(&self, min_error: f32) -> MeshletMesh {
         assert!(min_error.is_finite() && min_error >= 0.0);
 
@@ -424,8 +431,9 @@ impl MeshletMesh {
         }
     }
 
-    /// The BVH leaves at or above the cut: the same walk as `select_raytracing_meshlets`, but
-    /// keeping whole groups, since a group is the unit the BVH is rebuilt from.
+    /// The BVH leaves at or above the cut: the walk of `select_raytracing_meshlets`, but skipping
+    /// only strictly finer subtrees and keeping whole groups, since a group is the unit the BVH
+    /// is rebuilt from.
     fn collect_pruned_groups(&self, node_id: usize, min_error: f32, groups: &mut Vec<PrunedGroup>) {
         let node = &self.bvh[node_id];
         for child in 0..8 {
@@ -1668,6 +1676,52 @@ mod tests {
             .collect();
         assert_eq!(by_aabb.len(), mesh.meshlets.len());
         by_aabb
+    }
+
+    #[test]
+    fn read_decodes_what_write_encoded() {
+        use crate::meshlet::asset::{MeshletMeshSaveOrLoadError, MESHLET_MESH_ASSET_VERSION};
+
+        let mesh = torus_meshlet_mesh();
+        let mut file = Vec::new();
+        mesh.write(&mut file).unwrap();
+        let read = MeshletMesh::read(&mut file.as_slice()).unwrap();
+        assert_eq!(read.vertex_positions, mesh.vertex_positions);
+        assert_eq!(read.vertex_normals, mesh.vertex_normals);
+        assert_eq!(read.vertex_uvs, mesh.vertex_uvs);
+        assert_eq!(read.indices, mesh.indices);
+        assert_eq!(
+            bytemuck::cast_slice::<_, u8>(&read.bvh),
+            bytemuck::cast_slice::<_, u8>(&mesh.bvh)
+        );
+        assert_eq!(
+            bytemuck::cast_slice::<_, u8>(&read.meshlets),
+            bytemuck::cast_slice::<_, u8>(&mesh.meshlets)
+        );
+        assert_eq!(
+            bytemuck::cast_slice::<_, u8>(&read.meshlet_cull_data),
+            bytemuck::cast_slice::<_, u8>(&mesh.meshlet_cull_data)
+        );
+        assert_eq!(
+            bytemuck::bytes_of(&read.aabb),
+            bytemuck::bytes_of(&mesh.aabb)
+        );
+        assert_eq!(read.bvh_depth, mesh.bvh_depth);
+        assert_eq!(read.triangle_count(), mesh.triangle_count());
+
+        // The header is checked before anything is decompressed.
+        assert!(matches!(
+            MeshletMesh::read(&mut &b"not a meshlet mesh"[..]),
+            Err(MeshletMeshSaveOrLoadError::WrongFileType)
+        ));
+        let mut stale = file.clone();
+        stale[8..16].copy_from_slice(&(MESHLET_MESH_ASSET_VERSION + 1).to_le_bytes());
+        assert!(matches!(
+            MeshletMesh::read(&mut stale.as_slice()),
+            Err(MeshletMeshSaveOrLoadError::WrongVersion { found }) if found == MESHLET_MESH_ASSET_VERSION + 1
+        ));
+        file.truncate(file.len() / 2);
+        assert!(MeshletMesh::read(&mut file.as_slice()).is_err());
     }
 
     #[test]

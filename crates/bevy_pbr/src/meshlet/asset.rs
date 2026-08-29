@@ -391,32 +391,29 @@ impl AssetSaver for MeshletMeshSaver {
         _settings: &(),
         _asset_path: AssetPath<'_>,
     ) -> Result<(), MeshletMeshSaveOrLoadError> {
-        // Write asset magic number
-        writer
-            .write_all(&MESHLET_MESH_ASSET_MAGIC.to_le_bytes())
-            .await?;
+        asset.write(&mut AsyncWriteSyncAdapter(writer))
+    }
+}
 
-        // Write asset version
-        writer
-            .write_all(&MESHLET_MESH_ASSET_VERSION.to_le_bytes())
-            .await?;
-
-        writer.write_all(bytemuck::bytes_of(&asset.aabb)).await?;
-        writer
-            .write_all(bytemuck::bytes_of(&asset.bvh_depth))
-            .await?;
+impl MeshletMesh {
+    /// Encodes a `.meshlet_mesh` file, as [`MeshletMeshSaver`] does; the inverse of
+    /// [`Self::read`].
+    pub fn write(&self, writer: &mut dyn Write) -> Result<(), MeshletMeshSaveOrLoadError> {
+        writer.write_all(&MESHLET_MESH_ASSET_MAGIC.to_le_bytes())?;
+        writer.write_all(&MESHLET_MESH_ASSET_VERSION.to_le_bytes())?;
+        writer.write_all(bytemuck::bytes_of(&self.aabb))?;
+        writer.write_all(bytemuck::bytes_of(&self.bvh_depth))?;
 
         // Compress and write asset data
-        let mut writer = FrameEncoder::new(AsyncWriteSyncAdapter(writer));
-        write_slice(&asset.vertex_positions, &mut writer)?;
-        write_slice(&asset.vertex_normals, &mut writer)?;
-        write_slice(&asset.vertex_uvs, &mut writer)?;
-        write_slice(&asset.indices, &mut writer)?;
-        write_slice(&asset.bvh, &mut writer)?;
-        write_slice(&asset.meshlets, &mut writer)?;
-        write_slice(&asset.meshlet_cull_data, &mut writer)?;
+        let mut writer = FrameEncoder::new(writer);
+        write_slice(&self.vertex_positions, &mut writer)?;
+        write_slice(&self.vertex_normals, &mut writer)?;
+        write_slice(&self.vertex_uvs, &mut writer)?;
+        write_slice(&self.indices, &mut writer)?;
+        write_slice(&self.bvh, &mut writer)?;
+        write_slice(&self.meshlets, &mut writer)?;
+        write_slice(&self.meshlet_cull_data, &mut writer)?;
         writer.finish()?;
-
         Ok(())
     }
 }
