@@ -165,6 +165,32 @@ pub struct ImageLoaderSettings {
     /// [`SourceColorPrimaries::Bt709`]. `Some` overrides whatever the file says.
     #[serde(default)]
     pub source_primaries: Option<SourceColorPrimaries>,
+    /// Upper bound on the loaded image's width and height, in pixels, met by
+    /// dropping the largest mip levels the file carries rather than by resampling.
+    ///
+    /// Leading levels are dropped until both the width and the height of the
+    /// first kept level are `<= max_dimension`; the smallest level is always kept,
+    /// so a single-level image and an image already within the bound load
+    /// unchanged. The kept levels become the whole chain: the texture's size is the
+    /// first kept level's, `mip_level_count` shrinks by the number dropped, and the
+    /// data holds only the kept levels in upload order. Cubemaps, array and 3D
+    /// textures drop the same levels for every face, layer and slice, since a level
+    /// holds all of them.
+    ///
+    /// For block-compressed formats the first kept level must be a whole number of
+    /// blocks (wgpu rejects a base level that is not), so the cut pulls back to the
+    /// nearest larger block-aligned level. A bound below the block size lands on the
+    /// smallest block-aligned level, and a chain whose extents are not powers of two
+    /// can land well above the bound: a 1000x1000 BC7 chain capped at 256 loads at
+    /// 500x500, since 250 is not a multiple of 4.
+    ///
+    /// Only KTX2 and DDS carry a mip chain on disk, so only they honor this; with a
+    /// supercompressed KTX2 the dropped levels are never decompressed, which is what
+    /// makes a large texture set cheap to load below its authored size. Basis and
+    /// every `image`-crate format (PNG, JPEG, EXR, ...) load at full size and warn
+    /// once when this is set.
+    #[serde(default)]
+    pub max_dimension: Option<u32>,
 }
 
 impl Default for ImageLoaderSettings {
@@ -177,6 +203,7 @@ impl Default for ImageLoaderSettings {
             asset_usage: RenderAssetUsages::default(),
             array_layout: None,
             source_primaries: None,
+            max_dimension: None,
         }
     }
 }
@@ -235,13 +262,14 @@ impl AssetLoader for ImageLoader {
             }
         };
 
-        let mut image = Image::from_buffer(
+        let mut image = Image::from_buffer_with_max_dimension(
             &bytes,
             image_type,
             self.supported_compressed_formats,
             settings.is_srgb,
             settings.sampler.clone(),
             settings.asset_usage,
+            settings.max_dimension,
         )
         .map_err(|err| FileTextureError {
             error: err,

@@ -16,11 +16,18 @@ use super::{CompressedImageFormats, Image, TextureError, TranscodeFormat};
 ///
 /// Returns an error if the provided buffer contained invalid data, decompression fails, or transcoding
 /// of unsupported data formats fails.
+///
+/// `max_dimension` drops leading mip levels as described on
+/// [`ImageLoaderSettings::max_dimension`](crate::ImageLoaderSettings::max_dimension).
+/// DDS stores every layer's whole chain contiguously, so unlike KTX2 the dropped
+/// levels are still read from the file; only the kept tail of each layer is copied
+/// into the image.
 #[cfg(feature = "dds")]
 pub fn dds_buffer_to_image(
     buffer: &[u8],
     supported_compressed_formats: CompressedImageFormats,
     is_srgb: bool,
+    max_dimension: Option<u32>,
 ) -> Result<Image, TextureError> {
     let mut cursor = Cursor::new(buffer);
     let dds = Dds::read(&mut cursor)
@@ -100,17 +107,29 @@ pub fn dds_buffer_to_image(
         });
     }
 
+    let logical_size = Extent3d {
+        width: dds.get_width(),
+        height: dds.get_height(),
+        depth_or_array_layers,
+    };
+    let skip = crate::image::mip_levels_to_skip(
+        logical_size.width,
+        logical_size.height,
+        mip_map_level,
+        texture_format.block_dimensions(),
+        max_dimension,
+    );
+
     // DDS mipmap layout is directly compatible with wgpu's layout (Slice -> Face -> Mip):
     // https://learn.microsoft.com/fr-fr/windows/win32/direct3ddds/dx-graphics-dds-reference
-    image.data = if let Some(transcode_format) = transcode_format {
+    let mut data = if let Some(transcode_format) = transcode_format {
         match transcode_format {
             TranscodeFormat::Rgb8 => {
                 let (chunks, _) = dds.data.as_chunks();
-                let data = chunks
+                chunks
                     .iter()
                     .flat_map(|&[r, g, b]| [r, g, b, u8::MAX])
-                    .collect();
-                Some(data)
+                    .collect()
             }
             _ => {
                 return Err(TextureError::TranscodeError(format!(
@@ -119,10 +138,78 @@ pub fn dds_buffer_to_image(
             }
         }
     } else {
-        Some(dds.data)
+        dds.data
     };
 
+    if skip > 0 {
+        let dimension = image.texture_descriptor.dimension;
+        data = drop_leading_mips_layer_major(
+            &data,
+            logical_size,
+            dimension,
+            texture_format,
+            mip_map_level,
+            skip,
+        )?;
+        image.texture_descriptor.size = logical_size
+            .mip_level_size(skip, dimension)
+            .physical_size(texture_format);
+        image.texture_descriptor.mip_level_count = mip_map_level - skip;
+    }
+    image.data = Some(data);
+
     Ok(image)
+}
+
+/// Rebuilds a layer-major (`layer -> mip`) chain without its first `skip` levels.
+///
+/// Each layer's kept tail is already contiguous in the source, so this is one copy
+/// per layer; a 3D texture is a single layer whose levels shrink in depth too.
+fn drop_leading_mips_layer_major(
+    data: &[u8],
+    logical_size: Extent3d,
+    dimension: TextureDimension,
+    format: TextureFormat,
+    level_count: u32,
+    skip: u32,
+) -> Result<Vec<u8>, TextureError> {
+    let block_bytes = format.block_copy_size(None).ok_or_else(|| {
+        TextureError::UnsupportedTextureFormat(format!(
+            "cannot size mip levels of {format:?} to drop them"
+        ))
+    })? as usize;
+    let (block_width, block_height) = format.block_dimensions();
+    let layers = match dimension {
+        TextureDimension::D3 => 1,
+        _ => logical_size.depth_or_array_layers,
+    } as usize;
+    let level_bytes = |level: u32| {
+        let mut level_size = logical_size.mip_level_size(level, dimension);
+        if dimension != TextureDimension::D3 {
+            level_size.depth_or_array_layers = 1;
+        }
+        let physical = level_size.physical_size(format);
+        (physical.width / block_width) as usize
+            * (physical.height / block_height) as usize
+            * physical.depth_or_array_layers as usize
+            * block_bytes
+    };
+    let dropped_bytes: usize = (0..skip).map(level_bytes).sum();
+    let layer_bytes: usize = (0..level_count).map(level_bytes).sum();
+    if data.len() < layer_bytes * layers {
+        return Err(TextureError::InvalidData(format!(
+            "DDS data holds {} bytes but its header describes {}",
+            data.len(),
+            layer_bytes * layers
+        )));
+    }
+    let mut kept = Vec::with_capacity((layer_bytes - dropped_bytes) * layers);
+    for layer in 0..layers {
+        kept.extend_from_slice(
+            &data[layer * layer_bytes + dropped_bytes..(layer + 1) * layer_bytes],
+        );
+    }
+    Ok(kept)
 }
 
 /// Gets a [`TextureFormat`] from a [`Dds`] file.
@@ -416,10 +503,58 @@ mod test {
             0x49, 0x92, 0x24, 0x16, 0x95, 0xae, 0x42, 0xfc, 0, 0xaa, 0x55, 0xff, 0xff, 0x49, 0x92,
             0x24, 0x49, 0x92, 0x24, 0xd8, 0xad, 0xae, 0x42, 0xaf, 0x0a, 0xaa, 0x55,
         ];
-        let r = dds_buffer_to_image(&buffer, CompressedImageFormats::BC, true);
+        let r = dds_buffer_to_image(&buffer, CompressedImageFormats::BC, true, None);
         assert!(r.is_ok());
         if let Ok(r) = r {
             fake_wgpu_create_texture_with_data(&r.texture_descriptor, r.data.as_ref().unwrap());
         }
+    }
+
+    #[test]
+    fn max_dimension_cuts_every_layer_of_a_layer_major_chain() {
+        use ddsfile::{AlphaMode, D3D10ResourceDimension, Dds, DxgiFormat, NewDxgiParams};
+
+        // Two array layers of an 8x8 RGBA8 chain, every texel byte tagged with its
+        // layer and level so the kept bytes prove which surfaces survived.
+        let mut dds = Dds::new_dxgi(NewDxgiParams {
+            height: 8,
+            width: 8,
+            depth: None,
+            format: DxgiFormat::R8G8B8A8_UNorm,
+            mipmap_levels: Some(4),
+            array_layers: Some(2),
+            caps2: None,
+            is_cubemap: false,
+            resource_dimension: D3D10ResourceDimension::Texture2D,
+            alpha_mode: AlphaMode::Unknown,
+        })
+        .unwrap();
+        let mut tagged = Vec::new();
+        for layer in 0..2u8 {
+            for level in 0..4u32 {
+                let bytes = ((8 >> level) * (8 >> level)) as usize * 4;
+                tagged.extend(std::iter::repeat_n(layer * 16 + level as u8, bytes));
+            }
+        }
+        assert_eq!(dds.data.len(), tagged.len());
+        dds.data = tagged;
+        let mut buffer = Vec::new();
+        dds.write(&mut buffer).unwrap();
+
+        let image =
+            dds_buffer_to_image(&buffer, CompressedImageFormats::empty(), false, Some(2)).unwrap();
+        let size = image.texture_descriptor.size;
+        assert_eq!(
+            (size.width, size.height, size.depth_or_array_layers),
+            (2, 2, 2)
+        );
+        assert_eq!(image.texture_descriptor.mip_level_count, 2);
+        let mut expected = Vec::new();
+        for layer in 0..2u8 {
+            expected.extend(std::iter::repeat_n(layer * 16 + 2, 16));
+            expected.extend(std::iter::repeat_n(layer * 16 + 3, 4));
+        }
+        assert_eq!(image.data.as_deref(), Some(&expected[..]));
+        fake_wgpu_create_texture_with_data(&image.texture_descriptor, image.data.as_ref().unwrap());
     }
 }

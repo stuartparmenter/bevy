@@ -103,6 +103,8 @@ impl AssetSaver for ImageSaver {
             asset_usage: asset.asset_usage,
             array_layout: None,
             source_primaries: Some(asset.source_primaries),
+            // The saved file is already at the size it was loaded at.
+            max_dimension: None,
         })
     }
 }

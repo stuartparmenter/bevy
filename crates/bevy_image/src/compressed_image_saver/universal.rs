@@ -69,6 +69,7 @@ impl CompressedImageSaverUniversal {
             texture_format: None,
             array_layout: None,
             source_primaries: Some(image.source_primaries),
+            max_dimension: None,
         })
     }
 }
