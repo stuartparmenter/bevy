@@ -207,7 +207,9 @@ impl MeshletMesh {
             packed[channel] = read_packed_bits(&self.vertex_positions, start_bit, bits[channel]);
             start_bit += bits[channel] as u32;
         }
-        let scale = ((1u32 << meshlet.vertex_position_quantization_factor) as f32) * 100.0;
+        let scale = super::from_mesh::vertex_position_quantization_scale(
+            meshlet.vertex_position_quantization_factor,
+        );
         Vec3::new(
             packed[0] as f32 + meshlet.min_vertex_position_channel_x,
             packed[1] as f32 + meshlet.min_vertex_position_channel_y,

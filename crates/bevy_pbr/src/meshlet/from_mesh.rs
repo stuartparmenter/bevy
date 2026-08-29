@@ -36,6 +36,20 @@ pub const MESHLET_DEFAULT_VERTEX_POSITION_QUANTIZATION_FACTOR: u8 = 4;
 
 const CENTIMETERS_PER_METER: f32 = 100.0;
 
+/// Grid steps per metre at a vertex position quantization factor: positions
+/// snap to 1/2^factor of a centimetre.
+pub fn vertex_position_quantization_scale(vertex_position_quantization_factor: u8) -> f32 {
+    (1 << vertex_position_quantization_factor) as f32 * CENTIMETERS_PER_METER
+}
+
+/// The fixed-point grid position a meshlet mesh stores for `position`, which
+/// is also the identity two vertices must share to be one point after the
+/// build.
+pub fn quantize_vertex_position(position: Vec3, vertex_position_quantization_factor: u8) -> IVec3 {
+    (position * vertex_position_quantization_scale(vertex_position_quantization_factor) + 0.5)
+        .as_ivec3()
+}
+
 impl MeshletMesh {
     /// Process a [`Mesh`] to generate a [`MeshletMesh`].
     ///
@@ -143,9 +157,7 @@ impl MeshletMesh {
 
         let border_locks = match locks {
             InputLocks::None => vec![false; vertices.vertex_count],
-            InputLocks::OpenBorders => {
-                mesh_border_locks(&indices, &position_only_vertex_remap, vertices.vertex_count)
-            }
+            InputLocks::OpenBorders => mesh_border_locks(&indices, &position_only_vertex_remap),
             InputLocks::Explicit(locked) => {
                 if locked.len() != vertices.vertex_count {
                     return Err(MeshToMeshletMeshConversionError::WrongLockCount {
@@ -829,11 +841,7 @@ fn group_meshlets(
 /// Marks every vertex that lies on an open edge of the mesh - an edge used by
 /// exactly one triangle, in position-only terms - so a partition's seam with
 /// its neighbours stays put through simplification.
-fn mesh_border_locks(
-    indices: &[u32],
-    position_only_vertex_remap: &[u32],
-    vertex_count: usize,
-) -> Vec<bool> {
+fn mesh_border_locks(indices: &[u32], position_only_vertex_remap: &[u32]) -> Vec<bool> {
     let mut edge_uses: HashMap<(u32, u32), u32> = HashMap::default();
     for triangle in indices.chunks_exact(3) {
         let corners = [
@@ -855,8 +863,15 @@ fn mesh_border_locks(
             border_positions[b as usize] = true;
         }
     }
-    (0..vertex_count)
-        .map(|vertex_id| border_positions[position_only_vertex_remap[vertex_id] as usize])
+    spread_over_positions(&border_positions, position_only_vertex_remap)
+}
+
+/// Per-vertex flags from per-position flags: a lock belongs to a position, so
+/// every vertex sharing one (a UV or normal seam) carries it.
+fn spread_over_positions(position_flags: &[bool], position_only_vertex_remap: &[u32]) -> Vec<bool> {
+    position_only_vertex_remap
+        .iter()
+        .map(|position| position_flags[*position as usize])
         .collect()
 }
 
@@ -971,9 +986,6 @@ fn build_and_compress_per_meshlet_vertex_data(
     let start_vertex_position_bit = vertex_positions.len() as u32;
     let start_vertex_attribute_id = vertex_normals.len() as u32;
 
-    let quantization_factor =
-        (1 << vertex_position_quantization_factor) as f32 * CENTIMETERS_PER_METER;
-
     let mut min_quantized_position_channels = IVec3::MAX;
     let mut max_quantized_position_channels = IVec3::MIN;
     let mut min_vertex_uv = Vec2::splat(f32::INFINITY);
@@ -998,7 +1010,8 @@ fn build_and_compress_per_meshlet_vertex_data(
         vertex_normals.push(pack2x16snorm(octahedral_encode(normal)));
 
         // Quantize position to a fixed-point IVec3
-        let quantized_position = (position * quantization_factor + 0.5).as_ivec3();
+        let quantized_position =
+            quantize_vertex_position(position, vertex_position_quantization_factor);
         quantized_positions[i] = quantized_position;
 
         // Compute per X/Y/Z-channel quantized position min/max for this meshlet
@@ -1529,8 +1542,7 @@ enum InputLocks<'a> {
     Explicit(&'a [bool]),
 }
 
-/// Spreads per-vertex lock flags over every vertex sharing a locked
-/// position, so a seam vertex split for its UVs or normals is held whole.
+/// Per-vertex lock flags widened to every vertex sharing a locked position.
 fn position_locks(locked: &[bool], position_only_vertex_remap: &[u32]) -> Vec<bool> {
     let mut locked_positions = vec![false; position_only_vertex_remap.len()];
     for (vertex_id, flag) in locked.iter().enumerate() {
@@ -1538,10 +1550,7 @@ fn position_locks(locked: &[bool], position_only_vertex_remap: &[u32]) -> Vec<bo
             locked_positions[position_only_vertex_remap[vertex_id] as usize] = true;
         }
     }
-    position_only_vertex_remap
-        .iter()
-        .map(|position| locked_positions[*position as usize])
-        .collect()
+    spread_over_positions(&locked_positions, position_only_vertex_remap)
 }
 
 #[cfg(test)]
@@ -1929,13 +1938,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn locked_borders_pin_a_partition_seam_through_every_lod() {
-        AsyncComputeTaskPool::get_or_init(bevy_tasks::TaskPool::default);
-        // A 24x24 grid of quads: open borders all round, as a partition of a
-        // larger surface has. Every interior vertex is free to move; the
-        // border must not.
-        let n = 24u32;
+    /// An `n` by `n` grid of quads on the XZ plane with open borders all
+    /// round, as a partition of a larger surface has; returns its positions
+    /// and the mesh.
+    fn open_grid(n: u32) -> (Vec<[f32; 3]>, Mesh) {
         let mut positions = Vec::new();
         let mut normals = Vec::new();
         let mut uvs = Vec::new();
@@ -1953,39 +1959,57 @@ mod tests {
                 indices.extend_from_slice(&[i, i + n + 1, i + 1, i + 1, i + n + 1, i + n + 2]);
             }
         }
+        let mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::all())
+            .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions.clone())
+            .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+            .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+            .with_inserted_indices(Indices::U32(indices));
+        (positions, mesh)
+    }
+
+    fn contains_position(geometry: &MeshletRaytracingGeometry, p: &[f32; 3]) -> bool {
+        geometry.positions.iter().any(|q| {
+            (q[0] - p[0]).abs() < 1e-3 && (q[1] - p[1]).abs() < 1e-3 && (q[2] - p[2]).abs() < 1e-3
+        })
+    }
+
+    /// The coarsest cut: the root of the LOD hierarchy carries an unbounded
+    /// error, so any finite budget below it selects it.
+    fn coarsest(mesh: &MeshletMesh) -> MeshletRaytracingGeometry {
+        let cut = mesh.raytracing_geometry(1.0e6);
+        assert!(!cut.indices.is_empty());
+        cut
+    }
+
+    #[test]
+    fn locked_borders_pin_a_partition_seam_through_every_lod() {
+        AsyncComputeTaskPool::get_or_init(bevy_tasks::TaskPool::default);
+        // Every interior vertex is free to move; the border must not.
+        let n = 24u32;
+        let (positions, mesh) = open_grid(n);
+        let indices = match mesh.indices() {
+            Some(Indices::U32(indices)) => indices.clone(),
+            _ => unreachable!(),
+        };
         let remap: Vec<u32> = (0..positions.len() as u32).collect();
-        let locks = mesh_border_locks(&indices, &remap, positions.len());
+        let locks = mesh_border_locks(&indices, &remap);
         let border = |i: usize| {
             let (x, y) = (i as u32 % (n + 1), i as u32 / (n + 1));
             x == 0 || y == 0 || x == n || y == n
         };
         assert!((0..positions.len()).all(|i| locks[i] == border(i)));
 
-        let mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::all())
-            .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions.clone())
-            .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
-            .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
-            .with_inserted_indices(Indices::U32(indices));
-        let locked = MeshletMesh::from_mesh_with_locked_borders(&mesh, 4).unwrap();
         // The coarsest cut of the locked build still contains every border
         // position of the source, where the free build is allowed to lose them.
-        // The root of the LOD hierarchy carries an unbounded error, so any finite
-        // budget below it selects the coarsest cut.
-        let coarsest = locked.raytracing_geometry(1.0e6);
-        assert!(!coarsest.indices.is_empty());
-        let border_positions: Vec<[f32; 3]> = (0..positions.len())
-            .filter(|&i| border(i))
-            .map(|i| positions[i])
-            .collect();
-        for p in &border_positions {
-            assert!(
-                coarsest.positions.iter().any(|q| {
-                    (q[0] - p[0]).abs() < 1e-3
-                        && (q[1] - p[1]).abs() < 1e-3
-                        && (q[2] - p[2]).abs() < 1e-3
-                }),
-                "border vertex {p:?} moved or vanished"
-            );
+        let locked = MeshletMesh::from_mesh_with_locked_borders(&mesh, 4).unwrap();
+        let cut = coarsest(&locked);
+        for (i, p) in positions.iter().enumerate() {
+            if border(i) {
+                assert!(
+                    contains_position(&cut, p),
+                    "border vertex {p:?} moved or vanished"
+                );
+            }
         }
     }
 
@@ -1996,29 +2020,8 @@ mod tests {
     fn explicit_locks_pin_only_the_named_seam() {
         AsyncComputeTaskPool::get_or_init(bevy_tasks::TaskPool::default);
         let n = 24u32;
-        let mut positions = Vec::new();
-        let mut normals = Vec::new();
-        let mut uvs = Vec::new();
-        for y in 0..=n {
-            for x in 0..=n {
-                positions.push([x as f32, 0.0, y as f32]);
-                normals.push([0.0, 1.0, 0.0]);
-                uvs.push([x as f32 / n as f32, y as f32 / n as f32]);
-            }
-        }
-        let mut indices = Vec::new();
-        for y in 0..n {
-            for x in 0..n {
-                let i = y * (n + 1) + x;
-                indices.extend_from_slice(&[i, i + n + 1, i + 1, i + 1, i + n + 1, i + n + 2]);
-            }
-        }
-        let mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::all())
-            .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions.clone())
-            .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
-            .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
-            .with_inserted_indices(Indices::U32(indices));
-        let seam = |i: usize| i as u32 % (n + 1) == 0;
+        let (positions, mesh) = open_grid(n);
+        let seam = |i: usize| (i as u32).is_multiple_of(n + 1);
         let locked: Vec<bool> = (0..positions.len()).map(seam).collect();
 
         assert!(matches!(
@@ -2034,38 +2037,34 @@ mod tests {
             MeshletMesh::from_mesh_with_locks(&mesh, 4, &vec![false; positions.len()]).unwrap();
         assert_eq!(unlocked.meshlets.len(), free.meshlets.len());
         assert_eq!(
-            unlocked.raytracing_geometry(1.0e6).indices.len(),
-            free.raytracing_geometry(1.0e6).indices.len()
+            coarsest(&unlocked).indices.len(),
+            coarsest(&free).indices.len()
         );
 
         let pinned = MeshletMesh::from_mesh_with_locks(&mesh, 4, &locked).unwrap();
         let bordered = MeshletMesh::from_mesh_with_locked_borders(&mesh, 4).unwrap();
-        let coarsest = pinned.raytracing_geometry(1.0e6);
-        let present = |p: &[f32; 3]| {
-            coarsest.positions.iter().any(|q| {
-                (q[0] - p[0]).abs() < 1e-3
-                    && (q[1] - p[1]).abs() < 1e-3
-                    && (q[2] - p[2]).abs() < 1e-3
-            })
-        };
+        let cut = coarsest(&pinned);
         for (i, p) in positions.iter().enumerate() {
             if seam(i) {
-                assert!(present(p), "seam vertex {p:?} moved or vanished");
+                assert!(
+                    contains_position(&cut, p),
+                    "seam vertex {p:?} moved or vanished"
+                );
             }
         }
         let far_edge_kept = positions
             .iter()
             .enumerate()
             .filter(|(i, _)| *i as u32 % (n + 1) == n)
-            .filter(|(_, p)| present(p))
+            .filter(|(_, p)| contains_position(&cut, p))
             .count();
         assert!(
             far_edge_kept < n as usize + 1,
             "the unlocked border kept all {far_edge_kept} of its {} vertices",
             n + 1
         );
-        let pinned_triangles = coarsest.indices.len() / 3;
-        let bordered_triangles = bordered.raytracing_geometry(1.0e6).indices.len() / 3;
+        let pinned_triangles = cut.indices.len() / 3;
+        let bordered_triangles = coarsest(&bordered).indices.len() / 3;
         assert!(
             pinned_triangles * 2 < bordered_triangles,
             "one locked edge left {pinned_triangles} triangles, every open edge {bordered_triangles}"
