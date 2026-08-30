@@ -3,7 +3,6 @@ import package::meshlet::bindings::{
     constants,
     meshlet_view_instance_visibility,
     meshlet_instance_aabbs,
-    meshlet_instance_bvh_root_nodes,
     meshlet_bvh_cull_count_write,
     meshlet_bvh_cull_dispatch,
     meshlet_bvh_cull_queue,
@@ -65,9 +64,8 @@ fn cull_instances(@builtin(global_invocation_id) global_invocation_id: vec3<u32>
     }
 
     // If we pass, push the instance's root node to BVH cull
-    let root_node = meshlet_instance_bvh_root_nodes[instance_id];
     let id = atomicAdd(&meshlet_bvh_cull_count_write, 1u);
-    meshlet_bvh_cull_queue[id] = InstancedOffset(instance_id, root_node);
+    meshlet_bvh_cull_queue[id] = InstancedOffset(instance_id, 0u);
     if ((id & 15u) == 0u) {
         atomicAdd(&meshlet_bvh_cull_dispatch.x, 1u);
     }
