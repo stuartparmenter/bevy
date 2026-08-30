@@ -21,7 +21,7 @@ use tracing::info_span;
 pub struct BindGroupCacheState {
     cached: [Option<BindGroup>; 2],
     pub invalid: bool,
-    last_buffer_ids: [Option<BufferId>; 9],
+    last_buffer_ids: [Option<BufferId>; 10],
     last_light_count: u32,
     last_dfg_ids: Option<(TextureViewId, SamplerId)>,
     pub dummy_buffer: Buffer,
@@ -40,7 +40,7 @@ impl BindGroupCacheState {
         Self {
             cached: [None, None],
             invalid: true,
-            last_buffer_ids: [None; 9],
+            last_buffer_ids: [None; 10],
             last_light_count: 0,
             last_dfg_ids: None,
             dummy_buffer,
@@ -60,7 +60,7 @@ fn buffer_bindings<'a>(
 
 impl RaytracingSceneBindings {
     /// Each sparse buffer's GPU buffer id, or `None` where it has not been created yet.
-    fn buffer_ids(&self) -> [Option<BufferId>; 9] {
+    fn buffer_ids(&self) -> [Option<BufferId>; 10] {
         [
             self.assets.materials.buffer().map(Buffer::id),
             self.instances.transforms.buffer().map(Buffer::id),
@@ -77,6 +77,7 @@ impl RaytracingSceneBindings {
                 .previous_frame_id_translations
                 .buffer()
                 .map(Buffer::id),
+            self.scene_parameters.buffer().map(Buffer::id),
         ]
     }
 
@@ -205,6 +206,12 @@ impl RaytracingSceneBindings {
             .filter(|_| self.tlas.built[current_index ^ 1])
             .unwrap_or(current);
 
+        let scene_parameters = self
+            .scene_parameters
+            .buffer()
+            .unwrap()
+            .as_entire_buffer_binding();
+
         render_device.create_bind_group(
             "raytracing_scene_bind_group",
             layout,
@@ -225,6 +232,7 @@ impl RaytracingSceneBindings {
                 translations,
                 dfg_view,
                 dfg_sampler,
+                scene_parameters,
             )),
         )
     }

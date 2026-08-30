@@ -15,7 +15,9 @@ use self::instances::{
 use self::lights::LightState;
 use self::tlas::TlasState;
 pub use self::tlas::{build_raytracing_tlas, TlasInstanceSetupPipeline};
-use super::{blas::BlasManager, extract::StandardMaterialAssets, RaytracingMesh3d};
+use super::{
+    blas::BlasManager, extract::StandardMaterialAssets, RaytracingMesh3d, SolariEnvironmentLight,
+};
 use bevy_ecs::{
     entity::Entity,
     lifecycle::RemovedComponents,
@@ -23,6 +25,7 @@ use bevy_ecs::{
     system::{Query, Res, ResMut},
     world::{FromWorld, World},
 };
+use bevy_math::Vec3;
 use bevy_pbr::ExtractedDirectionalLight;
 use bevy_render::{
     mesh::allocator::MeshAllocator,
@@ -31,7 +34,51 @@ use bevy_render::{
     renderer::{RenderDevice, RenderQueue},
     texture::GpuImage,
 };
-use tracing::info_span;
+use core::f32::consts::TAU;
+use tracing::{info, info_span};
+
+/// Small scene constants the shaders read alongside Solari's other scene data.
+///
+/// wgpu forbids uniform-buffer bindings in a bind group that also contains binding arrays, so
+/// these live in a read-only storage buffer instead.
+#[derive(ShaderType, Clone, Copy, Default, PartialEq)]
+struct GpuSceneParameters {
+    environment_radiance: Vec3,
+    max_world_geometry_error: f32,
+    inverse_environment_light_pdf: f32,
+    _padding: Vec3,
+}
+
+/// Logs the scene's composition once it has held still for a couple of frames, so a settling
+/// scene reports its final shape rather than every loading step.
+#[derive(Default)]
+struct SceneSummaryLog {
+    last: Option<(u32, usize, usize, usize, usize)>,
+    stable_frames: u8,
+    reported: Option<(u32, usize, usize, usize, usize)>,
+}
+
+impl SceneSummaryLog {
+    fn observe(&mut self, summary: (u32, usize, usize, usize, usize)) {
+        if self.last == Some(summary) {
+            self.stable_frames = self.stable_frames.saturating_add(1);
+        } else {
+            self.last = Some(summary);
+            self.stable_frames = 0;
+        }
+        if self.stable_frames >= 2 && self.reported != Some(summary) {
+            info!(
+                raytracing_instances = summary.0,
+                emissive_mesh_lights = summary.1,
+                directional_lights = summary.2,
+                environment_lights = summary.3,
+                total_light_sources = summary.4,
+                "prepared Solari raytracing scene"
+            );
+            self.reported = Some(summary);
+        }
+    }
+}
 
 /// Insert this resource into the render world to make the raytracing scene retain the previous
 /// frame's TLAS and the light id translation table that maps into it.
@@ -50,6 +97,9 @@ pub struct RaytracingSceneBindings {
     lights: LightState,
     tlas: TlasState,
     bind_groups: BindGroupCacheState,
+    scene_parameters: StorageBuffer<GpuSceneParameters>,
+    last_scene_parameters: Option<GpuSceneParameters>,
+    summary: SceneSummaryLog,
 }
 
 impl RaytracingSceneBindings {
@@ -60,44 +110,49 @@ impl RaytracingSceneBindings {
     }
 }
 
+fn bind_group_layout_descriptor() -> BindGroupLayoutDescriptor {
+    BindGroupLayoutDescriptor::new(
+        "raytracing_scene_bind_group_layout",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::COMPUTE,
+            (
+                storage_buffer_read_only_sized(false, None).count(MAX_MESH_SLAB_COUNT),
+                storage_buffer_read_only_sized(false, None).count(MAX_MESH_SLAB_COUNT),
+                texture_2d(TextureSampleType::Float { filterable: true }).count(MAX_TEXTURE_COUNT),
+                sampler(SamplerBindingType::Filtering).count(MAX_TEXTURE_COUNT),
+                storage_buffer_read_only_sized(false, None),
+                acceleration_structure(),
+                acceleration_structure(),
+                storage_buffer_read_only_sized(false, None),
+                storage_buffer_read_only_sized(false, None),
+                storage_buffer_read_only_sized(false, None),
+                storage_buffer_read_only_sized(false, None),
+                storage_buffer_read_only_sized(false, None),
+                storage_buffer_read_only_sized(false, None),
+                storage_buffer_read_only_sized(false, None),
+                texture_2d(TextureSampleType::Float { filterable: true }),
+                sampler(SamplerBindingType::Filtering),
+                storage_buffer_read_only::<GpuSceneParameters>(false),
+            ),
+        ),
+    )
+}
+
 impl FromWorld for RaytracingSceneBindings {
     fn from_world(world: &mut World) -> Self {
         let render_device = world.resource::<RenderDevice>();
 
-        let bind_group_layout = BindGroupLayoutDescriptor::new(
-            "raytracing_scene_bind_group_layout",
-            &BindGroupLayoutEntries::sequential(
-                ShaderStages::COMPUTE,
-                (
-                    storage_buffer_read_only_sized(false, None).count(MAX_MESH_SLAB_COUNT),
-                    storage_buffer_read_only_sized(false, None).count(MAX_MESH_SLAB_COUNT),
-                    texture_2d(TextureSampleType::Float { filterable: true })
-                        .count(MAX_TEXTURE_COUNT),
-                    sampler(SamplerBindingType::Filtering).count(MAX_TEXTURE_COUNT),
-                    storage_buffer_read_only_sized(false, None),
-                    acceleration_structure(),
-                    acceleration_structure(),
-                    storage_buffer_read_only_sized(false, None),
-                    storage_buffer_read_only_sized(false, None),
-                    storage_buffer_read_only_sized(false, None),
-                    storage_buffer_read_only_sized(false, None),
-                    storage_buffer_read_only_sized(false, None),
-                    storage_buffer_read_only_sized(false, None),
-                    storage_buffer_read_only_sized(false, None),
-                    texture_2d(TextureSampleType::Float { filterable: true }),
-                    sampler(SamplerBindingType::Filtering),
-                ),
-            ),
-        );
-
         Self {
             bind_group: None,
-            bind_group_layout,
+            bind_group_layout: bind_group_layout_descriptor(),
             assets: AssetState::new(),
             instances: InstanceState::new(),
             lights: LightState::new(),
             tlas: TlasState::new(render_device),
             bind_groups: BindGroupCacheState::new(render_device),
+            scene_parameters: StorageBuffer::from(GpuSceneParameters::default()),
+            last_scene_parameters: None,
+            summary: SceneSummaryLog::default(),
         }
     }
 }
@@ -108,6 +163,7 @@ pub fn prepare_raytracing_scene_resources(
     changed_instances: Query<Entity, ChangedInstanceFilter>,
     mut removed_instances: RemovedComponents<RaytracingMesh3d>,
     directional_lights: Query<(Entity, &ExtractedDirectionalLight)>,
+    environment_lights: Query<(Entity, &SolariEnvironmentLight)>,
     needs_previous_frame_data: Option<Res<RaytracingSceneNeedsPreviousFrameData>>,
     mesh_allocator: Res<MeshAllocator>,
     blas_manager: Res<BlasManager>,
@@ -154,7 +210,17 @@ pub fn prepare_raytracing_scene_resources(
     );
 
     // Update the light set, now that emissive instances are resolved
-    bindings.lights.update(&directional_lights);
+    bindings.lights.update(&directional_lights, &environment_lights);
+
+    write_scene_parameters(bindings, &render_device, &render_queue);
+
+    bindings.summary.observe((
+        bindings.instances.live_count,
+        bindings.lights.emissive_light_count(),
+        bindings.lights.directional_light_count(),
+        bindings.lights.environment_light_count(),
+        bindings.lights.index.len(),
+    ));
 
     // Upload the above writes
     write_sparse_buffers(bindings, &render_device, &render_queue);
@@ -172,6 +238,31 @@ pub fn prepare_raytracing_scene_resources(
         build_ready,
         needs_previous_frame_data,
     );
+}
+
+/// Refreshes the scene-constant storage buffer whenever one of its inputs changed.
+fn write_scene_parameters(
+    bindings: &mut RaytracingSceneBindings,
+    device: &RenderDevice,
+    queue: &RenderQueue,
+) {
+    let environment_light_count = bindings.lights.environment_light_count();
+    let parameters = GpuSceneParameters {
+        environment_radiance: bindings.lights.environment_radiance,
+        max_world_geometry_error: bindings.instances.max_world_geometry_error(),
+        inverse_environment_light_pdf: if environment_light_count == 0 {
+            0.0
+        } else {
+            TAU * bindings.lights.index.len() as f32 / environment_light_count as f32
+        },
+        _padding: Vec3::ZERO,
+    };
+
+    if bindings.last_scene_parameters != Some(parameters) {
+        bindings.scene_parameters.set(parameters);
+        bindings.scene_parameters.write_buffer(device, queue);
+        bindings.last_scene_parameters = Some(parameters);
+    }
 }
 
 /// Grows every sparse buffer to hold at least one element, then snapshots its dirty set into
@@ -212,4 +303,57 @@ fn write_sparse_buffers(
     lights
         .previous_frame_id_translations
         .write_buffers(device, queue);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bind_group_layout_descriptor;
+    use bevy_render::render_resource::{BindingType, BufferBindingType};
+
+    #[test]
+    fn raytracing_scene_binding_arrays_do_not_share_a_group_with_uniform_buffers() {
+        let layout = bind_group_layout_descriptor();
+        assert!(layout.entries.iter().any(|entry| entry.count.is_some()));
+        assert!(layout.entries.iter().all(|entry| {
+            !matches!(
+                &entry.ty,
+                BindingType::Buffer {
+                    ty: BufferBindingType::Uniform,
+                    ..
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn only_a_rasterized_surface_pays_the_shading_normal_safety_factor() {
+        // Both bias sites resolve an unknown error through the same bound, so the scene-wide maximum
+        // cannot end up less conservative than the per-instance path of the instance that set it.
+        // Only the rasterized one is offset along a normal-mapped normal, so only it needs the
+        // factor; a ray hit carries a true geometric normal.
+        let shader = include_str!("../bindings.wesl");
+        let body = |name: &str| {
+            shader
+                .split_once(&format!("fn {name}"))
+                .unwrap_or_else(|| panic!("{name} must exist"))
+                .1
+                .split_once("\n}")
+                .unwrap_or_else(|| panic!("{name} must have a body"))
+                .0
+                .to_string()
+        };
+
+        let rasterized = body("rasterized_surface_ray_origin_bias");
+        let per_instance = body("ray_origin_bias_for_instance");
+        for bias in [&rasterized, &per_instance] {
+            assert!(bias.contains("bounded_world_geometry_error("), "{bias}");
+        }
+        assert!(rasterized.contains("RAY_ORIGIN_BIAS_SHADING_NORMAL_SAFETY *"));
+        assert!(
+            !per_instance.contains("RAY_ORIGIN_BIAS_SHADING_NORMAL_SAFETY"),
+            "{per_instance}"
+        );
+        assert!(body("bounded_world_geometry_error")
+            .contains("max(scene_parameters.max_world_geometry_error, 0.0)"));
+    }
 }

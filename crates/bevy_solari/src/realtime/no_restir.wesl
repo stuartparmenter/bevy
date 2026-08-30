@@ -1,7 +1,7 @@
 import package::realtime::gbuffer_utils::gpixel_resolve;
 import package::realtime::initial_path::generate_initial_path;
 import package::realtime::bindings::{constants, depth_buffer, gbuffer, view, view_output};
-import package::scene::bindings::RAY_T_MAX;
+import package::scene::bindings::{rasterized_surface_ray_origin_bias, RAY_T_MAX};
 import package::realtime::world_cache_query::{query_world_cache, WORLD_CACHE_CELL_LIFETIME};
 
 enable wgpu_ray_query;
@@ -18,7 +18,7 @@ fn initial_and_shade(@builtin(workgroup_id) workgroup_id: vec3<u32>, @builtin(gl
 
     let surface = gpixel_resolve(textureLoad(gbuffer, global_id.xy, 0), depth, global_id.xy, view.main_pass_viewport.zw, view.world_from_clip);
 
-    let path = generate_initial_path(surface.world_position, surface.world_normal, surface.material, workgroup_id.xy, global_id.xy, &rng);
+    let path = generate_initial_path(surface.world_position, surface.world_normal, surface.material, surface.world_geometry_error, workgroup_id.xy, global_id.xy, &rng);
 
     var pixel_color = path.radiance;
     pixel_color += surface.material.emissive;
@@ -26,5 +26,5 @@ fn initial_and_shade(@builtin(workgroup_id) workgroup_id: vec3<u32>, @builtin(gl
     textureStore(view_output, global_id.xy, vec4(pixel_color, 1.0));
 
     @if(VISUALIZE_WORLD_CACHE)
-    textureStore(view_output, global_id.xy, vec4(query_world_cache(surface.world_position, surface.world_normal, view.world_position, RAY_T_MAX, WORLD_CACHE_CELL_LIFETIME, &rng) * view.exposure, 1.0));
+    textureStore(view_output, global_id.xy, vec4(query_world_cache(surface.world_position, surface.world_normal, rasterized_surface_ray_origin_bias(surface.world_geometry_error), view.world_position, RAY_T_MAX, WORLD_CACHE_CELL_LIFETIME, &rng) * view.exposure, 1.0));
 }

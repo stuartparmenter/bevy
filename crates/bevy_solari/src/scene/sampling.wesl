@@ -1,7 +1,7 @@
 import bevy_pbr::render::pbr_lighting::D_GGX;
 import bevy_pbr::render::utils::{rand_vec2f, rand_u, rand_range_u};
 import bevy_render::maths::{PI_2, orthonormalize};
-import package::scene::bindings::{trace_ray, trace_ray_previous_frame, RAY_T_MIN, RAY_T_MAX, light_sources, directional_lights, LightSource, LIGHT_SOURCE_KIND_DIRECTIONAL, resolve_triangle_data_full, ResolvedRayHitFull, MIRROR_ROUGHNESS_THRESHOLD};
+import package::scene::bindings::{trace_ray, trace_ray_previous_frame, RAY_T_MIN, RAY_T_MAX, geometry_ids, light_sources, directional_lights, LightSource, LIGHT_SOURCE_KIND_ENVIRONMENT, light_source_is_emissive_mesh, resolve_triangle_data_full, ResolvedRayHitFull, MIRROR_ROUGHNESS_THRESHOLD};
 
 enable wgpu_ray_query;
 
@@ -89,7 +89,16 @@ fn isnan(x: f32) -> bool {
     return (bitcast<u32>(x) & 0x7fffffffu) > 0x7f800000u;
 }
 
+fn isfinite(x: f32) -> bool {
+    return !isinf(x) && !isnan(x);
+}
+
+fn isfinite3(x: vec3<f32>) -> bool {
+    return isfinite(x.x) && isfinite(x.y) && isfinite(x.z);
+}
+
 const NULL_LIGHT_ID = 0xFFFFFFFFu;
+const MAX_EMISSIVE_TRIANGLES_PER_LIGHT = 0xFFFFu;
 
 struct LightSample {
     light_id: u32,
@@ -112,6 +121,7 @@ struct LightContribution {
     inverse_solid_angle_pdf: f32,
     wi: vec3<f32>,
     brdf_rays_can_hit: bool,
+    is_environment: bool,
 }
 
 struct GenerateRandomLightSampleResult {
@@ -119,28 +129,71 @@ struct GenerateRandomLightSampleResult {
     resolved_light_sample: ResolvedLightSample,
 }
 
-fn sample_random_light(ray_origin: vec3<f32>, origin_world_normal: vec3<f32>, rng: ptr<function, u32>) -> LightContribution {
+// True when a missed BRDF ray would collect this light's radiance from sample_environment_radiance,
+// so the two strategies have to be MIS-weighted. Sun disks are directional but are not part of the
+// environment radiance, so they stay NEE-only.
+fn light_sample_is_environment(light_sample: LightSample) -> bool {
+    if light_sample.light_id == NULL_LIGHT_ID {
+        return false;
+    }
+    return light_sources[light_sample.light_id >> 16u].kind == LIGHT_SOURCE_KIND_ENVIRONMENT;
+}
+
+fn emissive_light_first_triangle(light_source: LightSource) -> u32 {
+    return light_source.kind >> 1u;
+}
+
+fn emissive_light_triangle_count(light_source: LightSource) -> u32 {
+    let first_triangle = emissive_light_first_triangle(light_source);
+    let total_triangle_count = geometry_ids[light_source.id].triangle_count;
+    let remaining = total_triangle_count - min(first_triangle, total_triangle_count);
+    return min(remaining, MAX_EMISSIVE_TRIANGLES_PER_LIGHT);
+}
+
+fn emissive_hit_triangle_count(hit: ResolvedRayHitFull) -> u32 {
+    let first_triangle =
+        (hit.triangle_id / MAX_EMISSIVE_TRIANGLES_PER_LIGHT) * MAX_EMISSIVE_TRIANGLES_PER_LIGHT;
+    let remaining = hit.triangle_count - min(first_triangle, hit.triangle_count);
+    return min(remaining, MAX_EMISSIVE_TRIANGLES_PER_LIGHT);
+}
+
+fn sample_random_light(ray_origin: vec3<f32>, origin_world_normal: vec3<f32>, ray_origin_bias: f32, rng: ptr<function, u32>) -> LightContribution {
     let sample = generate_random_light_sample(rng);
     var light_contribution = calculate_resolved_light_contribution(sample.resolved_light_sample, ray_origin, origin_world_normal);
-    light_contribution.radiance *= trace_visibility(ray_origin, sample.resolved_light_sample.world_position);
+    if light_sample_is_environment(sample.light_sample) {
+        light_contribution.is_environment = true;
+        light_contribution.brdf_rays_can_hit = true;
+    }
+    light_contribution.radiance *= trace_visibility(ray_origin, origin_world_normal, sample.resolved_light_sample.world_position, ray_origin_bias);
     return light_contribution;
 }
 
 fn random_emissive_light_pdf(hit: ResolvedRayHitFull, ray_distance: f32, NdotV: f32) -> f32 {
     let light_count = arrayLength(&light_sources);
-    let area_pdf = 1.0 / (f32(light_count) * f32(hit.triangle_count) * hit.triangle_area);
-    return area_pdf * (ray_distance * ray_distance) / NdotV;
+    let triangle_count = emissive_hit_triangle_count(hit);
+    if light_count == 0u || triangle_count == 0u || hit.triangle_area <= 0.0 || NdotV <= 0.0 {
+        return 0.0;
+    }
+    let area_pdf = 1.0 / (f32(light_count) * f32(triangle_count) * hit.triangle_area);
+    let pdf = area_pdf * (ray_distance * ray_distance) / NdotV;
+    return select(0.0, pdf, isfinite(pdf) && pdf >= 0.0);
 }
 
 fn generate_random_light_sample(rng: ptr<function, u32>) -> GenerateRandomLightSampleResult {
     let light_count = arrayLength(&light_sources);
+    if light_count == 0u {
+        return GenerateRandomLightSampleResult(
+            LightSample(NULL_LIGHT_ID, 0u),
+            ResolvedLightSample(vec4(0.0), vec3(0.0), vec3(0.0), 0.0),
+        );
+    }
     let light_id = rand_range_u(light_count, rng);
 
     let light_source = light_sources[light_id];
 
     var triangle_id = 0u;
-    if light_source.kind != LIGHT_SOURCE_KIND_DIRECTIONAL {
-        let triangle_count = light_source.kind >> 1u;
+    if light_source_is_emissive_mesh(light_source) {
+        let triangle_count = emissive_light_triangle_count(light_source);
         triangle_id = rand_range_u(triangle_count, rng);
     }
 
@@ -154,7 +207,7 @@ fn generate_random_light_sample(rng: ptr<function, u32>) -> GenerateRandomLightS
 }
 
 fn resolve_light_sample(light_sample: LightSample, light_source: LightSource) -> ResolvedLightSample {
-    if light_source.kind == LIGHT_SOURCE_KIND_DIRECTIONAL {
+    if !light_source_is_emissive_mesh(light_source) {
         let directional_light = directional_lights[light_source.id];
 
         var direction_to_light: vec3<f32>;
@@ -183,8 +236,9 @@ fn resolve_light_sample(light_sample: LightSample, light_source: LightSource) ->
         directional_light.inverse_pdf,
     );
 } else {
-        let triangle_count = light_source.kind >> 1u;
-        let triangle_id = light_sample.light_id & 0xFFFFu;
+        let triangle_count = emissive_light_triangle_count(light_source);
+        let triangle_id = emissive_light_first_triangle(light_source)
+            + (light_sample.light_id & 0xFFFFu);
         let barycentrics = triangle_barycentrics(light_sample.seed);
         let triangle_data = resolve_triangle_data_full(light_source.id, triangle_id, barycentrics);
 
@@ -199,50 +253,88 @@ fn resolve_light_sample(light_sample: LightSample, light_source: LightSource) ->
 
 fn calculate_resolved_light_contribution(resolved_light_sample: ResolvedLightSample, ray_origin: vec3<f32>, origin_world_normal: vec3<f32>) -> LightContribution {
     let ray = resolved_light_sample.world_position.xyz - (resolved_light_sample.world_position.w * ray_origin);
-    let light_distance = length(ray);
-    let wi = ray / light_distance;
+    let light_distance_squared = dot(ray, ray);
+    if !(light_distance_squared > 1e-12) || !isfinite(light_distance_squared) {
+        return LightContribution(vec3(0.0), 0.0, 0.0, vec3(0.0), false, false);
+    }
+    let wi = ray * inverseSqrt(light_distance_squared);
 
     let cos_theta_light = saturate(dot(-wi, resolved_light_sample.world_normal));
-    let light_distance_squared = light_distance * light_distance;
     let denominator = cos_theta_light / light_distance_squared;
 
     let radiance = resolved_light_sample.radiance * denominator;
     let inverse_solid_angle_pdf = resolved_light_sample.inverse_pdf * denominator;
-
-    return LightContribution(radiance, resolved_light_sample.inverse_pdf, inverse_solid_angle_pdf, wi, resolved_light_sample.world_position.w == 1.0);
-}
-
-fn trace_visibility(ray_origin: vec3<f32>, point: vec4<f32>) -> f32 {
-    var ray_direction = point.xyz;
-    var ray_t_max = RAY_T_MAX;
-
-    if point.w == 1.0 {
-        let ray = ray_direction - ray_origin;
-        let dist = length(ray);
-        ray_direction = ray / dist;
-        ray_t_max = dist - RAY_T_MIN;
+    if !isfinite3(radiance) || !isfinite(resolved_light_sample.inverse_pdf) || !isfinite(inverse_solid_angle_pdf) {
+        return LightContribution(vec3(0.0), 0.0, 0.0, wi, false, false);
     }
 
-    if ray_t_max < RAY_T_MIN { return 0.0; }
+    // Environment samples also satisfy brdf_rays_can_hit, but the packed tile sample cannot say so:
+    // callers that know the light source set it themselves.
+    return LightContribution(radiance, resolved_light_sample.inverse_pdf, inverse_solid_angle_pdf, wi, resolved_light_sample.world_position.w == 1.0, false);
+}
 
-    let ray_hit = trace_ray(ray_origin, ray_direction, RAY_T_MIN, ray_t_max, RAY_FLAG_TERMINATE_ON_FIRST_HIT);
+// The light sample point is resolved from the same vertex buffers and the same instance transform
+// the BLAS was built from, so it lies exactly on the traced triangle. All the far end of a shadow
+// ray has to survive is float rounding - not a geometry error. Spending the origin's error there as
+// well truncated every shadow ray by that error a second time, which erased the shadow of any
+// occluder standing closer to its light than the bias.
+const LIGHT_SAMPLE_END_EPSILON_RELATIVE = 0.001f;
+
+struct VisibilityRay {
+    origin: vec3<f32>,
+    direction: vec3<f32>,
+    t_max: f32,
+    // False when the two endpoints settle the query on their own and no ray is needed.
+    trace: bool,
+    // Visibility to report when `trace` is false.
+    visibility: f32,
+}
+
+fn visibility_without_tracing(visibility: f32) -> VisibilityRay {
+    return VisibilityRay(vec3(0.0), vec3(0.0), 0.0, false, visibility);
+}
+
+fn setup_visibility_ray(ray_origin_in: vec3<f32>, origin_world_normal: vec3<f32>, point: vec4<f32>, ray_origin_bias: f32) -> VisibilityRay {
+    let toward_light = select(point.xyz, point.xyz - ray_origin_in, point.w == 1.0);
+    if !isfinite3(toward_light) { return visibility_without_tracing(0.0); }
+
+    // Lift the origin clear of its own instance's simplified BLAS first, then measure the ray from
+    // where it actually starts, so the bias is spent once instead of at both ends. A light below
+    // `origin_world_normal` lifts the origin into the surface, which is correct for a geometric
+    // normal and would not be for a shading normal - but every caller weights the result by a cosine
+    // against that same normal, so no shading normal reaches the flip with a nonzero weight.
+    let side = select(-1.0, 1.0, dot(origin_world_normal, toward_light) >= 0.0);
+    let ray_origin = ray_origin_in + origin_world_normal * side * max(ray_origin_bias, RAY_T_MIN);
+
+    if point.w != 1.0 {
+        return VisibilityRay(ray_origin, point.xyz, RAY_T_MAX, true, 0.0);
+    }
+
+    let ray = point.xyz - ray_origin;
+    let dist = length(ray);
+    if !isfinite(dist) { return visibility_without_tracing(0.0); }
+
+    let t_max = dist - max(RAY_T_MIN, LIGHT_SAMPLE_END_EPSILON_RELATIVE * dist);
+    // The light sits inside the shell the origin was lifted into, so nothing can lie between the
+    // two points. Reporting that as occluded is what stopped a candle body being lit by its flame.
+    if t_max < RAY_T_MIN { return visibility_without_tracing(1.0); }
+
+    return VisibilityRay(ray_origin, ray / dist, t_max, true, 0.0);
+}
+
+fn trace_visibility(ray_origin_in: vec3<f32>, origin_world_normal: vec3<f32>, point: vec4<f32>, ray_origin_bias: f32) -> f32 {
+    let ray = setup_visibility_ray(ray_origin_in, origin_world_normal, point, ray_origin_bias);
+    if !ray.trace { return ray.visibility; }
+
+    let ray_hit = trace_ray(ray.origin, ray.direction, RAY_T_MIN, ray.t_max, RAY_FLAG_TERMINATE_ON_FIRST_HIT);
     return f32(ray_hit.kind == RAY_QUERY_INTERSECTION_NONE);
 }
 
-fn trace_visibility_previous_frame(ray_origin: vec3<f32>, point: vec4<f32>) -> f32 {
-    var ray_direction = point.xyz;
-    var ray_t_max = RAY_T_MAX;
+fn trace_visibility_previous_frame(ray_origin_in: vec3<f32>, origin_world_normal: vec3<f32>, point: vec4<f32>, ray_origin_bias: f32) -> f32 {
+    let ray = setup_visibility_ray(ray_origin_in, origin_world_normal, point, ray_origin_bias);
+    if !ray.trace { return ray.visibility; }
 
-    if point.w == 1.0 {
-        let ray = ray_direction - ray_origin;
-        let dist = length(ray);
-        ray_direction = ray / dist;
-        ray_t_max = dist - RAY_T_MIN;
-    }
-
-    if ray_t_max < RAY_T_MIN { return 0.0; }
-
-    let ray_hit = trace_ray_previous_frame(ray_origin, ray_direction, RAY_T_MIN, ray_t_max, RAY_FLAG_TERMINATE_ON_FIRST_HIT);
+    let ray_hit = trace_ray_previous_frame(ray.origin, ray.direction, RAY_T_MIN, ray.t_max, RAY_FLAG_TERMINATE_ON_FIRST_HIT);
     return f32(ray_hit.kind == RAY_QUERY_INTERSECTION_NONE);
 }
 

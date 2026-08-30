@@ -7,12 +7,14 @@ use bevy_asset::embedded_asset;
 use bevy_shader::load_shader_library;
 pub use binder::prepare_raytracing_scene_resources;
 pub use binder::{RaytracingSceneBindings, RaytracingSceneNeedsPreviousFrameData};
-pub use types::RaytracingMesh3d;
+pub use blas::{RaytracingSceneStatus, RaytracingSceneStatusSnapshot};
+pub use types::{RaytracingMesh3d, SolariEnvironmentLight};
 
 use crate::SolariPlugins;
 use bevy_app::{App, Plugin};
 use bevy_ecs::schedule::IntoScheduleConfigs;
 use bevy_render::{
+    extract_resource::ExtractResourcePlugin,
     mesh::{
         allocator::{allocate_and_free_meshes, MeshAllocatorSettings},
         RenderMesh,
@@ -25,11 +27,14 @@ use bevy_render::{
 use binder::{
     build_raytracing_tlas, prepare_raytracing_scene_bind_group, TlasInstanceSetupPipeline,
 };
-use blas::{compact_raytracing_blas, delete_raytracing_blas, prepare_raytracing_blas, BlasManager};
+use blas::{
+    compact_raytracing_blas, delete_raytracing_blas, prepare_raytracing_blas,
+    update_raytracing_scene_status, BlasManager,
+};
 use extract::{
     extract_raytracing_material_assets, extract_raytracing_scene_meshes_and_materials,
     extract_raytracing_scene_structural, extract_raytracing_scene_transforms,
-    StandardMaterialAssets,
+    extract_solari_environment_lights, StandardMaterialAssets,
 };
 use tracing::warn;
 
@@ -42,6 +47,7 @@ impl Plugin for RaytracingScenePlugin {
         load_shader_library!(app, "bindings.wesl");
         load_shader_library!(app, "sampling.wesl");
         embedded_asset!(app, "binder/setup_tlas_instances.wesl");
+        app.init_resource::<RaytracingSceneStatus>();
     }
 
     fn finish(&self, app: &mut App) {
@@ -56,6 +62,10 @@ impl Plugin for RaytracingScenePlugin {
             );
             return;
         }
+
+        app.add_plugins(ExtractResourcePlugin::<RaytracingSceneStatus>::default());
+
+        let render_app = app.sub_app_mut(RenderApp);
 
         render_app
             .world_mut()
@@ -74,6 +84,7 @@ impl Plugin for RaytracingScenePlugin {
                     extract_raytracing_scene_transforms,
                     extract_raytracing_scene_meshes_and_materials,
                     extract_raytracing_material_assets,
+                    extract_solari_environment_lights,
                 ),
             )
             .add_systems(
@@ -86,6 +97,9 @@ impl Plugin for RaytracingScenePlugin {
                     compact_raytracing_blas
                         .in_set(RenderSystems::PrepareAssets)
                         .after(prepare_raytracing_blas),
+                    update_raytracing_scene_status
+                        .in_set(RenderSystems::PrepareAssets)
+                        .after(compact_raytracing_blas),
                     prepare_raytracing_scene_resources.in_set(RenderSystems::PrepareResources),
                     prepare_raytracing_scene_bind_group.in_set(RenderSystems::PrepareBindGroups),
                 ),

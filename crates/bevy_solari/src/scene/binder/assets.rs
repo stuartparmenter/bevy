@@ -6,13 +6,15 @@ use super::{
 use bevy_asset::AssetId;
 use bevy_color::{ColorToComponents, LinearRgba};
 use bevy_image::Image;
-use bevy_math::Vec3;
+use bevy_math::{Mat3, Vec3, Vec4};
 use bevy_pbr::StandardMaterial;
 use bevy_platform::collections::{HashMap, HashSet};
 use bevy_render::{
     impl_atomic_pod,
     render_asset::{ExtractedAssets, RenderAssets},
-    render_resource::{AtomicPod, AtomicSparseBufferVec, BufferUsages, Sampler, TextureView},
+    render_resource::{
+        AtomicPod, AtomicSparseBufferVec, BufferUsages, Sampler, TextureFormat, TextureView,
+    },
     texture::GpuImage,
 };
 use bevy_utils::once;
@@ -38,11 +40,57 @@ pub struct GpuMaterial {
     perceptual_roughness: f32,
     emissive: Vec3,
     metallic: f32,
-    _padding: Vec3,
+    flags: u32,
+    _padding_a: u32,
+    _padding_b: u32,
     reflectance: f32,
+    /// A `mat3x3<f32>` on the shader side: three vec4-aligned columns.
+    uv_transform: [Vec4; 3],
 }
 
 impl_atomic_pod!(GpuMaterial, GpuMaterialBlob);
+
+/// Matches `MATERIAL_FLAGS_FLIP_NORMAL_MAP_Y` in `bindings.wesl`.
+pub const MATERIAL_FLAGS_FLIP_NORMAL_MAP_Y: u32 = 1;
+/// Matches `MATERIAL_FLAGS_METALLIC_ROUGHNESS_RG` in `bindings.wesl`.
+pub const MATERIAL_FLAGS_METALLIC_ROUGHNESS_RG: u32 = 2;
+
+/// Same decisions as `StandardMaterial::as_bind_group_shader_type`, so a surface shades the same
+/// whether a raster pass or a ray resolves it. The caller skips any material whose textures are
+/// not all `GpuImage`s yet, so a missing metallic-roughness texture here means there is none.
+fn material_flags(material: &StandardMaterial, texture_assets: &RenderAssets<GpuImage>) -> u32 {
+    let mut flags = 0;
+    if material.flip_normal_map_y {
+        flags |= MATERIAL_FLAGS_FLIP_NORMAL_MAP_Y;
+    }
+    let metallic_roughness_format = material
+        .metallic_roughness_texture
+        .as_ref()
+        .and_then(|handle| texture_assets.get(handle.id()))
+        .map(|texture| texture.texture_descriptor.format);
+    if matches!(
+        metallic_roughness_format,
+        Some(
+            TextureFormat::Rg8Unorm
+                | TextureFormat::Rg16Unorm
+                | TextureFormat::Bc5RgUnorm
+                | TextureFormat::EacRg11Unorm
+        )
+    ) {
+        flags |= MATERIAL_FLAGS_METALLIC_ROUGHNESS_RG;
+    }
+    flags
+}
+
+/// `uv_transform` as the three vec4-aligned columns of the shader's `mat3x3<f32>`.
+fn uv_transform_columns(material: &StandardMaterial) -> [Vec4; 3] {
+    let matrix = Mat3::from(material.uv_transform);
+    [
+        matrix.x_axis.extend(0.0),
+        matrix.y_axis.extend(0.0),
+        matrix.z_axis.extend(0.0),
+    ]
+}
 
 /// Stable material and texture slots, plus the retry state for assets that aren't ready yet.
 pub struct AssetState {
@@ -202,8 +250,11 @@ impl AssetState {
                 perceptual_roughness: material.perceptual_roughness,
                 emissive,
                 metallic: material.metallic,
+                flags: material_flags(material, texture_assets),
+                _padding_a: 0,
+                _padding_b: 0,
                 reflectance: material.reflectance,
-                _padding: Vec3::ZERO,
+                uv_transform: uv_transform_columns(material),
             },
         );
 
@@ -261,5 +312,21 @@ impl AssetState {
         for image_id in textures.into_iter().flatten() {
             self.textures.release(&image_id);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MATERIAL_FLAGS_FLIP_NORMAL_MAP_Y, MATERIAL_FLAGS_METALLIC_ROUGHNESS_RG};
+
+    #[test]
+    fn material_flags_match_the_shader_constants() {
+        let shader = include_str!("../bindings.wesl");
+        assert!(shader.contains(&format!(
+            "const MATERIAL_FLAGS_FLIP_NORMAL_MAP_Y = {MATERIAL_FLAGS_FLIP_NORMAL_MAP_Y}u;"
+        )));
+        assert!(shader.contains(&format!(
+            "const MATERIAL_FLAGS_METALLIC_ROUGHNESS_RG = {MATERIAL_FLAGS_METALLIC_ROUGHNESS_RG}u;"
+        )));
     }
 }

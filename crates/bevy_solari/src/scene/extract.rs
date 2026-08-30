@@ -1,4 +1,4 @@
-use super::{RaytracingMesh3d, RaytracingSceneBindings};
+use super::{RaytracingMesh3d, RaytracingSceneBindings, SolariEnvironmentLight};
 use bevy_asset::{AssetEvent, AssetId, Assets};
 use bevy_ecs::{
     lifecycle::RemovedComponents,
@@ -7,7 +7,7 @@ use bevy_ecs::{
     resource::Resource,
     system::{Commands, Query, Res, ResMut},
 };
-use bevy_pbr::{MeshMaterial3d, PreviousGlobalTransform, StandardMaterial};
+use bevy_pbr::{MeshGeometryError, MeshMaterial3d, PreviousGlobalTransform, StandardMaterial};
 use bevy_platform::collections::HashMap;
 use bevy_render::{sync_world::RenderEntity, Extract};
 use bevy_transform::components::GlobalTransform;
@@ -19,6 +19,7 @@ pub fn extract_raytracing_scene_structural(
             (
                 RenderEntity,
                 &RaytracingMesh3d,
+                &MeshGeometryError,
                 &MeshMaterial3d<StandardMaterial>,
                 &GlobalTransform,
                 Option<&PreviousGlobalTransform>,
@@ -37,9 +38,12 @@ pub fn extract_raytracing_scene_structural(
         }
     }
 
-    for (render_entity, mesh, material, transform, previous_frame_transform) in &new_instances {
+    for (render_entity, mesh, geometry_error, material, transform, previous_frame_transform) in
+        &new_instances
+    {
         commands.entity(render_entity).insert((
             mesh.clone(),
+            *geometry_error,
             material.clone(),
             *transform,
             previous_frame_transform
@@ -78,7 +82,8 @@ pub fn extract_raytracing_scene_transforms(
         });
 }
 
-/// Updates the mesh and material of existing raytracing instances in the render world.
+/// Updates the mesh, material and geometry error of existing raytracing instances in the render
+/// world.
 pub fn extract_raytracing_scene_meshes_and_materials(
     main_instances: Extract<
         Query<
@@ -86,20 +91,52 @@ pub fn extract_raytracing_scene_meshes_and_materials(
                 RenderEntity,
                 &RaytracingMesh3d,
                 &MeshMaterial3d<StandardMaterial>,
+                &MeshGeometryError,
             ),
             Or<(
                 Changed<RaytracingMesh3d>,
                 Changed<MeshMaterial3d<StandardMaterial>>,
+                Changed<MeshGeometryError>,
             )>,
         >,
     >,
-    mut render_instances: Query<(&mut RaytracingMesh3d, &mut MeshMaterial3d<StandardMaterial>)>,
+    mut render_instances: Query<(
+        &mut RaytracingMesh3d,
+        &mut MeshMaterial3d<StandardMaterial>,
+        &mut MeshGeometryError,
+    )>,
 ) {
-    for (render_entity, new_mesh, new_material) in &main_instances {
-        if let Ok((mut mesh, mut material)) = render_instances.get_mut(render_entity) {
+    for (render_entity, new_mesh, new_material, new_geometry_error) in &main_instances {
+        if let Ok((mut mesh, mut material, mut geometry_error)) =
+            render_instances.get_mut(render_entity)
+        {
             *mesh = new_mesh.clone();
             *material = new_material.clone();
+            *geometry_error = *new_geometry_error;
         }
+    }
+}
+
+/// Mirrors [`SolariEnvironmentLight`] components into the render world.
+///
+/// The component is a few floats, so copying every one each frame is cheaper than
+/// tracking changes for it.
+pub fn extract_solari_environment_lights(
+    environment_lights: Extract<Query<(RenderEntity, &SolariEnvironmentLight)>>,
+    mut removed_environment_lights: Extract<RemovedComponents<SolariEnvironmentLight>>,
+    render_entities: Extract<Query<RenderEntity>>,
+    mut commands: Commands,
+) {
+    for main_entity in removed_environment_lights.read() {
+        if let Ok(render_entity) = render_entities.get(main_entity) {
+            commands
+                .entity(render_entity)
+                .remove::<SolariEnvironmentLight>();
+        }
+    }
+
+    for (render_entity, environment_light) in &environment_lights {
+        commands.entity(render_entity).insert(*environment_light);
     }
 }
 
