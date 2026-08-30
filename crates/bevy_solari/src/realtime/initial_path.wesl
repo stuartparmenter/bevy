@@ -4,9 +4,9 @@ import bevy_render::maths::PI;
 import bevy_render::utils::octahedral_encode;
 import package::scene::brdf::{brdf_pdf, evaluate_and_sample_brdf, evaluate_brdf, F_AB};
 import package::realtime::presample_light_tiles::unpack_resolved_light_sample;
-import package::realtime::bindings::{empty_reservoir, light_tile_resolved_samples, light_tile_samples, Reservoir, constants, view};
-import package::scene::sampling::{calculate_resolved_light_contribution, isinf, LightSample, NULL_LIGHT_ID, power_heuristic, trace_visibility};
-import package::scene::bindings::{light_sources, RAY_T_MAX, RAY_T_MIN, resolve_ray_hit_full, ResolvedMaterial, ResolvedRayHitFull, trace_ray};
+import package::realtime::bindings::{empty_reservoir, light_tile_resolved_samples, light_tile_samples, pixel_world_size, Reservoir, constants, view};
+import package::scene::sampling::{calculate_resolved_light_contribution, emissive_hit_triangle_count, isfinite, isfinite3, isinf, light_sample_is_environment, LightSample, NULL_LIGHT_ID, power_heuristic, trace_visibility};
+import package::scene::bindings::{environment_light_pdf, light_sources, sample_environment_radiance, MIRROR_ROUGHNESS_THRESHOLD, RAY_T_MAX, RAY_T_MIN, offset_ray_origin, rasterized_surface_ray_origin_bias, ray_origin_bias_with_raster_lod, resolve_ray_hit_full, ResolvedMaterial, ResolvedRayHitFull, trace_ray};
 import package::realtime::world_cache_query::{get_cell_size, query_world_cache, WORLD_CACHE_CELL_LIFETIME};
 
 @if(DLSS_RR_GUIDE_BUFFERS)
@@ -34,7 +34,9 @@ struct InitialSamplingResult {
 /// surface), x2 = first BRDF-sampled hit (the reconnection vertex).
 struct PathState {
     ray_origin: vec3<f32>,
+    ray_origin_bias: f32,
     normal: vec3<f32>,
+    geometric_normal: vec3<f32>,
     wo: vec3<f32>,
     material: ResolvedMaterial,
     /// Throughput past x1. With ReSTIR the brdf*cos at x1 is factored out of it, see x1_brdf.
@@ -54,10 +56,15 @@ struct PathState {
     @if(RESTIR) selected_target_function: f32,
 }
 
-fn new_path_state(world_position: vec3<f32>, world_normal: vec3<f32>, wo: vec3<f32>, material: ResolvedMaterial) -> PathState {
+fn new_path_state(world_position: vec3<f32>, world_normal: vec3<f32>, wo: vec3<f32>, material: ResolvedMaterial, surface_world_geometry_error: f32) -> PathState {
     var path: PathState;
-    path.ray_origin = world_position + (world_normal * RAY_T_MIN);
+    path.ray_origin = world_position;
+    // x1 is a rasterized G-buffer surface, so it carries the raster LOD's drift from the traced
+    // geometry on top of its instance's own BLAS error. Every deeper vertex is a ray hit lying
+    // exactly on the traced surface and keeps the plain per-instance bias.
+    path.ray_origin_bias = ray_origin_bias_with_raster_lod(rasterized_surface_ray_origin_bias(surface_world_geometry_error), pixel_world_size(world_position, view.world_position));
     path.normal = world_normal;
+    path.geometric_normal = world_normal;
     path.wo = wo;
     path.material = material;
     path.throughput_past_first_hit = vec3(1.0);
@@ -75,12 +82,12 @@ fn new_path_state(world_position: vec3<f32>, world_normal: vec3<f32>, wo: vec3<f
     return path;
 }
 
-fn generate_initial_path(world_position: vec3<f32>, world_normal: vec3<f32>, material: ResolvedMaterial, workgroup_id: vec2<u32>, pixel_id: vec2<u32>, rng: ptr<function, u32>) -> InitialSamplingResult {
+fn generate_initial_path(world_position: vec3<f32>, world_normal: vec3<f32>, material: ResolvedMaterial, surface_world_geometry_error: f32, workgroup_id: vec2<u32>, pixel_id: vec2<u32>, rng: ptr<function, u32>) -> InitialSamplingResult {
     let wo = normalize(view.world_position - world_position);
     let primary_NdotV = max(dot(world_normal, wo), 0.0001);
     let primary_F_ab = F_AB(material.perceptual_roughness, primary_NdotV);
 
-    var path = new_path_state(world_position, world_normal, wo, material);
+    var path = new_path_state(world_position, world_normal, wo, material, surface_world_geometry_error);
 
     @if(DLSS_RR_GUIDE_BUFFERS)
     var psr = psr_init(world_normal, material);
@@ -99,14 +106,31 @@ fn generate_initial_path(world_position: vec3<f32>, world_normal: vec3<f32>, mat
         // Sample the BRDF and trace the next ray
         let next_bounce = evaluate_and_sample_brdf(path.wo, path.normal, path.material, F_ab, rng);
         if next_bounce.pdf == 0.0 { break; }
-        let ray = trace_ray(path.ray_origin, next_bounce.wi, RAY_T_MIN, RAY_T_MAX, RAY_FLAG_NONE);
-
+        let biased_ray_origin = offset_ray_origin(path.ray_origin, path.geometric_normal, next_bounce.wi, path.ray_origin_bias);
+        let ray = trace_ray(biased_ray_origin, next_bounce.wi, RAY_T_MIN, RAY_T_MAX, RAY_FLAG_NONE);
         if ray.kind == RAY_QUERY_INTERSECTION_NONE {
             @if(DLSS_RR_GUIDE_BUFFERS)
             if !psr.finished && !next_bounce.diffuse_selected {
                 psr_environment_miss(pixel_id, wo);
             }
 
+            let environment_radiance = sample_environment_radiance(next_bounce.wi);
+            let p_nee_environment = f32(di_samples) * environment_light_pdf(next_bounce.wi) * p_nee;
+            var brdf_mis_weight = power_heuristic(next_bounce.pdf, p_nee_environment);
+            if isinf(next_bounce.pdf) {
+                brdf_mis_weight = 1.0;
+            }
+            let bounced_environment = next_bounce.throughput * environment_radiance * brdf_mis_weight;
+            if bounce == 0u {
+                path.radiance += bounced_environment;
+            } else {
+                // With ReSTIR the primary brdf*cos was divided out of throughput_past_first_hit
+                // for shade-time reconnection; a miss is never reused, so apply it here.
+                var full_throughput = path.throughput_past_first_hit;
+                @if(RESTIR)
+                full_throughput *= path.x1_brdf;
+                path.radiance += full_throughput * bounced_environment;
+            }
             break;
         }
 
@@ -158,8 +182,10 @@ fn generate_initial_path(world_position: vec3<f32>, world_normal: vec3<f32>, mat
             path.throughput_past_first_hit *= next_bounce.throughput;
         }
 
-        // Resample emissive hits
-        if any(ray_hit.material.emissive > vec3(0.0)) && dot(ray_hit.world_normal, -next_bounce.wi) > 0.0 {
+        // Resample emissive hits. Gated on front_face rather than the shading normal, which
+        // resolve_ray_hit_full has already turned toward the ray: emission is one-sided here to
+        // match NEE, where cos_theta_light culls the back side.
+        if any(ray_hit.material.emissive > vec3(0.0)) && ray_hit.front_face {
             generate_emissive_candidate(&path, ray_hit, next_bounce.wi, p_brdf, ray.t, p_nee, di_samples, bounce, rng);
         }
 
@@ -169,8 +195,10 @@ fn generate_initial_path(world_position: vec3<f32>, world_normal: vec3<f32>, mat
         }
 
         // Advance to the next vertex
-        path.ray_origin = ray_hit.world_position + (ray_hit.geometric_world_normal * RAY_T_MIN);
+        path.ray_origin = ray_hit.world_position;
+        path.ray_origin_bias = ray_hit.ray_origin_bias;
         path.normal = ray_hit.world_normal;
+        path.geometric_normal = ray_hit.geometric_world_normal;
         path.wo = -next_bounce.wi;
         path.material = ray_hit.material;
 
@@ -192,7 +220,7 @@ fn generate_initial_path(world_position: vec3<f32>, world_normal: vec3<f32>, mat
     var result: InitialSamplingResult;
     result.radiance = path.radiance;
     @if(RESTIR) {
-        if path.selected_target_function > 0.0 {
+        if path.selected_target_function > 0.0 && isfinite(path.weight_sum) {
             path.reservoir.unbiased_contribution_weight = path.weight_sum / path.selected_target_function;
         }
         result.reservoir = path.reservoir;
@@ -211,14 +239,20 @@ fn generate_nee_candidate(
 ) {
     if rand_f(rng) >= p_nee { return; }
 
-    let di = sample_light_ris((*path).ray_origin, (*path).normal, (*path).wo, (*path).material, F_ab, di_samples, workgroup_id, bounce, rng);
+    let di = sample_light_ris((*path).ray_origin, (*path).ray_origin_bias, (*path).normal, (*path).geometric_normal, (*path).wo, (*path).material, F_ab, di_samples, workgroup_id, bounce, rng);
     let di_target_function = luminance(di.brdf_radiance);
     if di_target_function <= 0.0 { return; }
 
     // MIS against the BRDF strategy. RIS over N candidates makes the effective NEE pdf at the
     // winner roughly N * light_pdf(winner), so scale by p_nee for the stochastic gate.
     var nee_mis_weight = 1.0;
-    if di.brdf_rays_can_hit && di.inverse_solid_angle_pdf > 0.0 {
+    if di.is_environment {
+        // The dual of the BRDF-miss weight in generate_initial_path. environment_light_pdf
+        // answers for every environment entry at once, which is the density that miss uses.
+        let p_nee_strategy = f32(di_samples) * environment_light_pdf(di.wi) * p_nee;
+        let p_brdf_at_nee = brdf_pdf((*path).wo, di.wi, (*path).normal, (*path).material, F_ab);
+        nee_mis_weight = power_heuristic(p_nee_strategy, p_brdf_at_nee);
+    } else if di.brdf_rays_can_hit && di.inverse_solid_angle_pdf > 0.0 {
         let p_nee_strategy = f32(di_samples) * (1.0 / di.inverse_solid_angle_pdf) * p_nee;
         let p_brdf_at_nee = brdf_pdf((*path).wo, di.wi, (*path).normal, (*path).material, F_ab);
         nee_mis_weight = power_heuristic(p_nee_strategy, p_brdf_at_nee);
@@ -277,16 +311,22 @@ struct DiSample {
     brdf_radiance: vec3<f32>,
     inverse_solid_angle_pdf: f32,
     brdf_rays_can_hit: bool,
+    is_environment: bool,
 }
 
-fn sample_light_ris(ray_origin: vec3<f32>, normal: vec3<f32>, wo: vec3<f32>, material: ResolvedMaterial, F_ab: vec2<f32>, di_samples: u32, workgroup_id: vec2<u32>, bounce: u32, rng: ptr<function, u32>) -> DiSample {
-    var workgroup_rng = (workgroup_id.x * 5782582u) + workgroup_id.y + bounce;
+fn sample_light_ris(ray_origin: vec3<f32>, ray_origin_bias: f32, normal: vec3<f32>, geometric_normal: vec3<f32>, wo: vec3<f32>, material: ResolvedMaterial, F_ab: vec2<f32>, di_samples: u32, workgroup_id: vec2<u32>, bounce: u32, rng: ptr<function, u32>) -> DiSample {
+    if di_samples == 0u {
+        return DiSample(0.0, LightSample(NULL_LIGHT_ID, 0u), vec3(0.0), vec3(0.0), 0.0, false, false);
+    }
+    // Without a frame term every workgroup reads the same light tile forever, correlating the
+    // variance of the workgroups sharing it into a screen-aligned pattern. The multiplier must
+    // differ from `frame_rng`'s stride, or the frame term only slides that pattern along x.
+    var workgroup_rng = (workgroup_id.x * 0x9E3779B9u) + workgroup_id.y + bounce + constants.frame_rng;
     let light_tile_start = rand_range_u(128u, &workgroup_rng) * 1024u;
 
     var weight_sum = 0.0;
     var selected_target_function = 0.0;
     var selected_tile_sample = 0u;
-    var selected_world_position = vec4(0.0);
     var selected_wi = vec3(0.0);
     var selected_brdf_radiance = vec3(0.0);
     var selected_inverse_solid_angle_pdf = 0.0;
@@ -297,17 +337,20 @@ fn sample_light_ris(ray_origin: vec3<f32>, normal: vec3<f32>, wo: vec3<f32>, mat
         let resolved_light_sample = unpack_resolved_light_sample(light_tile_resolved_samples[tile_sample], view.exposure);
         let light_contribution = calculate_resolved_light_contribution(resolved_light_sample, ray_origin, normal);
         let brdf_current = evaluate_brdf(wo, light_contribution.wi, normal, material, F_ab);
-        let brdf_radiance = brdf_current * light_contribution.radiance;
+        let visibility = trace_visibility(ray_origin, geometric_normal, resolved_light_sample.world_position, ray_origin_bias);
+        let brdf_radiance = brdf_current * light_contribution.radiance * visibility;
 
         let target_function = luminance(brdf_radiance);
         let resampling_weight = mis_weight * (target_function * light_contribution.inverse_pdf);
+        if !(resampling_weight > 0.0) || !isfinite(resampling_weight) || !isfinite3(brdf_radiance) {
+            continue;
+        }
 
         weight_sum += resampling_weight;
 
         if rand_f(rng) * weight_sum < resampling_weight {
             selected_target_function = target_function;
             selected_tile_sample = tile_sample;
-            selected_world_position = resolved_light_sample.world_position;
             selected_wi = light_contribution.wi;
             selected_inverse_solid_angle_pdf = light_contribution.inverse_solid_angle_pdf;
             selected_brdf_rays_can_hit = light_contribution.brdf_rays_can_hit;
@@ -316,12 +359,19 @@ fn sample_light_ris(ray_origin: vec3<f32>, normal: vec3<f32>, wo: vec3<f32>, mat
     }
 
     var unbiased_contribution_weight = 0.0;
-    if selected_target_function > 0.0 {
+    if selected_target_function > 0.0 && isfinite(weight_sum) {
         unbiased_contribution_weight = weight_sum / selected_target_function;
-        unbiased_contribution_weight *= trace_visibility(ray_origin, selected_world_position);
     }
 
-    return DiSample(unbiased_contribution_weight, light_tile_samples[selected_tile_sample], selected_wi, selected_brdf_radiance, selected_inverse_solid_angle_pdf, selected_brdf_rays_can_hit);
+    // The packed tile sample cannot say whether it came from the environment, so classify the RIS
+    // winner from its light source. Only the winner is used for MIS, so the loop does not need it.
+    let selected_light_sample = light_tile_samples[selected_tile_sample];
+    var selected_is_environment = false;
+    if selected_target_function > 0.0 {
+        selected_is_environment = light_sample_is_environment(selected_light_sample);
+    }
+
+    return DiSample(unbiased_contribution_weight, selected_light_sample, selected_wi, selected_brdf_radiance, selected_inverse_solid_angle_pdf, selected_brdf_rays_can_hit || selected_is_environment, selected_is_environment);
 }
 
 fn generate_emissive_candidate(
@@ -337,7 +387,11 @@ fn generate_emissive_candidate(
 ) {
     let NdotV_hit = max(dot(ray_hit.world_normal, -wi), 0.0001);
     let light_count = arrayLength(&light_sources);
-    let area_pdf = 1.0 / (f32(light_count) * f32(ray_hit.triangle_count) * ray_hit.triangle_area);
+    let triangle_count = emissive_hit_triangle_count(ray_hit);
+    if light_count == 0u || triangle_count == 0u || !(ray_hit.triangle_area > 0.0) {
+        return;
+    }
+    let area_pdf = 1.0 / (f32(light_count) * f32(triangle_count) * ray_hit.triangle_area);
     let p_light = area_pdf * ray_t * ray_t / NdotV_hit;
     let emissive_mis_weight = power_heuristic(p_brdf, p_light * p_nee * f32(di_samples));
 
@@ -404,7 +458,7 @@ fn terminate_into_cache(
     let world_cache_cell_size = get_cell_size(ray_hit.world_position, view.world_position, ray_t, &rng_copy);
     if ray_t <= sqrt(3.0) * world_cache_cell_size { return false; }
 
-    let cached_radiance = query_world_cache(ray_hit.world_position, ray_hit.geometric_world_normal, view.world_position, ray_t, WORLD_CACHE_CELL_LIFETIME, rng);
+    let cached_radiance = query_world_cache(ray_hit.world_position, ray_hit.geometric_world_normal, ray_hit.ray_origin_bias, view.world_position, ray_t, WORLD_CACHE_CELL_LIFETIME, rng);
 
     let cache_outgoing = (ray_hit.material.base_color / PI) * cached_radiance;
     let cache_L_at_reconnection = (*path).throughput_past_first_hit * cache_outgoing;

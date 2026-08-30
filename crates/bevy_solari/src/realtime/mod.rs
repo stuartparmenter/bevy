@@ -262,3 +262,183 @@ fn manage_prepass_double_buffers(
         }
     }
 }
+
+#[cfg(test)]
+mod shader_source_tests {
+    use bevy_math::{ops, Vec3};
+
+    #[test]
+    fn ris_visibility_is_part_of_candidate_evaluation() {
+        let initial_path = include_str!("initial_path.wesl");
+        let candidate_visibility = initial_path
+            .find("let visibility = trace_visibility(ray_origin, geometric_normal")
+            .expect("initial-path RIS candidates must test visibility");
+        let candidate_target = initial_path[candidate_visibility..]
+            .find("let target_function = luminance(brdf_radiance);")
+            .expect("initial-path RIS must evaluate a target after visibility");
+        assert!(candidate_target > 0);
+        assert!(
+            !initial_path.contains("unbiased_contribution_weight *= trace_visibility"),
+            "the selected RIS winner must not issue a redundant visibility ray"
+        );
+
+        let world_cache_update = include_str!("world_cache_update.wesl");
+        assert!(world_cache_update
+            .contains("let visibility = trace_visibility(world_position, world_normal"));
+        assert!(!world_cache_update.contains("unbiased_contribution_weight *= trace_visibility"));
+    }
+
+    #[test]
+    fn shadow_rays_do_not_spend_the_origin_bias_at_the_light_end() {
+        // The light point lies exactly on the traced triangle, so truncating the ray by the shading
+        // surface's BLAS error charged that error twice and hid every occluder standing closer to
+        // its light than the bias.
+        let sampling = include_str!("../scene/sampling.wesl");
+        assert!(!sampling.contains("dist - ray_origin_bias"));
+        assert!(
+            sampling.contains("dist - max(RAY_T_MIN, LIGHT_SAMPLE_END_EPSILON_RELATIVE * dist)")
+        );
+
+        // A light inside the offset shell has nothing between it and the surface, so it is visible.
+        // Reporting it occluded is what stopped emitters lighting the geometry they sit on.
+        assert!(
+            sampling.contains("if t_max < RAY_T_MIN { return visibility_without_tracing(1.0); }")
+        );
+    }
+
+    #[test]
+    fn world_cache_linear_probe_wraps() {
+        let world_cache_query = include_str!("world_cache_query.wesl");
+        assert!(world_cache_query.contains("key = wrap_key(key + 1u);"));
+        assert!(!world_cache_query.contains("\n            key += 1u;"));
+    }
+
+    #[test]
+    fn world_cache_normal_buckets_split_perpendicular_surfaces() {
+        // A bucket one unit wide over a component's [-1, 1] range reduces the key to the sign of
+        // each component, so a floor and the wall it meets share a cell whenever both normals tip
+        // into the same octant, and the seeding surface owns the hemisphere sample_gi samples and
+        // the albedo folded into that cell's radiance.
+        let world_cache_query = include_str!("world_cache_query.wesl");
+        assert!(world_cache_query.contains(
+            "return quantize_position(world_normal, WORLD_CACHE_NORMAL_QUANTIZATION_FACTOR);"
+        ));
+
+        // Read the width and the epsilon out of the shader rather than repeating them, so widening
+        // the bucket fails the separation check below instead of only the text pin above.
+        let shader_f32 = |prefix: &str, terminator: char| -> f32 {
+            world_cache_query
+                .split_once(prefix)
+                .and_then(|(_, rest)| rest.split_once(terminator))
+                .and_then(|(value, _)| value.trim().parse().ok())
+                .unwrap_or_else(|| panic!("the shader must declare a parsable {prefix}"))
+        };
+        let factor = shader_f32("const WORLD_CACHE_NORMAL_QUANTIZATION_FACTOR: f32 = ", ';');
+        let epsilon = shader_f32("return floor(world_position / quantization_factor + ", ')');
+
+        // The key is bitcast, so two normals share a cell only when their bucket bits match.
+        let quantize = |normal: Vec3| {
+            (normal / factor + Vec3::splat(epsilon))
+                .floor()
+                .to_array()
+                .map(f32::to_bits)
+        };
+
+        const GRID: usize = 16;
+        let mut buckets = Vec::new();
+        for i in 0..GRID {
+            for j in 0..GRID {
+                let (sin_theta, cos_theta) =
+                    ops::sin_cos(core::f32::consts::PI * (i as f32 + 0.5) / GRID as f32);
+                let (sin_phi, cos_phi) =
+                    ops::sin_cos(core::f32::consts::TAU * (j as f32 + 0.5) / GRID as f32);
+                let normal = Vec3::new(sin_theta * cos_phi, sin_theta * sin_phi, cos_theta);
+                buckets.push((quantize(normal), normal));
+            }
+        }
+
+        for (index, (key, normal)) in buckets.iter().enumerate() {
+            for (other_key, other_normal) in &buckets[index + 1..] {
+                assert!(
+                    key != other_key || normal.dot(*other_normal) > 0.5,
+                    "{normal} and {other_normal} are over 60 degrees apart in one cell"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ray_misses_consume_the_shared_environment() {
+        let initial_path = include_str!("initial_path.wesl");
+        assert!(initial_path.contains("sample_environment_radiance(next_bounce.wi)"));
+        assert!(initial_path.contains("environment_light_pdf(next_bounce.wi)"));
+        assert!(
+            initial_path.contains("environment_light_pdf(di.wi)"),
+            "environment NEE must MIS against the BRDF-miss strategy that owns the same radiance"
+        );
+    }
+
+    #[test]
+    fn world_cache_gi_misses_do_not_re_add_the_environment() {
+        // sample_di samples the environment for every cell with a full-range visibility ray, and
+        // the GI ray is truncated at world_cache_max_gi_ray_distance, so a miss must add nothing.
+        let world_cache_update = include_str!("world_cache_update.wesl");
+        assert!(!world_cache_update.contains("sample_environment_radiance"));
+    }
+
+    #[test]
+    fn light_tile_selection_is_reshuffled_every_frame() {
+        // The tiles are refilled every frame, so a frozen choice is not a frozen set of lights. It
+        // does keep each workgroup sharing its tile with exactly the same others, whose variance
+        // then correlates into a pattern the temporal filter reproduces instead of averaging out.
+        let initial_path = include_str!("initial_path.wesl");
+        assert!(initial_path.contains(
+            "var workgroup_rng = (workgroup_id.x * 0x9E3779B9u) + workgroup_id.y + bounce + constants.frame_rng;"
+        ));
+        let world_cache_update = include_str!("world_cache_update.wesl");
+        assert!(world_cache_update.contains(
+            "var workgroup_rng = (workgroup_id.x * 0x9E3779B9u) + workgroup_id.y + constants.frame_rng;"
+        ));
+    }
+
+    #[test]
+    fn rasterized_surfaces_widen_the_ray_origin_bias_with_distance() {
+        // The G-buffer surface is whichever meshlet LOD stays under ~1px of screen error, so it
+        // drifts from the traced geometry by an amount that grows with camera distance. A constant
+        // geometry-error bias leaves distant shading points inside the traced proxy, where every
+        // visibility and GI ray is self-occluded and the pixel resolves to black.
+        let initial_path = include_str!("initial_path.wesl");
+        assert!(initial_path.contains(
+            "ray_origin_bias_with_raster_lod(rasterized_surface_ray_origin_bias(surface_world_geometry_error), pixel_world_size(world_position, view.world_position))"
+        ));
+        // The scene-wide maximum is the unknown fallback now, not the primary vertex's answer.
+        assert!(!initial_path.contains("primary_ray_origin_bias"));
+
+        // One import plus the canonical and other domains of a reservoir merge.
+        let restir = include_str!("restir.wesl");
+        assert_eq!(restir.matches("ray_origin_bias_with_raster_lod").count(), 3);
+
+        // The two merge domains are different surfaces and can be different instances. Reusing the
+        // canonical bias for both compiles, shows no acne, and only leaks as energy loss and blotchy
+        // convergence, so pin the two expressions apart.
+        assert!(
+            restir.contains("rasterized_surface_ray_origin_bias(canonical_world_geometry_error)")
+        );
+        assert!(restir.contains("rasterized_surface_ray_origin_bias(other_world_geometry_error)"));
+
+        // Cache rays must escape their surface by the same distance the DI rays do.
+        let world_cache_update = include_str!("world_cache_update.wesl");
+        assert!(world_cache_update.contains("fn cell_ray_origin_bias"));
+        assert_eq!(
+            world_cache_update
+                .matches("cell_ray_origin_bias(geometry_data)")
+                .count(),
+            2
+        );
+
+        // The added term must stay bounded, or a distant surface biases its rays straight through
+        // the wall behind it.
+        let scene_bindings = include_str!("../scene/bindings.wesl");
+        assert!(scene_bindings.contains("min(lod_error, RAY_ORIGIN_BIAS_RASTER_LOD_MAX)"));
+    }
+}
