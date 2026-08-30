@@ -35,6 +35,7 @@ members = [
   "examples/large_scenes/caldera_hotel",
   "examples/large_scenes/bevy_city",
   "examples/large_scenes/zero_day",
+  "examples/large_scenes/zorah",
   # Mipmap generator for testing large bevy scenes with mips and texture compression.
   "examples/large_scenes/mipmap_generator",
   # Benchmarks
