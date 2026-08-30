@@ -11,7 +11,7 @@ use bevy_ecs::{
 use bevy_image::Image;
 use bevy_light::{EnvironmentMapLight, GeneratedEnvironmentMapLight};
 use bevy_math::Quat;
-use bevy_pbr::{MeshMaterial3d, PreviousGlobalTransform, StandardMaterial};
+use bevy_pbr::{MeshGeometryError, MeshMaterial3d, PreviousGlobalTransform, StandardMaterial};
 use bevy_platform::collections::HashMap;
 use bevy_render::{sync_world::RenderEntity, Extract};
 use bevy_transform::components::GlobalTransform;
@@ -25,6 +25,7 @@ pub fn extract_raytracing_scene_structural(
             (
                 RenderEntity,
                 &RaytracingMesh3d,
+                &MeshGeometryError,
                 &MeshMaterial3d<StandardMaterial>,
                 &GlobalTransform,
                 Option<&PreviousGlobalTransform>,
@@ -43,9 +44,12 @@ pub fn extract_raytracing_scene_structural(
         }
     }
 
-    for (render_entity, mesh, material, transform, previous_frame_transform) in &new_instances {
+    for (render_entity, mesh, geometry_error, material, transform, previous_frame_transform) in
+        &new_instances
+    {
         commands.entity(render_entity).insert((
             mesh.clone(),
+            *geometry_error,
             material.clone(),
             *transform,
             previous_frame_transform
@@ -84,7 +88,8 @@ pub fn extract_raytracing_scene_transforms(
         });
 }
 
-/// Updates the mesh and material of existing raytracing instances in the render world.
+/// Updates the mesh, material and geometry error of existing raytracing instances in the render
+/// world.
 pub fn extract_raytracing_scene_meshes_and_materials(
     main_instances: Extract<
         Query<
@@ -92,19 +97,28 @@ pub fn extract_raytracing_scene_meshes_and_materials(
                 RenderEntity,
                 &RaytracingMesh3d,
                 &MeshMaterial3d<StandardMaterial>,
+                &MeshGeometryError,
             ),
             Or<(
                 Changed<RaytracingMesh3d>,
                 Changed<MeshMaterial3d<StandardMaterial>>,
+                Changed<MeshGeometryError>,
             )>,
         >,
     >,
-    mut render_instances: Query<(&mut RaytracingMesh3d, &mut MeshMaterial3d<StandardMaterial>)>,
+    mut render_instances: Query<(
+        &mut RaytracingMesh3d,
+        &mut MeshMaterial3d<StandardMaterial>,
+        &mut MeshGeometryError,
+    )>,
 ) {
-    for (render_entity, new_mesh, new_material) in &main_instances {
-        if let Ok((mut mesh, mut material)) = render_instances.get_mut(render_entity) {
+    for (render_entity, new_mesh, new_material, new_geometry_error) in &main_instances {
+        if let Ok((mut mesh, mut material, mut geometry_error)) =
+            render_instances.get_mut(render_entity)
+        {
             *mesh = new_mesh.clone();
             *material = new_material.clone();
+            *geometry_error = *new_geometry_error;
         }
     }
 }

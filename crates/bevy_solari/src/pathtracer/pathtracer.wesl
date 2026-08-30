@@ -3,7 +3,7 @@ import bevy_pbr::render::utils::{rand_f, rand_vec2f};
 import bevy_render::view::View;
 import package::scene::brdf::{evaluate_brdf, evaluate_and_sample_brdf, brdf_pdf, F_AB};
 import package::scene::sampling::{sample_random_light, random_emissive_light_pdf, power_heuristic, sample_environment_map_light};
-import package::scene::bindings::{environment_light_pdf, trace_ray, resolve_ray_hit_full, RAY_T_MIN, RAY_T_MAX, MIRROR_ROUGHNESS_THRESHOLD};
+import package::scene::bindings::{environment_light_pdf, trace_ray, resolve_ray_hit_full, offset_ray_origin, RAY_T_MIN, RAY_T_MAX, MIRROR_ROUGHNESS_THRESHOLD};
 
 enable wgpu_ray_query;
 
@@ -52,14 +52,16 @@ fn pathtrace(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 let p_light = random_emissive_light_pdf(ray_hit, ray.t, NdotV);
                 mis_weight = power_heuristic(p_bounce, p_light);
             }
-            if dot(ray_hit.world_normal, wo) > 0.0 {
+            // Emission is one-sided, matching NEE's cos_theta_light. Gated on front_face because
+            // resolve_ray_hit_full has already turned the shading normal toward the ray.
+            if ray_hit.front_face {
                 radiance += mis_weight * throughput * ray_hit.material.emissive;
             }
 
             // Sample direct lighting, but only if the surface is not mirror-like
             let is_perfectly_specular = ray_hit.material.roughness <= MIRROR_ROUGHNESS_THRESHOLD && ray_hit.material.metallic > 0.9999;
             if !is_perfectly_specular {
-                let direct_lighting = sample_random_light(ray_hit.world_position, ray_hit.world_normal, &rng);
+                let direct_lighting = sample_random_light(ray_hit.world_position, ray_hit.geometric_world_normal, ray_hit.ray_origin_bias, &rng);
 
                 mis_weight = 1.0;
                 if direct_lighting.brdf_rays_can_hit {
@@ -81,7 +83,9 @@ fn pathtrace(@builtin(global_invocation_id) global_id: vec3<u32>) {
             let next_bounce = evaluate_and_sample_brdf(wo, ray_hit.world_normal, ray_hit.material, F_ab, &rng);
             if next_bounce.pdf == 0.0 { break; }
             ray_direction = next_bounce.wi;
-            ray_origin = ray_hit.world_position + (ray_hit.geometric_world_normal * RAY_T_MIN);
+            // Every vertex here is a ray hit on the traced geometry itself, so unlike the realtime
+            // path there is no rasterized surface to drift away from it and no LOD term to add.
+            ray_origin = offset_ray_origin(ray_hit.world_position, ray_hit.geometric_world_normal, ray_direction, ray_hit.ray_origin_bias);
             ray_t_min = RAY_T_MIN;
             p_bounce = next_bounce.pdf;
             throughput *= next_bounce.throughput;

@@ -39,7 +39,7 @@ use bevy_render::{
     renderer::{RenderDevice, RenderQueue},
     texture::GpuImage,
 };
-use tracing::info_span;
+use tracing::{info, info_span};
 
 /// Small scene constants the shaders read alongside Solari's other scene data.
 ///
@@ -47,6 +47,7 @@ use tracing::info_span;
 /// these live in a read-only storage buffer instead.
 #[derive(ShaderType, Clone, Copy, PartialEq, Debug)]
 struct GpuSceneParameters {
+    max_world_geometry_error: f32,
     /// Face size of the bound importance pyramid.
     environment_face_size: u32,
     /// Mip count of the bound pyramid, `log2(face_size) + 3`.
@@ -58,6 +59,37 @@ struct GpuSceneParameters {
 pub struct EnvironmentParams<'w> {
     environment_map_light: Res<'w, ExtractedEnvironmentMapLight>,
     importance_maps: ResMut<'w, EnvironmentImportanceMaps>,
+}
+
+/// Logs the scene's composition once it has held still for a couple of frames, so a settling
+/// scene reports its final shape rather than every loading step.
+#[derive(Default)]
+struct SceneSummaryLog {
+    last: Option<(u32, usize, usize, usize, usize)>,
+    stable_frames: u8,
+    reported: Option<(u32, usize, usize, usize, usize)>,
+}
+
+impl SceneSummaryLog {
+    fn observe(&mut self, summary: (u32, usize, usize, usize, usize)) {
+        if self.last == Some(summary) {
+            self.stable_frames = self.stable_frames.saturating_add(1);
+        } else {
+            self.last = Some(summary);
+            self.stable_frames = 0;
+        }
+        if self.stable_frames >= 2 && self.reported != Some(summary) {
+            info!(
+                raytracing_instances = summary.0,
+                emissive_mesh_lights = summary.1,
+                directional_lights = summary.2,
+                environment_lights = summary.3,
+                total_light_sources = summary.4,
+                "prepared Solari raytracing scene"
+            );
+            self.reported = Some(summary);
+        }
+    }
 }
 
 /// Insert this resource into the render world to make the raytracing scene retain the previous
@@ -81,6 +113,7 @@ pub struct RaytracingSceneBindings {
     environment_map_light_buffer: StorageBuffer<GpuEnvironmentMapLight>,
     scene_parameters: StorageBuffer<GpuSceneParameters>,
     last_scene_parameters: Option<GpuSceneParameters>,
+    summary: SceneSummaryLog,
 }
 
 impl RaytracingSceneBindings {
@@ -97,42 +130,43 @@ impl RaytracingSceneBindings {
     }
 }
 
+fn bind_group_layout_descriptor() -> BindGroupLayoutDescriptor {
+    BindGroupLayoutDescriptor::new(
+        "raytracing_scene_bind_group_layout",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::COMPUTE,
+            (
+                storage_buffer_read_only_sized(false, None).count(MAX_MESH_SLAB_COUNT),
+                storage_buffer_read_only_sized(false, None).count(MAX_MESH_SLAB_COUNT),
+                texture_2d(TextureSampleType::Float { filterable: true }).count(MAX_TEXTURE_COUNT),
+                sampler(SamplerBindingType::Filtering).count(MAX_TEXTURE_COUNT),
+                storage_buffer_read_only_sized(false, None),
+                acceleration_structure(),
+                acceleration_structure(),
+                storage_buffer_read_only_sized(false, None),
+                storage_buffer_read_only_sized(false, None),
+                storage_buffer_read_only_sized(false, None),
+                storage_buffer_read_only_sized(false, None),
+                storage_buffer_read_only_sized(false, None),
+                storage_buffer_read_only_sized(false, None),
+                storage_buffer_read_only_sized(false, None),
+                texture_2d(TextureSampleType::Float { filterable: true }),
+                sampler(SamplerBindingType::Filtering),
+                texture_cube(TextureSampleType::Float { filterable: true }),
+                sampler(SamplerBindingType::Filtering),
+                storage_buffer_read_only_sized(false, None),
+                storage_buffer_read_only::<GpuSceneParameters>(false),
+                // R32Float is not filterable without FLOAT32_FILTERABLE and the pyramid is
+                // only ever read with textureLoad.
+                texture_2d(TextureSampleType::Float { filterable: false }),
+            ),
+        ),
+    )
+}
+
 impl FromWorld for RaytracingSceneBindings {
     fn from_world(world: &mut World) -> Self {
         let render_device = world.resource::<RenderDevice>();
-
-        let bind_group_layout = BindGroupLayoutDescriptor::new(
-            "raytracing_scene_bind_group_layout",
-            &BindGroupLayoutEntries::sequential(
-                ShaderStages::COMPUTE,
-                (
-                    storage_buffer_read_only_sized(false, None).count(MAX_MESH_SLAB_COUNT),
-                    storage_buffer_read_only_sized(false, None).count(MAX_MESH_SLAB_COUNT),
-                    texture_2d(TextureSampleType::Float { filterable: true })
-                        .count(MAX_TEXTURE_COUNT),
-                    sampler(SamplerBindingType::Filtering).count(MAX_TEXTURE_COUNT),
-                    storage_buffer_read_only_sized(false, None),
-                    acceleration_structure(),
-                    acceleration_structure(),
-                    storage_buffer_read_only_sized(false, None),
-                    storage_buffer_read_only_sized(false, None),
-                    storage_buffer_read_only_sized(false, None),
-                    storage_buffer_read_only_sized(false, None),
-                    storage_buffer_read_only_sized(false, None),
-                    storage_buffer_read_only_sized(false, None),
-                    storage_buffer_read_only_sized(false, None),
-                    texture_2d(TextureSampleType::Float { filterable: true }),
-                    sampler(SamplerBindingType::Filtering),
-                    texture_cube(TextureSampleType::Float { filterable: true }),
-                    sampler(SamplerBindingType::Filtering),
-                    storage_buffer_read_only_sized(false, None),
-                    storage_buffer_read_only::<GpuSceneParameters>(false),
-                    // R32Float is not filterable without FLOAT32_FILTERABLE and the pyramid is
-                    // only ever read with textureLoad.
-                    texture_2d(TextureSampleType::Float { filterable: false }),
-                ),
-            ),
-        );
 
         let environment_map_light_sampler = render_device.create_sampler(&SamplerDescriptor {
             label: Some("solari_environment_map_light_sampler"),
@@ -150,7 +184,7 @@ impl FromWorld for RaytracingSceneBindings {
 
         Self {
             bind_group: None,
-            bind_group_layout,
+            bind_group_layout: bind_group_layout_descriptor(),
             assets: AssetState::new(),
             instances: InstanceState::new(),
             lights: LightState::new(),
@@ -159,10 +193,12 @@ impl FromWorld for RaytracingSceneBindings {
             environment_map_light_sampler,
             environment_map_light_buffer,
             scene_parameters: StorageBuffer::from(GpuSceneParameters {
+                max_world_geometry_error: 0.0,
                 environment_face_size: 1,
                 environment_mip_count: 3,
             }),
             last_scene_parameters: None,
+            summary: SceneSummaryLog::default(),
         }
     }
 }
@@ -239,6 +275,14 @@ pub fn prepare_raytracing_scene_resources(
         &render_device,
         &render_queue,
     );
+
+    bindings.summary.observe((
+        bindings.instances.live_count,
+        bindings.lights.emissive_light_count(),
+        bindings.lights.directional_light_count(),
+        bindings.lights.environment_light_count(),
+        bindings.lights.index.len(),
+    ));
 
     // Upload the above writes
     write_sparse_buffers(bindings, &render_device, &render_queue);
@@ -325,6 +369,7 @@ fn write_scene_parameters(
 ) {
     let pyramid = &environment_maps.pyramid;
     let parameters = GpuSceneParameters {
+        max_world_geometry_error: bindings.instances.max_world_geometry_error(),
         environment_face_size: pyramid.face_size(),
         environment_mip_count: pyramid.mip_count(),
     };
@@ -374,4 +419,58 @@ fn write_sparse_buffers(
     lights
         .previous_frame_id_translations
         .write_buffers(device, queue);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bind_group_layout_descriptor;
+    use bevy_render::render_resource::{BindingType, BufferBindingType};
+
+    #[test]
+    fn raytracing_scene_binding_arrays_do_not_share_a_group_with_uniform_buffers() {
+        let layout = bind_group_layout_descriptor();
+        assert_eq!(layout.entries.len(), 21);
+        assert!(layout.entries.iter().any(|entry| entry.count.is_some()));
+        assert!(layout.entries.iter().all(|entry| {
+            !matches!(
+                &entry.ty,
+                BindingType::Buffer {
+                    ty: BufferBindingType::Uniform,
+                    ..
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn only_a_rasterized_surface_pays_the_shading_normal_safety_factor() {
+        // Both bias sites resolve an unknown error through the same bound, so the scene-wide maximum
+        // cannot end up less conservative than the per-instance path of the instance that set it.
+        // Only the rasterized one is offset along a normal-mapped normal, so only it needs the
+        // factor; a ray hit carries a true geometric normal.
+        let shader = include_str!("../bindings.wesl");
+        let body = |name: &str| {
+            shader
+                .split_once(&format!("fn {name}"))
+                .unwrap_or_else(|| panic!("{name} must exist"))
+                .1
+                .split_once("\n}")
+                .unwrap_or_else(|| panic!("{name} must have a body"))
+                .0
+                .to_string()
+        };
+
+        let rasterized = body("rasterized_surface_ray_origin_bias");
+        let per_instance = body("ray_origin_bias_for_instance");
+        for bias in [&rasterized, &per_instance] {
+            assert!(bias.contains("bounded_world_geometry_error("), "{bias}");
+        }
+        assert!(rasterized.contains("RAY_ORIGIN_BIAS_SHADING_NORMAL_SAFETY *"));
+        assert!(
+            !per_instance.contains("RAY_ORIGIN_BIAS_SHADING_NORMAL_SAFETY"),
+            "{per_instance}"
+        );
+        assert!(body("bounded_world_geometry_error")
+            .contains("max(scene_parameters.max_world_geometry_error, 0.0)"));
+    }
 }

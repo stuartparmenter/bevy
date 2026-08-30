@@ -8,6 +8,7 @@ use bevy_asset::embedded_asset;
 use bevy_shader::load_shader_library;
 pub use binder::prepare_raytracing_scene_resources;
 pub use binder::{RaytracingSceneBindings, RaytracingSceneNeedsPreviousFrameData};
+pub use blas::{RaytracingSceneStatus, RaytracingSceneStatusSnapshot};
 pub use environment::EnvironmentImportanceMaps;
 pub use types::RaytracingMesh3d;
 
@@ -15,6 +16,7 @@ use crate::SolariPlugins;
 use bevy_app::{App, Plugin};
 use bevy_ecs::schedule::IntoScheduleConfigs;
 use bevy_render::{
+    extract_resource::ExtractResourcePlugin,
     mesh::{
         allocator::{allocate_and_free_meshes, MeshAllocatorSettings},
         RenderMesh,
@@ -27,7 +29,10 @@ use bevy_render::{
 use binder::{
     build_raytracing_tlas, prepare_raytracing_scene_bind_group, TlasInstanceSetupPipeline,
 };
-use blas::{compact_raytracing_blas, delete_raytracing_blas, prepare_raytracing_blas, BlasManager};
+use blas::{
+    compact_raytracing_blas, delete_raytracing_blas, prepare_raytracing_blas,
+    update_raytracing_scene_status, BlasManager,
+};
 use environment::{build_environment_importance_maps, init_environment_importance_maps};
 use extract::{
     extract_raytracing_environment_map_light, extract_raytracing_material_assets,
@@ -48,6 +53,7 @@ impl Plugin for RaytracingScenePlugin {
         embedded_asset!(app, "binder/setup_tlas_instances.wesl");
         embedded_asset!(app, "environment_importance_map_build.wesl");
         embedded_asset!(app, "environment_importance_map_downsample.wesl");
+        app.init_resource::<RaytracingSceneStatus>();
     }
 
     fn finish(&self, app: &mut App) {
@@ -62,6 +68,10 @@ impl Plugin for RaytracingScenePlugin {
             );
             return;
         }
+
+        app.add_plugins(ExtractResourcePlugin::<RaytracingSceneStatus>::default());
+
+        let render_app = app.sub_app_mut(RenderApp);
 
         render_app
             .world_mut()
@@ -95,6 +105,9 @@ impl Plugin for RaytracingScenePlugin {
                     compact_raytracing_blas
                         .in_set(RenderSystems::PrepareAssets)
                         .after(prepare_raytracing_blas),
+                    update_raytracing_scene_status
+                        .in_set(RenderSystems::PrepareAssets)
+                        .after(compact_raytracing_blas),
                     prepare_raytracing_scene_resources.in_set(RenderSystems::PrepareResources),
                     prepare_raytracing_scene_bind_group.in_set(RenderSystems::PrepareBindGroups),
                     build_environment_importance_maps
