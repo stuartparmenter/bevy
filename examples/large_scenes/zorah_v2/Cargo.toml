@@ -24,6 +24,8 @@ bevy = { path = "../../..", default-features = false, features = [
   "ktx2",
   "zstd_rust",
   "png",
+  # The sidecar environment map is an equirectangular .hdr.
+  "hdr",
   "std",
   "3d_bevy_render",
 ] }

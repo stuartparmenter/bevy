@@ -287,9 +287,39 @@ impl Default for SceneView {
     }
 }
 
+/// The environment map from the sidecar's `settings`: the reference
+/// renderer's only light.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SceneEnvironmentMap {
+    /// Asset path of the equirectangular `.hdr`, relative to the export root.
+    pub path: String,
+    /// RTXMG's `envmap rotation`: degrees about +Y applied to its lookup
+    /// direction.
+    pub rotation_degrees: f32,
+    /// RTXMG's `envmap intensity`, a plain multiplier on the map.
+    pub intensity: f32,
+}
+
+impl Default for SceneEnvironmentMap {
+    /// The sidecar's values, as for [`SceneView`].
+    fn default() -> Self {
+        Self {
+            path: String::from("envmaps/pizzo_pernice_4k.hdr"),
+            rotation_degrees: 262.174,
+            intensity: 1.0,
+        }
+    }
+}
+
+/// An environment map multiplier the app can use: finite and not negative.
+pub fn usable_intensity(intensity: f32) -> Option<f32> {
+    (intensity.is_finite() && intensity >= 0.0).then_some(intensity)
+}
+
 #[derive(Deserialize)]
 struct SceneJson {
     view: Option<ViewJson>,
+    settings: Option<SettingsJson>,
 }
 
 #[derive(Deserialize)]
@@ -299,10 +329,21 @@ struct ViewJson {
     fov: Option<f32>,
 }
 
-/// Parses the sidecar's `view`; fields it lacks keep the defaults.
-pub fn parse_view(json: &[u8]) -> Result<SceneView, serde_json::Error> {
+#[derive(Deserialize)]
+struct SettingsJson {
+    envmap: Option<String>,
+    #[serde(rename = "envmap rotation")]
+    envmap_rotation: Option<f32>,
+    #[serde(rename = "envmap intensity")]
+    envmap_intensity: Option<f32>,
+}
+
+/// Parses the sidecar's `view` and environment `settings`; fields it lacks
+/// keep the defaults.
+pub fn parse_sidecar(json: &[u8]) -> Result<(SceneView, SceneEnvironmentMap), serde_json::Error> {
     let scene: SceneJson = serde_json::from_slice(json)?;
     let mut view = SceneView::default();
+    let mut map = SceneEnvironmentMap::default();
     if let Some(given) = scene.view {
         if let Some(position) = given.position {
             view.position = Vec3::from(position);
@@ -314,26 +355,38 @@ pub fn parse_view(json: &[u8]) -> Result<SceneView, serde_json::Error> {
             view.fov_degrees = fov;
         }
     }
-    Ok(view)
+    if let Some(settings) = scene.settings {
+        if let Some(path) = settings.envmap.filter(|path| !path.is_empty()) {
+            map.path = path;
+        }
+        if let Some(rotation) = settings.envmap_rotation.filter(|r| r.is_finite()) {
+            map.rotation_degrees = rotation;
+        }
+        if let Some(intensity) = settings.envmap_intensity.and_then(usable_intensity) {
+            map.intensity = intensity;
+        }
+    }
+    Ok((view, map))
 }
 
 /// The sidecar beside `gltf_path`, or the defaults when it is missing or
 /// unreadable. A malformed sidecar is reported as the returned warning, since
 /// this runs before the app has a log subscriber.
-pub fn read_view(gltf_path: &Path) -> (SceneView, Option<String>) {
-    let sidecar = gltf_path.with_extension("scene.json");
-    match fs::read(&sidecar) {
-        Ok(bytes) => match parse_view(&bytes) {
-            Ok(view) => (view, None),
+pub fn read_sidecar(gltf_path: &Path) -> (SceneView, SceneEnvironmentMap, Option<String>) {
+    let sidecar_path = gltf_path.with_extension("scene.json");
+    match fs::read(&sidecar_path) {
+        Ok(bytes) => match parse_sidecar(&bytes) {
+            Ok((view, map)) => (view, map, None),
             Err(error) => (
                 SceneView::default(),
+                SceneEnvironmentMap::default(),
                 Some(format!(
-                    "{}: {error}; using the default view",
-                    sidecar.display()
+                    "{}: {error}; using the default view and environment map",
+                    sidecar_path.display()
                 )),
             ),
         },
-        Err(_) => (SceneView::default(), None),
+        Err(_) => (SceneView::default(), SceneEnvironmentMap::default(), None),
     }
 }
 
@@ -343,14 +396,38 @@ mod tests {
 
     #[test]
     fn parses_the_sidecar_view() {
-        let view = parse_view(
+        let (view, map) = parse_sidecar(
             br#"{"view": {"position": [1, 2, 3], "lookat": [4, 5, 6], "up": [0, 1, 0], "fov": 40}}"#,
         )
         .unwrap();
         assert_eq!(view.position, Vec3::new(1.0, 2.0, 3.0));
         assert_eq!(view.target, Vec3::new(4.0, 5.0, 6.0));
         assert_eq!(view.fov_degrees, 40.0);
-        assert_eq!(parse_view(b"{}").unwrap(), SceneView::default());
+        assert_eq!(map, SceneEnvironmentMap::default());
+        assert_eq!(
+            parse_sidecar(b"{}").unwrap(),
+            (SceneView::default(), SceneEnvironmentMap::default())
+        );
+    }
+
+    #[test]
+    fn parses_the_sidecar_environment_map() {
+        let (_, map) = parse_sidecar(
+            br#"{"settings": {"envmap": "envmaps/other.hdr", "envmap rotation": 90.5, "envmap elevation": 0.0, "envmap intensity": 2.0}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            map,
+            SceneEnvironmentMap {
+                path: String::from("envmaps/other.hdr"),
+                rotation_degrees: 90.5,
+                intensity: 2.0,
+            }
+        );
+        // Missing, empty and invalid fields keep the defaults.
+        let (_, map) =
+            parse_sidecar(br#"{"settings": {"envmap": "", "envmap intensity": -1.0}}"#).unwrap();
+        assert_eq!(map, SceneEnvironmentMap::default());
     }
 
     /// Walks the real export when `ZORAH_ROOT` points at it: every chained

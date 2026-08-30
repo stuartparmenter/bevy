@@ -612,7 +612,6 @@ pub fn warm_up_raytracing(
     mut pending: ResMut<PendingScene>,
     raytracing_status: Res<RaytracingSceneStatus>,
     camera: Single<Entity, With<ZorahCamera>>,
-    mut ambient_light: ResMut<GlobalAmbientLight>,
     mut next_state: ResMut<NextState<ZorahState>>,
     #[cfg(feature = "dlss")] dlss_rr_supported: Option<Res<DlssRayReconstructionSupported>>,
 ) {
@@ -676,10 +675,6 @@ pub fn warm_up_raytracing(
         return;
     }
 
-    // The preview ambient has done its job. Deferred and meshlet geometry
-    // skip it under Solari anyway, but a forward-shaded `Mesh3d` (a BLEND
-    // material under `--preserve-alpha`) would add it on top of the traced light.
-    *ambient_light = GlobalAmbientLight::NONE;
     let mut camera = commands.entity(*camera);
     camera.insert(SolariLighting {
         // Upstream turned ReSTIR off by default and leans on the denoiser instead. Zorah's

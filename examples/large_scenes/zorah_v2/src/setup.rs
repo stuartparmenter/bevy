@@ -1,6 +1,6 @@
 //! The camera, the stand-in lights, and the dev keys.
 
-use std::time::Instant;
+use std::{f32::consts::PI, time::Instant};
 
 use bevy::{
     app::AppExit,
@@ -26,8 +26,9 @@ use bevy::{
 
 use crate::{
     bake::{self, BakeSettings, MeshJob},
+    environment::EnvironmentMapLoad,
     runner::{PendingRaytracingInstance, PendingScene, ZorahState},
-    scene::{SceneInstance, SceneView},
+    scene::{SceneEnvironmentMap, SceneInstance, SceneView},
 };
 
 /// Node name fragments of the fire props that get an emissive proxy.
@@ -59,13 +60,13 @@ pub struct ZorahCamera;
 #[derive(Resource)]
 pub struct SetupOptions {
     pub view: SceneView,
+    /// The sidecar's HDR: the sky light and the backdrop.
+    pub environment_map: SceneEnvironmentMap,
     pub camera_position: Option<Vec3>,
     pub camera_target: Option<Vec3>,
     pub exposure_ev100: Option<f32>,
     pub auto_exposure: bool,
     pub exposure_bias: f32,
-    pub sky_illuminance: f32,
-    pub sky_color: Vec3,
     pub sun_illuminance: f32,
     pub fire_lumens: f32,
     pub solari_albedo: bool,
@@ -88,24 +89,11 @@ pub fn setup(
     mut commands: Commands,
     mut options: ResMut<SetupOptions>,
     scene: Res<crate::runner::SceneData>,
+    asset_server: Res<AssetServer>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut compensation_curves: ResMut<Assets<AutoExposureCompensationCurve>>,
-    mut ambient_light: ResMut<GlobalAmbientLight>,
 ) {
-    let sky_color = LinearRgba::rgb(
-        options.sky_color.x,
-        options.sky_color.y,
-        options.sky_color.z,
-    );
-    // Overrides the `GlobalAmbientLight::NONE` main inserts for the preview
-    // only: it keeps the raster image lit while the BLASes build instead of
-    // showing a black frame, and the warm-up zeroes it again when Solari
-    // takes over. Brightness is radiance; a uniform sky of illuminance E has
-    // radiance E / pi, so the preview matches the traced sky it stands in for.
-    ambient_light.color = Color::LinearRgba(sky_color);
-    ambient_light.brightness = options.sky_illuminance / std::f32::consts::PI;
-
     if options.sun_illuminance > 0.0 {
         commands.spawn((
             Name::new("Sun"),
@@ -201,16 +189,22 @@ pub fn setup(
             ..default()
         });
     }
+    // The map goes on the camera once `install_environment_map` has
+    // converted it; until then the preview is unlit (a second or two).
+    commands.insert_resource(EnvironmentMapLoad::start(
+        &asset_server,
+        options.environment_map.clone(),
+    ));
     info!(
         camera_position = %camera_position,
         camera_target = %camera_target,
         fov_degrees = options.view.fov_degrees,
         base_ev100,
         auto_exposure,
-        sky_illuminance = options.sky_illuminance,
+        environment_map = options.environment_map.path.as_str(),
         sun_illuminance = options.sun_illuminance,
         fire_proxies = raytracing_instances.len(),
-        "Zorah view and stand-in lighting set up"
+        "Zorah view and lighting set up"
     );
 
     let jobs = std::mem::take(&mut options.jobs);
@@ -243,8 +237,7 @@ fn spawn_fire_proxies(
     let sphere = meshes.add(Sphere::new(1.0).mesh().uv(16, 8));
     let color = blackbody_srgb(FIRE_TEMPERATURE_K).to_linear();
     // Flux spread over the sphere as v1 does for point lights: lm / (4 pi^2 r^2).
-    let radiance =
-        lumens / (4.0 * ops::powf(std::f32::consts::PI * FIRE_PROXY_RADIUS, 2.0)).max(0.0001);
+    let radiance = lumens / (4.0 * ops::powf(PI * FIRE_PROXY_RADIUS, 2.0)).max(0.0001);
     let material = materials.add(StandardMaterial {
         base_color: Color::BLACK,
         emissive: LinearRgba::rgb(
