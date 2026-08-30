@@ -33,7 +33,7 @@ fn fragment(
 @if(MESHLET_MESH_MATERIAL_PASS)
     let in = resolve_vertex_output(frag_coord);
 @if(MESHLET_MESH_MATERIAL_PASS)
-    let is_front = true;
+    let is_front = in.is_front;
 
 @if(!MESHLET_MESH_MATERIAL_PASS && BINDLESS)
     let slot = mesh[in.instance_index].material_and_lightmap_bind_group_slot & 0xffffu;

@@ -7,8 +7,6 @@ mod instance_manager;
 mod material_pipeline_prepare;
 mod material_shade_nodes;
 mod meshlet_mesh_manager;
-mod persistent_buffer;
-mod persistent_buffer_impls;
 mod pipelines;
 mod resource_manager;
 mod visibility_buffer_raster_node;
@@ -20,6 +18,8 @@ pub(crate) use self::{
     },
 };
 
+#[cfg(feature = "meshlet_processor")]
+pub use self::asset::MeshletRaytracingGeometry;
 pub use self::asset::{
     MeshletMesh, MeshletMeshLoader, MeshletMeshSaver, MESHLET_MESH_ASSET_VERSION,
 };
@@ -50,6 +50,8 @@ use bevy_asset::{embedded_asset, AssetApp, AssetId, Handle};
 use bevy_camera::visibility::{self, Visibility, VisibilityClass};
 use bevy_core_pipeline::{
     core_3d::main_opaque_pass_3d,
+    deferred::node::late_deferred_prepass,
+    prepass::node::early_prepass,
     prepass::{DeferredPrepass, MotionVectorPrepass, NormalPrepass},
     schedule::{Core3d, Core3dSystems},
 };
@@ -91,7 +93,9 @@ use tracing::error;
 /// * Requires preprocessing meshes. See [`MeshletMesh`] for details.
 /// * Limitations on the kinds of materials you can use. See [`MeshletMesh`] for details.
 ///
-/// This plugin requires a fairly recent GPU that supports [`WgpuFeatures::TEXTURE_INT64_ATOMIC`].
+/// This plugin requires a fairly recent GPU that supports [`WgpuFeatures::TEXTURE_INT64_ATOMIC`]
+/// and non-uniform storage-buffer binding arrays. Mesh data is stored in fixed 64 MiB pages so
+/// large scenes never require a monolithic storage buffer or a whole-heap reallocation.
 ///
 /// This plugin currently works only on the Vulkan and Metal backends.
 ///
@@ -124,6 +128,9 @@ impl MeshletPlugin {
             | WgpuFeatures::SUBGROUP
             | WgpuFeatures::DEPTH_CLIP_CONTROL
             | WgpuFeatures::IMMEDIATES
+            | WgpuFeatures::BUFFER_BINDING_ARRAY
+            | WgpuFeatures::STORAGE_RESOURCE_BINDING_ARRAY
+            | WgpuFeatures::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING
     }
 }
 
@@ -199,9 +206,11 @@ impl Plugin for MeshletPlugin {
                 Core3d,
                 (
                     meshlet_visibility_buffer_raster
+                        .before(early_prepass)
                         .before(per_view_shadow_pass::<EARLY_SHADOW_PASS>),
                     meshlet_prepass
                         .after(per_view_shadow_pass::<EARLY_SHADOW_PASS>)
+                        .after(late_deferred_prepass)
                         .in_set(Core3dSystems::Prepass),
                     meshlet_deferred_gbuffer_prepass
                         .after(meshlet_prepass)

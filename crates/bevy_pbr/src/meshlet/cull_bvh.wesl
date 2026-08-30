@@ -4,7 +4,8 @@ import package::meshlet::bindings::{
     get_aabb_error,
     get_aabb_child_offset,
     constants,
-    meshlet_bvh_nodes,
+    meshlet_instance_descriptors,
+    load_bvh_subnode,
     meshlet_bvh_cull_count_read,
     meshlet_bvh_cull_count_write,
     meshlet_bvh_cull_dispatch,
@@ -24,6 +25,8 @@ import package::meshlet::cull_shared::{
     should_occlusion_cull_aabb,
 };
 
+enable wgpu_binding_array;
+
 @compute
 @workgroup_size(128, 1, 1) // 8 threads per node, 16 nodes per workgroup
 fn cull_bvh(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
@@ -36,22 +39,19 @@ fn cull_bvh(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
     node = select(node, constants.rightmost_slot - node, constants.read_from_front == 0u);
     let instanced_offset = meshlet_bvh_cull_queue[node];
     let instance_id = instanced_offset.instance_id;
-    let bvh_node = &meshlet_bvh_nodes[instanced_offset.offset];
-
-    var aabb_error_offset = (*bvh_node).aabbs[subnode];
+    let descriptor = meshlet_instance_descriptors[instance_id];
+    let bvh_subnode = load_bvh_subnode(descriptor, instanced_offset.offset, subnode);
+    var aabb_error_offset = bvh_subnode.aabb;
     let aabb = get_aabb(&aabb_error_offset);
     let parent_error = get_aabb_error(&aabb_error_offset);
-    let lod_sphere = (*bvh_node).lod_bounds[subnode];
+    let lod_sphere = bvh_subnode.lod_bounds;
 
     let parent_is_imperceptible = lod_error_is_imperceptible(lod_sphere, parent_error, instance_id);
     // Error and frustum cull, in both passes
     if parent_is_imperceptible || !aabb_in_frustum(aabb, instance_id) { return; }
 
     let child_offset = get_aabb_child_offset(&aabb_error_offset);
-    let index = subnode >> 2u;
-    let bit_offset = subnode & 3u;
-    let packed_child_count = (*bvh_node).child_counts[index];
-    let child_count = extractBits(packed_child_count, bit_offset * 8u, 8u);
+    let child_count = bvh_subnode.child_count;
     var value = InstancedOffset(instance_id, child_offset);
 
     // If we pass, try occlusion culling
