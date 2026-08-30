@@ -22,15 +22,47 @@ use bevy_mesh::{
 use bevy_platform::collections::{HashMap, HashSet};
 use bevy_render::{camera::ExtractedCamera, erased_render_asset::ErasedRenderAssets};
 use bevy_render::{
-    camera::TemporalJitter, material_bind_groups::MaterialBindGroupAllocators, render_resource::*,
+    camera::TemporalJitter,
+    material_bind_groups::{MaterialBindGroupAllocators, MaterialBindGroupIndex},
+    render_resource::*,
     view::ExtractedView,
 };
 use bevy_utils::default;
 use core::any::TypeId;
 
-/// A list of `(Material ID, Pipeline, BindGroup)` for a view for use in [`meshlet_main_opaque_pass`](`super::meshlet_main_opaque_pass`).
+/// One fullscreen material draw: which material slot to draw, the pipeline to draw it with, and
+/// where its bind group lives.
+pub struct MeshletViewMaterial {
+    pub material_id: u32,
+    pub pipeline: CachedRenderPipelineId,
+    pub material_type: TypeId,
+    pub binding: MaterialBindGroupIndex,
+}
+
+impl MeshletViewMaterial {
+    /// The bind group to draw with, or `None` while it is not ready.
+    ///
+    /// These lists are built in [`RenderSystems::QueueMeshes`], which the schedule orders strictly
+    /// before [`RenderSystems::PrepareBindGroups`] - so a material mutated this frame has always
+    /// invalidated its slab's bind group and never yet had it rebuilt. Resolving here skips just
+    /// that material for the frame instead of every material sharing its slab.
+    ///
+    /// [`RenderSystems::QueueMeshes`]: bevy_render::RenderSystems::QueueMeshes
+    /// [`RenderSystems::PrepareBindGroups`]: bevy_render::RenderSystems::PrepareBindGroups
+    pub fn bind_group<'a>(
+        &self,
+        allocators: &'a MaterialBindGroupAllocators,
+    ) -> Option<&'a BindGroup> {
+        allocators
+            .get(&self.material_type)?
+            .get(self.binding)?
+            .bind_group()
+    }
+}
+
+/// A list of [`MeshletViewMaterial`] for a view for use in [`meshlet_main_opaque_pass`](`super::meshlet_main_opaque_pass`).
 #[derive(Component, Deref, DerefMut, Default)]
-pub struct MeshletViewMaterialsMainOpaquePass(pub Vec<(u32, CachedRenderPipelineId, BindGroup)>);
+pub struct MeshletViewMaterialsMainOpaquePass(pub Vec<MeshletViewMaterial>);
 
 /// Prepare [`Material`] pipelines for [`MeshletMesh`](`super::MeshletMesh`) entities for use in [`meshlet_main_opaque_pass`](`super::meshlet_main_opaque_pass`),
 /// and register the material with [`InstanceManager`].
@@ -44,7 +76,6 @@ pub fn prepare_material_meshlet_meshes_main_opaque_pass(
     render_materials: Res<ErasedRenderAssets<PreparedMaterial>>,
     meshlet_pipelines: Res<MeshletPipelines>,
     render_material_instances: Res<RenderMaterialInstances>,
-    material_bind_group_allocators: Res<MaterialBindGroupAllocators>,
     mut mesh_vertex_buffer_layouts: ResMut<MeshVertexBufferLayouts>,
     mut views: Query<
         (
@@ -177,10 +208,6 @@ pub fn prepare_material_meshlet_meshes_main_opaque_pass(
             let type_id = material_id.type_id();
             let erased_key =
                 meshlet_material_pipeline_key(view_key, type_id, &material.properties.material_key);
-            let Some(material_bind_group_allocator) = material_bind_group_allocators.get(&type_id)
-            else {
-                continue;
-            };
 
             let pipeline_id = if let Some(&id) = cache.get(&erased_key) {
                 id
@@ -251,30 +278,23 @@ pub fn prepare_material_meshlet_meshes_main_opaque_pass(
                 pipeline_id
             };
 
-            let material_id = instance_manager.get_material_id(material_id);
-            let Some(material_bind_group) =
-                material_bind_group_allocator.get(material.binding.group)
-            else {
-                continue;
-            };
-            let Some(bind_group) = material_bind_group.bind_group() else {
-                continue;
-            };
-
-            materials.push((material_id, pipeline_id, (*bind_group).clone()));
+            materials.push(MeshletViewMaterial {
+                material_id: instance_manager.get_material_id(material_id),
+                pipeline: pipeline_id,
+                material_type: type_id,
+                binding: material.binding.group,
+            });
         }
     }
 }
 
-/// A list of `(Material ID, Pipeline, BindGroup)` for a view for use in [`meshlet_prepass`](`super::meshlet_prepass`).
+/// A list of [`MeshletViewMaterial`] for a view for use in [`meshlet_prepass`](`super::meshlet_prepass`).
 #[derive(Component, Deref, DerefMut, Default)]
-pub struct MeshletViewMaterialsPrepass(pub Vec<(u32, CachedRenderPipelineId, BindGroup)>);
+pub struct MeshletViewMaterialsPrepass(pub Vec<MeshletViewMaterial>);
 
-/// A list of `(Material ID, Pipeline, BindGroup)` for a view for use in [`meshlet_deferred_gbuffer_prepass`](`super::meshlet_deferred_gbuffer_prepass`).
+/// A list of [`MeshletViewMaterial`] for a view for use in [`meshlet_deferred_gbuffer_prepass`](`super::meshlet_deferred_gbuffer_prepass`).
 #[derive(Component, Deref, DerefMut, Default)]
-pub struct MeshletViewMaterialsDeferredGBufferPrepass(
-    pub Vec<(u32, CachedRenderPipelineId, BindGroup)>,
-);
+pub struct MeshletViewMaterialsDeferredGBufferPrepass(pub Vec<MeshletViewMaterial>);
 
 /// Prepare [`Material`] pipelines for [`MeshletMesh`](`super::MeshletMesh`) entities for use in [`meshlet_prepass`](`super::meshlet_prepass`),
 /// and [`meshlet_deferred_gbuffer_prepass`](`super::meshlet_deferred_gbuffer_prepass`) and register the material with [`InstanceManager`].
@@ -284,7 +304,6 @@ pub fn prepare_material_meshlet_meshes_prepass(
     mut cache: Local<HashMap<ErasedMaterialPipelineKey, CachedRenderPipelineId>>,
     pipeline_cache: Res<PipelineCache>,
     prepass_pipeline: Res<PrepassPipeline>,
-    material_bind_group_allocators: Res<MaterialBindGroupAllocators>,
     render_materials: Res<ErasedRenderAssets<PreparedMaterial>>,
     meshlet_pipelines: Res<MeshletPipelines>,
     render_material_instances: Res<RenderMaterialInstances>,
@@ -333,10 +352,6 @@ pub fn prepare_material_meshlet_meshes_prepass(
                 continue;
             };
             let type_id = material_id.type_id();
-            let Some(material_bind_group_allocator) = material_bind_group_allocators.get(&type_id)
-            else {
-                continue;
-            };
 
             if material.properties.alpha_mode != AlphaMode::Opaque
                 || material.properties.reads_view_transmission_texture
@@ -447,17 +462,12 @@ pub fn prepare_material_meshlet_meshes_prepass(
                 pipeline_id
             };
 
-            let material_id = instance_manager.get_material_id(material_id);
-            let Some(material_bind_group) =
-                material_bind_group_allocator.get(material.binding.group)
-            else {
-                continue;
+            let item = MeshletViewMaterial {
+                material_id: instance_manager.get_material_id(material_id),
+                pipeline: pipeline_id,
+                material_type: type_id,
+                binding: material.binding.group,
             };
-            let Some(bind_group) = material_bind_group.bind_group() else {
-                continue;
-            };
-
-            let item = (material_id, pipeline_id, (*bind_group).clone());
             if material_view_key.contains(MeshPipelineKey::DEFERRED_PREPASS) {
                 deferred_materials.push(item);
             } else {
@@ -534,5 +544,21 @@ mod tests {
 
         assert_eq!(first, same);
         assert_ne!(first, different);
+    }
+
+    #[test]
+    fn a_material_with_no_allocator_is_skipped_rather_than_resolved() {
+        // Resolution is total: the draw asks per material and skips what is not ready, so nothing
+        // has to pre-filter the list for it.
+        let material = MeshletViewMaterial {
+            material_id: 0,
+            pipeline: CachedRenderPipelineId::INVALID,
+            material_type: TypeId::of::<u32>(),
+            binding: MaterialBindGroupIndex(0),
+        };
+
+        assert!(material
+            .bind_group(&MaterialBindGroupAllocators::default())
+            .is_none());
     }
 }
