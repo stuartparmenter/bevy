@@ -30,12 +30,13 @@ use bevy_light::{
     EnvironmentMapLight, IrradianceVolume, NotShadowCaster, NotShadowReceiver,
     ShadowFilteringMethod, TransmittedShadowReceiver,
 };
-use bevy_math::{Affine3, Affine3Ext, Rect, UVec2, Vec3, Vec4};
+use bevy_math::{ops, Affine3, Affine3A, Affine3Ext, Rect, UVec2, Vec3, Vec4};
 use bevy_mesh::{
     skinning::SkinnedMesh, BaseMeshPipelineKey, Mesh, Mesh3d, MeshAttributeCompressionFlags,
     MeshTag, MeshVertexBufferLayoutRef, VertexAttributeDescriptor,
 };
 use bevy_platform::collections::{hash_map::Entry, HashMap};
+use bevy_reflect::{prelude::ReflectDefault, Reflect};
 use bevy_render::batching::gpu_preprocessing::{
     BufferDataInput, PreviousInstanceInputUniformBuffer,
 };
@@ -721,6 +722,109 @@ impl MeshUniform {
     }
 }
 
+/// A conservative upper bound, in mesh-local units, on how far this mesh's rasterized surface may
+/// deviate from the reference geometry it stands in for.
+///
+/// Consumers that trace against a different representation of the same object - a simplified BLAS,
+/// an SDF - need this to push ray origins off the surface they read out of the G-buffer, or the ray
+/// starts inside the traced proxy and instantly self-intersects. Scaled into world space and
+/// quantized into [`MeshFlags`], it reaches the deferred G-buffer's flag byte.
+///
+/// `MeshGeometryError(0.0)` means "provably exact" and is a far tighter claim than saying nothing:
+/// it drops the consumer to its smallest bias. Anything negative, [`GEOMETRY_ERROR_UNKNOWN`]
+/// included, states no error and leaves the consumer on its own conservative bound. That is the
+/// [`Default`], so a mesh that never authored one is not mistaken for an exact one.
+///
+/// Removing the component does not clear the flag until the entity changes for some other reason.
+/// The stale value is the previously quantized, larger code, so it stays conservative.
+#[derive(Component, FromTemplate, Clone, Copy, Debug, Deref, DerefMut, Reflect, PartialEq)]
+#[reflect(Component, Default, Clone, PartialEq)]
+pub struct MeshGeometryError(pub f32);
+
+impl Default for MeshGeometryError {
+    fn default() -> Self {
+        Self(GEOMETRY_ERROR_UNKNOWN)
+    }
+}
+
+/// The geometry error that states no error at all, as opposed to an exact `0.0`.
+///
+/// Dequantizing [`GEOMETRY_ERROR_CODE_UNKNOWN`] yields this, and so does scaling an unusable error
+/// into world space, so one comparison against zero separates "unknown" from "exact" everywhere.
+pub const GEOMETRY_ERROR_UNKNOWN: f32 = -1.0;
+
+/// Scales a mesh-local geometry error into world space, conservatively.
+///
+/// `sqrt(||M||_1 * ||M||_inf)` bounds the largest singular value of the transform's linear part,
+/// including shear, so the result is never an underestimate. Input that cannot be scaled - negative,
+/// NaN, infinite, or overflowing - states no error, because claiming exactness on garbage hands the
+/// consumer the tightest bias in the system.
+pub fn world_geometry_error(local_error: f32, world_from_local: &Affine3A) -> f32 {
+    if !local_error.is_finite() || local_error < 0.0 {
+        return GEOMETRY_ERROR_UNKNOWN;
+    }
+    if local_error == 0.0 {
+        return 0.0;
+    }
+
+    let matrix3 = world_from_local.matrix3;
+    let columns = [
+        Vec3::from(matrix3.x_axis).abs(),
+        Vec3::from(matrix3.y_axis).abs(),
+        Vec3::from(matrix3.z_axis).abs(),
+    ];
+    let norm_one = columns
+        .iter()
+        .map(|column| column.element_sum())
+        .fold(0.0f32, f32::max);
+    let row_sums = columns[0] + columns[1] + columns[2];
+    let norm_infinity = row_sums.max_element();
+    let error = local_error * (norm_one * norm_infinity).sqrt();
+    if error.is_finite() {
+        error
+    } else {
+        GEOMETRY_ERROR_UNKNOWN
+    }
+}
+
+/// Quantized code for "no geometry error was stated". Consumers fall back to their own conservative
+/// bound.
+pub const GEOMETRY_ERROR_CODE_UNKNOWN: u32 = 0;
+/// Quantized code for a provably zero geometry error.
+pub const GEOMETRY_ERROR_CODE_ZERO: u32 = 1;
+
+/// Quantizes a world-space geometry error into the 5-bit code [`MeshFlags`] carries.
+///
+/// Third-octave log steps over codes 2..=31, spanning 2^-10 m (0.98 mm) to 2^(29/3 - 10) m
+/// (0.794 m). Rounds up, so the dequantized value is always at least the input and a bias derived
+/// from it stays an upper bound. Anything past the top step returns [`GEOMETRY_ERROR_CODE_UNKNOWN`]
+/// rather than rounding down.
+pub fn quantize_geometry_error(world_error: f32) -> u32 {
+    if !world_error.is_finite() || world_error < 0.0 {
+        return GEOMETRY_ERROR_CODE_UNKNOWN;
+    }
+    if world_error == 0.0 {
+        return GEOMETRY_ERROR_CODE_ZERO;
+    }
+    let step = (3.0 * (ops::log2(world_error) + 10.0)).ceil();
+    if step > 29.0 {
+        return GEOMETRY_ERROR_CODE_UNKNOWN;
+    }
+    2 + step.max(0.0) as u32
+}
+
+/// Inverse of [`quantize_geometry_error`]. Returns [`GEOMETRY_ERROR_UNKNOWN`] for
+/// [`GEOMETRY_ERROR_CODE_UNKNOWN`].
+///
+/// Mirrored in WGSL by `bevy_pbr::deferred::types::deferred_geometry_error`.
+pub fn dequantize_geometry_error(code: u32) -> f32 {
+    match code {
+        GEOMETRY_ERROR_CODE_UNKNOWN => GEOMETRY_ERROR_UNKNOWN,
+        GEOMETRY_ERROR_CODE_ZERO => 0.0,
+        code => ops::exp2((code as f32 - 2.0) / 3.0 - 10.0),
+    }
+}
+
 // NOTE: These must match the bit flags in bevy_pbr/src/render/mesh_types.wesl!
 bitflags::bitflags! {
     /// Various flags and tightly-packed values on a mesh.
@@ -733,6 +837,8 @@ bitflags::bitflags! {
         ///
         /// This will be `u16::MAX` if this mesh has no LOD.
         const LOD_INDEX_MASK              = (1 << 16) - 1;
+        /// Bitmask for the 5-bit quantized world geometry error code.
+        const GEOMETRY_ERROR_CODE_MASK    = 0x1F << 16;
         /// Whether visibility ranges use the center of the AABB to compute
         /// distance from the camera.
         ///
@@ -762,6 +868,7 @@ impl MeshFlags {
         no_frustum_culling: bool,
         not_shadow_receiver: bool,
         transmitted_receiver: bool,
+        geometry_error: Option<&MeshGeometryError>,
     ) -> MeshFlags {
         let mut mesh_flags = if not_shadow_receiver {
             MeshFlags::empty()
@@ -788,11 +895,33 @@ impl MeshFlags {
         mesh_flags |=
             MeshFlags::from_bits_retain((lod_index_bits as u32) << MeshFlags::LOD_INDEX_SHIFT);
 
+        mesh_flags |= MeshFlags::from_geometry_error(geometry_error, &transform.affine());
+
         mesh_flags
     }
 
     /// The first bit of the LOD index.
     pub const LOD_INDEX_SHIFT: u32 = 0;
+
+    /// The first bit of the quantized world geometry error code.
+    pub const GEOMETRY_ERROR_CODE_SHIFT: u32 = 16;
+
+    /// Quantizes an instance's geometry error, in world space, into
+    /// [`MeshFlags::GEOMETRY_ERROR_CODE_MASK`].
+    ///
+    /// No component yields [`GEOMETRY_ERROR_CODE_UNKNOWN`], i.e. no bits set, which leaves every
+    /// consumer on whatever bound it used before the mesh stated one.
+    pub fn from_geometry_error(
+        geometry_error: Option<&MeshGeometryError>,
+        world_from_local: &Affine3A,
+    ) -> MeshFlags {
+        let Some(geometry_error) = geometry_error else {
+            return MeshFlags::empty();
+        };
+        let code =
+            quantize_geometry_error(world_geometry_error(geometry_error.0, world_from_local));
+        MeshFlags::from_bits_retain(code << MeshFlags::GEOMETRY_ERROR_CODE_SHIFT)
+    }
 }
 
 bitflags::bitflags! {
@@ -1811,6 +1940,7 @@ pub fn extract_meshes_for_cpu_building(
             Has<NoAutomaticBatching>,
             Option<&VisibilityRange>,
             Option<&RenderLayers>,
+            Option<&MeshGeometryError>,
         )>,
     >,
 ) {
@@ -1831,6 +1961,7 @@ pub fn extract_meshes_for_cpu_building(
             no_automatic_batching,
             visibility_range,
             render_layers,
+            geometry_error,
         )| {
             if !view_visibility.get() {
                 return;
@@ -1848,6 +1979,7 @@ pub fn extract_meshes_for_cpu_building(
                 no_frustum_culling,
                 not_shadow_receiver,
                 transmitted_receiver,
+                geometry_error,
             );
 
             let mesh_material = mesh_material_ids.mesh_material(MainEntity::from(entity));
@@ -1922,6 +2054,7 @@ type GpuMeshExtractionQuery = (
     ),
     Option<Read<VisibilityRange>>,
     Option<Read<RenderLayers>>,
+    Option<Read<MeshGeometryError>>,
 );
 
 /// Extracts meshes from the main world to thread-local buffers in the render
@@ -1957,6 +2090,7 @@ pub fn extract_meshes_for_gpu_building(
                 )>,
                 Changed<VisibilityRange>,
                 Changed<SkinnedMesh>,
+                Changed<MeshGeometryError>,
             )>,
         >,
     >,
@@ -2135,6 +2269,7 @@ fn extract_mesh_for_gpu_building(
         ),
         visibility_range,
         render_layers,
+        geometry_error,
     ): <GpuMeshExtractionQuery as QueryData>::Item<'_, '_>,
     render_visibility_ranges: &RenderVisibilityRanges,
     render_mesh_instances: &RenderMeshInstancesGpu,
@@ -2161,6 +2296,7 @@ fn extract_mesh_for_gpu_building(
         no_frustum_culling,
         not_shadow_receiver,
         transmitted_receiver,
+        geometry_error,
     );
 
     // Calculate shared mesh data.
@@ -4821,7 +4957,143 @@ impl<P: PhaseItem> RenderCommand<P> for DrawMesh {
 mod tests {
     use core::sync::atomic::{AtomicU64, Ordering};
 
-    use super::{AtomicU64ZeroBitIter, MeshPipelineKey};
+    use super::{
+        dequantize_geometry_error, quantize_geometry_error, world_geometry_error,
+        AtomicU64ZeroBitIter, MeshFlags, MeshGeometryError, MeshPipelineKey,
+        GEOMETRY_ERROR_CODE_UNKNOWN, GEOMETRY_ERROR_CODE_ZERO, GEOMETRY_ERROR_UNKNOWN,
+    };
+    use bevy_math::{ops, Affine3A, Vec3};
+    use core::f32::consts::FRAC_PI_4;
+
+    /// The measured per-instance world geometry errors in Zorah's Throne Room, plus the endpoints
+    /// that decide whether the quantizer can ever round a bias down.
+    const MEASURED_WORLD_ERRORS: [f32; 6] = [0.0, 0.02, 0.0283, 0.0543, 0.1395, 0.185];
+
+    #[test]
+    fn quantized_geometry_error_is_never_an_underestimate() {
+        // Rounding down is exactly how a tighter ray bias turns into shadow acne, so every
+        // representable error must dequantize to at least itself.
+        let mut sweep: Vec<f32> = (0..=140)
+            .map(|i| ops::exp2(-20.0 + (i as f32) * (23.3 / 140.0)))
+            .collect();
+        sweep.extend_from_slice(&MEASURED_WORLD_ERRORS);
+        for error in sweep {
+            let code = quantize_geometry_error(error);
+            assert!(
+                code < 32,
+                "{error} quantized to an out-of-range code {code}"
+            );
+            assert!(
+                code == GEOMETRY_ERROR_CODE_UNKNOWN || dequantize_geometry_error(code) >= error,
+                "{error} dequantized to {} below itself",
+                dequantize_geometry_error(code)
+            );
+        }
+    }
+
+    #[test]
+    fn geometry_error_quantizer_reserves_its_two_special_codes() {
+        assert_eq!(
+            quantize_geometry_error(f32::NAN),
+            GEOMETRY_ERROR_CODE_UNKNOWN
+        );
+        assert_eq!(
+            quantize_geometry_error(f32::INFINITY),
+            GEOMETRY_ERROR_CODE_UNKNOWN
+        );
+        assert_eq!(quantize_geometry_error(1e6), GEOMETRY_ERROR_CODE_UNKNOWN);
+        assert_eq!(quantize_geometry_error(0.0), GEOMETRY_ERROR_CODE_ZERO);
+        // Only an exact zero may claim exactness; a negative error states none.
+        assert_eq!(
+            quantize_geometry_error(GEOMETRY_ERROR_UNKNOWN),
+            GEOMETRY_ERROR_CODE_UNKNOWN
+        );
+        assert_eq!(
+            dequantize_geometry_error(GEOMETRY_ERROR_CODE_UNKNOWN),
+            GEOMETRY_ERROR_UNKNOWN
+        );
+        assert_eq!(dequantize_geometry_error(GEOMETRY_ERROR_CODE_ZERO), 0.0);
+    }
+
+    #[test]
+    fn the_default_geometry_error_states_no_error() {
+        // `RaytracingMesh3d` requires this component, so its default is what every mesh that never
+        // authored one reports, and it has to mean the same as not having the component at all.
+        assert_eq!(
+            MeshFlags::from_geometry_error(
+                Some(&MeshGeometryError::default()),
+                &Affine3A::IDENTITY
+            )
+            .bits(),
+            MeshFlags::from_geometry_error(None, &Affine3A::IDENTITY).bits()
+        );
+    }
+
+    #[test]
+    fn third_octave_steps_cost_at_most_a_quarter_of_over_bias() {
+        let quantized = dequantize_geometry_error(quantize_geometry_error(0.02));
+        assert!((0.02..=0.02 * 1.26).contains(&quantized), "{quantized}");
+    }
+
+    #[test]
+    fn geometry_error_codes_are_per_instance() {
+        // The bug this encodes: a 9.25x-scaled instance used to raise the bias of every other
+        // instance in the scene, including unscaled ones sharing its geometry error.
+        let unscaled =
+            MeshFlags::from_geometry_error(Some(&MeshGeometryError(0.02)), &Affine3A::IDENTITY);
+        let scaled = MeshFlags::from_geometry_error(
+            Some(&MeshGeometryError(0.02)),
+            &Affine3A::from_scale(Vec3::splat(9.25)),
+        );
+        assert_ne!(unscaled.bits(), scaled.bits());
+
+        let unscaled_code = unscaled.bits() >> MeshFlags::GEOMETRY_ERROR_CODE_SHIFT;
+        assert!(dequantize_geometry_error(unscaled_code) <= 0.026);
+    }
+
+    #[test]
+    fn a_mesh_that_states_no_geometry_error_sets_no_bits() {
+        assert_eq!(
+            MeshFlags::from_geometry_error(None, &Affine3A::IDENTITY).bits(),
+            MeshFlags::empty().bits()
+        );
+    }
+
+    #[test]
+    fn geometry_error_scales_conservatively() {
+        assert_eq!(world_geometry_error(0.02, &Affine3A::IDENTITY), 0.02);
+        assert_eq!(
+            world_geometry_error(0.02, &Affine3A::from_scale(Vec3::new(2.0, 9.25, 0.5))),
+            0.185
+        );
+        // A pure rotation cannot magnify anything, but sqrt(||M||_1 * ||M||_inf) still overshoots
+        // it by up to sqrt(2). Pinned so a tightening to sigma_max is a deliberate edit.
+        let rotated = world_geometry_error(0.02, &Affine3A::from_rotation_y(FRAC_PI_4));
+        assert!((0.02..=0.02 * core::f32::consts::SQRT_2 + 1e-6).contains(&rotated));
+    }
+
+    #[test]
+    fn unusable_geometry_error_states_no_error_rather_than_an_exact_one() {
+        for unusable in [-1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(
+                world_geometry_error(unusable, &Affine3A::IDENTITY),
+                GEOMETRY_ERROR_UNKNOWN,
+                "{unusable}"
+            );
+        }
+        // An authored exact zero is a real claim and must survive.
+        assert_eq!(world_geometry_error(0.0, &Affine3A::IDENTITY), 0.0);
+    }
+
+    #[test]
+    fn the_wgsl_decoder_matches_the_rust_quantizer() {
+        // The G-buffer round trip crosses a language boundary with no shared source, so pin the
+        // two halves to each other by text.
+        let deferred_types = include_str!("../deferred/types.wesl");
+        assert!(deferred_types.contains("exp2((f32(code) - 2.0) / 3.0 - 10.0)"));
+        let mesh_types = include_str!("mesh_types.wesl");
+        assert!(mesh_types.contains("0x1Fu << 16u"));
+    }
 
     #[test]
     fn mesh_key_msaa_samples() {
