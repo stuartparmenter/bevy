@@ -33,6 +33,20 @@ pub const MESHLET_DEFAULT_VERTEX_POSITION_QUANTIZATION_FACTOR: u8 = 4;
 
 const CENTIMETERS_PER_METER: f32 = 100.0;
 
+/// Grid steps per metre at a vertex position quantization factor: positions
+/// snap to 1/2^factor of a centimetre.
+pub fn vertex_position_quantization_scale(vertex_position_quantization_factor: u8) -> f32 {
+    (1 << vertex_position_quantization_factor) as f32 * CENTIMETERS_PER_METER
+}
+
+/// The fixed-point grid position a meshlet mesh stores for `position`, which
+/// is also the identity two vertices must share to be one point after the
+/// build.
+pub fn quantize_vertex_position(position: Vec3, vertex_position_quantization_factor: u8) -> IVec3 {
+    (position * vertex_position_quantization_scale(vertex_position_quantization_factor) + 0.5)
+        .as_ivec3()
+}
+
 impl MeshletMesh {
     /// Process a [`Mesh`] to generate a [`MeshletMesh`].
     ///
@@ -65,6 +79,64 @@ impl MeshletMesh {
         mesh: &Mesh,
         vertex_position_quantization_factor: u8,
     ) -> Result<Self, MeshToMeshletMeshConversionError> {
+        Self::build(mesh, vertex_position_quantization_factor, InputLocks::None)
+    }
+
+    /// Like [`Self::from_mesh`], but keeps every vertex on an open edge of the
+    /// mesh where it is at every LOD.
+    ///
+    /// Simplification only locks the vertices that neighbouring meshlet groups
+    /// share, which keeps a closed surface crack-free. A mesh that is one piece
+    /// of a larger surface - a partition of a mesh too large to build at once,
+    /// or a tile that meets its neighbours edge to edge - has open borders that
+    /// nothing else in the mesh shares, so coarser LODs move them and the seam
+    /// with the adjacent piece opens into cracks. Locking the border pins the
+    /// seam at every LOD, at the cost of the border never simplifying.
+    ///
+    /// Every open edge is locked, whether or not anything meets it. A closed
+    /// surface cut into partitions has open edges only along the cuts, so the
+    /// cost is small there; a mesh that is open everywhere - separate tiles,
+    /// loose shells, foliage cards, ribbons - is pinned nearly everywhere and
+    /// its coarse LODs stay close to full detail. Such a mesh should use
+    /// [`Self::from_mesh_with_locks`] with only the vertices it really shares.
+    pub fn from_mesh_with_locked_borders(
+        mesh: &Mesh,
+        vertex_position_quantization_factor: u8,
+    ) -> Result<Self, MeshToMeshletMeshConversionError> {
+        Self::build(
+            mesh,
+            vertex_position_quantization_factor,
+            InputLocks::OpenBorders,
+        )
+    }
+
+    /// Like [`Self::from_mesh`], but keeps the vertices `locked` marks (one
+    /// entry per input vertex) where they are at every LOD.
+    ///
+    /// This is the precise form of [`Self::from_mesh_with_locked_borders`]:
+    /// the caller names the seam instead of every open edge. Locking a vertex
+    /// locks its position, so every vertex sharing that position (a UV or
+    /// normal seam) is held with it; a locked position persists into the
+    /// coarsest LOD and is never collapsed, so lock only what geometry built
+    /// separately depends on meeting - a partition cut, the edge a tile
+    /// shares with its neighbour - and nothing else.
+    pub fn from_mesh_with_locks(
+        mesh: &Mesh,
+        vertex_position_quantization_factor: u8,
+        locked: &[bool],
+    ) -> Result<Self, MeshToMeshletMeshConversionError> {
+        Self::build(
+            mesh,
+            vertex_position_quantization_factor,
+            InputLocks::Explicit(locked),
+        )
+    }
+
+    fn build(
+        mesh: &Mesh,
+        vertex_position_quantization_factor: u8,
+        locks: InputLocks<'_>,
+    ) -> Result<Self, MeshToMeshletMeshConversionError> {
         let s = debug_span!("build meshlet mesh");
         let _e = s.enter();
 
@@ -79,6 +151,20 @@ impl MeshletMesh {
 
         // Generate a position-only vertex buffer for determining triangle/meshlet connectivity
         let position_only_vertex_remap = generate_position_remap(&vertices);
+
+        let border_locks = match locks {
+            InputLocks::None => vec![false; vertices.vertex_count],
+            InputLocks::OpenBorders => mesh_border_locks(&indices, &position_only_vertex_remap),
+            InputLocks::Explicit(locked) => {
+                if locked.len() != vertices.vertex_count {
+                    return Err(MeshToMeshletMeshConversionError::WrongLockCount {
+                        required: vertices.vertex_count,
+                        provided: locked.len(),
+                    });
+                }
+                position_locks(locked, &position_only_vertex_remap)
+            }
+        };
 
         // Split the mesh into an initial list of meshlets (LOD 0)
         let (mut meshlets, mut cull_data) =
@@ -114,6 +200,7 @@ impl MeshletMesh {
             // Lock borders between groups to prevent cracks when simplifying
             lock_group_borders(
                 &mut vertex_locks,
+                &border_locks,
                 &groups,
                 &meshlets,
                 &position_only_vertex_remap,
@@ -241,6 +328,262 @@ impl MeshletMesh {
             bvh_depth: depth,
         })
     }
+}
+
+impl MeshletMesh {
+    /// Drops every meshlet finer than `min_error` and rebuilds the mesh over the rest, so a scene
+    /// can trade detail it cannot afford to keep resident for a bounded geometric error.
+    ///
+    /// What is dropped: every LOD subtree whose BVH error is strictly below `min_error` - those
+    /// meshlets are only ever selected when the coarser meshlets that approximate them to within
+    /// that error are perceptibly wrong. The rule is strict, unlike the `<=` of
+    /// [`Self::raytracing_geometry`], so that `pruned(0.0)` is an identity on any mesh, including
+    /// one whose simplification reached a zero-error level; the cost is that a subtree with an
+    /// error of exactly `min_error` survives here where the `min_error` cut would skip it, so
+    /// `pruned(e)` holds the geometry of the cut at the next float below `e` and can retain a
+    /// little more than the `e` cut. Everything coarser survives with its packed vertex and index
+    /// data compacted, and the BVH is rebuilt over the survivors, so the result is a smaller
+    /// upload rather than a view of the original. `pruned(0.0)` still shrinks a little, since
+    /// compaction drops the padding meshopt leaves between index runs.
+    ///
+    /// Error semantics afterwards: a surviving meshlet whose own error was below `min_error` has
+    /// lost the finer children it would otherwise hand over to, so its error becomes `0.0` and
+    /// the runtime treats it as full detail - `cull_clusters.wgsl` only rasterizes a meshlet whose
+    /// own error is imperceptible, and a positive error would cull it up close and leave a hole
+    /// where its children used to be. Its `lod_group_sphere` is kept; with an error of zero it no
+    /// longer affects the test. Every other meshlet and every BVH node keeps its error, so the
+    /// geometry `raytracing_geometry(e)` selects from the result is the unpruned mesh's for every
+    /// `e >= min_error`, while a tighter request can only reach the detail that survived and so
+    /// returns the geometry pruning kept. What that call reports as `achieved_error` is not
+    /// comparable, though: the rewritten zeros hide how far those meshlets sit from the true
+    /// surface, so a consumer that biases by it (a BLAS cut) should select from the unpruned
+    /// mesh.
+    pub fn pruned(&self, min_error: f32) -> MeshletMesh {
+        assert!(min_error.is_finite() && min_error >= 0.0);
+
+        let mut groups = Vec::new();
+        self.collect_pruned_groups(0, min_error, &mut groups);
+        assert!(
+            !groups.is_empty(),
+            "the coarsest LOD carries an unbounded error and always survives"
+        );
+
+        // Lay the survivors out finest LOD first, as the bake did, so the BVH keeps each LOD in
+        // its own subtree and the cull traversal can skip whole LODs at once.
+        let levels = pruned_group_levels(&groups, &self.meshlet_cull_data);
+        let mut order: Vec<usize> = (0..groups.len()).collect();
+        order.sort_by_key(|&i| (levels[i], groups[i].aabb.child_offset));
+
+        let source_bits = self.vertex_positions.view_bits::<Lsb0>();
+        let mut vertex_positions = BitVec::<u32, Lsb0>::new();
+        let mut vertex_normals = Vec::new();
+        let mut vertex_uvs = Vec::new();
+        let mut indices = Vec::new();
+        let mut meshlets = Vec::new();
+        let mut cull_data = Vec::new();
+        let mut temp_groups = Vec::with_capacity(groups.len());
+        let mut lods: Vec<Range<u32>> = Vec::new();
+        for &group_id in &order {
+            let group = &groups[group_id];
+            let first = meshlets.len() as u32;
+            let next = temp_groups.len() as u32;
+            match lods.last_mut() {
+                Some(lod) if levels[group_id] == levels[order[lod.start as usize]] => lod.end += 1,
+                _ => lods.push(next..next + 1),
+            }
+
+            let start = group.aabb.child_offset as usize;
+            for meshlet_id in start..start + group.count as usize {
+                let meshlet = self.meshlets[meshlet_id];
+                let vertex_count = meshlet.vertex_count_minus_one as usize + 1;
+                let bits_per_vertex = meshlet.bits_per_vertex_position_channel_x as usize
+                    + meshlet.bits_per_vertex_position_channel_y as usize
+                    + meshlet.bits_per_vertex_position_channel_z as usize;
+                let position_start = meshlet.start_vertex_position_bit as usize;
+                let attribute_start = meshlet.start_vertex_attribute_id as usize;
+                let index_start = meshlet.start_index_id as usize;
+                let index_count = meshlet.triangle_count as usize * 3;
+
+                meshlets.push(Meshlet {
+                    start_vertex_position_bit: vertex_positions.len() as u32,
+                    start_vertex_attribute_id: vertex_normals.len() as u32,
+                    start_index_id: indices.len() as u32,
+                    ..meshlet
+                });
+                vertex_positions.extend_from_bitslice(
+                    &source_bits[position_start..position_start + vertex_count * bits_per_vertex],
+                );
+                vertex_normals.extend_from_slice(
+                    &self.vertex_normals[attribute_start..attribute_start + vertex_count],
+                );
+                vertex_uvs.extend_from_slice(
+                    &self.vertex_uvs[attribute_start..attribute_start + vertex_count],
+                );
+                indices.extend_from_slice(&self.indices[index_start..index_start + index_count]);
+
+                let data = self.meshlet_cull_data[meshlet_id];
+                let error = if data.aabb.error < min_error {
+                    0.0
+                } else {
+                    data.aabb.error
+                };
+                cull_data.push(MeshletCullData {
+                    aabb: MeshletAabbErrorOffset { error, ..data.aabb },
+                    lod_group_sphere: data.lod_group_sphere,
+                });
+            }
+
+            temp_groups.push(TempMeshletGroup {
+                aabb: Aabb3d::new(group.aabb.center, group.aabb.half_extent),
+                lod_bounds: BoundingSphere::new(group.lod_bounds.center, group.lod_bounds.radius),
+                parent_error: group.aabb.error,
+                meshlets: [first, group.count as u32].into_iter().collect(),
+            });
+        }
+        vertex_positions.set_uninitialized(false);
+
+        let mut bvh = BvhBuilder::default();
+        for lod in lods {
+            bvh.add_lod(lod.start, &temp_groups[..lod.end as usize]);
+        }
+        let (mut bvh, aabb, bvh_depth) = bvh.build_nodes(&temp_groups);
+        // The builder round-trips leaf bounds through `Aabb3d`, which is not bit-exact; the
+        // leaves are the bake's own values, so restore them.
+        let group_by_first: HashMap<u32, usize> = temp_groups
+            .iter()
+            .zip(&order)
+            .map(|(group, &group_id)| (group.meshlets[0], group_id))
+            .collect();
+        for node in &mut bvh {
+            for child in 0..8 {
+                let count = node.child_counts[child];
+                if count == 0 {
+                    break;
+                }
+                if count != u8::MAX {
+                    let group = &groups[group_by_first[&node.aabbs[child].child_offset]];
+                    node.aabbs[child].center = group.aabb.center;
+                    node.aabbs[child].half_extent = group.aabb.half_extent;
+                }
+            }
+        }
+        verify_bvh_complete(&bvh, &temp_cull_data(&cull_data));
+
+        MeshletMesh {
+            vertex_positions: vertex_positions.into_vec().into(),
+            vertex_normals: vertex_normals.into(),
+            vertex_uvs: vertex_uvs.into(),
+            indices: indices.into(),
+            bvh: bvh.into(),
+            meshlets: meshlets.into(),
+            meshlet_cull_data: cull_data.into(),
+            aabb,
+            bvh_depth,
+        }
+    }
+
+    /// The BVH leaves at or above the cut: the walk of `select_raytracing_meshlets`, but skipping
+    /// only strictly finer subtrees and keeping whole groups, since a group is the unit the BVH
+    /// is rebuilt from.
+    fn collect_pruned_groups(&self, node_id: usize, min_error: f32, groups: &mut Vec<PrunedGroup>) {
+        let node = &self.bvh[node_id];
+        for child in 0..8 {
+            let child_count = node.child_counts[child];
+            if child_count == 0 {
+                break;
+            }
+            let aabb = node.aabbs[child];
+            if aabb.error < min_error {
+                continue;
+            }
+            if child_count == u8::MAX {
+                self.collect_pruned_groups(aabb.child_offset as usize, min_error, groups);
+            } else {
+                groups.push(PrunedGroup {
+                    aabb,
+                    lod_bounds: node.lod_bounds[child],
+                    count: child_count,
+                });
+            }
+        }
+    }
+}
+
+/// The built cull data in the form the BVH builder and its verifier work in.
+fn temp_cull_data(cull_data: &[MeshletCullData]) -> Vec<TempMeshletCullData> {
+    cull_data
+        .iter()
+        .map(|data| TempMeshletCullData {
+            aabb: Aabb3d::new(data.aabb.center, data.aabb.half_extent),
+            lod_group_sphere: BoundingSphere::new(
+                data.lod_group_sphere.center,
+                data.lod_group_sphere.radius,
+            ),
+            error: data.aabb.error,
+        })
+        .collect()
+}
+
+/// A BVH leaf of a built mesh: the group it was simplified as, addressing a run of `count`
+/// meshlets at `aabb.child_offset`.
+struct PrunedGroup {
+    aabb: MeshletAabbErrorOffset,
+    lod_bounds: MeshletBoundingSphere,
+    count: u8,
+}
+
+/// Recovers how many simplification generations sit below each surviving group. A meshlet carries
+/// the LOD sphere and error of the group it was simplified from, verbatim, so those values name a
+/// group's children among the survivors; a group whose children were all pruned is a leaf. This
+/// only shapes the rebuilt BVH, so a coincidental match costs tree quality, not correctness.
+fn pruned_group_levels(groups: &[PrunedGroup], cull_data: &[MeshletCullData]) -> Vec<u32> {
+    fn key(sphere: MeshletBoundingSphere, error: f32) -> ([u32; 3], u32, u32) {
+        (
+            sphere.center.to_array().map(f32::to_bits),
+            sphere.radius.to_bits(),
+            error.to_bits(),
+        )
+    }
+    fn level(
+        group_id: usize,
+        groups: &[PrunedGroup],
+        cull_data: &[MeshletCullData],
+        by_key: &HashMap<([u32; 3], u32, u32), usize>,
+        levels: &mut [Option<u32>],
+        visiting: &mut [bool],
+    ) -> u32 {
+        if let Some(level) = levels[group_id] {
+            return level;
+        }
+        if visiting[group_id] {
+            return 0;
+        }
+        visiting[group_id] = true;
+        let group = &groups[group_id];
+        let start = group.aabb.child_offset as usize;
+        let mut result = 0;
+        for data in &cull_data[start..start + group.count as usize] {
+            if let Some(&child) = by_key.get(&key(data.lod_group_sphere, data.aabb.error))
+                && child != group_id
+            {
+                result = result.max(1 + level(child, groups, cull_data, by_key, levels, visiting));
+            }
+        }
+        visiting[group_id] = false;
+        levels[group_id] = Some(result);
+        result
+    }
+
+    let by_key: HashMap<_, _> = groups
+        .iter()
+        .enumerate()
+        .map(|(i, group)| (key(group.lod_bounds, group.aabb.error), i))
+        .collect();
+    let mut levels = vec![None; groups.len()];
+    let mut visiting = vec![false; groups.len()];
+    (0..groups.len())
+        .map(|i| level(i, groups, cull_data, &by_key, &mut levels, &mut visiting))
+        .collect()
 }
 
 fn validate_input_mesh(mesh: &Mesh) -> Result<Cow<'_, [u32]>, MeshToMeshletMeshConversionError> {
@@ -492,8 +835,46 @@ fn group_meshlets(
     groups
 }
 
+/// Marks every vertex that lies on an open edge of the mesh - an edge used by
+/// exactly one triangle, in position-only terms - so a partition's seam with
+/// its neighbours stays put through simplification.
+fn mesh_border_locks(indices: &[u32], position_only_vertex_remap: &[u32]) -> Vec<bool> {
+    let mut edge_uses: HashMap<(u32, u32), u32> = HashMap::default();
+    for triangle in indices.chunks_exact(3) {
+        let corners = [
+            position_only_vertex_remap[triangle[0] as usize],
+            position_only_vertex_remap[triangle[1] as usize],
+            position_only_vertex_remap[triangle[2] as usize],
+        ];
+        for (a, b) in [(0, 1), (1, 2), (2, 0)] {
+            let edge = (corners[a].min(corners[b]), corners[a].max(corners[b]));
+            if edge.0 != edge.1 {
+                *edge_uses.entry(edge).or_default() += 1;
+            }
+        }
+    }
+    let mut border_positions = vec![false; position_only_vertex_remap.len()];
+    for (&(a, b), &uses) in &edge_uses {
+        if uses == 1 {
+            border_positions[a as usize] = true;
+            border_positions[b as usize] = true;
+        }
+    }
+    spread_over_positions(&border_positions, position_only_vertex_remap)
+}
+
+/// Per-vertex flags from per-position flags: a lock belongs to a position, so
+/// every vertex sharing one (a UV or normal seam) carries it.
+fn spread_over_positions(position_flags: &[bool], position_only_vertex_remap: &[u32]) -> Vec<bool> {
+    position_only_vertex_remap
+        .iter()
+        .map(|position| position_flags[*position as usize])
+        .collect()
+}
+
 fn lock_group_borders(
     vertex_locks: &mut [bool],
+    border_locks: &[bool],
     groups: &[TempMeshletGroup],
     meshlets: &Meshlets,
     position_only_vertex_remap: &[u32],
@@ -520,10 +901,11 @@ fn lock_group_borders(
         }
     }
 
-    // Lock vertices used by more than 1 group
+    // Lock vertices used by more than 1 group, and the mesh's own open borders
+    // when the caller asked for them.
     for i in 0..vertex_locks.len() {
         let vertex_id = position_only_vertex_remap[i] as usize;
-        vertex_locks[i] = position_only_locks[vertex_id] == -2;
+        vertex_locks[i] = border_locks[i] || position_only_locks[vertex_id] == -2;
     }
 }
 
@@ -601,9 +983,6 @@ fn build_and_compress_per_meshlet_vertex_data(
     let start_vertex_position_bit = vertex_positions.len() as u32;
     let start_vertex_attribute_id = vertex_normals.len() as u32;
 
-    let quantization_factor =
-        (1 << vertex_position_quantization_factor) as f32 * CENTIMETERS_PER_METER;
-
     let mut min_quantized_position_channels = IVec3::MAX;
     let mut max_quantized_position_channels = IVec3::MIN;
     let mut min_vertex_uv = Vec2::splat(f32::INFINITY);
@@ -628,7 +1007,8 @@ fn build_and_compress_per_meshlet_vertex_data(
         vertex_normals.push(pack2x16snorm(octahedral_encode(normal)));
 
         // Quantize position to a fixed-point IVec3
-        let quantized_position = (position * quantization_factor + 0.5).as_ivec3();
+        let quantized_position =
+            quantize_vertex_position(position, vertex_position_quantization_factor);
         quantized_positions[i] = quantized_position;
 
         // Compute per X/Y/Z-channel quantized position min/max for this meshlet
@@ -948,7 +1328,7 @@ impl BvhBuilder {
     }
 
     fn build(
-        mut self,
+        self,
         meshlets: &mut Meshlets,
         mut groups: Vec<TempMeshletGroup>,
         cull_data: &mut Vec<TempMeshletCullData>,
@@ -973,6 +1353,15 @@ impl BvhBuilder {
         meshlets.meshlets = remap;
         *cull_data = remapped_cull_data;
 
+        let (out, aabb, max_depth) = self.build_nodes(&groups);
+        verify_bvh_complete(&out, cull_data);
+        (out, aabb, max_depth)
+    }
+
+    /// Emits the node array over groups whose `meshlets` already hold the `[first, count]` of a
+    /// contiguous run in the meshlet array, so a caller that never had loose meshlets to remap
+    /// (pruning a built mesh) shares the layout `from_mesh` produces.
+    fn build_nodes(mut self, groups: &[TempMeshletGroup]) -> (Vec<BvhNode>, MeshletAabb, u32) {
         let mut out = vec![];
         let mut aabb = aabb_default();
         let mut max_depth = 0;
@@ -988,7 +1377,7 @@ impl BvhBuilder {
             max_depth = 1;
         } else {
             let root = self.build_temp();
-            let root = self.build_inner(&groups, &mut out, &mut max_depth, root, 1);
+            let root = self.build_inner(groups, &mut out, &mut max_depth, root, 1);
             assert_eq!(root, 0, "root must be 0");
 
             let root = &out[0];
@@ -1004,13 +1393,6 @@ impl BvhBuilder {
             }
         }
 
-        let mut reachable = vec![false; meshlets.meshlets.len()];
-        verify_bvh(&out, cull_data, &mut reachable, 0);
-        assert!(
-            reachable.iter().all(|&x| x),
-            "all meshlets must be reachable"
-        );
-
         (
             out,
             MeshletAabb {
@@ -1020,6 +1402,16 @@ impl BvhBuilder {
             max_depth,
         )
     }
+}
+
+/// Checks the LOD invariants the cull shaders rely on and that the tree reaches every meshlet.
+fn verify_bvh_complete(out: &[BvhNode], cull_data: &[TempMeshletCullData]) {
+    let mut reachable = vec![false; cull_data.len()];
+    verify_bvh(out, cull_data, &mut reachable, 0);
+    assert!(
+        reachable.iter().all(|&x| x),
+        "all meshlets must be reachable"
+    );
 }
 
 fn verify_bvh(
@@ -1133,11 +1525,35 @@ pub enum MeshToMeshletMeshConversionError {
     },
     #[error("Mesh has no indices")]
     MeshMissingIndices,
+    #[error("Mesh has {required} vertices, but {provided} lock flags were given")]
+    WrongLockCount { required: usize, provided: usize },
+}
+
+/// Which input vertices the simplifier must keep in place at every LOD, on
+/// top of the group borders it always locks.
+enum InputLocks<'a> {
+    None,
+    /// Every vertex on an edge only one triangle uses.
+    OpenBorders,
+    /// The caller's choice, one flag per vertex.
+    Explicit(&'a [bool]),
+}
+
+/// Per-vertex lock flags widened to every vertex sharing a locked position.
+fn position_locks(locked: &[bool], position_only_vertex_remap: &[u32]) -> Vec<bool> {
+    let mut locked_positions = vec![false; position_only_vertex_remap.len()];
+    for (vertex_id, flag) in locked.iter().enumerate() {
+        if *flag {
+            locked_positions[position_only_vertex_remap[vertex_id] as usize] = true;
+        }
+    }
+    spread_over_positions(&locked_positions, position_only_vertex_remap)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::meshlet::MeshletRaytracingGeometry;
     use bevy_asset::RenderAssetUsages;
 
     #[test]
@@ -1186,5 +1602,469 @@ mod tests {
         let simplified = meshlet.raytracing_geometry(0.02);
         assert!(!simplified.indices.is_empty());
         assert!(simplified.indices.len() <= exact.indices.len());
+    }
+
+    #[test]
+    fn raytracing_geometry_reports_the_error_it_achieved_not_the_one_requested() {
+        AsyncComputeTaskPool::get_or_init(bevy_tasks::TaskPool::default);
+        // Two triangles cannot be simplified, so this deviates from the reference by nothing no
+        // matter how loose a bound it is asked for. Reporting the request instead lets one such
+        // mesh set a scene-wide ray bias it has no error to justify.
+        let quad = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::all())
+            .with_inserted_attribute(
+                Mesh::ATTRIBUTE_POSITION,
+                vec![
+                    [-0.5, 0.0, -0.5],
+                    [0.5, 0.0, -0.5],
+                    [-0.5, 0.0, 0.5],
+                    [0.5, 0.0, 0.5],
+                ],
+            )
+            .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, vec![[0.0, 1.0, 0.0]; 4])
+            .with_inserted_attribute(
+                Mesh::ATTRIBUTE_UV_0,
+                vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
+            )
+            .with_inserted_indices(Indices::U32(vec![0, 2, 1, 1, 2, 3]));
+        let meshlet = MeshletMesh::from_mesh(&quad, 4).unwrap();
+
+        let geometry = meshlet.raytracing_geometry(0.02);
+        assert_eq!(geometry.indices.len() / 3, 2);
+        assert_eq!(geometry.achieved_error, 0.0);
+
+        // And a cut that does simplify never overstates the bound it was given.
+        assert!(meshlet.raytracing_geometry(0.0).achieved_error <= 0.0);
+    }
+
+    /// A closed torus dense enough to simplify through several LODs.
+    fn torus_meshlet_mesh() -> MeshletMesh {
+        AsyncComputeTaskPool::get_or_init(bevy_tasks::TaskPool::default);
+        const MAJOR: u32 = 128;
+        const MINOR: u32 = 64;
+        let mut positions = Vec::new();
+        let mut normals = Vec::new();
+        let mut uvs = Vec::new();
+        for i in 0..MAJOR {
+            let u = i as f32 / MAJOR as f32;
+            let (su, cu) = bevy_math::ops::sin_cos(u * f32::consts::TAU);
+            for j in 0..MINOR {
+                let v = j as f32 / MINOR as f32;
+                let (sv, cv) = bevy_math::ops::sin_cos(v * f32::consts::TAU);
+                let ring = 1.0 + 0.4 * cv;
+                positions.push([ring * cu, 0.4 * sv, ring * su]);
+                normals.push([cv * cu, sv, cv * su]);
+                uvs.push([u, v]);
+            }
+        }
+        let mut indices = Vec::new();
+        for i in 0..MAJOR {
+            for j in 0..MINOR {
+                let a = i * MINOR + j;
+                let b = i * MINOR + (j + 1) % MINOR;
+                let c = ((i + 1) % MAJOR) * MINOR + j;
+                let d = ((i + 1) % MAJOR) * MINOR + (j + 1) % MINOR;
+                indices.extend_from_slice(&[a, c, b, b, c, d]);
+            }
+        }
+        let mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::all())
+            .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+            .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+            .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+            .with_inserted_indices(Indices::U32(indices));
+        MeshletMesh::from_mesh(&mesh, 4).unwrap()
+    }
+
+    fn total_triangles(mesh: &MeshletMesh) -> usize {
+        mesh.meshlets
+            .iter()
+            .map(|meshlet| meshlet.triangle_count as usize)
+            .sum()
+    }
+
+    /// The bounded errors of every BVH leaf, ascending and deduplicated: the thresholds at which
+    /// pruning changes what it keeps.
+    fn leaf_errors(mesh: &MeshletMesh) -> Vec<f32> {
+        let mut errors: Vec<f32> = mesh
+            .bvh
+            .iter()
+            .flat_map(|node| (0..8).map(move |i| (node.child_counts[i], node.aabbs[i].error)))
+            .filter(|&(count, error)| count != 0 && count != u8::MAX && error < f32::MAX)
+            .map(|(_, error)| error)
+            .collect();
+        errors.sort_by(f32::total_cmp);
+        errors.dedup();
+        errors
+    }
+
+    /// A cut as a sorted bag of triangles, so cuts from differently ordered meshes compare.
+    fn triangle_bag(geometry: &MeshletRaytracingGeometry) -> Vec<[[u32; 3]; 3]> {
+        let mut triangles: Vec<_> = geometry
+            .indices
+            .chunks_exact(3)
+            .map(|triangle| {
+                let mut corners = <[u32; 3]>::try_from(triangle)
+                    .unwrap()
+                    .map(|index| geometry.positions[index as usize].map(f32::to_bits));
+                corners.sort_unstable();
+                corners
+            })
+            .collect();
+        triangles.sort_unstable();
+        triangles
+    }
+
+    /// The packed bytes a meshlet owns, independent of where they sit in the streams.
+    fn meshlet_payload(
+        mesh: &MeshletMesh,
+        meshlet: &Meshlet,
+    ) -> (BitVec<u32, Lsb0>, Vec<u32>, Vec<u32>, Vec<u8>) {
+        let vertex_count = meshlet.vertex_count_minus_one as usize + 1;
+        let bits_per_vertex = (meshlet.bits_per_vertex_position_channel_x
+            + meshlet.bits_per_vertex_position_channel_y
+            + meshlet.bits_per_vertex_position_channel_z) as usize;
+        let position_start = meshlet.start_vertex_position_bit as usize;
+        let attribute_start = meshlet.start_vertex_attribute_id as usize;
+        let index_start = meshlet.start_index_id as usize;
+        (
+            mesh.vertex_positions.view_bits::<Lsb0>()
+                [position_start..position_start + vertex_count * bits_per_vertex]
+                .to_bitvec(),
+            mesh.vertex_normals[attribute_start..attribute_start + vertex_count].to_vec(),
+            mesh.vertex_uvs[attribute_start..attribute_start + vertex_count].to_vec(),
+            mesh.indices[index_start..index_start + meshlet.triangle_count as usize * 3].to_vec(),
+        )
+    }
+
+    /// Meshlets keyed by their tight AABB, which pruning copies verbatim and no two meshlets of
+    /// one mesh share.
+    fn meshlets_by_aabb(mesh: &MeshletMesh) -> HashMap<[u32; 6], usize> {
+        let by_aabb: HashMap<_, _> = mesh
+            .meshlet_cull_data
+            .iter()
+            .enumerate()
+            .map(|(id, data)| {
+                let mut key = [0; 6];
+                key[..3].copy_from_slice(&data.aabb.center.to_array().map(f32::to_bits));
+                key[3..].copy_from_slice(&data.aabb.half_extent.to_array().map(f32::to_bits));
+                (key, id)
+            })
+            .collect();
+        assert_eq!(by_aabb.len(), mesh.meshlets.len());
+        by_aabb
+    }
+
+    #[test]
+    fn read_decodes_what_write_encoded() {
+        use crate::meshlet::asset::{MeshletMeshSaveOrLoadError, MESHLET_MESH_ASSET_VERSION};
+
+        let mesh = torus_meshlet_mesh();
+        let mut file = Vec::new();
+        mesh.write(&mut file).unwrap();
+        let read = MeshletMesh::read(&mut file.as_slice()).unwrap();
+        assert_eq!(read.vertex_positions, mesh.vertex_positions);
+        assert_eq!(read.vertex_normals, mesh.vertex_normals);
+        assert_eq!(read.vertex_uvs, mesh.vertex_uvs);
+        assert_eq!(read.indices, mesh.indices);
+        assert_eq!(
+            bytemuck::cast_slice::<_, u8>(&read.bvh),
+            bytemuck::cast_slice::<_, u8>(&mesh.bvh)
+        );
+        assert_eq!(
+            bytemuck::cast_slice::<_, u8>(&read.meshlets),
+            bytemuck::cast_slice::<_, u8>(&mesh.meshlets)
+        );
+        assert_eq!(
+            bytemuck::cast_slice::<_, u8>(&read.meshlet_cull_data),
+            bytemuck::cast_slice::<_, u8>(&mesh.meshlet_cull_data)
+        );
+        assert_eq!(
+            bytemuck::bytes_of(&read.aabb),
+            bytemuck::bytes_of(&mesh.aabb)
+        );
+        assert_eq!(read.bvh_depth, mesh.bvh_depth);
+        assert_eq!(read.triangle_count(), mesh.triangle_count());
+
+        // The header is checked before anything is decompressed.
+        assert!(matches!(
+            MeshletMesh::read(&mut &b"not a meshlet mesh"[..]),
+            Err(MeshletMeshSaveOrLoadError::WrongFileType)
+        ));
+        let mut stale = file.clone();
+        stale[8..16].copy_from_slice(&(MESHLET_MESH_ASSET_VERSION + 1).to_le_bytes());
+        assert!(matches!(
+            MeshletMesh::read(&mut stale.as_slice()),
+            Err(MeshletMeshSaveOrLoadError::WrongVersion { found }) if found == MESHLET_MESH_ASSET_VERSION + 1
+        ));
+        file.truncate(file.len() / 2);
+        assert!(MeshletMesh::read(&mut file.as_slice()).is_err());
+    }
+
+    #[test]
+    fn pruning_at_zero_keeps_every_meshlet() {
+        let mesh = torus_meshlet_mesh();
+        let pruned = mesh.pruned(0.0);
+        assert_eq!(pruned.meshlets.len(), mesh.meshlets.len());
+        assert_eq!(total_triangles(&pruned), total_triangles(&mesh));
+        // Compaction drops the padding meshopt puts between index runs, and nothing else.
+        assert!(pruned.packed_byte_len() <= mesh.packed_byte_len());
+        assert_eq!(pruned.vertex_positions.len(), mesh.vertex_positions.len());
+        assert_eq!(pruned.vertex_normals.len(), mesh.vertex_normals.len());
+        assert_eq!(pruned.bvh.len(), mesh.bvh.len());
+        assert_eq!(pruned.meshlet_count(), mesh.meshlet_count());
+        verify_bvh_complete(&pruned.bvh, &temp_cull_data(&pruned.meshlet_cull_data));
+        assert_eq!(
+            triangle_bag(&pruned.raytracing_geometry(0.0)),
+            triangle_bag(&mesh.raytracing_geometry(0.0))
+        );
+        // Nothing lost its children, so nothing had its error rewritten.
+        let mut original: Vec<u32> = mesh
+            .meshlet_cull_data
+            .iter()
+            .map(|d| d.aabb.error.to_bits())
+            .collect();
+        let mut kept: Vec<u32> = pruned
+            .meshlet_cull_data
+            .iter()
+            .map(|d| d.aabb.error.to_bits())
+            .collect();
+        original.sort_unstable();
+        kept.sort_unstable();
+        assert_eq!(original, kept);
+    }
+
+    #[test]
+    fn pruning_trades_meshlets_for_an_error_bound() {
+        let mesh = torus_meshlet_mesh();
+        let errors = leaf_errors(&mesh);
+        assert!(
+            errors.len() >= 4,
+            "torus must simplify through several LODs"
+        );
+        // Just past a leaf error, so each threshold drops at least one more group than the last;
+        // the final one leaves only the unsimplifiable coarsest LOD.
+        let thresholds = [
+            errors[errors.len() / 4].next_up(),
+            errors[errors.len() / 2].next_up(),
+            errors[errors.len() * 3 / 4].next_up(),
+            errors[errors.len() - 1].next_up(),
+        ];
+        let original_by_aabb = meshlets_by_aabb(&mesh);
+
+        let mut previous_meshlets = mesh.meshlets.len();
+        let mut previous_bytes = mesh.packed_byte_len();
+        for min_error in thresholds {
+            let pruned = mesh.pruned(min_error);
+            assert!(pruned.meshlets.len() < previous_meshlets, "{min_error}");
+            assert!(pruned.packed_byte_len() < previous_bytes, "{min_error}");
+            assert_eq!(pruned.meshlets.len(), pruned.meshlet_cull_data.len());
+            previous_meshlets = pruned.meshlets.len();
+            previous_bytes = pruned.packed_byte_len();
+
+            verify_bvh_complete(&pruned.bvh, &temp_cull_data(&pruned.meshlet_cull_data));
+            assert!(pruned.bvh_depth >= 1);
+
+            // The cut at the bound, and every looser one, is unchanged.
+            for error in [min_error, min_error * 4.0, 1.0e6] {
+                assert_eq!(
+                    triangle_bag(&pruned.raytracing_geometry(error)),
+                    triangle_bag(&mesh.raytracing_geometry(error)),
+                    "cut at {error} after pruning at {min_error}"
+                );
+            }
+            // A tighter request cannot reach detail that is gone.
+            assert_eq!(
+                triangle_bag(&pruned.raytracing_geometry(0.0)),
+                triangle_bag(&mesh.raytracing_geometry(min_error))
+            );
+
+            // Survivors that lost their children read as full detail; every other error, sphere,
+            // and byte of packed data is the original's.
+            let mut finest_rewritten = 0;
+            for (id, meshlet) in pruned.meshlets.iter().enumerate() {
+                let data = &pruned.meshlet_cull_data[id];
+                assert!(data.aabb.error == 0.0 || data.aabb.error >= min_error);
+
+                let mut key = [0; 6];
+                key[..3].copy_from_slice(&data.aabb.center.to_array().map(f32::to_bits));
+                key[3..].copy_from_slice(&data.aabb.half_extent.to_array().map(f32::to_bits));
+                let original_id = original_by_aabb[&key];
+                let original = &mesh.meshlet_cull_data[original_id];
+                assert_eq!(
+                    data.lod_group_sphere.center.to_array().map(f32::to_bits),
+                    original
+                        .lod_group_sphere
+                        .center
+                        .to_array()
+                        .map(f32::to_bits)
+                );
+                assert_eq!(
+                    data.lod_group_sphere.radius,
+                    original.lod_group_sphere.radius
+                );
+                if original.aabb.error < min_error {
+                    assert_eq!(data.aabb.error, 0.0);
+                    finest_rewritten += usize::from(original.aabb.error > 0.0);
+                } else {
+                    assert_eq!(data.aabb.error, original.aabb.error);
+                }
+
+                let original_meshlet = &mesh.meshlets[original_id];
+                assert_eq!(
+                    bytemuck::bytes_of(&Meshlet {
+                        start_vertex_position_bit: 0,
+                        start_vertex_attribute_id: 0,
+                        start_index_id: 0,
+                        ..*meshlet
+                    }),
+                    bytemuck::bytes_of(&Meshlet {
+                        start_vertex_position_bit: 0,
+                        start_vertex_attribute_id: 0,
+                        start_index_id: 0,
+                        ..*original_meshlet
+                    })
+                );
+                assert_eq!(
+                    meshlet_payload(&pruned, meshlet),
+                    meshlet_payload(&mesh, original_meshlet)
+                );
+            }
+            assert!(
+                finest_rewritten > 0,
+                "{min_error} left no simplified meshlet as the finest"
+            );
+        }
+    }
+
+    /// An `n` by `n` grid of quads on the XZ plane with open borders all
+    /// round, as a partition of a larger surface has; returns its positions
+    /// and the mesh.
+    fn open_grid(n: u32) -> (Vec<[f32; 3]>, Mesh) {
+        let mut positions = Vec::new();
+        let mut normals = Vec::new();
+        let mut uvs = Vec::new();
+        for y in 0..=n {
+            for x in 0..=n {
+                positions.push([x as f32, 0.0, y as f32]);
+                normals.push([0.0, 1.0, 0.0]);
+                uvs.push([x as f32 / n as f32, y as f32 / n as f32]);
+            }
+        }
+        let mut indices = Vec::new();
+        for y in 0..n {
+            for x in 0..n {
+                let i = y * (n + 1) + x;
+                indices.extend_from_slice(&[i, i + n + 1, i + 1, i + 1, i + n + 1, i + n + 2]);
+            }
+        }
+        let mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::all())
+            .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions.clone())
+            .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+            .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+            .with_inserted_indices(Indices::U32(indices));
+        (positions, mesh)
+    }
+
+    fn contains_position(geometry: &MeshletRaytracingGeometry, p: &[f32; 3]) -> bool {
+        geometry.positions.iter().any(|q| {
+            (q[0] - p[0]).abs() < 1e-3 && (q[1] - p[1]).abs() < 1e-3 && (q[2] - p[2]).abs() < 1e-3
+        })
+    }
+
+    /// The coarsest cut: the root of the LOD hierarchy carries an unbounded
+    /// error, so any finite budget below it selects it.
+    fn coarsest(mesh: &MeshletMesh) -> MeshletRaytracingGeometry {
+        let cut = mesh.raytracing_geometry(1.0e6);
+        assert!(!cut.indices.is_empty());
+        cut
+    }
+
+    #[test]
+    fn locked_borders_pin_a_partition_seam_through_every_lod() {
+        AsyncComputeTaskPool::get_or_init(bevy_tasks::TaskPool::default);
+        // Every interior vertex is free to move; the border must not.
+        let n = 24u32;
+        let (positions, mesh) = open_grid(n);
+        let indices = match mesh.indices() {
+            Some(Indices::U32(indices)) => indices.clone(),
+            _ => unreachable!(),
+        };
+        let remap: Vec<u32> = (0..positions.len() as u32).collect();
+        let locks = mesh_border_locks(&indices, &remap);
+        let border = |i: usize| {
+            let (x, y) = (i as u32 % (n + 1), i as u32 / (n + 1));
+            x == 0 || y == 0 || x == n || y == n
+        };
+        assert!((0..positions.len()).all(|i| locks[i] == border(i)));
+
+        // The coarsest cut of the locked build still contains every border
+        // position of the source, where the free build is allowed to lose them.
+        let locked = MeshletMesh::from_mesh_with_locked_borders(&mesh, 4).unwrap();
+        let cut = coarsest(&locked);
+        for (i, p) in positions.iter().enumerate() {
+            if border(i) {
+                assert!(
+                    contains_position(&cut, p),
+                    "border vertex {p:?} moved or vanished"
+                );
+            }
+        }
+    }
+
+    /// An open grid with only one of its four borders locked: that edge must
+    /// survive to the coarsest LOD, the opposite edge must lose vertices, and
+    /// the whole must simplify far below what locking every open edge allows.
+    #[test]
+    fn explicit_locks_pin_only_the_named_seam() {
+        AsyncComputeTaskPool::get_or_init(bevy_tasks::TaskPool::default);
+        let n = 24u32;
+        let (positions, mesh) = open_grid(n);
+        let seam = |i: usize| (i as u32).is_multiple_of(n + 1);
+        let locked: Vec<bool> = (0..positions.len()).map(seam).collect();
+
+        assert!(matches!(
+            MeshletMesh::from_mesh_with_locks(&mesh, 4, &locked[1..]),
+            Err(MeshToMeshletMeshConversionError::WrongLockCount {
+                required,
+                provided
+            }) if required == positions.len() && provided == positions.len() - 1
+        ));
+
+        let free = MeshletMesh::from_mesh(&mesh, 4).unwrap();
+        let unlocked =
+            MeshletMesh::from_mesh_with_locks(&mesh, 4, &vec![false; positions.len()]).unwrap();
+        assert_eq!(unlocked.meshlets.len(), free.meshlets.len());
+        assert_eq!(
+            coarsest(&unlocked).indices.len(),
+            coarsest(&free).indices.len()
+        );
+
+        let pinned = MeshletMesh::from_mesh_with_locks(&mesh, 4, &locked).unwrap();
+        let bordered = MeshletMesh::from_mesh_with_locked_borders(&mesh, 4).unwrap();
+        let cut = coarsest(&pinned);
+        for (i, p) in positions.iter().enumerate() {
+            if seam(i) {
+                assert!(
+                    contains_position(&cut, p),
+                    "seam vertex {p:?} moved or vanished"
+                );
+            }
+        }
+        let far_edge_kept = positions
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i as u32 % (n + 1) == n)
+            .filter(|(_, p)| contains_position(&cut, p))
+            .count();
+        assert!(
+            far_edge_kept < n as usize + 1,
+            "the unlocked border kept all {far_edge_kept} of its {} vertices",
+            n + 1
+        );
+        let pinned_triangles = cut.indices.len() / 3;
+        let bordered_triangles = coarsest(&bordered).indices.len() / 3;
+        assert!(
+            pinned_triangles * 2 < bordered_triangles,
+            "one locked edge left {pinned_triangles} triangles, every open edge {bordered_triangles}"
+        );
     }
 }
