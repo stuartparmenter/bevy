@@ -160,9 +160,8 @@ bake starts from the app's first frame and the states go `Baking` ->
   the app waits for Solari's measured BLAS readiness (`available_blas >=
   expected`, no queued builds or compactions), then inserts `SolariLighting`
   (and DLSS Ray Reconstruction when the `dlss` feature is on and the GPU
-  supports it). Until then the meshlet raster preview is lit by a flat
-  ambient term of the same sky colour and radiance (illuminance / pi),
-  which is zeroed again when Solari takes over.
+  supports it). Until then the meshlet raster preview is lit by the
+  camera's `EnvironmentMapLight`.
 - Placements whose world matrix carries shear (a rotated child under a
   non-uniformly scaled parent; the palm trees here) are spawned as a chain of
   parent entities mirroring their glTF nodes, since one `Transform` cannot
@@ -173,14 +172,26 @@ bake starts from the app's first frame and the states go `Baking` ->
 ## Lighting caveat
 
 The export has no lights. RTXMG, the reference renderer, lights it with the
-sidecar's equirectangular HDR alone, which bevy_solari cannot bind yet (its
-environment light is a uniform hemisphere), and lets sky light into the
-throne room through its stained glass as thin-wall transmission, which
-bevy_solari has no notion of either. The `--sky-*`, `--sun-illuminance`,
-`--emissive-boost` and `--fire-lumens` flags are stand-ins until a textured
-environment light and thin-wall transmission exist in bevy_solari. By
-default transmissive materials are left out of the BLAS so the sky reaches
-the throne room through its windows.
+sidecar's equirectangular HDR alone (`settings.envmap` in
+`<name>.scene.json`, with its `envmap rotation` and `envmap intensity`)
+and lets sky light into the throne room through its stained glass as
+thin-wall transmission, which bevy_solari has no notion of. By default
+transmissive materials are left out of the BLAS so the sky reaches the
+throne room through its windows; `--emissive-boost` and `--fire-lumens`
+remain stand-ins for the interiors.
+
+The HDR is converted to a cubemap at start-up and put on the camera as an
+`EnvironmentMapLight`, which bevy_solari importance-samples, and as a
+`Skybox` behind the geometry Solari's primary rays miss. Its values are in
+arbitrary units, so its intensity is normalised so that the map's sky (sun
+texels excluded) averages the radiance of a 15000 lux uniform sky;
+`--envmap-intensity` multiplies that. The map is rotated by the sidecar's
+`envmap rotation` minus 180 degrees, since RTXMG turns its lookup direction
+by minus that angle and the converter's seam is half a turn from RTXMG's.
+The analytic `--sun-illuminance` sun stays on by default: the map's sun
+disc is a few texels and Solari resolves it poorly; `--sun-illuminance 0`
+lights from the map alone. A map that fails to load or convert leaves the
+sun as the only light.
 
 The export has no exposure data either; auto exposure uses the reference
 renderer's metering (the mean of the 80th..95th luminance percentiles
@@ -213,9 +224,8 @@ scaled to -0.5 EV before ACES), and `--exposure-bias` adds to it.
 | `--double-sided-all` | off | Render everything double-sided like the reference renderer. |
 | `--gltf-specular` | off | Honour `KHR_materials_specular`. Off because the export's 0.498 is UE's default Specular 0.5 written literally, and taking it as glTF would halve F0. |
 | `--glass-in-blas` | off | Include transmissive materials in the BLAS. |
-| `--sky-illuminance lux` | `15000` | Uniform sky light. |
-| `--sky-color r,g,b` | `0.78,0.86,1.0` | Sky colour, linear. |
-| `--sun-illuminance lux` | `0` | Directional sun from the .cfg direction (0.6, 0.7, 0.36) and colour (1.0, 0.8, 0.5); `0` = none. |
+| `--envmap-intensity k` | `1` | Multiplies the environment map over its normalisation (sky mean = a 15000 lux uniform sky). |
+| `--sun-illuminance lux` | `100000` | Directional sun from the .cfg direction (0.6, 0.7, 0.36) and colour (1.0, 0.8, 0.5); `0` = none. |
 | `--emissive-boost k` | `4` | Multiplies every emissive material (lamp glass, coals). |
 | `--fire-lumens lm` | `800` | Emissive proxy sphere at every `FirePot`/`FireGrate`/`Firewood_Coal` node; `0` = none. |
 | `--clay` | off | Flat grey clay everywhere, lighting only. |

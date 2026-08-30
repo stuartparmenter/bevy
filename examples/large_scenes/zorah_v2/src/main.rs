@@ -14,6 +14,7 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod bake;
+mod environment;
 mod geometry;
 mod lod;
 mod materials;
@@ -45,10 +46,11 @@ use bevy::{
 use bevy::anti_alias::dlss::DlssProjectId;
 
 use bake::{BakeEvent, BakeSettings, MeshJob};
+use environment::EnvironmentMapLoad;
 use lod::{LodSettings, ZorahPart, ZorahPartLoader};
 use materials::{MaterialCache, MaterialOptions, MaterialSpec};
 use runner::{SceneData, SpawnOptions, ZorahState};
-use scene::SceneView;
+use scene::{SceneEnvironmentMap, SceneView};
 use setup::{ScreenshotAfter, SetupOptions};
 
 const DOWNLOAD_HINT: &str =
@@ -58,13 +60,10 @@ const ROOT_GLTF: &str = "zorah_textured_public.v1.gltf";
 const CACHE_DIR_NAME: &str = ".bevy_zorah_cache";
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 
-// TODO(lighting): the export carries no lights at all. RTXMG, the reference
-// renderer, lights it with the sidecar's equirectangular HDR alone, which
-// bevy_solari cannot bind yet (its environment light is a uniform +Y
-// hemisphere), and lets sky light through the throne room's stained glass as
-// thin-wall transmission, which it has no notion of either. The sky, sun,
-// emissive-boost and fire flags below are stand-ins until a textured
-// environment light and thin-wall transmission exist in bevy_solari.
+// TODO(lighting): RTXMG, the reference renderer, lets sky light into the
+// throne room through its stained glass as thin-wall transmission, which
+// bevy_solari has no notion of; the emissive-boost and fire flags stand in for
+// it. The sidecar HDR itself is bound by `environment.rs`.
 
 // Doc comments here are argh's help text, where backticks would print literally.
 #[expect(clippy::doc_markdown, reason = "argh prints these as help text")]
@@ -163,16 +162,12 @@ struct Args {
     #[argh(switch)]
     glass_in_blas: bool,
 
-    /// illuminance in lux of the uniform sky Solari lights the scene with
-    #[argh(option, default = "15000.0")]
-    sky_illuminance: f32,
+    /// multiplier on the sidecar environment map, over the normalisation that gives its sky (sun excluded) the mean radiance of a 15000 lux uniform sky
+    #[argh(option, default = "1.0")]
+    envmap_intensity: f32,
 
-    /// sky colour r,g,b in linear 0..1
-    #[argh(option, default = "String::from(\"0.78,0.86,1.0\")")]
-    sky_color: String,
-
-    /// illuminance in lux of a directional sun from the .cfg direction; 0 = no sun
-    #[argh(option, default = "0.0")]
+    /// illuminance in lux of a directional sun from the .cfg direction (default direct sunlight, 100000); 0 = no sun
+    #[argh(option, default = "100000.0")]
     sun_illuminance: f32,
 
     /// multiplier on every emissive material so lamp glass and coals act as light sources
@@ -203,10 +198,6 @@ impl Args {
             raster_error: bound("--raster-error", self.raster_error)?,
             raytracing_error: bound("--raytracing-error", self.raytracing_error)?,
         })
-    }
-
-    fn sky_color(&self) -> Result<Vec3, String> {
-        parse_vec3(&self.sky_color).map_err(|error| format!("--sky-color: {error}"))
     }
 
     fn camera_position(&self) -> Result<Option<Vec3>, String> {
@@ -401,7 +392,7 @@ struct Prepared {
     scene: SceneData,
     materials: Vec<MaterialSpec>,
     view: SceneView,
-    sky_color: Vec3,
+    environment_map: SceneEnvironmentMap,
     camera_position: Option<Vec3>,
     camera_target: Option<Vec3>,
     /// Logged once the app has a subscriber.
@@ -414,7 +405,6 @@ struct Prepared {
 fn prepare(args: &Args) -> Result<Prepared, String> {
     // Validated up front so a typo fails before the bake, not after it.
     let lod = args.lod()?;
-    let sky_color = args.sky_color()?;
     let camera_position = args.camera_position()?;
     let camera_target = args.camera_target()?;
     let root = resolve_scene_root(args)?;
@@ -455,7 +445,7 @@ fn prepare(args: &Args) -> Result<Prepared, String> {
                 .collect()
         })
         .collect();
-    let (view, view_warning) = scene::read_view(&root.gltf);
+    let (view, environment_map, view_warning) = scene::read_sidecar(&root.gltf);
     let warnings = view_warning.into_iter().collect::<Vec<_>>();
 
     // Only the selected meshes' instances spawn; the rest are dropped here so
@@ -515,7 +505,7 @@ fn prepare(args: &Args) -> Result<Prepared, String> {
         },
         materials,
         view,
-        sky_color,
+        environment_map,
         camera_position,
         camera_target,
         summary,
@@ -588,14 +578,20 @@ fn run_app(args: &Args, prepared: Prepared) -> ExitCode {
         scene,
         materials,
         view,
-        sky_color,
+        environment_map,
         camera_position,
         camera_target,
         summary,
         warnings,
     } = prepared;
+    let environment_map = SceneEnvironmentMap {
+        intensity: environment_map.intensity
+            * scene::usable_intensity(args.envmap_intensity).unwrap_or(1.0),
+        ..environment_map
+    };
     let setup_options = SetupOptions {
         view,
+        environment_map,
         camera_position,
         camera_target,
         exposure_ev100: args.exposure_ev100.filter(|ev100| ev100.is_finite()),
@@ -605,8 +601,6 @@ fn run_app(args: &Args, prepared: Prepared) -> ExitCode {
         } else {
             0.0
         },
-        sky_illuminance: args.sky_illuminance.max(0.0),
-        sky_color,
         sun_illuminance: args.sun_illuminance.max(0.0),
         fire_lumens: args.fire_lumens.max(0.0),
         solari_albedo: args.solari_albedo,
@@ -648,16 +642,14 @@ fn run_app(args: &Args, prepared: Prepared) -> ExitCode {
             AssetSourceBuilder::platform_default(&root.cache_dir.to_string_lossy(), None),
         )
         .add_plugins((
-            DefaultPlugins
-                .set(task_pool_plugin())
-                .set(AssetPlugin {
-                    // Textures load by the root glTF's own relative URIs.
-                    file_path: root.dir.to_string_lossy().into_owned(),
-                    // Thousands of textures and cache parts, none with a
-                    // .meta file: skip the probe for each.
-                    meta_check: AssetMetaCheck::Never,
-                    ..default()
-                }),
+            DefaultPlugins.set(task_pool_plugin()).set(AssetPlugin {
+                // Textures load by the root glTF's own relative URIs.
+                file_path: root.dir.to_string_lossy().into_owned(),
+                // Thousands of textures and cache parts, none with a
+                // .meta file: skip the probe for each.
+                meta_check: AssetMetaCheck::Never,
+                ..default()
+            }),
             MeshletPlugin {
                 // Zorah's instanced scene exceeds eight million leaf meshlets
                 // before hierarchy and candidate pressure; an undersized cull
@@ -705,6 +697,10 @@ fn run_app(args: &Args, prepared: Prepared) -> ExitCode {
         .add_systems(
             Update,
             runner::warm_up_raytracing.run_if(in_state(ZorahState::WarmingRaytracing)),
+        )
+        .add_systems(
+            Update,
+            environment::install_environment_map.run_if(resource_exists::<EnvironmentMapLoad>),
         )
         .add_systems(Update, setup::dump_camera_and_screenshot)
         .run();
