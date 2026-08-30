@@ -15,14 +15,22 @@ use self::instances::{
 use self::lights::LightState;
 use self::tlas::TlasState;
 pub use self::tlas::{build_raytracing_tlas, TlasInstanceSetupPipeline};
-use super::{blas::BlasManager, extract::StandardMaterialAssets, RaytracingMesh3d};
+use super::{
+    blas::BlasManager,
+    environment::EnvironmentImportanceMaps,
+    extract::{ExtractedEnvironmentMapLight, StandardMaterialAssets},
+    RaytracingMesh3d,
+};
+use bevy_asset::AssetId;
 use bevy_ecs::{
     entity::Entity,
     lifecycle::RemovedComponents,
     resource::Resource,
-    system::{Query, Res, ResMut},
+    system::{Query, Res, ResMut, SystemParam},
     world::{FromWorld, World},
 };
+use bevy_image::Image;
+use bevy_log::warn_once;
 use bevy_pbr::ExtractedDirectionalLight;
 use bevy_render::{
     mesh::allocator::MeshAllocator,
@@ -32,6 +40,25 @@ use bevy_render::{
     texture::GpuImage,
 };
 use tracing::info_span;
+
+/// Small scene constants the shaders read alongside Solari's other scene data.
+///
+/// wgpu forbids uniform-buffer bindings in a bind group that also contains binding arrays, so
+/// these live in a read-only storage buffer instead.
+#[derive(ShaderType, Clone, Copy, PartialEq, Debug)]
+struct GpuSceneParameters {
+    /// Face size of the bound importance pyramid.
+    environment_face_size: u32,
+    /// Mip count of the bound pyramid, `log2(face_size) + 3`.
+    environment_mip_count: u32,
+}
+
+/// The environment light and the importance pyramid kept in step with it.
+#[derive(SystemParam)]
+pub struct EnvironmentParams<'w> {
+    environment_map_light: Res<'w, ExtractedEnvironmentMapLight>,
+    importance_maps: ResMut<'w, EnvironmentImportanceMaps>,
+}
 
 /// Insert this resource into the render world to make the raytracing scene retain the previous
 /// frame's TLAS and the light id translation table that maps into it.
@@ -52,6 +79,8 @@ pub struct RaytracingSceneBindings {
     bind_groups: BindGroupCacheState,
     environment_map_light_sampler: Sampler,
     environment_map_light_buffer: StorageBuffer<GpuEnvironmentMapLight>,
+    scene_parameters: StorageBuffer<GpuSceneParameters>,
+    last_scene_parameters: Option<GpuSceneParameters>,
 }
 
 impl RaytracingSceneBindings {
@@ -59,6 +88,12 @@ impl RaytracingSceneBindings {
     /// frame's table translates from this frame's light ids rather than older ones.
     pub fn note_light_translations_consumed(&self) {
         self.lights.note_translations_consumed();
+    }
+
+    /// The linear sampler the environment map is read with, also used to build its importance
+    /// pyramid so the two see the same filtered radiance.
+    pub(crate) fn environment_map_light_sampler(&self) -> &Sampler {
+        &self.environment_map_light_sampler
     }
 }
 
@@ -91,6 +126,10 @@ impl FromWorld for RaytracingSceneBindings {
                     texture_cube(TextureSampleType::Float { filterable: true }),
                     sampler(SamplerBindingType::Filtering),
                     storage_buffer_read_only_sized(false, None),
+                    storage_buffer_read_only::<GpuSceneParameters>(false),
+                    // R32Float is not filterable without FLOAT32_FILTERABLE and the pyramid is
+                    // only ever read with textureLoad.
+                    texture_2d(TextureSampleType::Float { filterable: false }),
                 ),
             ),
         );
@@ -119,6 +158,11 @@ impl FromWorld for RaytracingSceneBindings {
             bind_groups: BindGroupCacheState::new(render_device),
             environment_map_light_sampler,
             environment_map_light_buffer,
+            scene_parameters: StorageBuffer::from(GpuSceneParameters {
+                environment_face_size: 1,
+                environment_mip_count: 3,
+            }),
+            last_scene_parameters: None,
         }
     }
 }
@@ -129,6 +173,7 @@ pub fn prepare_raytracing_scene_resources(
     changed_instances: Query<Entity, ChangedInstanceFilter>,
     mut removed_instances: RemovedComponents<RaytracingMesh3d>,
     directional_lights: Query<(Entity, &ExtractedDirectionalLight)>,
+    mut environment_params: EnvironmentParams,
     needs_previous_frame_data: Option<Res<RaytracingSceneNeedsPreviousFrameData>>,
     mesh_allocator: Res<MeshAllocator>,
     blas_manager: Res<BlasManager>,
@@ -174,8 +219,26 @@ pub fn prepare_raytracing_scene_resources(
         &changed_instances,
     );
 
-    // Update the light set, now that emissive instances are resolved
-    bindings.lights.update(&directional_lights);
+    // Keep the environment's importance pyramid in step with the cubemap the bind group binds
+    let environment_present = resolve_environment_map(
+        &mut environment_params,
+        &texture_assets,
+        &extracted_images,
+        &render_device,
+        &render_queue,
+    );
+
+    // Update the light set, now that emissive instances and the environment are resolved
+    bindings
+        .lights
+        .update(&directional_lights, environment_present);
+
+    write_scene_parameters(
+        bindings,
+        &environment_params.importance_maps,
+        &render_device,
+        &render_queue,
+    );
 
     // Upload the above writes
     write_sparse_buffers(bindings, &render_device, &render_queue);
@@ -193,6 +256,84 @@ pub fn prepare_raytracing_scene_resources(
         build_ready,
         needs_previous_frame_data,
     );
+}
+
+/// The environment light's cubemap, once its image is prepared and really is a cubemap; `None`
+/// means the scene has no environment light. The bind group and the light list both go through
+/// this, so the light is present exactly when its cubemap is bound.
+fn environment_cubemap<'a>(
+    environment_map_light: &ExtractedEnvironmentMapLight,
+    texture_assets: &'a RenderAssets<GpuImage>,
+) -> Option<(AssetId<Image>, &'a GpuImage)> {
+    let asset = environment_map_light.cubemap.as_ref()?.id();
+    let gpu = texture_assets.get(asset)?;
+    let layers = gpu.texture_descriptor.size.depth_or_array_layers;
+    let view_dimension = gpu
+        .texture_view_descriptor
+        .as_ref()
+        .and_then(|descriptor| descriptor.dimension);
+    if layers != 6 || view_dimension != Some(TextureViewDimension::Cube) {
+        warn_once!(
+            ?asset,
+            layers,
+            ?view_dimension,
+            "the environment map light's image is not a cubemap (it needs 6 array layers and a \
+             texture_view_descriptor with dimension Cube); Solari renders no environment until \
+             it is"
+        );
+        return None;
+    }
+    Some((asset, gpu))
+}
+
+/// Keeps [`EnvironmentImportanceMaps`] targeted at the environment cubemap, and returns whether
+/// there is an environment light this frame.
+fn resolve_environment_map(
+    environment_params: &mut EnvironmentParams,
+    texture_assets: &RenderAssets<GpuImage>,
+    modified_images: &ExtractedAssets<GpuImage>,
+    render_device: &RenderDevice,
+    render_queue: &RenderQueue,
+) -> bool {
+    let environment_map_light = &*environment_params.environment_map_light;
+    let importance_maps = &mut *environment_params.importance_maps;
+    match environment_cubemap(environment_map_light, texture_assets) {
+        Some((asset, gpu)) => {
+            importance_maps.request(
+                asset,
+                gpu,
+                environment_map_light.contents_change_every_frame
+                    || modified_images.modified.contains(&asset),
+                render_device,
+                render_queue,
+            );
+            true
+        }
+        None => {
+            importance_maps.release();
+            false
+        }
+    }
+}
+
+/// Refreshes the scene-constant storage buffer whenever one of its inputs changed.
+fn write_scene_parameters(
+    bindings: &mut RaytracingSceneBindings,
+    environment_maps: &EnvironmentImportanceMaps,
+    device: &RenderDevice,
+    queue: &RenderQueue,
+) {
+    let pyramid = &environment_maps.pyramid;
+    let parameters = GpuSceneParameters {
+        environment_face_size: pyramid.face_size(),
+        environment_mip_count: pyramid.mip_count(),
+    };
+
+    if bindings.last_scene_parameters != Some(parameters) {
+        bindings.scene_parameters.set(parameters);
+        bindings.scene_parameters.write_buffer(device, queue);
+        bindings.last_scene_parameters = Some(parameters);
+    }
 }
 
 /// Grows every sparse buffer to hold at least one element, then snapshots its dirty set into

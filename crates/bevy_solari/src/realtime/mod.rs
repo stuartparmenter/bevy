@@ -172,10 +172,7 @@ pub struct SolariLighting {
     ///
     /// Higher values capture indirect light from farther away for more accurate
     /// GI at the cost of longer (more expensive) ray traversal and increased noise.
-    /// Lower values are faster and less noisy but may miss distant lighting or leak sky lighting.
-    ///
-    /// Rays that miss within this distance are treated as reaching the environment
-    /// map light, and leak sky lighting into the cache.
+    /// Lower values are faster and less noisy but may miss distant lighting.
     pub world_cache_max_gi_ray_distance: f32,
 
     /// Soft upper limit on the number of world cache cells to update each frame.
@@ -263,5 +260,27 @@ fn manage_prepass_double_buffers(
                 entity.remove::<DepthPrepassDoubleBuffer>();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod shader_source_tests {
+    #[test]
+    fn ray_misses_consume_the_shared_environment() {
+        let initial_path = include_str!("initial_path.wesl");
+        assert!(initial_path.contains("sample_environment_map_light(next_bounce.wi)"));
+        assert!(initial_path.contains("environment_light_pdf(next_bounce.wi)"));
+        assert!(
+            initial_path.contains("environment_light_pdf(di.wi)"),
+            "environment NEE must MIS against the BRDF-miss strategy that owns the same radiance"
+        );
+    }
+
+    #[test]
+    fn world_cache_gi_misses_do_not_re_add_the_environment() {
+        // sample_di samples the environment for every cell with a full-range visibility ray, and
+        // the GI ray is truncated at world_cache_max_gi_ray_distance, so a miss must add nothing.
+        let world_cache_update = include_str!("world_cache_update.wesl");
+        assert!(!world_cache_update.contains("sample_environment_map_light"));
     }
 }

@@ -158,6 +158,10 @@ pub struct ExtractedEnvironmentMapLight {
     pub cubemap: Option<Handle<Image>>,
     pub intensity: f32,
     pub rotation: Quat,
+    /// The cubemap is a `GeneratedEnvironmentMapLight` source, which may be rewritten on the GPU
+    /// every frame (`AtmosphereEnvironmentMapLight` renders into one), so the importance pyramid
+    /// is rebuilt every frame.
+    pub contents_change_every_frame: bool,
 }
 
 /// Finds the environment map light to use for the raytraced scene, if any.
@@ -179,15 +183,19 @@ pub fn extract_raytracing_environment_map_light(
         }
 
         let env_map_light = match (generated, pregenerated) {
+            // Generation copies the intensity and rotation into the `EnvironmentMapLight` once,
+            // and raster lighting reads them from there from then on, so follow it when present.
             (Some(generated), _) => ExtractedEnvironmentMapLight {
                 cubemap: Some(generated.environment_map.clone()),
-                intensity: generated.intensity,
-                rotation: generated.rotation,
+                intensity: pregenerated.map_or(generated.intensity, |light| light.intensity),
+                rotation: pregenerated.map_or(generated.rotation, |light| light.rotation),
+                contents_change_every_frame: true,
             },
             (None, Some(pregenerated)) => ExtractedEnvironmentMapLight {
                 cubemap: Some(pregenerated.specular_map.clone()),
                 intensity: pregenerated.intensity,
                 rotation: pregenerated.rotation,
+                contents_change_every_frame: false,
             },
             (None, None) => continue,
         };
