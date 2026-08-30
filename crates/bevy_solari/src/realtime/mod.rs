@@ -368,6 +368,25 @@ mod shader_source_tests {
     }
 
     #[test]
+    fn ray_misses_consume_the_shared_environment() {
+        let initial_path = include_str!("initial_path.wesl");
+        assert!(initial_path.contains("sample_environment_radiance(next_bounce.wi)"));
+        assert!(initial_path.contains("environment_light_pdf(next_bounce.wi)"));
+        assert!(
+            initial_path.contains("environment_light_pdf(di.wi)"),
+            "environment NEE must MIS against the BRDF-miss strategy that owns the same radiance"
+        );
+    }
+
+    #[test]
+    fn world_cache_gi_misses_do_not_re_add_the_environment() {
+        // sample_di samples the environment for every cell with a full-range visibility ray, and
+        // the GI ray is truncated at world_cache_max_gi_ray_distance, so a miss must add nothing.
+        let world_cache_update = include_str!("world_cache_update.wesl");
+        assert!(!world_cache_update.contains("sample_environment_radiance"));
+    }
+
+    #[test]
     fn light_tile_selection_is_reshuffled_every_frame() {
         // The tiles are refilled every frame, so a frozen choice is not a frozen set of lights. It
         // does keep each workgroup sharing its tile with exactly the same others, whose variance
