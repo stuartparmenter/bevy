@@ -44,7 +44,7 @@ use bevy::{
     },
     solari::prelude::{
         MeshGeometryError, RaytracingMesh3d, RaytracingSceneStatus, RaytracingSceneStatusSnapshot,
-        SolariEnvironmentLight, SolariLighting, SolariPlugins,
+        SolariLighting, SolariPlugins,
     },
 };
 use serde::Deserialize;
@@ -682,7 +682,6 @@ struct DataLayerMember(Vec<u16>);
 struct DormantLayerParts {
     raytracing: Option<RaytracingMesh3d>,
     meshlet: Option<MeshletMesh3d>,
-    environment: Option<SolariEnvironmentLight>,
     decal: Option<ClusteredDecal>,
 }
 
@@ -2696,7 +2695,6 @@ fn spawn_exported_lights(
     let mut spot_count = 0usize;
     let mut directional_count = 0usize;
     let mut sky_count = 0usize;
-    let mut environment_count = 0usize;
     let mut unsupported_profiles = 0usize;
     let mut scaled_light_functions = 0usize;
     let mut legacy_unit_count = 0usize;
@@ -2870,7 +2868,7 @@ fn spawn_exported_lights(
                     // SkyAtmosphere, so its brightness follows the sun rather
                     // than the fixed source-unit bridge. Solari sees no
                     // environment map, so the capture becomes its uniform sky.
-                    let (color, illuminance) = match captured_sky {
+                    let (_, illuminance) = match captured_sky {
                         Some(sky) if light.real_time_capture => (
                             LinearRgba::rgb(
                                 color.red * sky.tint.red,
@@ -2882,17 +2880,11 @@ fn spawn_exported_lights(
                         _ => (color, ue_sky_light_illuminance(light.intensity)),
                     };
                     sky_brightness += illuminance;
-                    commands.spawn((
-                        Name::new(format!("{} Solari environment", light.name)),
-                        SolariEnvironmentLight { color, illuminance },
-                        layers.clone(),
-                    ));
-                    environment_count += 1;
                     info!(
                         light = %light.name,
                         real_time_capture = light.real_time_capture,
                         illuminance,
-                        "Zorah sky light as a uniform Solari environment"
+                        "Zorah sky light"
                     );
                 }
                 kind => warn!(light = %light.name, %kind, "unsupported Zorah light component"),
@@ -2912,7 +2904,6 @@ fn spawn_exported_lights(
         spot_count,
         directional_count,
         sky_count,
-        environment_count,
         unsupported_profiles,
         scaled_light_functions,
         legacy_unit_count,
@@ -3334,7 +3325,7 @@ fn captured_sky_light(
     // The scene half of the capture: stone lit by the sun over part of it and
     // by the sky everywhere, seen as an average radiance `rho * E / pi`, and
     // restated as the illuminance a uniform hemisphere of that radiance
-    // delivers (`pi * L`), which is what `SolariEnvironmentLight` takes.
+    // delivers (`pi * L`).
     let scene_fraction = capture.scene_fraction.clamp(0.0, 1.0);
     let sunlit_fraction = capture.sunlit_fraction.clamp(0.0, 1.0);
     let scene_flux = CAPTURED_SCENE_ALBEDO
@@ -4689,7 +4680,6 @@ type DataLayerParts<'w> = (
     &'w DataLayerMember,
     Option<&'w RaytracingMesh3d>,
     Option<&'w MeshletMesh3d>,
-    Option<&'w SolariEnvironmentLight>,
     Option<&'w ClusteredDecal>,
     Option<&'w mut DormantLayerParts>,
     Option<&'w mut Visibility>,
@@ -4727,7 +4717,7 @@ fn apply_data_layers(
 fn apply_data_layer_state(
     commands: &mut Commands,
     data_layers: &DataLayers,
-    (entity, member, raytracing, meshlet, environment, decal, dormant, visibility): QueryItem<
+    (entity, member, raytracing, meshlet, decal, dormant, visibility): QueryItem<
         DataLayerParts,
     >,
 ) {
@@ -4740,9 +4730,6 @@ fn apply_data_layer_state(
                 entity_commands.insert(part);
             }
             if let Some(part) = dormant.meshlet {
-                entity_commands.insert(part);
-            }
-            if let Some(part) = dormant.environment {
                 entity_commands.insert(part);
             }
             if let Some(part) = dormant.decal {
@@ -4765,10 +4752,6 @@ fn apply_data_layer_state(
         parts.meshlet = Some(meshlet.clone());
         entity_commands.remove::<MeshletMesh3d>();
     }
-    if let Some(environment) = environment {
-        parts.environment = Some(*environment);
-        entity_commands.remove::<SolariEnvironmentLight>();
-    }
     if let Some(decal) = decal {
         parts.decal = Some(decal.clone());
         entity_commands.remove::<ClusteredDecal>();
@@ -4778,7 +4761,6 @@ fn apply_data_layer_state(
             // A part attached after the layer went dormant joins the stash.
             dormant.raytracing = parts.raytracing.or(dormant.raytracing.take());
             dormant.meshlet = parts.meshlet.or(dormant.meshlet.take());
-            dormant.environment = parts.environment.or(dormant.environment.take());
             dormant.decal = parts.decal.or(dormant.decal.take());
         }
         None => {

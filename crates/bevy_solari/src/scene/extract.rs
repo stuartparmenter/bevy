@@ -1,4 +1,4 @@
-use super::{RaytracingMesh3d, RaytracingSceneBindings, SolariEnvironmentLight};
+use super::{RaytracingMesh3d, RaytracingSceneBindings};
 use bevy_asset::{AssetEvent, AssetId, Assets};
 use bevy_ecs::{
     lifecycle::RemovedComponents,
@@ -114,29 +114,6 @@ pub fn extract_raytracing_scene_meshes_and_materials(
             *material = new_material.clone();
             *geometry_error = *new_geometry_error;
         }
-    }
-}
-
-/// Mirrors [`SolariEnvironmentLight`] components into the render world.
-///
-/// The component is a few floats, so copying every one each frame is cheaper than
-/// tracking changes for it.
-pub fn extract_solari_environment_lights(
-    environment_lights: Extract<Query<(RenderEntity, &SolariEnvironmentLight)>>,
-    mut removed_environment_lights: Extract<RemovedComponents<SolariEnvironmentLight>>,
-    render_entities: Extract<Query<RenderEntity>>,
-    mut commands: Commands,
-) {
-    for main_entity in removed_environment_lights.read() {
-        if let Ok(render_entity) = render_entities.get(main_entity) {
-            commands
-                .entity(render_entity)
-                .remove::<SolariEnvironmentLight>();
-        }
-    }
-
-    for (render_entity, environment_light) in &environment_lights {
-        commands.entity(render_entity).insert(*environment_light);
     }
 }
 

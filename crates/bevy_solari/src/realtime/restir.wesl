@@ -7,8 +7,8 @@ import package::scene::brdf::{brdf_pdf, evaluate_brdf, F_AB};
 import package::realtime::gbuffer_utils::{gpixel_resolve, permute_pixel, pixel_dissimilar};
 import package::realtime::initial_path::{generate_initial_path, InitialSamplingResult};
 import package::realtime::bindings::{depth_buffer, empty_reservoir, gbuffer, motion_vectors, pixel_world_size, previous_depth_buffer, previous_gbuffer, previous_view, reservoirs_a, reservoirs_b, Reservoir, constants, view, view_output};
-import package::scene::sampling::{balance_heuristic, calculate_resolved_light_contribution, isinf, isnan, light_sample_is_environment, LightSample, NULL_LIGHT_ID, power_heuristic, resolve_light_sample, ResolvedLightSample, trace_visibility, trace_visibility_previous_frame};
-import package::scene::bindings::{environment_light_pdf, light_sources, LIGHT_NOT_PRESENT_THIS_FRAME, previous_frame_light_id_translations, rasterized_surface_ray_origin_bias, ray_origin_bias_with_raster_lod, RAY_T_MAX, ResolvedMaterial};
+import package::scene::sampling::{balance_heuristic, calculate_resolved_light_contribution, isinf, isnan, LightSample, NULL_LIGHT_ID, power_heuristic, resolve_light_sample, ResolvedLightSample, trace_visibility, trace_visibility_previous_frame};
+import package::scene::bindings::{light_sources, LIGHT_NOT_PRESENT_THIS_FRAME, previous_frame_light_id_translations, rasterized_surface_ray_origin_bias, ray_origin_bias_with_raster_lod, RAY_T_MAX, ResolvedMaterial};
 import package::realtime::world_cache_query::{query_world_cache, WORLD_CACHE_CELL_LIFETIME};
 
 enable wgpu_ray_query;
@@ -328,16 +328,11 @@ fn reservoir_contribution(reservoir: Reservoir, resolved: ResolvedLightSample, w
     if reservoir.light_sample.light_id != NULL_LIGHT_ID {
         let light_contribution = calculate_resolved_light_contribution(resolved, world_position, world_normal);
 
-        // MIS weight against the bounce-0 BRDF strategy (emissive hits and environment misses), recomputed from this surface's
+        // MIS weight against the bounce-0 BRDF-emissive strategy, recomputed from this surface's
         // brdf and material rather than baked into the unbiased contribution weight at generation. Mirrors the bounce-0
         // nee_mis_weight in generate_nee_candidate and generate_emissive_candidate, which puts the same factor in the target.
         var nee_mis_weight = 1.0;
-        if light_sample_is_environment(reservoir.light_sample) {
-            let p_nee = mix(1.0, material.perceptual_roughness, material.metallic);
-            let p_nee_strategy = f32(constants.primary_di_samples) * environment_light_pdf(light_contribution.wi) * p_nee;
-            let p_brdf_at_nee = brdf_pdf(wo, light_contribution.wi, world_normal, material, F_ab);
-            nee_mis_weight = power_heuristic(p_nee_strategy, p_brdf_at_nee);
-        } else if light_contribution.brdf_rays_can_hit && light_contribution.inverse_solid_angle_pdf > 0.0 {
+        if light_contribution.brdf_rays_can_hit && light_contribution.inverse_solid_angle_pdf > 0.0 {
             let light_count = arrayLength(&light_sources);
             let inverse_solid_angle_pdf = light_contribution.inverse_solid_angle_pdf * f32(light_count);
             let p_nee = mix(1.0, material.perceptual_roughness, material.metallic);

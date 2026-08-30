@@ -15,9 +15,7 @@ use self::instances::{
 use self::lights::LightState;
 use self::tlas::TlasState;
 pub use self::tlas::{build_raytracing_tlas, TlasInstanceSetupPipeline};
-use super::{
-    blas::BlasManager, extract::StandardMaterialAssets, RaytracingMesh3d, SolariEnvironmentLight,
-};
+use super::{blas::BlasManager, extract::StandardMaterialAssets, RaytracingMesh3d};
 use bevy_ecs::{
     entity::Entity,
     lifecycle::RemovedComponents,
@@ -25,7 +23,6 @@ use bevy_ecs::{
     system::{Query, Res, ResMut},
     world::{FromWorld, World},
 };
-use bevy_math::Vec3;
 use bevy_pbr::ExtractedDirectionalLight;
 use bevy_render::{
     mesh::allocator::MeshAllocator,
@@ -34,7 +31,6 @@ use bevy_render::{
     renderer::{RenderDevice, RenderQueue},
     texture::GpuImage,
 };
-use core::f32::consts::TAU;
 use tracing::{info, info_span};
 
 /// Small scene constants the shaders read alongside Solari's other scene data.
@@ -43,23 +39,20 @@ use tracing::{info, info_span};
 /// these live in a read-only storage buffer instead.
 #[derive(ShaderType, Clone, Copy, Default, PartialEq)]
 struct GpuSceneParameters {
-    environment_radiance: Vec3,
     max_world_geometry_error: f32,
-    inverse_environment_light_pdf: f32,
-    _padding: Vec3,
 }
 
 /// Logs the scene's composition once it has held still for a couple of frames, so a settling
 /// scene reports its final shape rather than every loading step.
 #[derive(Default)]
 struct SceneSummaryLog {
-    last: Option<(u32, usize, usize, usize, usize)>,
+    last: Option<(u32, usize, usize, usize)>,
     stable_frames: u8,
-    reported: Option<(u32, usize, usize, usize, usize)>,
+    reported: Option<(u32, usize, usize, usize)>,
 }
 
 impl SceneSummaryLog {
-    fn observe(&mut self, summary: (u32, usize, usize, usize, usize)) {
+    fn observe(&mut self, summary: (u32, usize, usize, usize)) {
         if self.last == Some(summary) {
             self.stable_frames = self.stable_frames.saturating_add(1);
         } else {
@@ -71,8 +64,7 @@ impl SceneSummaryLog {
                 raytracing_instances = summary.0,
                 emissive_mesh_lights = summary.1,
                 directional_lights = summary.2,
-                environment_lights = summary.3,
-                total_light_sources = summary.4,
+                total_light_sources = summary.3,
                 "prepared Solari raytracing scene"
             );
             self.reported = Some(summary);
@@ -163,7 +155,6 @@ pub fn prepare_raytracing_scene_resources(
     changed_instances: Query<Entity, ChangedInstanceFilter>,
     mut removed_instances: RemovedComponents<RaytracingMesh3d>,
     directional_lights: Query<(Entity, &ExtractedDirectionalLight)>,
-    environment_lights: Query<(Entity, &SolariEnvironmentLight)>,
     needs_previous_frame_data: Option<Res<RaytracingSceneNeedsPreviousFrameData>>,
     mesh_allocator: Res<MeshAllocator>,
     blas_manager: Res<BlasManager>,
@@ -210,7 +201,7 @@ pub fn prepare_raytracing_scene_resources(
     );
 
     // Update the light set, now that emissive instances are resolved
-    bindings.lights.update(&directional_lights, &environment_lights);
+    bindings.lights.update(&directional_lights);
 
     write_scene_parameters(bindings, &render_device, &render_queue);
 
@@ -218,7 +209,6 @@ pub fn prepare_raytracing_scene_resources(
         bindings.instances.live_count,
         bindings.lights.emissive_light_count(),
         bindings.lights.directional_light_count(),
-        bindings.lights.environment_light_count(),
         bindings.lights.index.len(),
     ));
 
@@ -246,16 +236,8 @@ fn write_scene_parameters(
     device: &RenderDevice,
     queue: &RenderQueue,
 ) {
-    let environment_light_count = bindings.lights.environment_light_count();
     let parameters = GpuSceneParameters {
-        environment_radiance: bindings.lights.environment_radiance,
         max_world_geometry_error: bindings.instances.max_world_geometry_error(),
-        inverse_environment_light_pdf: if environment_light_count == 0 {
-            0.0
-        } else {
-            TAU * bindings.lights.index.len() as f32 / environment_light_count as f32
-        },
-        _padding: Vec3::ZERO,
     };
 
     if bindings.last_scene_parameters != Some(parameters) {

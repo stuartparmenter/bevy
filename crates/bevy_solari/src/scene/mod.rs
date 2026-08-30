@@ -8,7 +8,7 @@ use bevy_shader::load_shader_library;
 pub use binder::prepare_raytracing_scene_resources;
 pub use binder::{RaytracingSceneBindings, RaytracingSceneNeedsPreviousFrameData};
 pub use blas::{RaytracingSceneStatus, RaytracingSceneStatusSnapshot};
-pub use types::{RaytracingMesh3d, SolariEnvironmentLight};
+pub use types::RaytracingMesh3d;
 
 use crate::SolariPlugins;
 use bevy_app::{App, Plugin};
@@ -34,7 +34,7 @@ use blas::{
 use extract::{
     extract_raytracing_material_assets, extract_raytracing_scene_meshes_and_materials,
     extract_raytracing_scene_structural, extract_raytracing_scene_transforms,
-    extract_solari_environment_lights, StandardMaterialAssets,
+    StandardMaterialAssets,
 };
 use tracing::warn;
 
@@ -84,7 +84,6 @@ impl Plugin for RaytracingScenePlugin {
                     extract_raytracing_scene_transforms,
                     extract_raytracing_scene_meshes_and_materials,
                     extract_raytracing_material_assets,
-                    extract_solari_environment_lights,
                 ),
             )
             .add_systems(

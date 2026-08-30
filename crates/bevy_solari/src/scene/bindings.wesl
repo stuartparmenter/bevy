@@ -16,10 +16,7 @@ struct InstanceGeometryIds {
 }
 
 struct SceneParameters {
-    environment_radiance: vec3<f32>,
     max_world_geometry_error: f32,
-    inverse_environment_light_pdf: f32,
-    _padding: vec3<f32>,
 }
 
 struct VertexBuffer { words: array<u32> }
@@ -99,13 +96,6 @@ struct LightSource {
 
 const LIGHT_SOURCE_KIND_EMISSIVE_MESH = 0u;
 const LIGHT_SOURCE_KIND_DIRECTIONAL = 1u;
-// Resolves like a directional light, but its radiance is also what a missed BRDF ray picks up from
-// sample_environment_radiance, so the two strategies have to be MIS-weighted against each other.
-const LIGHT_SOURCE_KIND_ENVIRONMENT = 3u;
-
-fn light_source_is_emissive_mesh(light_source: LightSource) -> bool {
-    return (light_source.kind & 1u) == 0u;
-}
 
 struct DirectionalLight {
     direction_to_light: vec3<f32>,
@@ -168,20 +158,6 @@ fn bounded_world_geometry_error(world_geometry_error: f32) -> f32 {
         max(scene_parameters.max_world_geometry_error, 0.0),
         world_geometry_error < 0.0,
     );
-}
-
-fn sample_environment_radiance(direction: vec3<f32>) -> vec3<f32> {
-    // Feather the horizon slightly to avoid a hard discontinuity while still
-    // modeling an upper-hemisphere captured sky.
-    let sky_visibility = smoothstep(-0.01, 0.01, direction.y);
-    return scene_parameters.environment_radiance * sky_visibility;
-}
-
-fn environment_light_pdf(direction: vec3<f32>) -> f32 {
-    if direction.y <= 0.0 || !(scene_parameters.inverse_environment_light_pdf > 0.0) {
-        return 0.0;
-    }
-    return 1.0 / scene_parameters.inverse_environment_light_pdf;
 }
 
 // A ray hit lies on the traced surface and carries a true geometric normal, so unlike a rasterized
