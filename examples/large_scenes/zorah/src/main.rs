@@ -15,7 +15,6 @@ use std::{
 use argh::FromArgs;
 use bevy::{
     asset::{LoadState, RenderAssetUsages},
-    ecs::query::QueryItem,
     camera::{CameraMainTextureUsages, Exposure, Hdr},
     camera_controller::free_camera::{FreeCamera, FreeCameraPlugin},
     core_pipeline::{
@@ -23,9 +22,11 @@ use bevy::{
         tonemapping::Tonemapping,
     },
     diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin},
+    ecs::query::QueryItem,
     light::{
         atmosphere::{Falloff, PhaseFunction, ScatteringMedium, ScatteringTerm},
-        Atmosphere, AtmosphereEnvironmentMapLight, ClusteredDecal, NotShadowCaster, SunDisk,
+        Atmosphere, AtmosphereEnvironmentMapLight, ClusteredDecal, EnvironmentMapLight,
+        NotShadowCaster, SunDisk,
     },
     curve::cubic_splines::LinearSpline,
     math::{ops, primitives::Measured2d, Affine2},
@@ -143,10 +144,9 @@ const UE_CANDLE_FLAME_SYSTEM: &str = "/Game/VFX/Candle/NS_CandleFlame_04.NS_Cand
 /// `GetAllActorsOfClass`.
 const UE_CANDLE_ACTOR_PREFIX: &str = "BP_Candle_";
 // UE SkyLight intensity is a multiplier over a captured environment rather
-// than a physical unit. Until Solari supports environment maps directly, use
-// the same source-unit bridge for raster ambient and traced environment light.
-// Keeping two different scales caused Greenhouse to jump from a plausible
-// preview to a 12.5x brighter environment as soon as Solari became active.
+// than a physical unit. With a SkyAtmosphere the capture is the atmosphere's
+// own generated environment map (see `AtmosphereSkyLight`); this bridge only
+// sizes the scalar raster ambient of a level without one.
 const UE_SKY_LIGHT_LUX_PER_UNIT: f32 = 80.0;
 
 fn ue_sky_light_illuminance(intensity: f32) -> f32 {
@@ -299,15 +299,6 @@ struct Args {
     #[argh(option, default = "0.0")]
     exposure_bias: f32,
 
-    /// share of a real-time SkyLight capture that is the sun- and sky-lit
-    /// scene rather than sky, 0-1 (default 0.7; 0 leaves only the sky)
-    #[argh(option, default = "0.7")]
-    sky_capture_scene: f32,
-
-    /// share of that captured scene in direct sun, 0-1 (default 0.4)
-    #[argh(option, default = "0.4")]
-    sky_capture_sunlit: f32,
-
     /// comma-separated runtime data layers to start active, e.g.
     /// DL_Lighting_Night,DL_Lighting_Candles (overrides the level's authored
     /// initial states; digit keys toggle layers while running)
@@ -321,7 +312,11 @@ struct Args {
 
     /// how slots with no usable material render: `magenta` (default) makes them
     /// unmistakable, `grey` mimics UE's own WorldGridMaterial fallback
-    #[argh(option, default = "MissingMaterialStyle::Magenta", from_str_fn(parse_missing_material_style))]
+    #[argh(
+        option,
+        default = "MissingMaterialStyle::Magenta",
+        from_str_fn(parse_missing_material_style)
+    )]
     missing_materials: MissingMaterialStyle,
 }
 
@@ -381,7 +376,11 @@ fn missing_material(style: MissingMaterialStyle, unlit: bool) -> StandardMateria
     };
     StandardMaterial {
         base_color,
-        perceptual_roughness: if style == MissingMaterialStyle::Grey { 0.8 } else { 1.0 },
+        perceptual_roughness: if style == MissingMaterialStyle::Grey {
+            0.8
+        } else {
+            1.0
+        },
         unlit,
         ..default()
     }
@@ -402,7 +401,6 @@ struct RuntimeOptions {
     exposure_ev100: Option<f32>,
     auto_exposure: bool,
     exposure_bias: f32,
-    sky_capture: SkyCaptureEstimate,
 }
 
 #[derive(Resource)]
@@ -683,6 +681,16 @@ struct DormantLayerParts {
     raytracing: Option<RaytracingMesh3d>,
     meshlet: Option<MeshletMesh3d>,
     decal: Option<ClusteredDecal>,
+}
+
+/// The UE SkyLight that the atmosphere's generated environment map stands in
+/// for, tagged with the SkyLight's data layers. `apply_sky_light_layers`
+/// keeps the camera's `EnvironmentMapLight::intensity` at `intensity` while a
+/// layer holding it is active and at 0 otherwise, which is the one place both
+/// raster and Solari read the scale from every frame.
+#[derive(Component)]
+struct SkyLightLayer {
+    intensity: f32,
 }
 
 #[derive(Deserialize)]
@@ -1321,12 +1329,17 @@ fn load_converted_world(
         let mut hidden = 0usize;
         for actor in actors.iter_mut().filter(|actor| !actor.hidden) {
             let matches = patterns.iter().any(|pattern| {
-                actor._label.as_deref().is_some_and(|label| label.contains(pattern))
+                actor
+                    ._label
+                    .as_deref()
+                    .is_some_and(|label| label.contains(pattern))
                     || actor.kind.contains(pattern)
-                    || actor
-                        .components
-                        .iter()
-                        .any(|component| component.mesh.as_deref().is_some_and(|mesh| mesh.contains(pattern)))
+                    || actor.components.iter().any(|component| {
+                        component
+                            .mesh
+                            .as_deref()
+                            .is_some_and(|mesh| mesh.contains(pattern))
+                    })
             });
             if matches {
                 actor.hidden = true;
@@ -2163,11 +2176,13 @@ fn build_material_handles(
                 emissive
             },
             emissive_texture: (!unlit_textures).then_some(emissive_texture).flatten(),
-            metallic_roughness_texture: (!unlit_textures && !clay)
-                .then_some(orm.clone())
-                .flatten(),
+            metallic_roughness_texture: (!unlit_textures && !clay).then_some(orm.clone()).flatten(),
             occlusion_texture: (!unlit_textures && !clay).then_some(orm).flatten(),
-            metallic: if unlit_textures || clay { 0.0 } else { metallic },
+            metallic: if unlit_textures || clay {
+                0.0
+            } else {
+                metallic
+            },
             perceptual_roughness: if unlit_textures {
                 1.0
             } else if clay {
@@ -2189,7 +2204,11 @@ fn build_material_handles(
             } else {
                 runtime_alpha_mode(&effective, preserve_alpha)
             },
-            depth_bias: if mesh_decal { MESH_DECAL_DEPTH_BIAS } else { 0.0 },
+            depth_bias: if mesh_decal {
+                MESH_DECAL_DEPTH_BIAS
+            } else {
+                0.0
+            },
             double_sided: render_properties.double_sided,
             cull_mode: render_properties.cull_mode,
             ..default()
@@ -2319,10 +2338,6 @@ fn main() {
             } else {
                 0.0
             },
-            sky_capture: SkyCaptureEstimate {
-                scene_fraction: args.sky_capture_scene,
-                sunlit_fraction: args.sky_capture_sunlit,
-            },
         })
         .insert_resource(converted_world)
         .insert_resource(data_layers)
@@ -2386,7 +2401,12 @@ fn main() {
     )
     .add_systems(
         Update,
-        (toggle_data_layers_by_key, apply_data_layers).chain(),
+        (
+            toggle_data_layers_by_key,
+            apply_data_layers,
+            apply_sky_light_layers,
+        )
+            .chain(),
     )
     .add_systems(Update, dump_camera_and_screenshot)
     .run();
@@ -2684,17 +2704,15 @@ fn spawn_exported_lights(
     spot_proxy_mesh: &Handle<Mesh>,
     materials: &mut Assets<StandardMaterial>,
     ambient_light: &mut GlobalAmbientLight,
-    sky_capture: SkyCaptureEstimate,
-) -> Vec<PendingRaytracingInstance> {
+) -> ExportedLighting {
     let has_atmosphere = has_sky_atmosphere(converted, data_layers);
-    let captured_sky = has_atmosphere
-        .then(|| captured_sky_light(converted, data_layers, sky_capture))
-        .flatten();
+    let mut sky_light: Option<AtmosphereSkyLight> = None;
     let mut raytracing_instances = Vec::new();
     let mut point_count = 0usize;
     let mut spot_count = 0usize;
     let mut directional_count = 0usize;
     let mut sky_count = 0usize;
+    let mut environment_count = 0usize;
     let mut unsupported_profiles = 0usize;
     let mut scaled_light_functions = 0usize;
     let mut legacy_unit_count = 0usize;
@@ -2817,9 +2835,12 @@ fn spawn_exported_lights(
                     // that flux by its mean; see `emitted_light_flux`.
                     let flux = emitted_light_flux(light, outer_angle);
                     let area_denominator = if light.kind == "point" {
-                        4.0 * std::f32::consts::PI.powi(2) * source_radius.powi(2)
+                        4.0 * std::f32::consts::PI
+                            * std::f32::consts::PI
+                            * source_radius
+                            * source_radius
                     } else {
-                        std::f32::consts::PI.powi(2) * source_radius.powi(2)
+                        std::f32::consts::PI * std::f32::consts::PI * source_radius * source_radius
                     };
                     let emissive = color * (flux / area_denominator.max(0.0001));
                     let material = materials.add(StandardMaterial {
@@ -2864,27 +2885,54 @@ fn spawn_exported_lights(
                 }
                 "sky" => {
                     sky_count += 1;
-                    // A real-time-capture SkyLight is a capture of the
-                    // SkyAtmosphere, so its brightness follows the sun rather
-                    // than the fixed source-unit bridge. Solari sees no
-                    // environment map, so the capture becomes its uniform sky.
-                    let (_, illuminance) = match captured_sky {
-                        Some(sky) if light.real_time_capture => (
-                            LinearRgba::rgb(
-                                color.red * sky.tint.red,
-                                color.green * sky.tint.green,
-                                color.blue * sky.tint.blue,
-                            ),
-                            sky.illuminance * light.intensity.max(0.0),
+                    if !has_atmosphere {
+                        // Nothing to capture: the scalar raster ambient is all
+                        // this level gets, and Solari has no environment light.
+                        sky_brightness += ue_sky_light_illuminance(light.intensity);
+                        info!(
+                            light = %light.name,
+                            "Zorah sky light without a SkyAtmosphere: raster ambient only, no Solari environment light"
+                        );
+                        continue;
+                    }
+                    // Zorah's SkyLights are real-time captures of the
+                    // SkyAtmosphere plus the scene around the capture point.
+                    // The atmosphere's generated environment map is that sky,
+                    // and Solari traces the scene's share for real, so the
+                    // SkyLight reduces to a scale on the map: `Intensity`
+                    // times the luminance of `LightColor`, the tint being all
+                    // the scalar `EnvironmentMapLight::intensity` can carry.
+                    let scale = light.intensity.max(0.0) * color.luminance();
+                    let peak = color.red.max(color.green).max(color.blue);
+                    if peak - color.red.min(color.green).min(color.blue) > 1e-3 {
+                        warn!(
+                            light = %light.name,
+                            ?color,
+                            "Zorah sky light tint reduced to its luminance"
+                        );
+                    }
+                    match &mut sky_light {
+                        None => {
+                            sky_light = Some(AtmosphereSkyLight {
+                                name: light.name.clone(),
+                                scale,
+                                layers: layers.clone(),
+                            });
+                            environment_count += 1;
+                        }
+                        // UE sums sky lights; Bevy renders one atmosphere
+                        // map and one environment light per camera.
+                        Some(first) => warn!(
+                            light = %light.name,
+                            first = %first.name,
+                            "extra Zorah sky light ignored"
                         ),
-                        _ => (color, ue_sky_light_illuminance(light.intensity)),
-                    };
-                    sky_brightness += illuminance;
+                    }
                     info!(
                         light = %light.name,
                         real_time_capture = light.real_time_capture,
-                        illuminance,
-                        "Zorah sky light"
+                        scale,
+                        "Zorah sky light as the atmosphere's environment map"
                     );
                 }
                 kind => warn!(light = %light.name, %kind, "unsupported Zorah light component"),
@@ -2892,25 +2940,46 @@ fn spawn_exported_lights(
         }
     }
 
-    // This is a responsive raster preview while BLASes warm up. Solari does
-    // not currently consume Bevy environment maps, so the exported
-    // directional and emissive proxy sources remain its traced lighting.
-    // AtmosphereEnvironmentMapLight supplies the raster ambient/specular
-    // environment when a UE SkyAtmosphere is present. Retain the old scalar
-    // ambient fallback only for levels without an atmosphere.
+    // With a SkyAtmosphere the camera's `AtmosphereEnvironmentMapLight` is the
+    // sky light for raster and Solari alike; the scalar ambient is the raster
+    // preview of a level without one.
     ambient_light.brightness = if has_atmosphere { 0.0 } else { sky_brightness };
+    if has_atmosphere && sky_light.is_none() {
+        info!("no Zorah sky light: the atmosphere is a backdrop only and Solari has no environment light");
+    }
     info!(
         point_count,
         spot_count,
         directional_count,
         sky_count,
+        environment_count,
         unsupported_profiles,
         scaled_light_functions,
         legacy_unit_count,
         solari_emitters = raytracing_instances.len(),
         "spawned exported Zorah lighting"
     );
-    raytracing_instances
+    ExportedLighting {
+        raytracing_instances,
+        sky_light,
+    }
+}
+
+struct ExportedLighting {
+    raytracing_instances: Vec<PendingRaytracingInstance>,
+    /// The level's SkyLight, present only alongside a SkyAtmosphere.
+    sky_light: Option<AtmosphereSkyLight>,
+}
+
+/// A UE SkyLight restated as a scale on the atmosphere's generated
+/// environment map, the cubemap `AtmosphereEnvironmentMapLight` renders from
+/// the same `Atmosphere` and sun every frame and that raster IBL and Solari's
+/// importance-sampled environment light both read.
+struct AtmosphereSkyLight {
+    name: String,
+    /// UE `Intensity` times the luminance of `LightColor`.
+    scale: f32,
+    layers: DataLayerMember,
 }
 
 /// Whether the level runs `NS_CandleFlame_04`. ThroneRoom holds the only
@@ -3179,9 +3248,11 @@ fn spawn_exported_decals(
     );
 }
 
-// The atmosphere, fog and sky capture are chosen once from the data layers
-// active at startup: Bevy renders one `Atmosphere`, so a layer toggle changes
-// lights, emitters, geometry and decals but keeps the sky it launched with.
+// The atmosphere and fog are chosen once from the data layers active at
+// startup: Bevy renders one `Atmosphere`, so a layer toggle changes lights,
+// emitters, geometry and decals but keeps the sky it launched with. The sky
+// light drawn from that atmosphere does follow its SkyLight's layers, through
+// `apply_sky_light_layers`.
 fn has_sky_atmosphere(converted: &ConvertedWorld, data_layers: &DataLayers) -> bool {
     active_sky_atmosphere_actor(converted, data_layers).is_some()
 }
@@ -3218,129 +3289,6 @@ fn active_height_fog<'a>(
         })
         .filter_map(|actor| actor.height_fog.as_ref())
         .find(|fog| fog.visible && !fog.hidden_in_game)
-}
-
-/// What a real-time-capture UE SkyLight sees: the SkyAtmosphere lit by the
-/// level's brightest active sun.
-#[derive(Clone, Copy)]
-struct CapturedSkyLight {
-    /// Diffuse horizontal illuminance from the whole sky dome, in lux.
-    illuminance: f32,
-    /// Chromaticity of the captured sky, normalised to unit luminance.
-    tint: LinearRgba,
-}
-
-/// Correlated colour temperature of a clear blue sky away from the sun; the
-/// CIE places it between 9,000 K and 12,000 K.
-const CLEAR_SKY_TEMPERATURE: f32 = 10_000.0;
-const REC709_LUMINANCE: Vec3 = Vec3::new(0.2126, 0.7152, 0.0722);
-
-/// Clear-sky diffuse horizontal illuminance as a fraction of the sun's
-/// perpendicular illuminance, from the CIE/Krochmann clear-sky fit
-/// `E_d = 800 + 15,500 sqrt(sin h)` lux against a 100,000 lux sun. Scaling by
-/// the authored sun rather than a real one keeps the sun-to-shade ratio the
-/// atmosphere would capture (about two stops at 56 degrees) whatever brightness
-/// the artist chose for the sun.
-fn clear_sky_diffuse_fraction(sun_elevation: f32) -> f32 {
-    0.008 + 0.155 * ops::sin(sun_elevation).max(0.0).sqrt()
-}
-
-/// What a real-time-capture SkyLight sees besides the sky. Zorah's captures sit
-/// inside the courtyards a couple of metres up, so most of the cubemap is the
-/// scene's own sun- and sky-lit stone, and UE applies that warm average as
-/// ambient everywhere. `scene_fraction` is the share of the capture that is
-/// scene rather than sky; `sunlit_fraction` the share of that scene in direct
-/// sun. Both are estimates of a capture the runtime never renders.
-#[derive(Clone, Copy)]
-struct SkyCaptureEstimate {
-    scene_fraction: f32,
-    sunlit_fraction: f32,
-}
-
-impl Default for SkyCaptureEstimate {
-    fn default() -> Self {
-        Self {
-            scene_fraction: 0.7,
-            sunlit_fraction: 0.4,
-        }
-    }
-}
-
-/// Linear albedo of the pale limestone the captures mostly see (sRGB about
-/// (0.72, 0.65, 0.55), read off the baked wall and floor textures).
-const CAPTURED_SCENE_ALBEDO: Vec3 = Vec3::new(0.48, 0.38, 0.26);
-
-fn captured_sky_light(
-    converted: &ConvertedWorld,
-    data_layers: &DataLayers,
-    capture: SkyCaptureEstimate,
-) -> Option<CapturedSkyLight> {
-    let mut sun: Option<(f32, f32, Vec3)> = None;
-    for actor in &converted.actors {
-        if actor.hidden || !data_layers.is_actor_active(actor) {
-            continue;
-        }
-        let actor_matrix = ue_matrix(&actor.transform);
-        for light in &actor.lights {
-            if light.kind != "directional"
-                || !light.visible
-                || light.hidden_in_game
-                || !light.affects_world
-                || light.intensity <= 0.0
-            {
-                continue;
-            }
-            let transform = ue_world_to_bevy(actor_matrix * ue_matrix(&light.transform));
-            // A directional light shines down its -Z; the sun sits the other way.
-            let elevation = ops::asin((-transform.forward().y).clamp(-1.0, 1.0));
-            if sun.is_none_or(|(illuminance, _, _)| light.intensity > illuminance) {
-                let color = light_color(light);
-                let color = Vec3::new(color.red, color.green, color.blue);
-                // `light_color` is a tint at unit peak; normalise its luminance
-                // so the illuminance stays the authored lux.
-                let color = color / color.dot(REC709_LUMINANCE).max(1e-6);
-                sun = Some((light.intensity, elevation, color));
-            }
-        }
-    }
-    let (sun_illuminance, sun_elevation, sun_color) = sun?;
-    let sky_luminance_scale = active_sky_atmosphere_actor(converted, data_layers)
-        .and_then(|actor| actor.atmosphere.as_ref())
-        .and_then(|atmosphere| {
-            atmosphere
-                .sky_luminance_factor
-                .or(atmosphere.sky_and_aerial_perspective_luminance_factor)
-        })
-        .map(ue_linear_rgb)
-        .map(|factor| factor.max(Vec3::ZERO).element_sum() / 3.0)
-        .filter(|value| value.is_finite())
-        .unwrap_or(1.0);
-    let sky_illuminance =
-        sun_illuminance * clear_sky_diffuse_fraction(sun_elevation) * sky_luminance_scale;
-    let sky = blackbody_srgb(CLEAR_SKY_TEMPERATURE).to_linear();
-    let sky_tint = Vec3::new(sky.red, sky.green, sky.blue);
-    let sky_tint = sky_tint / sky_tint.dot(REC709_LUMINANCE).max(1e-6);
-    let sky_flux = sky_tint * sky_illuminance;
-
-    // The scene half of the capture: stone lit by the sun over part of it and
-    // by the sky everywhere, seen as an average radiance `rho * E / pi`, and
-    // restated as the illuminance a uniform hemisphere of that radiance
-    // delivers (`pi * L`).
-    let scene_fraction = capture.scene_fraction.clamp(0.0, 1.0);
-    let sunlit_fraction = capture.sunlit_fraction.clamp(0.0, 1.0);
-    let scene_flux = CAPTURED_SCENE_ALBEDO
-        * (sun_color * (sun_illuminance * sunlit_fraction) + sky_flux)
-        * scene_fraction;
-    let flux = sky_flux * (1.0 - scene_fraction) + scene_flux;
-    let illuminance = flux.dot(REC709_LUMINANCE);
-    if illuminance.is_nan() || illuminance <= 0.0 {
-        return None;
-    }
-    let tint = flux / illuminance;
-    Some(CapturedSkyLight {
-        illuminance,
-        tint: LinearRgba::rgb(tint.x, tint.y, tint.z),
-    })
 }
 
 fn ue_linear_rgb(color: UeLinearColor) -> Vec3 {
@@ -3896,7 +3844,10 @@ fn setup(
         }
     }
     let (point_proxy_mesh, spot_proxy_mesh) = make_light_proxy_meshes(&mut meshes);
-    let mut raytracing_light_instances = spawn_exported_lights(
+    let ExportedLighting {
+        raytracing_instances: mut raytracing_light_instances,
+        sky_light,
+    } = spawn_exported_lights(
         &mut commands,
         &converted,
         &data_layers,
@@ -3904,8 +3855,19 @@ fn setup(
         &spot_proxy_mesh,
         &mut materials,
         &mut ambient_light,
-        options.sky_capture,
     );
+    // The UE SkyLight's `Intensity` and colour luminance scale the atmosphere's
+    // generated environment map on top of the SkyAtmosphere's own
+    // `SkyLuminanceFactor`, which Bevy's atmosphere has no other place for.
+    let atmosphere_sky_light = sky_light.map(|sky_light| {
+        let intensity = atmosphere_environment_intensity * sky_light.scale;
+        commands.spawn((
+            Name::new(format!("{} sky light", sky_light.name)),
+            SkyLightLayer { intensity },
+            sky_light.layers,
+        ));
+        intensity
+    });
     if options.candle_lights {
         raytracing_light_instances.extend(spawn_candle_flames(
             &mut commands,
@@ -4063,21 +4025,26 @@ fn setup(
         camera.insert(auto_exposure.auto_exposure(&mut compensation_curves));
     }
     if has_atmosphere {
-        camera.insert((
-            AtmosphereSettings {
-                // Keep useful aerial-perspective precision across these
-                // building-scale levels instead of spending the LUT's depth
-                // range on the default 32 km.
-                aerial_view_lut_max_distance: extent.max(1_000.0).min(16_000.0),
-                ..default()
-            },
-            // Generate raster diffuse/specular IBL from the same atmosphere
-            // and imported directional sun/moon.
-            AtmosphereEnvironmentMapLight {
-                intensity: atmosphere_environment_intensity,
-                ..default()
-            },
-        ));
+        camera.insert(AtmosphereSettings {
+            // Keep useful aerial-perspective precision across these
+            // building-scale levels instead of spending the LUT's depth
+            // range on the default 32 km.
+            aerial_view_lut_max_distance: extent.clamp(1_000.0, 16_000.0),
+            ..default()
+        });
+    }
+    if let Some(intensity) = atmosphere_sky_light {
+        // The SkyLight: a cubemap of this atmosphere under the imported sun or
+        // moon, regenerated every frame, that raster shades as diffuse and
+        // specular IBL and Solari importance-samples as its environment light.
+        camera.insert(AtmosphereEnvironmentMapLight {
+            intensity,
+            ..default()
+        });
+        info!(
+            intensity,
+            "Zorah sky light on the camera as AtmosphereEnvironmentMapLight"
+        );
     }
     info!(
         "queued Zorah level={} partitions={} skipped_components_without_converted_geometry={} camera_position={} camera_target={} exposure_ev100={} exposure_mode={}",
@@ -4209,7 +4176,7 @@ fn normalized_light_units(units: &str) -> &str {
 }
 
 fn spot_solid_angle(outer_angle_radians: f32) -> f32 {
-    2.0 * std::f32::consts::PI * (1.0 - outer_angle_radians.cos())
+    2.0 * std::f32::consts::PI * (1.0 - ops::cos(outer_angle_radians))
 }
 
 fn bevy_light_lumens(light: &LightRecord, outer_angle_radians: f32) -> f32 {
@@ -4272,19 +4239,19 @@ fn blackbody_srgb(temperature: f32) -> Color {
     let red = if temperature <= 66.0 {
         255.0
     } else {
-        329.698_73 * (temperature - 60.0).powf(-0.133_204_76)
+        329.698_73 * ops::powf(temperature - 60.0, -0.133_204_76)
     };
     let green = if temperature <= 66.0 {
-        99.470_8 * temperature.ln() - 161.119_57
+        99.470_8 * ops::ln(temperature) - 161.119_57
     } else {
-        288.122_16 * (temperature - 60.0).powf(-0.075_514_846)
+        288.122_16 * ops::powf(temperature - 60.0, -0.075_514_846)
     };
     let blue = if temperature >= 66.0 {
         255.0
     } else if temperature <= 19.0 {
         0.0
     } else {
-        138.517_73 * (temperature - 10.0).ln() - 305.044_8
+        138.517_73 * ops::ln(temperature - 10.0) - 305.044_8
     };
     Color::srgb(
         (red / 255.0).clamp(0.0, 1.0),
@@ -4378,10 +4345,10 @@ fn spawn_partitions_when_ready(
         if partition.spawned {
             continue;
         }
-        if let Some(root) = bundle_root(&partition.mesh_path) {
-            if !loaded_bundle_roots.contains(root) {
-                continue;
-            }
+        if let Some(root) = bundle_root(&partition.mesh_path)
+            && !loaded_bundle_roots.contains(root)
+        {
+            continue;
         }
         if partition.assets.is_none() {
             if let Some(assets) = loaded_assets.get(&partition.mesh_path) {
@@ -4660,10 +4627,12 @@ fn toggle_data_layers_by_key(keys: Res<ButtonInput<KeyCode>>, mut data_layers: R
         KeyCode::Digit9,
     ];
     let mut changed = false;
-    for (key, index) in DIGITS
-        .iter()
-        .zip(data_layers.toggleable().map(|(index, _)| index).collect::<Vec<_>>())
-    {
+    for (key, index) in DIGITS.iter().zip(
+        data_layers
+            .toggleable()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>(),
+    ) {
         if keys.just_pressed(*key) {
             let layer = &mut data_layers.layers[index];
             layer.active = !layer.active;
@@ -4672,6 +4641,32 @@ fn toggle_data_layers_by_key(keys: Res<ButtonInput<KeyCode>>, mut data_layers: R
     }
     if changed || keys.just_pressed(KeyCode::KeyL) {
         info!("data layers: {}", data_layers.status_line());
+    }
+}
+
+/// Follows the SkyLight's data layers with the camera's environment map:
+/// `EnvironmentMapLight` appears on the camera once `AtmosphereEnvironmentMapLight`
+/// has generated its cubemap, and from then on holds the intensity both raster
+/// IBL and Solari's environment light read, so an inactive layer zeroes it and
+/// an active one restores the SkyLight's value.
+fn apply_sky_light_layers(
+    data_layers: Res<DataLayers>,
+    sky_lights: Query<(&SkyLightLayer, &DataLayerMember)>,
+    mut cameras: Query<&mut EnvironmentMapLight, With<ZorahCamera>>,
+) {
+    for mut environment in &mut cameras {
+        if !data_layers.is_changed() && !environment.is_added() {
+            continue;
+        }
+        let intensity = sky_lights
+            .iter()
+            .filter(|(_, member)| data_layers.is_active(member))
+            .map(|(sky_light, _)| sky_light.intensity)
+            .sum::<f32>();
+        if environment.intensity != intensity {
+            info!(intensity, "sky light follows its data layer");
+            environment.intensity = intensity;
+        }
     }
 }
 
@@ -4717,9 +4712,7 @@ fn apply_data_layers(
 fn apply_data_layer_state(
     commands: &mut Commands,
     data_layers: &DataLayers,
-    (entity, member, raytracing, meshlet, decal, dormant, visibility): QueryItem<
-        DataLayerParts,
-    >,
+    (entity, member, raytracing, meshlet, decal, dormant, visibility): QueryItem<DataLayerParts>,
 ) {
     let mut entity_commands = commands.entity(entity);
     if data_layers.is_active(member) {
@@ -5804,7 +5797,11 @@ mod tests {
     #[test]
     fn data_layers_follow_the_authored_initial_runtime_state() {
         let records = [
-            test_layer_record("DL_Lighting_Night", "Runtime", Some("EDataLayerRuntimeState::Activated")),
+            test_layer_record(
+                "DL_Lighting_Night",
+                "Runtime",
+                Some("EDataLayerRuntimeState::Activated"),
+            ),
             test_layer_record("DL_Lighting_Orb", "Runtime", Some("Unloaded")),
             test_layer_record("DL_Outliner", "EDataLayerType::Editor", Some("Unloaded")),
         ];
@@ -5851,72 +5848,6 @@ mod tests {
     }
 
     #[test]
-    fn captured_sky_light_scales_with_the_active_sun() {
-        // A 25,000 lux sun at 56 degrees, as Restir authors it: the clear-sky
-        // dome delivers about two stops less than the sunlit floor.
-        let fraction = clear_sky_diffuse_fraction(56.0f32.to_radians());
-        assert!((fraction - 0.149).abs() < 0.002, "{fraction}");
-        let floor = 25_000.0 * 56.0f32.to_radians().sin();
-        let stops = (floor / (25_000.0 * fraction)).log2();
-        assert!((2.0..3.0).contains(&stops), "{stops}");
-        // A sun on the horizon still leaves the residual skylight.
-        assert!((clear_sky_diffuse_fraction(0.0) - 0.008).abs() < 1e-6);
-        assert!((clear_sky_diffuse_fraction(-0.5) - 0.008).abs() < 1e-6);
-    }
-
-    fn test_sun_actor(lux: f32) -> ActorRecord {
-        let mut actor = test_layer_actor("sun", &[]);
-        // Pitched up 45 degrees about UE's Y axis so the sun sits above the horizon.
-        actor.lights = vec![serde_json::from_value(serde_json::json!({
-            "name": "LightComponent0",
-            "type": "directional",
-            "transform": {
-                "translation": {"x": 0.0, "y": 0.0, "z": 0.0},
-                "rotation": {"x": 0.0, "y": 0.3826834, "z": 0.0, "w": 0.9238795},
-                "scale": {"x": 1.0, "y": 1.0, "z": 1.0}
-            },
-            "intensity": lux,
-            "intensity_units": "Lux",
-            "color": {"r": 255, "g": 255, "b": 255, "a": 255}
-        }))
-        .unwrap()];
-        actor
-    }
-
-    #[test]
-    fn sky_capture_blends_the_sky_with_the_lit_scene() {
-        let converted = ConvertedWorld {
-            level: "Restir_Level".into(),
-            actors: vec![test_sun_actor(25_000.0)],
-            data_layers: vec![],
-            post_process: None,
-            geometry: HashMap::new(),
-            materials: HashMap::new(),
-            textures: HashMap::new(),
-        };
-        let layers = DataLayers::from_manifest(&[], &converted.actors, None);
-        let sky_only = captured_sky_light(
-            &converted,
-            &layers,
-            SkyCaptureEstimate {
-                scene_fraction: 0.0,
-                sunlit_fraction: 0.0,
-            },
-        )
-        .unwrap();
-        let blended = captured_sky_light(&converted, &layers, SkyCaptureEstimate::default()).unwrap();
-        // The sky alone is blue; the captured stone pulls the average warm and
-        // brighter, and both tints stay at unit luminance.
-        assert!(sky_only.tint.blue > sky_only.tint.red);
-        assert!(blended.tint.red > sky_only.tint.red);
-        assert!(blended.illuminance > sky_only.illuminance);
-        for tint in [sky_only.tint, blended.tint] {
-            let luminance = Vec3::new(tint.red, tint.green, tint.blue).dot(REC709_LUMINANCE);
-            assert!((luminance - 1.0).abs() < 1e-4, "{luminance}");
-        }
-    }
-
-    #[test]
     fn mesh_decals_are_the_translucent_decal_masters_only() {
         let records: HashMap<String, MaterialRecord> = [
             (
@@ -5947,13 +5878,25 @@ mod tests {
         assert_eq!(dirt.master.as_deref(), Some("M_LS_Decal_FullPass_VT"));
         assert!(is_mesh_decal("/Game/MI_Dirt.MI_Dirt", &dirt));
         // A baked record loses its chain but keeps its library path.
-        let flat = EffectiveMaterial { blend_mode: SourceBlendMode::Translucent, ..default() };
-        assert!(is_mesh_decal("/Game/MaterialLibrary/Decals/Dirt/MI_X.MI_X", &flat));
+        let flat = EffectiveMaterial {
+            blend_mode: SourceBlendMode::Translucent,
+            ..default()
+        };
+        assert!(is_mesh_decal(
+            "/Game/MaterialLibrary/Decals/Dirt/MI_X.MI_X",
+            &flat
+        ));
         assert!(!is_mesh_decal("/Game/Assets/MI_X.MI_X", &flat));
         // The same master drawn opaque is not an overlay.
-        assert!(!is_mesh_decal("/Game/MI_Opaque.MI_Opaque", &resolve("/Game/MI_Opaque.MI_Opaque")));
+        assert!(!is_mesh_decal(
+            "/Game/MI_Opaque.MI_Opaque",
+            &resolve("/Game/MI_Opaque.MI_Opaque")
+        ));
         // Translucency alone is not a decal either.
-        assert!(!is_mesh_decal("/Game/MI_Water.MI_Water", &resolve("/Game/MI_Water.MI_Water")));
+        assert!(!is_mesh_decal(
+            "/Game/MI_Water.MI_Water",
+            &resolve("/Game/MI_Water.MI_Water")
+        ));
     }
 
     #[test]
@@ -6032,10 +5975,9 @@ mod tests {
         let (medium, _, _, _, _) = configured_atmosphere(Some(&record), None);
 
         // Earth-like density (blue 33.1e-6 per metre), not thirty times it.
-        assert!(medium.terms[0].scattering.abs_diff_eq(
-            Vec3::new(0.23, 0.4487749934196472, 1.0) * 0.0331e-3,
-            1e-9
-        ));
+        assert!(medium.terms[0]
+            .scattering
+            .abs_diff_eq(Vec3::new(0.23, 0.4487749934196472, 1.0) * 0.0331e-3, 1e-9));
         assert!((medium.terms[0].scattering.z - 33.1e-6).abs() < 1e-9);
         // Untouched terms keep UE's defaults rather than a unit scale.
         assert!(medium.terms[1]
@@ -6505,7 +6447,7 @@ mod tests {
     }
 
     #[test]
-    fn ue_sky_light_uses_the_same_scale_for_raster_and_solari() {
+    fn ue_sky_light_illuminance_sizes_the_raster_ambient_fallback() {
         assert!((ue_sky_light_illuminance(std::f32::consts::PI) - 251.32742).abs() < 1e-4);
         assert_eq!(ue_sky_light_illuminance(-1.0), 0.0);
     }
