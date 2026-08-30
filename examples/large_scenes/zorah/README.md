@@ -274,15 +274,17 @@ in effect. `--no-auto-exposure` meters every level fixed at the middle of its
 range, `--exposure-bias -0.5` trims either metering by half a stop (positive
 brightens), and `--exposure-ev100` fixes any level by hand.
 
-Each level's SkyLight is a real-time capture taken from inside the courtyard a
-couple of metres up, so in UE it is mostly a cubemap of the scene's own sun-
-and sky-lit stone, applied as a warm ambient everywhere. Solari has no
-environment map, so its uniform sky is an estimate of that capture: the clear
-sky the atmosphere would show, blended with the average radiance of pale stone
-under the sun and sky. `--sky-capture-scene` (default 0.7) is the share of the
-capture that is scene rather than sky and `--sky-capture-sunlit` (default 0.4)
-the share of that scene in direct sun; `--sky-capture-scene 0` keeps the sky
-alone.
+Each level's SkyLight is a real-time capture of the SkyAtmosphere, taken from
+inside the courtyard a couple of metres up so it also holds the scene's own
+sun- and sky-lit stone. The camera's `AtmosphereEnvironmentMapLight` is that
+capture: a cubemap of the Bevy `Atmosphere` under the imported sun, regenerated
+every frame, that raster shades as diffuse and specular IBL and Solari
+importance-samples as its environment light, while the scene's share of the
+capture is what Solari traces. The SkyLight's `Intensity` (1 in Restir and
+GreenHouse, 3 in ThroneRoom) and the luminance of its `LightColor` scale the
+map, together with the SkyAtmosphere's `SkyLuminanceFactor`. A level without a
+SkyAtmosphere keeps a scalar raster ambient of 80 lux per `Intensity` unit and
+gives Solari no environment light.
 
 `--ue-editor-camera` starts instead from the perspective viewport each map was
 last saved with in the UE editor (the download places no PlayerStart or camera
@@ -326,8 +328,8 @@ Zorah authors its lighting scenarios as World Partition data layers
 the level's `WorldDataLayers` initial states, and the runtime starts with the
 layers UE would activate. While running, digit keys `1`-`9` toggle the level's
 runtime layers in manifest order and `L` prints their state to the log; a toggle
-covers lights, Solari emitters, geometry and decals, while the sky atmosphere,
-fog and exposure stay as chosen at launch. The authored states are: Restir
+covers lights, the sky light, Solari emitters, geometry and decals, while the
+sky atmosphere, fog and exposure stay as chosen at launch. The authored states are: Restir
 `Day` + `Day_Support` on; GreenHouse `Sunset` + `Sunset_Support` on,
 `Sunset_Clouds` off; ThroneRoom `Night` + `Orb` on and `Candles` off (the
 6,443 candle actors carry no `InitialRuntimeState`, which is UE's `Unloaded`),
@@ -523,8 +525,8 @@ Remaining lighting approximations are explicit: Solari does not yet bind
 analytical point/spot lights, so their emissive proxies have Lambertian rather
 than exact UE angular profiles. UE IES profiles and procedural light-function
 materials retain uniform-flux proxies but the profiles themselves are not
-evaluated. SkyLight real-time/environment capture is a raster ambient
-approximation and is not yet a traced environment light.
+evaluated. A SkyLight tint other than white is reduced to its luminance, and a
+second SkyLight in the same layer set is ignored.
 
 The candle flames are opaque where UE's are additive. Nothing else is
 available: `bevy_solari` builds every BLAS geometry `OPAQUE`, its `trace_ray`
