@@ -445,7 +445,9 @@ fn append_section<T: Pod>(bytes: &mut Vec<u8>, values: &[T]) -> u32 {
     u32::try_from(start / 4).expect("meshlet page section base exceeded u32 words")
 }
 
-fn packed_meshlet_mesh_len(mesh: &MeshletMesh) -> usize {
+/// The upload size of a mesh: its streams at `SECTION_ALIGNMENT`, as `pack_meshlet_mesh` lays
+/// them out. Exposed to the asset as `MeshletMesh::packed_byte_len` for budgeting.
+pub(super) fn packed_meshlet_mesh_len(mesh: &MeshletMesh) -> usize {
     let mut length = 0usize;
     for section_length in [
         size_of_val(mesh.vertex_positions.as_ref()),
@@ -864,6 +866,7 @@ mod tests {
         };
         assert_eq!(validate_meshlet_mesh(&mesh), Ok(()));
         assert_eq!(packed_meshlet_mesh_len(&mesh), 560);
+        assert_eq!(mesh.packed_byte_len(), 560);
         let (bytes, descriptor) = pack_meshlet_mesh(&mesh);
         assert_eq!(bytes.len(), packed_meshlet_mesh_len(&mesh));
         for base in [
