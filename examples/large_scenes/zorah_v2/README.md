@@ -188,10 +188,9 @@ texels excluded) averages the radiance of a 15000 lux uniform sky;
 `--envmap-intensity` multiplies that. The map is rotated by the sidecar's
 `envmap rotation` minus 180 degrees, since RTXMG turns its lookup direction
 by minus that angle and the converter's seam is half a turn from RTXMG's.
-The analytic `--sun-illuminance` sun stays on by default: the map's sun
-disc is a few texels and Solari resolves it poorly; `--sun-illuminance 0`
-lights from the map alone. A map that fails to load or convert leaves the
-sun as the only light.
+The map is the only sun: RTXMG lights the scene with the panorama alone,
+and its sun sits in a wide haze halo, so shadows are soft by design. A map
+that fails to load or convert leaves only the emissive and fire lights.
 
 The export has no exposure data either; auto exposure uses the reference
 renderer's metering (the mean of the 80th..95th luminance percentiles
@@ -225,7 +224,6 @@ scaled to -0.5 EV before ACES), and `--exposure-bias` adds to it.
 | `--gltf-specular` | off | Honour `KHR_materials_specular`. Off because the export's 0.498 is UE's default Specular 0.5 written literally, and taking it as glTF would halve F0. |
 | `--glass-in-blas` | off | Include transmissive materials in the BLAS. |
 | `--envmap-intensity k` | `1` | Multiplies the environment map over its normalisation (sky mean = a 15000 lux uniform sky). |
-| `--sun-illuminance lux` | `100000` | Directional sun from the .cfg direction (0.6, 0.7, 0.36) and colour (1.0, 0.8, 0.5); `0` = none. |
 | `--emissive-boost k` | `4` | Multiplies every emissive material (lamp glass, coals). |
 | `--fire-lumens lm` | `800` | Emissive proxy sphere at every `FirePot`/`FireGrate`/`Firewood_Coal` node; `0` = none. |
 | `--clay` | off | Flat grey clay everywhere, lighting only. |
