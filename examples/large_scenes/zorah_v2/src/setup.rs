@@ -8,18 +8,21 @@ use bevy::{
     camera_controller::free_camera::FreeCamera,
     core_pipeline::{
         prepass::{DeferredPrepass, DepthPrepass},
-        tonemapping::{GranTurismo7Params, Tonemapping},
+        tonemapping::Tonemapping,
     },
     light::SunDisk,
+    curve::cubic_splines::LinearSpline,
     math::ops,
-    post_process::{auto_exposure::AutoExposure, bloom::Bloom},
+    post_process::{
+        auto_exposure::{AutoExposure, AutoExposureCompensationCurve},
+        bloom::Bloom,
+    },
     prelude::*,
     render::{
         render_resource::TextureUsages,
         view::screenshot::{save_to_disk, Screenshot, ScreenshotCaptured},
     },
     solari::prelude::SolariEnvironmentLight,
-    window::{AutoField, DisplayCalibrationPolicy, DisplayTarget, PrimaryWindow},
 };
 
 use crate::{
@@ -70,24 +73,6 @@ impl SetupOptions {
     }
 }
 
-/// Trusts the calibrated monitor for HDR luminance: hands peak and black level
-/// to the OS so GT7 tone maps against the panel's real headroom, and seeds a
-/// 200-nit HDR reference paper white. Gamut stays paired with the
-/// `HdrPlugin`-chosen transfer.
-pub fn setup_hdr_calibration(
-    window: Single<(Entity, &mut DisplayTarget), With<PrimaryWindow>>,
-    mut commands: Commands,
-) {
-    let (window, mut display_target) = window.into_inner();
-    display_target.paper_white_nits = 200.0;
-    commands.entity(window).insert(DisplayCalibrationPolicy {
-        paper_white: AutoField::Keep,
-        peak_luminance: AutoField::Auto,
-        min_luminance: AutoField::Auto,
-        gamut: AutoField::Keep,
-    });
-}
-
 /// Spawns the camera and the lights, then starts the bake. The bake starts
 /// here rather than in `main` so `MeshletMesh::from_mesh` finds the task pool
 /// the app sized, not a default one.
@@ -97,6 +82,7 @@ pub fn setup(
     scene: Res<crate::runner::SceneData>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut compensation_curves: ResMut<Assets<AutoExposureCompensationCurve>>,
     mut ambient_light: ResMut<GlobalAmbientLight>,
 ) {
     let sky_color = LinearRgba::rgb(
@@ -152,16 +138,16 @@ pub fn setup(
     // skips the filmic curve and the glare that would reshape them.
     let (tonemapping, bloom) = if options.solari_albedo {
         (
-            // `Linear` rather than `None`: the working space is Rec.2020 and
-            // only the tonemapping pass converts it back to the display gamut.
+            // `Linear` rather than `None`: the capture still wants the exposure
+            // correction and the sRGB transfer the tonemapping pass applies.
             Tonemapping::Linear,
             Bloom {
                 intensity: 0.0,
-                ..Bloom::GT7_GLARE
+                ..Bloom::NATURAL
             },
         )
     } else {
-        (Tonemapping::GranTurismo7, Bloom::GT7_GLARE)
+        (Tonemapping::AcesFitted, Bloom::NATURAL)
     };
     let mut camera = commands.spawn((
         Name::new("Camera"),
@@ -179,7 +165,7 @@ pub fn setup(
         CameraMainTextureUsages::default().with(TextureUsages::STORAGE_BINDING),
         Msaa::Off,
         Exposure { ev100: base_ev100 },
-        (tonemapping, GranTurismo7Params::default(), bloom),
+        (tonemapping, bloom),
         Projection::Perspective(PerspectiveProjection {
             fov: options.view.fov_degrees.to_radians(),
             ..default()
@@ -197,11 +183,18 @@ pub fn setup(
     // Solari's light-tile precision is unaffected by adaptation.
     let auto_exposure = options.auto_exposure && options.exposure_ev100.is_none();
     if auto_exposure {
+        // The metered target is independent of the base, so the bias has to
+        // enter the meter as well, as a flat exposure compensation over the
+        // whole metered range; positive brightens.
+        let range = AutoExposure::default().range;
+        let compensation_curve = AutoExposureCompensationCurve::from_curve(LinearSpline::new([
+            Vec2::new(*range.start(), options.exposure_bias),
+            Vec2::new(*range.end(), options.exposure_bias),
+        ]))
+        .expect("a flat two-point curve is monotonic and continuous");
         camera.insert(AutoExposure {
-            // The metered target is independent of the base, so the bias has
-            // to enter the meter as well; positive brightens, so it lowers
-            // the metering bias.
-            metering_bias: -options.exposure_bias,
+            range,
+            compensation_curve: compensation_curves.add(compensation_curve),
             ..default()
         });
     }

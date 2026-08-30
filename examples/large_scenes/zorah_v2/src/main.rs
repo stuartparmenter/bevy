@@ -22,12 +22,6 @@ mod runner;
 mod scene;
 mod setup;
 
-// Opt-in HDR setup shared with the other HDR examples: keeps the primary
-// window's `DisplayTarget` on the best transfer the surface can present
-// (PQ/HDR10, then scRGB-linear, then extended sRGB), else stays SDR.
-#[path = "../../../helpers/hdr.rs"]
-mod hdr;
-
 use std::{
     collections::{BTreeSet, HashMap},
     path::{Path, PathBuf},
@@ -44,7 +38,6 @@ use bevy::{
     pbr::{experimental::meshlet::MeshletPlugin, DefaultOpaqueRendererMethod},
     post_process::auto_exposure::AutoExposurePlugin,
     prelude::*,
-    render::{working_color_space::WorkingColorSpace, RenderPlugin},
     solari::prelude::SolariPlugins,
 };
 
@@ -660,14 +653,7 @@ fn run_app(args: &Args, prepared: Prepared) -> ExitCode {
                     // .meta file: skip the probe for each.
                     meta_check: AssetMetaCheck::Never,
                     ..default()
-                })
-                .set(RenderPlugin {
-                    // GT7's native working space.
-                    working_color_space: WorkingColorSpace::Rec2020,
-                    ..default()
                 }),
-            // Auto-select the best HDR output the surface can present, else SDR.
-            hdr::HdrPlugin::default(),
             MeshletPlugin {
                 // Zorah's instanced scene exceeds eight million leaf meshlets
                 // before hierarchy and candidate pressure; an undersized cull
@@ -703,7 +689,6 @@ fn run_app(args: &Args, prepared: Prepared) -> ExitCode {
                     }
                     info!("{summary}");
                 },
-                setup::setup_hdr_calibration,
                 setup::setup,
             ),
         )
