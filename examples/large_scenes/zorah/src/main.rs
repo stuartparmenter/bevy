@@ -1134,10 +1134,11 @@ impl Default for EffectiveMaterial {
 }
 
 /// UE renders the `M_LS_Decal_*` family as mesh decals: translucent dirt
-/// overlays modelled as thin meshes lying on the surface they stain. Drawn
-/// opaque they hide the surface and z-fight with it (ThroneRoom's door arches
-/// flickered), so they keep their blend and a depth bias whatever the alpha
-/// policy, and stay out of the traced scene the way DBuffer decals do.
+/// overlays modelled as thin meshes lying on the surface they stain. A blended
+/// one leaves the deferred path for the forward transparent phase, where the
+/// scene's shadowless lights blow it out, so they take `runtime_alpha_mode`'s
+/// policy like any other translucent material and only stay out of the traced
+/// scene and the shadow pass, the way DBuffer decals do.
 fn is_mesh_decal(object: &str, material: &EffectiveMaterial) -> bool {
     // The bake flattens instance chains, so the runtime manifest carries no
     // master; every decal instance lives under `/MaterialLibrary/Decals/`, which
@@ -1150,10 +1151,6 @@ fn is_mesh_decal(object: &str, material: &EffectiveMaterial) -> bool {
                 .as_deref()
                 .is_some_and(|master| master.starts_with("M_LS_Decal")))
 }
-
-/// Depth units (`wgpu::DepthBiasState::constant`) that lift a mesh decal off
-/// the coplanar surface it lies on.
-const MESH_DECAL_DEPTH_BIAS: f32 = 8.0;
 
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 enum SourceBlendMode {
@@ -2197,17 +2194,10 @@ fn build_material_handles(
             // masked partitions spawn as `Mesh3d` rather than meshlets. Solari
             // still traces every instance opaque, so the two renderers disagree
             // about the cutout until it gains alpha-tested ray queries.
-            alpha_mode: if mesh_decal {
-                AlphaMode::Blend
-            } else if unlit_textures {
+            alpha_mode: if unlit_textures {
                 AlphaMode::Opaque
             } else {
                 runtime_alpha_mode(&effective, preserve_alpha)
-            },
-            depth_bias: if mesh_decal {
-                MESH_DECAL_DEPTH_BIAS
-            } else {
-                0.0
             },
             double_sided: render_properties.double_sided,
             cull_mode: render_properties.cull_mode,
@@ -2257,7 +2247,7 @@ fn build_material_handles(
     if mesh_decal_materials != 0 {
         info!(
             mesh_decal_materials,
-            "mesh decals blend over their surfaces with a depth bias and stay out of the traced scene"
+            "mesh decals stay out of the traced scene and the shadow pass"
         );
     }
     (result, panning_water, mesh_decals)
