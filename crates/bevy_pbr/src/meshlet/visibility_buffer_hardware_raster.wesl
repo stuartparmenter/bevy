@@ -2,9 +2,8 @@
 
 import package::{
     meshlet::bindings::{
-        meshlet_cluster_meshlet_ids,
-        meshlets,
-        meshlet_cluster_instance_ids,
+        meshlet_instance_descriptors,
+        load_meshlet_geometry,
         meshlet_instance_uniforms,
         meshlet_raster_clusters,
         meshlet_previous_raster_counts,
@@ -17,6 +16,9 @@ import package::{
     render::mesh_functions::mesh_position_local_to_world,
 };
 import bevy_render::maths::affine3_to_square;
+
+enable wgpu_binding_array;
+
 var<immediate> meshlet_raster_cluster_rightmost_slot: u32;
 
 struct VertexOutput {
@@ -30,16 +32,17 @@ fn vertex(@builtin(instance_index) instance_index: u32, @builtin(vertex_index) v
     let cluster_in_draw = meshlet_previous_raster_counts[1] + instance_index;
     let cluster_id = meshlet_raster_cluster_rightmost_slot - cluster_in_draw;
     let instanced_offset = meshlet_raster_clusters[cluster_id];
-    var meshlet = meshlets[instanced_offset.offset];
+    let descriptor = meshlet_instance_descriptors[instanced_offset.instance_id];
+    var meshlet = load_meshlet_geometry(descriptor, instanced_offset.offset);
 
     let triangle_id = vertex_index / 3u;
     if triangle_id >= get_meshlet_triangle_count(&meshlet) { return dummy_vertex(); }
     let index_id = vertex_index;
-    let vertex_id = get_meshlet_vertex_id(meshlet.start_index_id + index_id);
+    let vertex_id = get_meshlet_vertex_id(descriptor, meshlet.start_index_id + index_id);
 
     let instance_uniform = meshlet_instance_uniforms[instanced_offset.instance_id];
 
-    let vertex_position = get_meshlet_vertex_position(&meshlet, vertex_id);
+    let vertex_position = get_meshlet_vertex_position(descriptor, &meshlet, vertex_id);
     let world_from_local = affine3_to_square(instance_uniform.world_from_local);
     let world_position = mesh_position_local_to_world(world_from_local, vec4(vertex_position, 1.0));
     let clip_position = view.clip_from_world * vec4(world_position.xyz, 1.0);

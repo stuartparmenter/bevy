@@ -22,7 +22,7 @@ fn lod_error_is_imperceptible(lod_sphere: vec4<f32>, simplification_error: f32, 
         let proj = projection[1][1];
         let height = 2.0 / proj;
         let norm_error = world_error / height;
-        return norm_error * view.viewport.w < 1.0;
+        return norm_error * view.main_pass_viewport.w < 1.0;
     } else {
         // Perspective
         var near = projection[3][2];
@@ -30,8 +30,9 @@ fn lod_error_is_imperceptible(lod_sphere: vec4<f32>, simplification_error: f32, 
         let world_sphere_radius = lod_sphere.w * world_scale;
         let d_pos = world_sphere_center - camera_pos;
         let d = sqrt(dot(d_pos, d_pos)) - world_sphere_radius;
-        let norm_error = simplification_error / max(d, near) * projection[1][1] * 0.5;
-        return norm_error * view.viewport.w < 1.0;
+        let world_error = simplification_error * world_scale;
+        let norm_error = world_error / max(d, near) * projection[1][1] * 0.5;
+        return norm_error * view.main_pass_viewport.w < 1.0;
     }
 }
 
@@ -197,7 +198,7 @@ fn should_occlusion_cull_aabb(aabb: MeshletAabb, instance_id: u32) -> bool {
     let clip_from_local = occlusion_cull_clip_from_local(instance_id);
     var screen_aabb = ScreenAabb(vec3<f32>(0.0), vec3<f32>(0.0));
     if project_aabb(clip_from_local, near, aabb, &screen_aabb) {
-        return occlusion_cull_screen_aabb(screen_aabb, view.viewport.zw);
+        return occlusion_cull_screen_aabb(screen_aabb, view.main_pass_viewport.zw);
     }
     return false;
 }

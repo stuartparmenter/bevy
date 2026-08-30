@@ -8,6 +8,8 @@ import package::{
     },
 };
 
+enable wgpu_binding_array;
+
 @vertex
 fn vertex(@builtin(vertex_index) vertex_input: u32) -> @builtin(position) vec4<f32> {
     let vertex_index = vertex_input % 3u;

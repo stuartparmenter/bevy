@@ -1,4 +1,7 @@
-use super::{meshlet_mesh_manager::MeshletMeshManager, MeshletMesh, MeshletMesh3d};
+use super::{
+    meshlet_mesh_manager::{MeshletGpuDescriptor, MeshletMeshManager},
+    MeshletMesh, MeshletMesh3d,
+};
 use crate::{
     meshlet::asset::MeshletAabb, MeshFlags, MeshGeometryError, MeshTransforms, MeshUniform,
     PreviousGlobalTransform, RenderMaterialInstances,
@@ -17,6 +20,7 @@ use bevy_platform::collections::{HashMap, HashSet};
 use bevy_render::{
     material_bind_groups::{MaterialBindingId, RenderMaterialBindings},
     render_resource::StorageBuffer,
+    renderer::RenderDevice,
     sync_world::MainEntity,
     MainWorld,
 };
@@ -40,8 +44,8 @@ pub struct InstanceManager {
     pub instance_aabbs: StorageBuffer<Vec<MeshletAabb>>,
     /// Per-instance material ID.
     pub instance_material_ids: StorageBuffer<Vec<u32>>,
-    /// Per-instance index to the root node of the instance's BVH.
-    pub instance_bvh_root_nodes: StorageBuffer<Vec<u32>>,
+    /// Per-instance page and asset-local section bases in the paged meshlet data heap.
+    pub instance_meshlet_descriptors: StorageBuffer<Vec<MeshletGpuDescriptor>>,
     /// Per-view per-instance visibility bit. Used for [`RenderLayers`] and [`NotShadowCaster`] support.
     pub view_instance_visibility: EntityHashMap<StorageBuffer<Vec<u32>>>,
 
@@ -75,9 +79,9 @@ impl InstanceManager {
                 buffer.set_label(Some("meshlet_instance_material_ids"));
                 buffer
             },
-            instance_bvh_root_nodes: {
+            instance_meshlet_descriptors: {
                 let mut buffer = StorageBuffer::default();
-                buffer.set_label(Some("meshlet_instance_bvh_root_nodes"));
+                buffer.set_label(Some("meshlet_instance_descriptors"));
                 buffer
             },
             view_instance_visibility: EntityHashMap::default(),
@@ -91,7 +95,7 @@ impl InstanceManager {
     pub fn add_instance(
         &mut self,
         instance: MainEntity,
-        root_bvh_node: u32,
+        meshlet_descriptor: MeshletGpuDescriptor,
         aabb: MeshletAabb,
         bvh_depth: u32,
         transform: &GlobalTransform,
@@ -152,7 +156,9 @@ impl InstanceManager {
         self.instance_uniforms.get_mut().push(mesh_uniform);
         self.instance_aabbs.get_mut().push(aabb);
         self.instance_material_ids.get_mut().push(0);
-        self.instance_bvh_root_nodes.get_mut().push(root_bvh_node);
+        self.instance_meshlet_descriptors
+            .get_mut()
+            .push(meshlet_descriptor);
 
         self.scene_instance_count += 1;
         self.max_bvh_depth = self.max_bvh_depth.max(bvh_depth);
@@ -181,7 +187,7 @@ impl InstanceManager {
         self.instance_uniforms.get_mut().clear();
         self.instance_aabbs.get_mut().clear();
         self.instance_material_ids.get_mut().clear();
-        self.instance_bvh_root_nodes.get_mut().clear();
+        self.instance_meshlet_descriptors.get_mut().clear();
         self.view_instance_visibility
             .retain(|view_entity, _| entities.contains(*view_entity));
         self.view_instance_visibility
@@ -201,6 +207,7 @@ pub fn extract_meshlet_mesh_entities(
     mut main_world: ResMut<MainWorld>,
     mesh_material_ids: Res<RenderMaterialInstances>,
     render_material_bindings: Res<RenderMaterialBindings>,
+    render_device: Res<RenderDevice>,
     mut system_state: Local<
         Option<
             SystemState<(
@@ -262,13 +269,17 @@ pub fn extract_meshlet_mesh_entities(
         }
 
         // Upload the instance's MeshletMesh asset data if not done already done
-        let (root_bvh_node, aabb, bvh_depth) =
-            meshlet_mesh_manager.queue_upload_if_needed(meshlet_mesh.id(), &mut assets);
+        let Some((meshlet_descriptor, aabb, bvh_depth)) = meshlet_mesh_manager
+            .queue_upload_if_needed(meshlet_mesh.id(), &mut assets, &render_device)
+        else {
+            // The asset is unusable or the meshlet heap is full. The manager logs why, once.
+            continue;
+        };
 
         // Add the instance's data to the instance manager
         instance_manager.add_instance(
             instance.into(),
-            root_bvh_node,
+            meshlet_descriptor,
             aabb,
             bvh_depth,
             transform,
