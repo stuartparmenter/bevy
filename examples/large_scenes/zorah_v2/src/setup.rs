@@ -10,7 +10,6 @@ use bevy::{
         prepass::{DeferredPrepass, DepthPrepass},
         tonemapping::Tonemapping,
     },
-    light::SunDisk,
     curve::cubic_splines::LinearSpline,
     math::ops,
     post_process::{
@@ -38,11 +37,6 @@ const FIRE_PROXY_HEIGHT: f32 = 0.3;
 const FIRE_PROXY_RADIUS: f32 = 0.15;
 /// A wood fire's colour temperature.
 const FIRE_TEMPERATURE_K: f32 = 1900.0;
-/// `vk_lod_clusters`' `--sundirection` (towards the sun) and `--suncolor`
-/// from the export's .cfg.
-const SUN_DIRECTION: Vec3 = Vec3::new(0.6, 0.7, 0.36);
-/// A renderer parameter, so linear rather than encoded.
-const SUN_COLOR: Color = Color::linear_rgb(1.0, 0.8, 0.5);
 /// The reference renderer's metering (donut's histogram eye adaptation, which
 /// RTXMG runs with its defaults): the mean of the 80th..95th luminance
 /// percentiles, so the scene is exposed for its bright end rather than its
@@ -67,7 +61,6 @@ pub struct SetupOptions {
     pub exposure_ev100: Option<f32>,
     pub auto_exposure: bool,
     pub exposure_bias: f32,
-    pub sun_illuminance: f32,
     pub fire_lumens: f32,
     pub solari_albedo: bool,
     pub bake: BakeSettings,
@@ -94,21 +87,6 @@ pub fn setup(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut compensation_curves: ResMut<Assets<AutoExposureCompensationCurve>>,
 ) {
-    if options.sun_illuminance > 0.0 {
-        commands.spawn((
-            Name::new("Sun"),
-            DirectionalLight {
-                color: SUN_COLOR,
-                illuminance: options.sun_illuminance,
-                // Solari provides the shadows; a cascade pass would only cost.
-                shadow_maps_enabled: false,
-                ..default()
-            },
-            SunDisk::EARTH,
-            Transform::from_translation(Vec3::ZERO).looking_to(-SUN_DIRECTION.normalize(), Vec3::Y),
-        ));
-    }
-
     let mut raytracing_instances = Vec::new();
     if options.fire_lumens > 0.0 {
         raytracing_instances = spawn_fire_proxies(
@@ -202,7 +180,6 @@ pub fn setup(
         base_ev100,
         auto_exposure,
         environment_map = options.environment_map.path.as_str(),
-        sun_illuminance = options.sun_illuminance,
         fire_proxies = raytracing_instances.len(),
         "Zorah view and lighting set up"
     );

@@ -137,7 +137,7 @@ impl EnvironmentMapLoad {
 /// Waits for the panorama, converts it on `AsyncComputeTaskPool` (the 4k
 /// source takes a third of a second in release, too long for a frame), then
 /// puts it on the camera as `EnvironmentMapLight` and `Skybox`. A load or
-/// conversion failure warns and leaves the sun as the only light. Runs while
+/// conversion failure warns and leaves only the emissive and fire lights. Runs while
 /// `EnvironmentMapLoad` exists.
 pub fn install_environment_map(
     mut commands: Commands,
@@ -215,7 +215,7 @@ pub fn install_environment_map(
         Err(reason) => {
             warn!(
                 path = load.map.path,
-                "environment map unusable ({reason}); the sun is the only light"
+                "environment map unusable ({reason}); only the emissive and fire lights remain"
             );
         }
     }

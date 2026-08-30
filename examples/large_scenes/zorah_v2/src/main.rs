@@ -166,10 +166,6 @@ struct Args {
     #[argh(option, default = "1.0")]
     envmap_intensity: f32,
 
-    /// illuminance in lux of a directional sun from the .cfg direction (default direct sunlight, 100000); 0 = no sun
-    #[argh(option, default = "100000.0")]
-    sun_illuminance: f32,
-
     /// multiplier on every emissive material so lamp glass and coals act as light sources
     #[argh(option, default = "4.0")]
     emissive_boost: f32,
@@ -601,7 +597,6 @@ fn run_app(args: &Args, prepared: Prepared) -> ExitCode {
         } else {
             0.0
         },
-        sun_illuminance: args.sun_illuminance.max(0.0),
         fire_lumens: args.fire_lumens.max(0.0),
         solari_albedo: args.solari_albedo,
         bake: settings,
