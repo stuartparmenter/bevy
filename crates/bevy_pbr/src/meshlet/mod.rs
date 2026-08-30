@@ -21,11 +21,13 @@ pub(crate) use self::{
 #[cfg(feature = "meshlet_processor")]
 pub use self::asset::MeshletRaytracingGeometry;
 pub use self::asset::{
-    MeshletMesh, MeshletMeshLoader, MeshletMeshSaver, MESHLET_MESH_ASSET_VERSION,
+    MeshletMesh, MeshletMeshLoader, MeshletMeshSaveOrLoadError, MeshletMeshSaver,
+    MESHLET_MESH_ASSET_VERSION,
 };
 #[cfg(feature = "meshlet_processor")]
 pub use self::from_mesh::{
-    MeshToMeshletMeshConversionError, MESHLET_DEFAULT_VERTEX_POSITION_QUANTIZATION_FACTOR,
+    quantize_vertex_position, vertex_position_quantization_scale, MeshToMeshletMeshConversionError,
+    MESHLET_DEFAULT_VERTEX_POSITION_QUANTIZATION_FACTOR,
 };
 use self::{
     instance_manager::extract_meshlet_mesh_entities,

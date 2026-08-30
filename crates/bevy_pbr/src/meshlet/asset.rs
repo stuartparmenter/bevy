@@ -61,6 +61,30 @@ pub struct MeshletMesh {
     pub(crate) bvh_depth: u32,
 }
 
+impl MeshletMesh {
+    /// The number of meshlets in this mesh, across every LOD.
+    pub fn meshlet_count(&self) -> usize {
+        self.meshlets.len()
+    }
+
+    /// The number of triangles in this mesh across every LOD, which is what its meshlet data
+    /// scales with; the finest LOD alone is the source mesh's count.
+    pub fn triangle_count(&self) -> usize {
+        self.meshlets
+            .iter()
+            .map(|meshlet| meshlet.triangle_count as usize)
+            .sum()
+    }
+
+    /// The bytes the meshlet manager uploads for this mesh: its seven packed streams laid out
+    /// back to back at the manager's section alignment, exactly as `pack_meshlet_mesh` in
+    /// `meshlet_mesh_manager.rs` sizes an allocation. A scene deciding what fits in the manager's
+    /// `MESHLET_MAX_PAGES` pages of `MESHLET_PAGE_SIZE` bytes budgets with this.
+    pub fn packed_byte_len(&self) -> usize {
+        super::meshlet_mesh_manager::packed_meshlet_mesh_len(self)
+    }
+}
+
 /// A fixed-error meshlet LOD decoded into hardware ray-tracing input geometry.
 ///
 /// Hardware acceleration structures cannot consume [`MeshletMesh`]'s variable-bit packed
@@ -73,6 +97,12 @@ pub struct MeshletRaytracingGeometry {
     pub normals: Vec<[f32; 3]>,
     pub uvs: Vec<[f32; 2]>,
     pub indices: Vec<u32>,
+    /// The largest geometric error any selected meshlet carries, which is what this geometry
+    /// actually deviates from the full-detail surface by - at most the requested `max_error`, and
+    /// usually far less. A consumer biasing rays off a rasterized surface wants this rather than the
+    /// request, because a mesh that simplifies to itself deviates by nothing and asking it to answer
+    /// for the request inflates every other instance's bias with it. Zero for empty geometry.
+    pub achieved_error: f32,
 }
 
 #[cfg(feature = "meshlet_processor")]
@@ -97,6 +127,10 @@ impl MeshletMesh {
             normals: Vec::with_capacity(vertex_count),
             uvs: Vec::with_capacity(vertex_count),
             indices: Vec::with_capacity(index_count),
+            achieved_error: selected
+                .iter()
+                .map(|&id| self.meshlet_cull_data[id].aabb.error)
+                .fold(0.0, f32::max),
         };
 
         for meshlet_id in selected {
@@ -173,7 +207,9 @@ impl MeshletMesh {
             packed[channel] = read_packed_bits(&self.vertex_positions, start_bit, bits[channel]);
             start_bit += bits[channel] as u32;
         }
-        let scale = ((1u32 << meshlet.vertex_position_quantization_factor) as f32) * 100.0;
+        let scale = super::from_mesh::vertex_position_quantization_scale(
+            meshlet.vertex_position_quantization_factor,
+        );
         Vec3::new(
             packed[0] as f32 + meshlet.min_vertex_position_channel_x,
             packed[1] as f32 + meshlet.min_vertex_position_channel_y,
@@ -357,32 +393,29 @@ impl AssetSaver for MeshletMeshSaver {
         _settings: &(),
         _asset_path: AssetPath<'_>,
     ) -> Result<(), MeshletMeshSaveOrLoadError> {
-        // Write asset magic number
-        writer
-            .write_all(&MESHLET_MESH_ASSET_MAGIC.to_le_bytes())
-            .await?;
+        asset.write(&mut AsyncWriteSyncAdapter(writer))
+    }
+}
 
-        // Write asset version
-        writer
-            .write_all(&MESHLET_MESH_ASSET_VERSION.to_le_bytes())
-            .await?;
-
-        writer.write_all(bytemuck::bytes_of(&asset.aabb)).await?;
-        writer
-            .write_all(bytemuck::bytes_of(&asset.bvh_depth))
-            .await?;
+impl MeshletMesh {
+    /// Encodes a `.meshlet_mesh` file, as [`MeshletMeshSaver`] does; the inverse of
+    /// [`Self::read`].
+    pub fn write(&self, writer: &mut dyn Write) -> Result<(), MeshletMeshSaveOrLoadError> {
+        writer.write_all(&MESHLET_MESH_ASSET_MAGIC.to_le_bytes())?;
+        writer.write_all(&MESHLET_MESH_ASSET_VERSION.to_le_bytes())?;
+        writer.write_all(bytemuck::bytes_of(&self.aabb))?;
+        writer.write_all(bytemuck::bytes_of(&self.bvh_depth))?;
 
         // Compress and write asset data
-        let mut writer = FrameEncoder::new(AsyncWriteSyncAdapter(writer));
-        write_slice(&asset.vertex_positions, &mut writer)?;
-        write_slice(&asset.vertex_normals, &mut writer)?;
-        write_slice(&asset.vertex_uvs, &mut writer)?;
-        write_slice(&asset.indices, &mut writer)?;
-        write_slice(&asset.bvh, &mut writer)?;
-        write_slice(&asset.meshlets, &mut writer)?;
-        write_slice(&asset.meshlet_cull_data, &mut writer)?;
+        let mut writer = FrameEncoder::new(writer);
+        write_slice(&self.vertex_positions, &mut writer)?;
+        write_slice(&self.vertex_normals, &mut writer)?;
+        write_slice(&self.vertex_uvs, &mut writer)?;
+        write_slice(&self.indices, &mut writer)?;
+        write_slice(&self.bvh, &mut writer)?;
+        write_slice(&self.meshlets, &mut writer)?;
+        write_slice(&self.meshlet_cull_data, &mut writer)?;
         writer.finish()?;
-
         Ok(())
     }
 }
@@ -402,27 +435,36 @@ impl AssetLoader for MeshletMeshLoader {
         _settings: &(),
         _load_context: &mut LoadContext<'_>,
     ) -> Result<MeshletMesh, MeshletMeshSaveOrLoadError> {
-        // Load and check magic number
-        let magic = async_read_u64(reader).await?;
+        MeshletMesh::read(&mut AsyncReadSyncAdapter(reader))
+    }
+
+    fn extensions(&self) -> &[&str] {
+        &["meshlet_mesh"]
+    }
+}
+
+impl MeshletMesh {
+    /// Decodes a `.meshlet_mesh` file, as [`MeshletMeshLoader`] does, for a caller without an
+    /// asset server: a tool measuring a cache of them, or a loader wrapping the format in one of
+    /// its own.
+    pub fn read(reader: &mut dyn Read) -> Result<MeshletMesh, MeshletMeshSaveOrLoadError> {
+        let magic = read_u64(reader)?;
         if magic != MESHLET_MESH_ASSET_MAGIC {
             return Err(MeshletMeshSaveOrLoadError::WrongFileType);
         }
-
-        // Load and check asset version
-        let version = async_read_u64(reader).await?;
+        let version = read_u64(reader)?;
         if version != MESHLET_MESH_ASSET_VERSION {
             return Err(MeshletMeshSaveOrLoadError::WrongVersion { found: version });
         }
 
         let mut bytes = [0u8; size_of::<MeshletAabb>()];
-        reader.read_exact(&mut bytes).await?;
+        reader.read_exact(&mut bytes)?;
         let aabb = bytemuck::cast(bytes);
         let mut bytes = [0u8; size_of::<u32>()];
-        reader.read_exact(&mut bytes).await?;
+        reader.read_exact(&mut bytes)?;
         let bvh_depth = u32::from_le_bytes(bytes);
 
-        // Load and decompress asset data
-        let reader = &mut FrameDecoder::new(AsyncReadSyncAdapter(reader));
+        let reader = &mut FrameDecoder::new(reader);
         let vertex_positions = read_slice(reader)?;
         let vertex_normals = read_slice(reader)?;
         let vertex_uvs = read_slice(reader)?;
@@ -443,10 +485,6 @@ impl AssetLoader for MeshletMeshLoader {
             bvh_depth,
         })
     }
-
-    fn extensions(&self) -> &[&str] {
-        &["meshlet_mesh"]
-    }
 }
 
 #[derive(Error, Debug)]
@@ -459,12 +497,6 @@ pub enum MeshletMeshSaveOrLoadError {
     CompressionOrDecompression(#[from] lz4_flex::frame::Error),
     #[error(transparent)]
     Io(#[from] std::io::Error),
-}
-
-async fn async_read_u64(reader: &mut dyn Reader) -> Result<u64, std::io::Error> {
-    let mut bytes = [0u8; 8];
-    reader.read_exact(&mut bytes).await?;
-    Ok(u64::from_le_bytes(bytes))
 }
 
 fn read_u64(reader: &mut dyn Read) -> Result<u64, std::io::Error> {
