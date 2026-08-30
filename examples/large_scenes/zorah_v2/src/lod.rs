@@ -70,6 +70,11 @@ pub struct PartStats {
     pub blas_vertices: u64,
     /// The largest error any BLAS meshlet carries.
     pub blas_achieved_error: f32,
+    /// Every vertex quantized to the same position in every meshlet, so the
+    /// position stream is empty and the part has no area to render; the
+    /// meshlet manager rejects the upload. A bake artefact of a mesh smaller
+    /// than the quantization step, not a corrupt file.
+    pub degenerate: bool,
 }
 
 /// One cache part as the runner consumes it: the pruned meshlet mesh and the
@@ -160,6 +165,7 @@ pub fn prepare_part(
         blas_triangles: (geometry.indices.len() / 3) as u64,
         blas_vertices: geometry.positions.len() as u64,
         blas_achieved_error: geometry.achieved_error,
+        degenerate: meshlet.has_no_vertex_positions(),
     };
     Ok((meshlet, blas_mesh(geometry), stats))
 }

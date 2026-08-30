@@ -62,6 +62,12 @@ pub struct MeshletMesh {
 }
 
 impl MeshletMesh {
+    /// Whether every vertex of every meshlet quantized to its meshlet's origin, leaving the packed
+    /// position stream empty. Such a mesh has no area and the meshlet manager refuses to upload it.
+    pub fn has_no_vertex_positions(&self) -> bool {
+        self.vertex_positions.is_empty()
+    }
+
     /// The number of meshlets in this mesh, across every LOD.
     pub fn meshlet_count(&self) -> usize {
         self.meshlets.len()
