@@ -11,6 +11,15 @@
 //! seed, which `ReSTIR` relies on: reservoirs store only `(light_id, seed)` and re-resolve the
 //! direction every frame, so the same seed must always yield the same direction.
 //!
+//! The pyramid's face size follows the bound cubemap: the source face size rounded down to a power
+//! of two and capped at [`ENVIRONMENT_IMPORTANCE_MAX_FACE_SIZE`], so up to the cap every leaf is
+//! one source texel. A coarser pyramid would sample a few-texel sun disc at its neighbourhood's
+//! average density: the leaf jitter is uniform, so most samples aimed at the disc's leaf miss it and
+//! the hits carry the leaf's too-low pdf. The pyramid is reallocated (texture, mip views, downsample
+//! bind groups) whenever the required face size changes; the initial one is small and only ever
+//! bound while there is no environment. At the cap the atlas is 4096x2048 `R32Float`, 32 MiB for
+//! mip 0 and about 43 MiB with the mips.
+//!
 //! The pyramid is rebuilt when the bound cubemap changes (a different asset or texture, or the
 //! bound asset re-prepared this frame) and every frame while the map is a
 //! `GeneratedEnvironmentMapLight` placeholder, whose contents `bevy_pbr`'s generation nodes rewrite
@@ -18,7 +27,9 @@
 //! another map is bound is not noticed if it comes back with the same texture. The build runs in
 //! the `Render` schedule ahead of the render graph, so a regenerated map is sampled through the
 //! pyramid of its previous frame's contents: one frame of lag in the sampling density only, never
-//! in the radiance, so it cannot bias the result.
+//! in the radiance, so it cannot bias the result. A per-frame rebuild costs one cubemap tap per
+//! atlas texel plus the downsample chain: 2M taps and about 2.8M texel writes for a typical 512/face
+//! generated atmosphere, four times that at the cap.
 //!
 //! Without an `EnvironmentMapLight` there is no environment light source at all: no entry in the
 //! light list, so its selection probability is 0, and a zero tint, so a missed ray collects 0. The
@@ -50,8 +61,12 @@ use bevy_render::{
 };
 use bevy_utils::default;
 
-/// Face size, in texels, of the importance pyramid.
-pub(crate) const ENVIRONMENT_IMPORTANCE_FACE_SIZE: u32 = 256;
+/// Largest face size, in texels, of the importance pyramid: a source with larger faces is sampled
+/// through a pyramid of this size, its leaves averaging `(source / cap)^2` texels each.
+pub const ENVIRONMENT_IMPORTANCE_MAX_FACE_SIZE: u32 = 1024;
+/// Face size of the pyramid allocated at startup, bound only while there is no environment.
+const ENVIRONMENT_IMPORTANCE_PLACEHOLDER_FACE_SIZE: u32 = 16;
+const ENVIRONMENT_IMPORTANCE_LABEL: &str = "solari_environment_importance_map";
 /// Faces per row of the importance atlas.
 pub(crate) const ENVIRONMENT_ATLAS_FACES_X: u32 = 4;
 /// Face rows of the importance atlas.
@@ -65,6 +80,12 @@ const ENVIRONMENT_IMPORTANCE_FLOOR: f32 = 1e-6;
 /// `log2(N) + 2` halvings reach `2x1` and one more reaches the `1x1` root.
 pub fn importance_mip_count(face_size: u32) -> u32 {
     face_size.ilog2() + 3
+}
+
+/// Pyramid face size for a source cubemap with faces of `source_face_size` texels: the source size
+/// rounded down to a power of two, at most [`ENVIRONMENT_IMPORTANCE_MAX_FACE_SIZE`].
+pub fn importance_face_size(source_face_size: u32) -> u32 {
+    (1u32 << source_face_size.max(1).ilog2()).min(ENVIRONMENT_IMPORTANCE_MAX_FACE_SIZE)
 }
 
 /// The `EnvironmentMapLight` of a Solari camera, mirrored into the render world.
@@ -204,8 +225,11 @@ pub(crate) fn importance_source_sampling(
 pub struct EnvironmentImportanceMaps {
     /// Linear/clamp sampler used for every cubemap read (build pass and scene bind group).
     pub sampler: Sampler,
-    /// The pyramid for the view's cubemap, re-targeted per asset; `source` is `None` while unused.
+    /// The pyramid for the view's cubemap, re-targeted per asset and reallocated when the source's
+    /// face size asks for a different [`importance_face_size`]; `source` is `None` while unused.
     pub pyramid: ImportancePyramid,
+    /// Layout of the downsample passes, needed to build a reallocated pyramid's bind groups.
+    downsample_layout: BindGroupLayout,
     /// A 1x1 black cube bound at scene binding 17 while no `EnvironmentMapLight` is bound. Only a
     /// placeholder for the static layout: with no environment light entry and a zero tint it is
     /// never sampled as light.
@@ -219,7 +243,8 @@ impl EnvironmentImportanceMaps {
     /// Targets the pyramid at `map`'s cubemap, scheduling a rebuild when the asset or its GPU
     /// texture differs from what the pyramid was last built from, when `modified` says the asset
     /// was re-prepared this frame (an in-place update keeps the texture), or on every call while
-    /// the map's contents change every frame.
+    /// the map's contents change every frame. A retarget reallocates the pyramid first when the
+    /// cubemap's face size asks for a different pyramid size.
     pub(crate) fn request(
         &mut self,
         map: &ExtractedSolariEnvironmentMap,
@@ -231,10 +256,24 @@ impl EnvironmentImportanceMaps {
         let source = (map.specular_map, gpu.texture.id());
         let retargeted = self.pyramid.source != Some(source);
         if retargeted {
+            let source_face_size = gpu.texture_descriptor.size.width;
+            let face_size = importance_face_size(source_face_size);
+            if self.pyramid.face_size() != face_size {
+                bevy_log::info!(
+                    source_face_size,
+                    face_size,
+                    "environment importance pyramid reallocated"
+                );
+                self.pyramid = ImportancePyramid::new(
+                    device,
+                    &self.downsample_layout,
+                    ENVIRONMENT_IMPORTANCE_LABEL,
+                    face_size,
+                );
+            }
             self.pyramid.source = Some(source);
-            let face_size = self.pyramid.face_size();
             let (source_mip, oversample) = importance_source_sampling(
-                gpu.texture_descriptor.size.width,
+                source_face_size,
                 gpu.texture_descriptor.mip_level_count,
                 face_size,
             );
@@ -330,8 +369,8 @@ pub fn init_environment_importance_maps(
     let pyramid = ImportancePyramid::new(
         &render_device,
         &downsample_layout,
-        "solari_environment_importance_map",
-        ENVIRONMENT_IMPORTANCE_FACE_SIZE,
+        ENVIRONMENT_IMPORTANCE_LABEL,
+        ENVIRONMENT_IMPORTANCE_PLACEHOLDER_FACE_SIZE,
     );
 
     // wgpu zero-initialises it, which is the black the placeholder wants.
@@ -359,6 +398,7 @@ pub fn init_environment_importance_maps(
     commands.insert_resource(EnvironmentImportanceMaps {
         sampler,
         pyramid,
+        downsample_layout,
         placeholder_cube,
         needs_build: false,
         build_constants: UniformBuffer::default(),
@@ -742,8 +782,32 @@ mod tests {
 
     #[test]
     fn importance_mip_counts() {
+        assert_eq!(importance_mip_count(1024), 13);
         assert_eq!(importance_mip_count(256), 11);
         assert_eq!(importance_mip_count(16), 7);
+    }
+
+    #[test]
+    fn pyramid_face_size_follows_the_source_up_to_the_cap() {
+        // At or below the cap every leaf is one source texel, whatever the source's mip chain.
+        let face_size = importance_face_size(1024);
+        assert_eq!(face_size, 1024);
+        assert_eq!(importance_source_sampling(1024, 1, face_size), (0, 1));
+        assert_eq!(importance_source_sampling(1024, 11, face_size), (0, 1));
+        assert_eq!(importance_face_size(128), 128);
+        assert_eq!(importance_source_sampling(128, 1, 128), (0, 1));
+        // Above the cap the leaves average source texels: a full chain through its mip, a mip-less
+        // source through taps.
+        let face_size = importance_face_size(4096);
+        assert_eq!(face_size, ENVIRONMENT_IMPORTANCE_MAX_FACE_SIZE);
+        assert_eq!(importance_source_sampling(4096, 1, face_size), (0, 4));
+        assert_eq!(importance_source_sampling(4096, 13, face_size), (2, 1));
+        // A non-power-of-two source rounds down, so no leaf straddles a texel boundary.
+        assert_eq!(importance_face_size(96), 64);
+        assert_eq!(importance_face_size(1), 1);
+        assert_eq!(importance_face_size(0), 1);
+        assert!(ENVIRONMENT_IMPORTANCE_MAX_FACE_SIZE.is_power_of_two());
+        assert!(ENVIRONMENT_IMPORTANCE_PLACEHOLDER_FACE_SIZE.is_power_of_two());
     }
 
     #[test]
