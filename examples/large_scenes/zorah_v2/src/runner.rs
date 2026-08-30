@@ -128,6 +128,8 @@ pub struct PendingScene {
     /// Distinct pruned parts larger than a page, which the manager rejects
     /// however empty its pages are.
     parts_oversized: usize,
+    /// Distinct parts whose vertices all quantized to one position; skipped.
+    parts_degenerate: usize,
     /// The largest BLAS error any part achieved.
     blas_error_max: f32,
     warmup_frames_remaining: u64,
@@ -154,6 +156,7 @@ impl PendingScene {
             meshlet_bytes: 0,
             meshlet_triangles: 0,
             parts_oversized: 0,
+            parts_degenerate: 0,
             blas_error_max: 0.0,
             warmup_frames_remaining: 0,
             warmup_timeout_reported: false,
@@ -239,6 +242,7 @@ pub fn stream_scene(
         spawned = pending.spawned,
         mesh_raster = pending.mesh_raster,
         parts_failed = pending.parts_failed,
+        parts_degenerate = pending.parts_degenerate,
         materials = material_cache.created,
         textures = material_cache.textures_requested,
         expected_blas = pending.expected_blas,
@@ -444,6 +448,18 @@ fn settle_loads(
                 );
                 continue;
             };
+            if part.stats.degenerate {
+                // Nothing to draw or trace, and not a load failure: a rebake
+                // would produce the same part.
+                pending.parts_degenerate += 1;
+                warn!(
+                    "{}/{}: every vertex quantized to one position ({} source triangles); skipped",
+                    loading.manifest.stem,
+                    loading.manifest.parts[part_index].meshlet_file,
+                    loading.manifest.parts[part_index].triangles
+                );
+                continue;
+            }
             pending.blas_triangles += part.stats.blas_triangles;
             pending.meshlet_bytes += part.stats.packed_bytes;
             if !fits_a_page(part.stats.packed_bytes) {
