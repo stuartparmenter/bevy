@@ -326,8 +326,12 @@ fn default_bake_workers() -> usize {
 fn task_pool_plugin() -> TaskPoolPlugin {
     let cores = bevy::tasks::available_parallelism();
     let mut options = TaskPoolOptions::default();
+    // The defaults cap the async pool at four threads; raising only the
+    // minimum above that cap is a clamp with min > max, which panics.
     options.async_compute.min_threads = cores;
+    options.async_compute.max_threads = cores;
     options.compute.min_threads = cores;
+    options.compute.max_threads = cores;
     TaskPoolPlugin {
         task_pool_options: options,
     }
