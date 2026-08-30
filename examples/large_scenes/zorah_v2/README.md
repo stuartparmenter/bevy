@@ -182,6 +182,10 @@ environment light and thin-wall transmission exist in bevy_solari. By
 default transmissive materials are left out of the BLAS so the sky reaches
 the throne room through its windows.
 
+The export has no exposure data either; auto exposure uses the reference
+renderer's metering (the mean of the 80th..95th luminance percentiles
+scaled to -0.5 EV before ACES), and `--exposure-bias` adds to it.
+
 ## Flags
 
 | Flag | Default | Effect |
@@ -203,7 +207,7 @@ the throne room through its windows.
 | `--camera-target x,y,z` | scene.json view | Starting look target. |
 | `--exposure-ev100 ev` | auto | Fixed exposure. |
 | `--no-auto-exposure` | off | Fixed exposure at the base EV100 (Blender's default minus the bias) instead of histogram auto exposure. |
-| `--exposure-bias ev` | `0` | Exposure compensation, positive brighter. |
+| `--exposure-bias ev` | `0` | Exposure compensation on top of the reference's, positive brighter. |
 | `--hide-nodes substr` | none | Skip nodes whose name contains the substring; repeatable. |
 | `--preserve-alpha` | off | Keep MASK/BLEND materials as alpha-tested `Mesh3d` (meshlets cannot alpha-test). |
 | `--double-sided-all` | off | Render everything double-sided like the reference renderer. |

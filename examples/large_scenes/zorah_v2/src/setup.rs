@@ -43,6 +43,15 @@ const FIRE_TEMPERATURE_K: f32 = 1900.0;
 const SUN_DIRECTION: Vec3 = Vec3::new(0.6, 0.7, 0.36);
 /// A renderer parameter, so linear rather than encoded.
 const SUN_COLOR: Color = Color::linear_rgb(1.0, 0.8, 0.5);
+/// The reference renderer's metering (donut's histogram eye adaptation, which
+/// RTXMG runs with its defaults): the mean of the 80th..95th luminance
+/// percentiles, so the scene is exposed for its bright end rather than its
+/// median, is scaled to `exp2(-0.5)` before the ACES curve. Bevy's meter
+/// scales its mean to 1.0 and adds the compensation, so the same target is a
+/// flat -0.5 EV over that same percentile band. The export has no exposure
+/// data of its own; this is where the reference's look comes from.
+const REFERENCE_METERING_FILTER: std::ops::RangeInclusive<f32> = 0.80..=0.95;
+const REFERENCE_EXPOSURE_COMPENSATION_EV: f32 = -0.5;
 
 #[derive(Component)]
 pub struct ZorahCamera;
@@ -183,17 +192,19 @@ pub fn setup(
     // Solari's light-tile precision is unaffected by adaptation.
     let auto_exposure = options.auto_exposure && options.exposure_ev100.is_none();
     if auto_exposure {
-        // The metered target is independent of the base, so the bias has to
-        // enter the meter as well, as a flat exposure compensation over the
-        // whole metered range; positive brightens.
+        // The metered target is independent of the base, so the reference's
+        // compensation and the bias enter the meter as a flat exposure
+        // compensation over the whole metered range; positive brightens.
         let range = AutoExposure::default().range;
+        let compensation_ev = REFERENCE_EXPOSURE_COMPENSATION_EV + options.exposure_bias;
         let compensation_curve = AutoExposureCompensationCurve::from_curve(LinearSpline::new([
-            Vec2::new(*range.start(), options.exposure_bias),
-            Vec2::new(*range.end(), options.exposure_bias),
+            Vec2::new(*range.start(), compensation_ev),
+            Vec2::new(*range.end(), compensation_ev),
         ]))
         .expect("a flat two-point curve is monotonic and continuous");
         camera.insert(AutoExposure {
             range,
+            filter: REFERENCE_METERING_FILTER,
             compensation_curve: compensation_curves.add(compensation_curve),
             ..default()
         });
