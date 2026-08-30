@@ -2,6 +2,7 @@ use super::{
     allocator::RetainedBindingArray, lights::GpuLightSource, RaytracingSceneBindings,
     TlasInstanceSetupPipeline,
 };
+use crate::scene::environment::EnvironmentImportanceMaps;
 use bevy_ecs::system::{Res, ResMut};
 use bevy_pbr::DfgLut;
 use bevy_render::{
@@ -24,6 +25,8 @@ pub struct BindGroupCacheState {
     last_buffer_ids: [Option<BufferId>; 10],
     last_light_count: u32,
     last_dfg_ids: Option<(TextureViewId, SamplerId)>,
+    /// The bound environment cubemap and importance pyramid views.
+    last_environment_ids: Option<(TextureViewId, TextureViewId)>,
     pub dummy_buffer: Buffer,
 }
 
@@ -43,6 +46,7 @@ impl BindGroupCacheState {
             last_buffer_ids: [None; 10],
             last_light_count: 0,
             last_dfg_ids: None,
+            last_environment_ids: None,
             dummy_buffer,
         }
     }
@@ -85,6 +89,8 @@ impl RaytracingSceneBindings {
         &mut self,
         dfg_view: &TextureView,
         dfg_sampler: &Sampler,
+        environment_map_view: &TextureView,
+        pyramid_view: &TextureView,
     ) -> bool {
         let mut invalid = self.bind_groups.invalid;
         self.bind_groups.invalid = false;
@@ -115,6 +121,12 @@ impl RaytracingSceneBindings {
             invalid = true;
         }
 
+        let environment_ids = Some((environment_map_view.id(), pyramid_view.id()));
+        if self.bind_groups.last_environment_ids != environment_ids {
+            self.bind_groups.last_environment_ids = environment_ids;
+            invalid = true;
+        }
+
         invalid
     }
 
@@ -126,6 +138,8 @@ impl RaytracingSceneBindings {
         fallback_texture: &FallbackImage,
         dfg_view: &TextureView,
         dfg_sampler: &Sampler,
+        environment_map_view: &TextureView,
+        environment_maps: &EnvironmentImportanceMaps,
     ) -> BindGroup {
         let _span = info_span!("create_bind_group").entered();
         let dummy = &self.bind_groups.dummy_buffer;
@@ -233,6 +247,11 @@ impl RaytracingSceneBindings {
                 dfg_view,
                 dfg_sampler,
                 scene_parameters,
+                environment_map_view,
+                // Always Solari's own linear sampler, never the image's: a Nearest image sampler
+                // would change the radiance without changing the pdf.
+                &environment_maps.sampler,
+                &environment_maps.pyramid.view,
             )),
         )
     }
@@ -245,6 +264,8 @@ impl RaytracingSceneBindings {
         fallback_texture: &FallbackImage,
         dfg_view: &TextureView,
         dfg_sampler: &Sampler,
+        environment_map_view: &TextureView,
+        environment_maps: &EnvironmentImportanceMaps,
     ) -> BindGroup {
         if let Some(bind_group) = &self.bind_groups.cached[current_index] {
             return bind_group.clone();
@@ -259,6 +280,8 @@ impl RaytracingSceneBindings {
             fallback_texture,
             dfg_view,
             dfg_sampler,
+            environment_map_view,
+            environment_maps,
         );
         if self.tlas.previous_binding_is_stable() {
             self.bind_groups.cached[current_index] = Some(bind_group.clone());
@@ -272,6 +295,7 @@ pub fn prepare_raytracing_scene_bind_group(
     texture_assets: Res<RenderAssets<GpuImage>>,
     fallback_texture: Res<FallbackImage>,
     dfg_lut: Res<DfgLut>,
+    environment_maps: Res<EnvironmentImportanceMaps>,
     render_device: Res<RenderDevice>,
     pipeline_cache: Res<PipelineCache>,
     sparse_buffer_update_pipelines: Res<SparseBufferUpdatePipelines>,
@@ -314,7 +338,17 @@ pub fn prepare_raytracing_scene_bind_group(
             &fallback_texture.d2.sampler,
         ));
 
-    if bindings.take_bind_group_invalidation(dfg_view, dfg_sampler) {
+    let environment_map_view = bindings
+        .environment_map_view
+        .clone()
+        .unwrap_or_else(|| environment_maps.placeholder_cube.clone());
+
+    if bindings.take_bind_group_invalidation(
+        dfg_view,
+        dfg_sampler,
+        &environment_map_view,
+        &environment_maps.pyramid.view,
+    ) {
         bindings.bind_groups.cached = [None, None];
     }
 
@@ -326,6 +360,8 @@ pub fn prepare_raytracing_scene_bind_group(
         &fallback_texture,
         dfg_view,
         dfg_sampler,
+        &environment_map_view,
+        &environment_maps,
     ));
 }
 

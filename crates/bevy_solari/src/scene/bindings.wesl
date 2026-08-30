@@ -1,5 +1,7 @@
 import bevy_pbr::render::pbr_functions::calculate_tbn_mikktspace;
-import bevy_render::maths::{affine3_to_square, orthonormalize};
+import bevy_pbr::render::utils::{dir_to_cube_uv, rand_vec2f, sample_cube_dir, CubeUV};
+import bevy_render::maths::{affine3_to_square, orthonormalize, quat_rotate};
+import package::scene::environment_map::{atlas_position_to_face, cube_face_jacobian, face_to_atlas_texel, ENVIRONMENT_ATLAS_EMPTY_FACE};
 
 enable wgpu_ray_query;
 enable wgpu_binding_array;
@@ -16,7 +18,16 @@ struct InstanceGeometryIds {
 }
 
 struct SceneParameters {
+    // Multiplies the cubemap texel: EnvironmentMapLight::intensity, or 0 with no environment (the
+    // cube binding is then a 1x1 black placeholder).
+    environment_tint: vec3<f32>,
     max_world_geometry_error: f32,
+    // EnvironmentMapLight::rotation.inverse() as (x, y, z, w); identity otherwise.
+    environment_world_to_cube_rotation: vec4<f32>,
+    // Face size and mip count of the bound importance pyramid.
+    environment_face_size: u32,
+    environment_mip_count: u32,
+    _padding: vec2<u32>,
 }
 
 struct VertexBuffer { words: array<u32> }
@@ -96,6 +107,13 @@ struct LightSource {
 
 const LIGHT_SOURCE_KIND_EMISSIVE_MESH = 0u;
 const LIGHT_SOURCE_KIND_DIRECTIONAL = 1u;
+// Resolves like a directional light, but its radiance is also what a missed BRDF ray picks up from
+// sample_environment_radiance, so the two strategies have to be MIS-weighted against each other.
+const LIGHT_SOURCE_KIND_ENVIRONMENT = 3u;
+
+fn light_source_is_emissive_mesh(light_source: LightSource) -> bool {
+    return (light_source.kind & 1u) == 0u;
+}
 
 struct DirectionalLight {
     direction_to_light: vec3<f32>,
@@ -123,6 +141,9 @@ const LIGHT_NOT_PRESENT_THIS_FRAME = 0xFFFFFFFFu;
 @group(0) @binding(14) var brdf_dfg_lut: texture_2d<f32>;
 @group(0) @binding(15) var brdf_dfg_lut_sampler: sampler;
 @group(0) @binding(16) var<storage, read> scene_parameters: SceneParameters;
+@group(0) @binding(17) var environment_map: texture_cube<f32>;
+@group(0) @binding(18) var environment_map_sampler: sampler;
+@group(0) @binding(19) var environment_importance_map: texture_2d<f32>;
 
 const RAY_T_MIN = 0.001f;
 const RAY_T_MAX = 100000.0f;
@@ -158,6 +179,131 @@ fn bounded_world_geometry_error(world_geometry_error: f32) -> f32 {
         max(scene_parameters.max_world_geometry_error, 0.0),
         world_geometry_error < 0.0,
     );
+}
+
+fn world_to_cube_direction(world_direction: vec3<f32>) -> vec3<f32> {
+    // Same two steps as bevy_pbr's compute_cubemap_sample_dir and the skybox: rotate by the
+    // inverse environment rotation, then flip Z for the left-handed cubemap.
+    let c = quat_rotate(scene_parameters.environment_world_to_cube_rotation, world_direction);
+    return vec3(c.x, c.y, -c.z);
+}
+
+fn cube_to_world_direction(cube_direction: vec3<f32>) -> vec3<f32> {
+    let q = scene_parameters.environment_world_to_cube_rotation;
+    return quat_rotate(vec4(-q.xyz, q.w), vec3(cube_direction.x, cube_direction.y, -cube_direction.z));
+}
+
+// Radiance arriving from `direction` (world space, pointing away from the surface), in nits.
+fn sample_environment_radiance(direction: vec3<f32>) -> vec3<f32> {
+    return textureSampleLevel(environment_map, environment_map_sampler, world_to_cube_direction(direction), 0.0).rgb
+        * scene_parameters.environment_tint;
+}
+
+fn environment_importance_root() -> f32 {
+    return textureLoad(environment_importance_map, vec2(0u, 0u), scene_parameters.environment_mip_count - 1u).r;
+}
+
+// Density per steradian of the jittered sample inside the leaf texel at `coords`, given the leaf's
+// weight and the root total. The Jacobian is evaluated at the sample's own uv, which is exactly the
+// density the jitter has there.
+fn environment_leaf_pdf(leaf: f32, root: f32, coords: CubeUV) -> f32 {
+    return (leaf / root) * cube_face_jacobian(coords.uv, scene_parameters.environment_face_size);
+}
+
+// Density per steradian with which sample_environment_direction produces `direction`, for one draw
+// of the environment light entry.
+fn environment_direction_pdf(direction: vec3<f32>) -> f32 {
+    let root = environment_importance_root();
+    if !(root > 0.0) { return 0.0; }
+    let coords = dir_to_cube_uv(world_to_cube_direction(direction));
+    let texel = face_to_atlas_texel(coords, scene_parameters.environment_face_size);
+    let leaf = textureLoad(environment_importance_map, texel, 0u).r;
+    return environment_leaf_pdf(leaf, root, coords);
+}
+
+// 1 / light_count while the environment entry, which the binder always pushes last, is in
+// light_sources; else 0.
+fn environment_light_selection_probability() -> f32 {
+    let light_count = arrayLength(&light_sources);
+    if light_count == 0u || light_sources[light_count - 1u].kind != LIGHT_SOURCE_KIND_ENVIRONMENT {
+        return 0.0;
+    }
+    return 1.0 / f32(light_count);
+}
+
+// Density of the whole environment NEE strategy: pick the environment entry, then a direction.
+// Every MIS site (BRDF miss and NEE) uses this one function, so the two strategies always agree.
+fn environment_light_pdf(direction: vec3<f32>) -> f32 {
+    let selection = environment_light_selection_probability();
+    if selection == 0.0 { return 0.0; }
+    return environment_direction_pdf(direction) * selection;
+}
+
+struct EnvironmentDirectionSample {
+    world_direction: vec3<f32>,
+    // 0 when nothing could be sampled (all-zero pyramid).
+    pdf: f32,
+}
+
+const ONE_MINUS_EPSILON = 0.99999994f;
+
+// Hierarchical warp (RTXDI-style): two uniforms from `seed` pick a quadrant per level from the root
+// down, rescaled after every choice, and what is left of them jitters inside the leaf texel.
+// Deterministic per seed: ReSTIR re-resolves (light_id, seed) every frame.
+fn sample_environment_direction(seed: u32) -> EnvironmentDirectionSample {
+    var rng = seed;
+    var u = min(rand_vec2f(&rng), vec2(ONE_MINUS_EPSILON));
+    let mip_count = scene_parameters.environment_mip_count;
+    var texel = vec2(0u, 0u);
+    var leaf = 0.0;
+    var root = 0.0;
+    var level = mip_count - 1u; // root
+    while level > 0u {
+        level -= 1u;
+        let base = texel * 2u;
+        let w00 = textureLoad(environment_importance_map, base, level).r;
+        let w10 = textureLoad(environment_importance_map, base + vec2(1u, 0u), level).r;
+        var w01 = 0.0;
+        var w11 = 0.0;
+        // Every level is even-sized in both directions except the 2x1 one under the root, whose
+        // second row does not exist.
+        let under_root = level + 2u == mip_count;
+        if !under_root {
+            w01 = textureLoad(environment_importance_map, base + vec2(0u, 1u), level).r;
+            w11 = textureLoad(environment_importance_map, base + vec2(1u, 1u), level).r;
+        }
+        let left = w00 + w01;
+        let total = left + w10 + w11;
+        if !(total > 0.0) { return EnvironmentDirectionSample(vec3(0.0, 1.0, 0.0), 0.0); }
+        // Parents are sums of their children, so the first level's total is the root.
+        if under_root { root = total; }
+        let p_left = left / total;
+        var column = vec2(w00, w01); // (top, bottom) of the chosen column
+        var child = vec2(0u, 0u);
+        if u.x < p_left {
+            u.x = u.x / p_left;
+        } else {
+            u.x = (u.x - p_left) / (1.0 - p_left);
+            child.x = 1u;
+            column = vec2(w10, w11);
+        }
+        let p_top = column.x / (column.x + column.y);
+        if u.y < p_top {
+            u.y = u.y / p_top;
+        } else {
+            u.y = (u.y - p_top) / (1.0 - p_top);
+            child.y = 1u;
+        }
+        u = clamp(u, vec2(0.0), vec2(ONE_MINUS_EPSILON));
+        texel = base + child;
+        leaf = select(column.x, column.y, child.y == 1u);
+    }
+    let coords = atlas_position_to_face(texel, u, scene_parameters.environment_face_size);
+    if coords.face == ENVIRONMENT_ATLAS_EMPTY_FACE {
+        return EnvironmentDirectionSample(vec3(0.0, 1.0, 0.0), 0.0);
+    }
+    let pdf = environment_leaf_pdf(leaf, root, coords);
+    return EnvironmentDirectionSample(cube_to_world_direction(sample_cube_dir(coords.uv, coords.face)), pdf);
 }
 
 // A ray hit lies on the traced surface and carries a true geometric normal, so unlike a rasterized

@@ -3,7 +3,7 @@ import bevy_pbr::render::utils::{rand_f, rand_vec2f};
 import bevy_render::view::View;
 import package::scene::brdf::{evaluate_brdf, evaluate_and_sample_brdf, brdf_pdf, F_AB};
 import package::scene::sampling::{sample_random_light, random_emissive_light_pdf, power_heuristic};
-import package::scene::bindings::{trace_ray, resolve_ray_hit_full, offset_ray_origin, RAY_T_MIN, RAY_T_MAX, MIRROR_ROUGHNESS_THRESHOLD};
+import package::scene::bindings::{environment_light_pdf, sample_environment_radiance, trace_ray, resolve_ray_hit_full, offset_ray_origin, RAY_T_MIN, RAY_T_MAX, MIRROR_ROUGHNESS_THRESHOLD};
 
 enable wgpu_ray_query;
 
@@ -66,7 +66,13 @@ fn pathtrace(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 mis_weight = 1.0;
                 if direct_lighting.brdf_rays_can_hit {
                     let pdf_of_bounce = brdf_pdf(wo, direct_lighting.wi, ray_hit.world_normal, ray_hit.material, F_ab);
-                    mis_weight = power_heuristic(1.0 / direct_lighting.inverse_solid_angle_pdf, pdf_of_bounce);
+                    // The environment is also collected by a missed BRDF ray, so it MIS-weights
+                    // against the same density that branch uses.
+                    var pdf_of_light = 1.0 / direct_lighting.inverse_solid_angle_pdf;
+                    if direct_lighting.is_environment {
+                        pdf_of_light = environment_light_pdf(direct_lighting.wi);
+                    }
+                    mis_weight = power_heuristic(pdf_of_light, pdf_of_bounce);
                 }
 
                 let direct_lighting_brdf = evaluate_brdf(wo, direct_lighting.wi, ray_hit.world_normal, ray_hit.material, F_ab);
@@ -88,7 +94,14 @@ fn pathtrace(@builtin(global_invocation_id) global_id: vec3<u32>) {
             let rr = saturate(luminance(throughput));
             if rand_f(&rng) >= rr { break; }
             throughput /= rr;
-        } else { break; }
+        } else {
+            var mis_weight = 1.0;
+            if p_bounce != 0.0 {
+                mis_weight = power_heuristic(p_bounce, environment_light_pdf(ray_direction));
+            }
+            radiance += mis_weight * throughput * sample_environment_radiance(ray_direction);
+            break;
+        }
     }
 
     // Camera exposure

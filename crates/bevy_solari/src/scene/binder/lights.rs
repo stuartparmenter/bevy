@@ -37,6 +37,8 @@ pub struct GpuLightSource {
 pub enum LightSourceId {
     EmissiveMesh { entity: Entity, first_triangle: u32 },
     Directional(Entity),
+    /// The single environment slot, the Solari camera's `EnvironmentMapLight`.
+    Environment,
 }
 
 impl LightSourceId {
@@ -116,14 +118,23 @@ impl GpuLightSource {
             id: directional_light_id,
         }
     }
+
+    /// The one environment entry: resolved through the importance pyramid, and flagged so the
+    /// shaders MIS-weight it against the environment radiance a missed BRDF ray picks up.
+    fn new_environment_light() -> GpuLightSource {
+        Self { kind: 3, id: 0 }
+    }
 }
 
-/// How many emissive-mesh sources fit once the directional lights have reserved theirs.
-/// [`MAX_LIGHT_SOURCES`] bounds the whole list, and only the emissive sources have anything to
-/// yield: a truncated sun disk is NEE-only and would vanish outright, while a truncated emissive
-/// chunk is only unsampled emission.
-pub fn emissive_light_source_budget(directional_light_count: usize) -> usize {
-    MAX_LIGHT_SOURCES.saturating_sub(directional_light_count)
+/// How many emissive-mesh sources fit once the directional and environment lights have reserved
+/// theirs. [`MAX_LIGHT_SOURCES`] bounds the whole list, and only the emissive sources have
+/// anything to yield: a truncated sun disk is NEE-only with no environment radiance to fall back
+/// on, while a truncated emissive chunk is only unsampled emission.
+pub fn emissive_light_source_budget(
+    directional_light_count: usize,
+    environment_light_count: usize,
+) -> usize {
+    MAX_LIGHT_SOURCES.saturating_sub(directional_light_count + environment_light_count)
 }
 
 pub fn emissive_triangle_chunks(triangle_count: u32) -> impl Iterator<Item = (u32, u32)> {
@@ -203,6 +214,7 @@ pub struct LightState {
     dropped_emissives: HashMap<LightSourceId, GpuLightSource>,
     reported_light_source_overflow: bool,
     directional_count: usize,
+    environment_count: usize,
 }
 
 impl LightState {
@@ -228,6 +240,7 @@ impl LightState {
             dropped_emissives: HashMap::default(),
             reported_light_source_overflow: false,
             directional_count: 0,
+            environment_count: 0,
         }
     }
 
@@ -235,15 +248,25 @@ impl LightState {
         self.directional_count
     }
 
+    pub fn environment_light_count(&self) -> usize {
+        self.environment_count
+    }
+
     pub fn emissive_light_count(&self) -> usize {
-        self.index.len().saturating_sub(self.directional_count)
+        self.index
+            .len()
+            .saturating_sub(self.directional_count + self.environment_count)
     }
 
     fn emissive_budget(&self) -> usize {
-        emissive_light_source_budget(self.directional_count)
+        emissive_light_source_budget(self.directional_count, self.environment_count)
     }
 
-    pub fn update(&mut self, directional_lights: &Query<(Entity, &ExtractedDirectionalLight)>) {
+    pub fn update(
+        &mut self,
+        directional_lights: &Query<(Entity, &ExtractedDirectionalLight)>,
+        environment_present: bool,
+    ) {
         // There are few enough directional lights to just walk them every frame
         let _span = info_span!("update_lights").entered();
 
@@ -272,9 +295,35 @@ impl LightState {
         }
 
         self.directional_count = directional_count;
+        self.environment_count = usize::from(environment_present);
+
+        if environment_present {
+            self.add_light(
+                LightSourceId::Environment,
+                GpuLightSource::new_environment_light(),
+            );
+        } else {
+            self.remove_light(LightSourceId::Environment);
+        }
 
         self.rebalance_emissives();
+        self.pin_environment_last();
         self.write_light_id_translations();
+    }
+
+    /// Moves the environment source to the end of the list. The shaders derive the environment's
+    /// selection probability from the last entry's kind, so it has to stay there.
+    fn pin_environment_last(&mut self) {
+        let Some(index) = self.index.get(&LightSourceId::Environment) else {
+            return;
+        };
+        if index == self.index.len() as u32 - 1 {
+            return;
+        }
+        self.remove_light(LightSourceId::Environment);
+        let index = self.index.insert(LightSourceId::Environment);
+        self.sources
+            .grow_and_set(index, GpuLightSource::new_environment_light());
     }
 
     pub fn add_light(&mut self, id: LightSourceId, source: GpuLightSource) {
@@ -433,11 +482,14 @@ mod tests {
     }
 
     #[test]
-    fn the_emissive_budget_leaves_room_for_every_directional_light() {
+    fn the_emissive_budget_leaves_room_for_every_directional_and_environment_light() {
         // The whole list has to fit, so a truncation can never reach the sun, which is NEE-only.
-        assert_eq!(emissive_light_source_budget(3) + 3, MAX_LIGHT_SOURCES);
-        // Only the tail truncation can help a scene whose own lights exceed the cap.
-        assert_eq!(emissive_light_source_budget(MAX_LIGHT_SOURCES), 0);
+        assert_eq!(
+            emissive_light_source_budget(3, 1) + 3 + 1,
+            MAX_LIGHT_SOURCES
+        );
+        // Only the tail truncation can help a scene whose own lights exceed the cap between them.
+        assert_eq!(emissive_light_source_budget(MAX_LIGHT_SOURCES, 1), 0);
     }
 
     #[test]
@@ -495,12 +547,19 @@ mod tests {
     fn light_source_kinds_match_the_shader_constants() {
         let shader = include_str!("../bindings.wesl");
 
-        let directional = GpuLightSource::new_directional_light(7);
-        assert_eq!(directional.id, 7);
+        let environment = GpuLightSource::new_environment_light();
+        assert_eq!(environment.id, 0);
         assert!(shader.contains(&format!(
-            "const LIGHT_SOURCE_KIND_DIRECTIONAL = {}u;",
-            directional.kind
+            "const LIGHT_SOURCE_KIND_ENVIRONMENT = {}u;",
+            environment.kind
         )));
+        // The environment kind must still read as non-emissive-mesh in the shader's low-bit test.
+        assert_eq!(environment.kind & 1, 1);
+        // The shader derives the environment's selection probability from the last entry's kind,
+        // so the light set must keep pinning it last.
+        assert!(shader
+            .contains("light_sources[light_count - 1u].kind != LIGHT_SOURCE_KIND_ENVIRONMENT"));
+        assert_eq!(GpuLightSource::new_directional_light(0).kind & 1, 1);
         assert_eq!(GpuLightSource::new_emissive_mesh_light(0, 0).kind & 1, 0);
     }
 }

@@ -1,5 +1,6 @@
 mod binder;
 mod blas;
+mod environment;
 mod extract;
 mod types;
 
@@ -8,6 +9,7 @@ use bevy_shader::load_shader_library;
 pub use binder::prepare_raytracing_scene_resources;
 pub use binder::{RaytracingSceneBindings, RaytracingSceneNeedsPreviousFrameData};
 pub use blas::{RaytracingSceneStatus, RaytracingSceneStatusSnapshot};
+pub use environment::EnvironmentImportanceMaps;
 pub use types::RaytracingMesh3d;
 
 use crate::SolariPlugins;
@@ -22,7 +24,7 @@ use bevy_render::{
     render_asset::prepare_assets,
     render_resource::{update_sparse_buffers, BufferUsages},
     renderer::{RenderDevice, RenderGraph, RenderGraphSystems},
-    ExtractSchedule, GpuResourceAppExt, Render, RenderApp, RenderSystems,
+    ExtractSchedule, GpuResourceAppExt, Render, RenderApp, RenderStartup, RenderSystems,
 };
 use binder::{
     build_raytracing_tlas, prepare_raytracing_scene_bind_group, TlasInstanceSetupPipeline,
@@ -31,10 +33,11 @@ use blas::{
     compact_raytracing_blas, delete_raytracing_blas, prepare_raytracing_blas,
     update_raytracing_scene_status, BlasManager,
 };
+use environment::{build_environment_importance_maps, init_environment_importance_maps};
 use extract::{
     extract_raytracing_material_assets, extract_raytracing_scene_meshes_and_materials,
     extract_raytracing_scene_structural, extract_raytracing_scene_transforms,
-    StandardMaterialAssets,
+    extract_solari_environment_maps, StandardMaterialAssets,
 };
 use tracing::warn;
 
@@ -46,7 +49,10 @@ impl Plugin for RaytracingScenePlugin {
         load_shader_library!(app, "brdf.wesl");
         load_shader_library!(app, "bindings.wesl");
         load_shader_library!(app, "sampling.wesl");
+        load_shader_library!(app, "environment_map.wesl");
         embedded_asset!(app, "binder/setup_tlas_instances.wesl");
+        embedded_asset!(app, "environment_importance_map_build.wesl");
+        embedded_asset!(app, "environment_importance_map_downsample.wesl");
         app.init_resource::<RaytracingSceneStatus>();
     }
 
@@ -77,6 +83,7 @@ impl Plugin for RaytracingScenePlugin {
             .init_gpu_resource::<StandardMaterialAssets>()
             .init_gpu_resource::<RaytracingSceneBindings>()
             .init_gpu_resource::<TlasInstanceSetupPipeline>()
+            .add_systems(RenderStartup, init_environment_importance_maps)
             .add_systems(
                 ExtractSchedule,
                 (
@@ -84,6 +91,7 @@ impl Plugin for RaytracingScenePlugin {
                     extract_raytracing_scene_transforms,
                     extract_raytracing_scene_meshes_and_materials,
                     extract_raytracing_material_assets,
+                    extract_solari_environment_maps,
                 ),
             )
             .add_systems(
@@ -101,6 +109,9 @@ impl Plugin for RaytracingScenePlugin {
                         .after(compact_raytracing_blas),
                     prepare_raytracing_scene_resources.in_set(RenderSystems::PrepareResources),
                     prepare_raytracing_scene_bind_group.in_set(RenderSystems::PrepareBindGroups),
+                    build_environment_importance_maps
+                        .after(RenderSystems::PrepareBindGroups)
+                        .before(RenderSystems::Render),
                 ),
             )
             .add_systems(

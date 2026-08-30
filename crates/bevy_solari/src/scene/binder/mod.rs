@@ -15,14 +15,21 @@ use self::instances::{
 use self::lights::LightState;
 use self::tlas::TlasState;
 pub use self::tlas::{build_raytracing_tlas, TlasInstanceSetupPipeline};
-use super::{blas::BlasManager, extract::StandardMaterialAssets, RaytracingMesh3d};
+use super::{
+    blas::BlasManager,
+    environment::{EnvironmentImportanceMaps, ExtractedSolariEnvironmentMap},
+    extract::StandardMaterialAssets,
+    RaytracingMesh3d,
+};
 use bevy_ecs::{
     entity::Entity,
     lifecycle::RemovedComponents,
     resource::Resource,
-    system::{Query, Res, ResMut},
+    system::{Query, Res, ResMut, SystemParam},
     world::{FromWorld, World},
 };
+use bevy_log::warn_once;
+use bevy_math::{Quat, UVec2, Vec3, Vec4};
 use bevy_pbr::ExtractedDirectionalLight;
 use bevy_render::{
     mesh::allocator::MeshAllocator,
@@ -37,22 +44,63 @@ use tracing::{info, info_span};
 ///
 /// wgpu forbids uniform-buffer bindings in a bind group that also contains binding arrays, so
 /// these live in a read-only storage buffer instead.
-#[derive(ShaderType, Clone, Copy, Default, PartialEq)]
+#[derive(ShaderType, Clone, Copy, PartialEq, Debug)]
 struct GpuSceneParameters {
+    /// Multiplies the cubemap texel: `splat(EnvironmentMapLight::intensity)`, or 0 with no
+    /// environment, so the placeholder cube contributes nothing.
+    environment_tint: Vec3,
     max_world_geometry_error: f32,
+    /// `EnvironmentMapLight::rotation.inverse()` as (x, y, z, w); identity otherwise.
+    environment_world_to_cube_rotation: Vec4,
+    /// Face size of the bound importance pyramid.
+    environment_face_size: u32,
+    /// Mip count of the bound pyramid, `log2(face_size) + 3`.
+    environment_mip_count: u32,
+    _padding: UVec2,
+}
+
+impl GpuSceneParameters {
+    /// `pyramid_face_size` and `pyramid_mip_count` describe the importance pyramid bound
+    /// alongside `environment`.
+    fn new(
+        environment: Option<&ExtractedSolariEnvironmentMap>,
+        pyramid_face_size: u32,
+        pyramid_mip_count: u32,
+        max_world_geometry_error: f32,
+    ) -> Self {
+        let (environment_tint, world_to_cube) = match environment {
+            None => (Vec3::ZERO, Quat::IDENTITY),
+            Some(map) => (Vec3::splat(map.intensity), map.rotation.inverse()),
+        };
+        Self {
+            environment_tint,
+            max_world_geometry_error,
+            environment_world_to_cube_rotation: Vec4::from(world_to_cube),
+            environment_face_size: pyramid_face_size,
+            environment_mip_count: pyramid_mip_count,
+            _padding: UVec2::ZERO,
+        }
+    }
+}
+
+/// Everything the environment bindings are chosen from.
+#[derive(SystemParam)]
+pub struct EnvironmentParams<'w, 's> {
+    maps: Query<'w, 's, (Entity, &'static ExtractedSolariEnvironmentMap)>,
+    importance_maps: ResMut<'w, EnvironmentImportanceMaps>,
 }
 
 /// Logs the scene's composition once it has held still for a couple of frames, so a settling
 /// scene reports its final shape rather than every loading step.
 #[derive(Default)]
 struct SceneSummaryLog {
-    last: Option<(u32, usize, usize, usize)>,
+    last: Option<(u32, usize, usize, usize, usize)>,
     stable_frames: u8,
-    reported: Option<(u32, usize, usize, usize)>,
+    reported: Option<(u32, usize, usize, usize, usize)>,
 }
 
 impl SceneSummaryLog {
-    fn observe(&mut self, summary: (u32, usize, usize, usize)) {
+    fn observe(&mut self, summary: (u32, usize, usize, usize, usize)) {
         if self.last == Some(summary) {
             self.stable_frames = self.stable_frames.saturating_add(1);
         } else {
@@ -64,7 +112,8 @@ impl SceneSummaryLog {
                 raytracing_instances = summary.0,
                 emissive_mesh_lights = summary.1,
                 directional_lights = summary.2,
-                total_light_sources = summary.3,
+                environment_lights = summary.3,
+                total_light_sources = summary.4,
                 "prepared Solari raytracing scene"
             );
             self.reported = Some(summary);
@@ -91,6 +140,8 @@ pub struct RaytracingSceneBindings {
     bind_groups: BindGroupCacheState,
     scene_parameters: StorageBuffer<GpuSceneParameters>,
     last_scene_parameters: Option<GpuSceneParameters>,
+    /// The Solari camera's bound environment cubemap; the placeholder cube stands in when `None`.
+    environment_map_view: Option<TextureView>,
     summary: SceneSummaryLog,
 }
 
@@ -125,6 +176,11 @@ fn bind_group_layout_descriptor() -> BindGroupLayoutDescriptor {
                 texture_2d(TextureSampleType::Float { filterable: true }),
                 sampler(SamplerBindingType::Filtering),
                 storage_buffer_read_only::<GpuSceneParameters>(false),
+                texture_cube(TextureSampleType::Float { filterable: true }),
+                sampler(SamplerBindingType::Filtering),
+                // R32Float is not filterable without FLOAT32_FILTERABLE and the pyramid is
+                // only ever read with textureLoad.
+                texture_2d(TextureSampleType::Float { filterable: false }),
             ),
         ),
     )
@@ -142,8 +198,9 @@ impl FromWorld for RaytracingSceneBindings {
             lights: LightState::new(),
             tlas: TlasState::new(render_device),
             bind_groups: BindGroupCacheState::new(render_device),
-            scene_parameters: StorageBuffer::from(GpuSceneParameters::default()),
+            scene_parameters: StorageBuffer::from(GpuSceneParameters::new(None, 1, 3, 0.0)),
             last_scene_parameters: None,
+            environment_map_view: None,
             summary: SceneSummaryLog::default(),
         }
     }
@@ -155,6 +212,7 @@ pub fn prepare_raytracing_scene_resources(
     changed_instances: Query<Entity, ChangedInstanceFilter>,
     mut removed_instances: RemovedComponents<RaytracingMesh3d>,
     directional_lights: Query<(Entity, &ExtractedDirectionalLight)>,
+    mut environment_params: EnvironmentParams,
     needs_previous_frame_data: Option<Res<RaytracingSceneNeedsPreviousFrameData>>,
     mesh_allocator: Res<MeshAllocator>,
     blas_manager: Res<BlasManager>,
@@ -200,15 +258,34 @@ pub fn prepare_raytracing_scene_resources(
         &changed_instances,
     );
 
-    // Update the light set, now that emissive instances are resolved
-    bindings.lights.update(&directional_lights);
+    // Bind this frame's environment cubemap and keep its importance pyramid current
+    let environment = resolve_environment_map(
+        bindings,
+        &mut environment_params,
+        &texture_assets,
+        &extracted_images,
+        &render_device,
+        &render_queue,
+    );
 
-    write_scene_parameters(bindings, &render_device, &render_queue);
+    // Update the light set, now that emissive instances and the environment are resolved
+    bindings
+        .lights
+        .update(&directional_lights, environment.is_some());
+
+    write_scene_parameters(
+        bindings,
+        environment.as_ref(),
+        &environment_params.importance_maps,
+        &render_device,
+        &render_queue,
+    );
 
     bindings.summary.observe((
         bindings.instances.live_count,
         bindings.lights.emissive_light_count(),
         bindings.lights.directional_light_count(),
+        bindings.lights.environment_light_count(),
         bindings.lights.index.len(),
     ));
 
@@ -230,15 +307,97 @@ pub fn prepare_raytracing_scene_resources(
     );
 }
 
+/// One environment at most: the Solari camera's `EnvironmentMapLight`, once its image is a bound
+/// cubemap. Until then there is no environment light.
+///
+/// Also keeps [`EnvironmentImportanceMaps`] targeted at the chosen cubemap, and records the view
+/// the bind group should use in `bindings.environment_map_view`.
+fn resolve_environment_map(
+    bindings: &mut RaytracingSceneBindings,
+    environment_params: &mut EnvironmentParams,
+    texture_assets: &RenderAssets<GpuImage>,
+    modified_images: &ExtractedAssets<GpuImage>,
+    render_device: &RenderDevice,
+    render_queue: &RenderQueue,
+) -> Option<ExtractedSolariEnvironmentMap> {
+    let EnvironmentParams {
+        maps: environment_maps_query,
+        importance_maps: environment_maps,
+    } = environment_params;
+
+    let mut chosen_map: Option<(Entity, &ExtractedSolariEnvironmentMap)> = None;
+    let mut first_map_id = None;
+    let mut maps_differ = false;
+    for (entity, map) in &*environment_maps_query {
+        maps_differ |= *first_map_id.get_or_insert(map.specular_map) != map.specular_map;
+        if chosen_map.is_none_or(|(chosen, _)| entity < chosen) {
+            chosen_map = Some((entity, map));
+        }
+    }
+    if maps_differ {
+        warn_once!(
+            "Solari cameras carry different EnvironmentMapLights; the scene can bind only one, \
+             so the lowest camera entity's is used"
+        );
+    }
+
+    let environment = chosen_map.and_then(|(_, map)| {
+        let gpu = texture_assets.get(map.specular_map)?;
+        let layers = gpu.texture_descriptor.size.depth_or_array_layers;
+        let view_dimension = gpu
+            .texture_view_descriptor
+            .as_ref()
+            .and_then(|descriptor| descriptor.dimension);
+        let is_cube = layers == 6 && view_dimension == Some(TextureViewDimension::Cube);
+        if !is_cube {
+            warn_once!(
+                asset = ?map.specular_map,
+                layers,
+                ?view_dimension,
+                "the Solari camera's EnvironmentMapLight specular_map is not a cubemap (it needs \
+                 6 array layers and a texture_view_descriptor with dimension Cube); Solari \
+                 renders no environment until it is"
+            );
+        }
+        is_cube.then_some((map, gpu))
+    });
+
+    let environment_maps = &mut **environment_maps;
+    match environment {
+        Some((map, gpu)) => {
+            environment_maps.request(
+                map,
+                gpu,
+                modified_images.modified.contains(&map.specular_map),
+                render_device,
+                render_queue,
+            );
+            bindings.environment_map_view = Some(gpu.texture_view.clone());
+        }
+        None => {
+            environment_maps.release();
+            bindings.environment_map_view = None;
+        }
+    }
+
+    environment.map(|(map, _)| map.clone())
+}
+
 /// Refreshes the scene-constant storage buffer whenever one of its inputs changed.
 fn write_scene_parameters(
     bindings: &mut RaytracingSceneBindings,
+    environment: Option<&ExtractedSolariEnvironmentMap>,
+    environment_maps: &EnvironmentImportanceMaps,
     device: &RenderDevice,
     queue: &RenderQueue,
 ) {
-    let parameters = GpuSceneParameters {
-        max_world_geometry_error: bindings.instances.max_world_geometry_error(),
-    };
+    let pyramid = &environment_maps.pyramid;
+    let parameters = GpuSceneParameters::new(
+        environment,
+        pyramid.face_size(),
+        pyramid.mip_count(),
+        bindings.instances.max_world_geometry_error(),
+    );
 
     if bindings.last_scene_parameters != Some(parameters) {
         bindings.scene_parameters.set(parameters);
@@ -289,12 +448,40 @@ fn write_sparse_buffers(
 
 #[cfg(test)]
 mod tests {
-    use super::bind_group_layout_descriptor;
+    use super::{bind_group_layout_descriptor, ExtractedSolariEnvironmentMap, GpuSceneParameters};
+    use bevy_asset::AssetId;
+    use bevy_math::{Quat, Vec3, Vec4};
     use bevy_render::render_resource::{BindingType, BufferBindingType};
+
+    #[test]
+    fn environment_map_light_becomes_a_tint_and_an_inverse_rotation() {
+        let map = ExtractedSolariEnvironmentMap {
+            specular_map: AssetId::default(),
+            intensity: 2000.0,
+            rotation: Quat::from_rotation_y(0.7),
+            contents_change_every_frame: false,
+        };
+        let gpu = GpuSceneParameters::new(Some(&map), 256, 11, 0.0);
+        assert_eq!(gpu.environment_tint, Vec3::splat(2000.0));
+        assert!(gpu
+            .environment_world_to_cube_rotation
+            .abs_diff_eq(Vec4::from(Quat::from_rotation_y(-0.7)), 1e-6));
+        assert_eq!(gpu.environment_face_size, 256);
+        assert_eq!(gpu.environment_mip_count, 11);
+
+        // No environment: a zero tint, so whatever cube is bound contributes nothing.
+        let gpu = GpuSceneParameters::new(None, 256, 11, 0.0);
+        assert_eq!(gpu.environment_tint, Vec3::ZERO);
+        assert_eq!(
+            gpu.environment_world_to_cube_rotation,
+            Vec4::from(Quat::IDENTITY)
+        );
+    }
 
     #[test]
     fn raytracing_scene_binding_arrays_do_not_share_a_group_with_uniform_buffers() {
         let layout = bind_group_layout_descriptor();
+        assert_eq!(layout.entries.len(), 20);
         assert!(layout.entries.iter().any(|entry| entry.count.is_some()));
         assert!(layout.entries.iter().all(|entry| {
             !matches!(

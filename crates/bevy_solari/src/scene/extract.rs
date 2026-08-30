@@ -1,12 +1,18 @@
-use super::{RaytracingMesh3d, RaytracingSceneBindings};
+use super::{
+    environment::ExtractedSolariEnvironmentMap, RaytracingMesh3d, RaytracingSceneBindings,
+};
+use crate::{pathtracer::Pathtracer, realtime::SolariLighting};
 use bevy_asset::{AssetEvent, AssetId, Assets};
+use bevy_camera::Camera;
 use bevy_ecs::{
+    entity::Entity,
     lifecycle::RemovedComponents,
     message::MessageReader,
-    query::{Added, Changed, Or, With},
+    query::{Added, Changed, Has, Or, With},
     resource::Resource,
     system::{Commands, Query, Res, ResMut},
 };
+use bevy_light::{EnvironmentMapLight, GeneratedEnvironmentMapLight};
 use bevy_pbr::{MeshGeometryError, MeshMaterial3d, PreviousGlobalTransform, StandardMaterial};
 use bevy_platform::collections::HashMap;
 use bevy_render::{sync_world::RenderEntity, Extract};
@@ -113,6 +119,85 @@ pub fn extract_raytracing_scene_meshes_and_materials(
             *mesh = new_mesh.clone();
             *material = new_material.clone();
             *geometry_error = *new_geometry_error;
+        }
+    }
+}
+
+/// Mirrors the `EnvironmentMapLight` of every active Solari camera into the render world.
+///
+/// Only cameras whose relevant state changed are revisited. The mirrored component is present
+/// exactly while the camera is active, has `SolariLighting` or `Pathtracer`, and has an
+/// `EnvironmentMapLight`; losing any of those removes it, so the binder can never pick a stale one.
+///
+/// A `GeneratedEnvironmentMapLight` on the camera (what `AtmosphereEnvironmentMapLight` turns
+/// into) marks the map as regenerated every frame: its `EnvironmentMapLight` holds placeholder
+/// images whose GPU contents `bevy_pbr`'s generation nodes rewrite each frame, so the importance
+/// pyramid has to follow. Both systems that insert those components run in `Update`, so the flag
+/// is already correct on the frame the `EnvironmentMapLight` first appears.
+pub fn extract_solari_environment_maps(
+    changed_cameras: Extract<
+        Query<
+            Entity,
+            (
+                With<Camera>,
+                Or<(
+                    Changed<EnvironmentMapLight>,
+                    Changed<GeneratedEnvironmentMapLight>,
+                    Changed<Camera>,
+                    Added<SolariLighting>,
+                    Added<Pathtracer>,
+                )>,
+            ),
+        >,
+    >,
+    cameras: Extract<
+        Query<(
+            RenderEntity,
+            &Camera,
+            Option<&EnvironmentMapLight>,
+            Has<GeneratedEnvironmentMapLight>,
+            Has<SolariLighting>,
+            Has<Pathtracer>,
+        )>,
+    >,
+    mut removed_environment_maps: Extract<RemovedComponents<EnvironmentMapLight>>,
+    mut removed_generated_maps: Extract<RemovedComponents<GeneratedEnvironmentMapLight>>,
+    mut removed_lighting: Extract<RemovedComponents<SolariLighting>>,
+    mut removed_pathtracers: Extract<RemovedComponents<Pathtracer>>,
+    mut commands: Commands,
+) {
+    let removed = removed_environment_maps
+        .read()
+        .chain(removed_generated_maps.read())
+        .chain(removed_lighting.read())
+        .chain(removed_pathtracers.read());
+    for main_entity in changed_cameras.iter().chain(removed) {
+        let Ok((
+            render_entity,
+            camera,
+            environment_map,
+            is_generated,
+            has_lighting,
+            has_pathtracer,
+        )) = cameras.get(main_entity)
+        else {
+            continue;
+        };
+        let Ok(mut entity_commands) = commands.get_entity(render_entity) else {
+            continue;
+        };
+        match environment_map {
+            Some(environment_map) if camera.is_active && (has_lighting || has_pathtracer) => {
+                entity_commands.insert(ExtractedSolariEnvironmentMap {
+                    specular_map: environment_map.specular_map.id(),
+                    intensity: environment_map.intensity,
+                    rotation: environment_map.rotation,
+                    contents_change_every_frame: is_generated,
+                });
+            }
+            _ => {
+                entity_commands.remove::<ExtractedSolariEnvironmentMap>();
+            }
         }
     }
 }
