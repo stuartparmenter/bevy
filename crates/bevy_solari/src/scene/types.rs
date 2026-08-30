@@ -1,5 +1,4 @@
 use bevy_asset::Handle;
-use bevy_color::LinearRgba;
 use bevy_derive::{Deref, DerefMut};
 use bevy_ecs::{component::Component, prelude::ReflectComponent, template::FromTemplate};
 use bevy_mesh::Mesh;
@@ -28,27 +27,3 @@ use derive_more::derive::From;
     MeshGeometryError
 )]
 pub struct RaytracingMesh3d(pub Handle<Mesh>);
-
-/// A uniform upper-hemisphere environment source used by Solari.
-///
-/// `illuminance` is the horizontal-surface illuminance in lux. Solari converts
-/// this to constant sky radiance with `L = E / PI` and samples directions
-/// uniformly over the world-space `+Y` hemisphere. This provides a compact
-/// bridge for captured sky lights until textured environment maps are bound by
-/// the raytracing scene.
-#[derive(Component, Clone, Copy, Debug, Reflect, PartialEq)]
-#[reflect(Component, Clone, PartialEq)]
-#[require(SyncToRenderWorld)]
-pub struct SolariEnvironmentLight {
-    pub color: LinearRgba,
-    pub illuminance: f32,
-}
-
-impl Default for SolariEnvironmentLight {
-    fn default() -> Self {
-        Self {
-            color: LinearRgba::WHITE,
-            illuminance: 1_000.0,
-        }
-    }
-}

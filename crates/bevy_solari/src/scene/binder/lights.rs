@@ -1,5 +1,4 @@
 use super::allocator::SlotAllocator;
-use crate::scene::SolariEnvironmentLight;
 use bevy_color::ColorToComponents;
 use bevy_ecs::{entity::Entity, system::Query};
 use bevy_math::{
@@ -38,8 +37,6 @@ pub struct GpuLightSource {
 pub enum LightSourceId {
     EmissiveMesh { entity: Entity, first_triangle: u32 },
     Directional(Entity),
-    /// The captured-sky radiance of a [`SolariEnvironmentLight`].
-    Environment(Entity),
 }
 
 impl LightSourceId {
@@ -119,26 +116,14 @@ impl GpuLightSource {
             id: directional_light_id,
         }
     }
-
-    /// Resolves like a directional light, but flagged so the shaders can MIS-weight it against the
-    /// environment radiance a missed BRDF ray picks up.
-    fn new_environment_light(directional_light_id: u32) -> GpuLightSource {
-        Self {
-            kind: 3,
-            id: directional_light_id,
-        }
-    }
 }
 
-/// How many emissive-mesh sources fit once the directional and environment lights have reserved
-/// theirs. [`MAX_LIGHT_SOURCES`] bounds the whole list, and only the emissive sources have anything
-/// to yield: a truncated sun disk is NEE-only with no environment radiance to fall back on, while a
-/// truncated emissive chunk is only unsampled emission.
-pub fn emissive_light_source_budget(
-    directional_light_count: usize,
-    environment_light_count: usize,
-) -> usize {
-    MAX_LIGHT_SOURCES.saturating_sub(directional_light_count + environment_light_count)
+/// How many emissive-mesh sources fit once the directional lights have reserved theirs.
+/// [`MAX_LIGHT_SOURCES`] bounds the whole list, and only the emissive sources have anything to
+/// yield: a truncated sun disk is NEE-only and would vanish outright, while a truncated emissive
+/// chunk is only unsampled emission.
+pub fn emissive_light_source_budget(directional_light_count: usize) -> usize {
+    MAX_LIGHT_SOURCES.saturating_sub(directional_light_count)
 }
 
 pub fn emissive_triangle_chunks(triangle_count: u32) -> impl Iterator<Item = (u32, u32)> {
@@ -198,23 +183,6 @@ impl GpuDirectionalLight {
             TAU * 2.0 * sin(angular_size / 4.0).squared(),
         )
     }
-
-    fn new_environment(environment_light: &SolariEnvironmentLight) -> Self {
-        Self {
-            direction_to_light: Vec3::Y,
-            // A cone with a 90-degree half-angle is the world +Y hemisphere.
-            cos_theta_max: 0.0,
-            // Uniform hemispheric radiance produces E = PI * L on a
-            // horizontal surface.
-            luminance: Self::environment_radiance(environment_light),
-            inverse_pdf: TAU,
-        }
-    }
-
-    fn environment_radiance(environment_light: &SolariEnvironmentLight) -> Vec3 {
-        environment_light.color.to_vec3()
-            * (environment_light.illuminance.max(0.0) / core::f32::consts::PI)
-    }
 }
 
 /// Light slots and the incremental previous-frame id translation state.
@@ -227,7 +195,6 @@ pub struct LightState {
     /// Light ids as of the last frame whose translation table the lighting shader actually read.
     previous_index: HashMap<LightSourceId, u32>,
     nonidentity_translations: Vec<u32>,
-    /// Directional and environment sources share the `directional_lights` buffer's slots.
     directional_slots: SlotAllocator<LightSourceId>,
     /// Set by the lighting node once it has recorded work reading the translation table.
     translations_consumed: AtomicBool,
@@ -236,9 +203,6 @@ pub struct LightState {
     dropped_emissives: HashMap<LightSourceId, GpuLightSource>,
     reported_light_source_overflow: bool,
     directional_count: usize,
-    environment_count: usize,
-    /// Sum of every environment light's radiance, for the BRDF-miss fallback in scene parameters.
-    pub environment_radiance: Vec3,
 }
 
 impl LightState {
@@ -264,8 +228,6 @@ impl LightState {
             dropped_emissives: HashMap::default(),
             reported_light_source_overflow: false,
             directional_count: 0,
-            environment_count: 0,
-            environment_radiance: Vec3::ZERO,
         }
     }
 
@@ -273,33 +235,23 @@ impl LightState {
         self.directional_count
     }
 
-    pub fn environment_light_count(&self) -> usize {
-        self.environment_count
-    }
-
     pub fn emissive_light_count(&self) -> usize {
-        self.index
-            .len()
-            .saturating_sub(self.directional_count + self.environment_count)
+        self.index.len().saturating_sub(self.directional_count)
     }
 
     fn emissive_budget(&self) -> usize {
-        emissive_light_source_budget(self.directional_count, self.environment_count)
+        emissive_light_source_budget(self.directional_count)
     }
 
-    pub fn update(
-        &mut self,
-        directional_lights: &Query<(Entity, &ExtractedDirectionalLight)>,
-        environment_lights: &Query<(Entity, &SolariEnvironmentLight)>,
-    ) {
-        // There are few enough analytic lights to just walk them every frame
+    pub fn update(&mut self, directional_lights: &Query<(Entity, &ExtractedDirectionalLight)>) {
+        // There are few enough directional lights to just walk them every frame
         let _span = info_span!("update_lights").entered();
 
-        let mut live_analytic_lights = HashSet::<LightSourceId>::default();
+        let mut live_directional_lights = HashSet::<LightSourceId>::default();
         let mut directional_count = 0;
         for (entity, directional_light) in directional_lights {
             let id = LightSourceId::Directional(entity);
-            live_analytic_lights.insert(id);
+            live_directional_lights.insert(id);
             directional_count += 1;
 
             let slot = self.directional_slots.get_or_allocate(id);
@@ -308,25 +260,11 @@ impl LightState {
             self.add_light(id, GpuLightSource::new_directional_light(slot));
         }
 
-        let mut environment_count = 0;
-        let mut environment_radiance = Vec3::ZERO;
-        for (entity, environment_light) in environment_lights {
-            let id = LightSourceId::Environment(entity);
-            live_analytic_lights.insert(id);
-            environment_count += 1;
-            environment_radiance += GpuDirectionalLight::environment_radiance(environment_light);
-
-            let slot = self.directional_slots.get_or_allocate(id);
-            self.directional_lights
-                .grow_and_set(slot, GpuDirectionalLight::new_environment(environment_light));
-            self.add_light(id, GpuLightSource::new_environment_light(slot));
-        }
-
         let stale: Vec<LightSourceId> = self
             .directional_slots
             .keys()
             .copied()
-            .filter(|id| !live_analytic_lights.contains(id))
+            .filter(|id| !live_directional_lights.contains(id))
             .collect();
         for id in stale {
             self.directional_slots.remove(&id);
@@ -334,8 +272,6 @@ impl LightState {
         }
 
         self.directional_count = directional_count;
-        self.environment_count = environment_count;
-        self.environment_radiance = environment_radiance;
 
         self.rebalance_emissives();
         self.write_light_id_translations();
@@ -470,10 +406,7 @@ mod tests {
         emissive_light_source_budget, emissive_triangle_chunks, GpuDirectionalLight,
         GpuLightSource, LightIndex, LightSourceId, MAX_LIGHT_SOURCES, MIN_SUN_DISK_ANGULAR_SIZE,
     };
-    use crate::scene::SolariEnvironmentLight;
-    use bevy_color::LinearRgba;
     use bevy_ecs::entity::Entity;
-    use bevy_math::Vec3;
 
     #[test]
     fn light_index_keeps_sources_on_the_same_entity_independent() {
@@ -500,25 +433,11 @@ mod tests {
     }
 
     #[test]
-    fn environment_illuminance_converts_to_uniform_hemisphere_radiance() {
-        let light = SolariEnvironmentLight {
-            color: LinearRgba::new(1.0, 0.5, 0.25, 1.0),
-            illuminance: core::f32::consts::PI,
-        };
-        let gpu = GpuDirectionalLight::new_environment(&light);
-
-        assert_eq!(gpu.direction_to_light, Vec3::Y);
-        assert_eq!(gpu.cos_theta_max, 0.0);
-        assert!(gpu.luminance.abs_diff_eq(Vec3::new(1.0, 0.5, 0.25), 1e-6));
-        assert_eq!(gpu.inverse_pdf, core::f32::consts::TAU);
-    }
-
-    #[test]
-    fn the_emissive_budget_leaves_room_for_every_directional_and_environment_light() {
+    fn the_emissive_budget_leaves_room_for_every_directional_light() {
         // The whole list has to fit, so a truncation can never reach the sun, which is NEE-only.
-        assert_eq!(emissive_light_source_budget(3, 1) + 3 + 1, MAX_LIGHT_SOURCES);
-        // Only the tail truncation can help a scene whose own lights exceed the cap between them.
-        assert_eq!(emissive_light_source_budget(MAX_LIGHT_SOURCES, 1), 0);
+        assert_eq!(emissive_light_source_budget(3) + 3, MAX_LIGHT_SOURCES);
+        // Only the tail truncation can help a scene whose own lights exceed the cap.
+        assert_eq!(emissive_light_source_budget(MAX_LIGHT_SOURCES), 0);
     }
 
     #[test]
@@ -576,15 +495,12 @@ mod tests {
     fn light_source_kinds_match_the_shader_constants() {
         let shader = include_str!("../bindings.wesl");
 
-        let environment = GpuLightSource::new_environment_light(7);
-        assert_eq!(environment.id, 7);
+        let directional = GpuLightSource::new_directional_light(7);
+        assert_eq!(directional.id, 7);
         assert!(shader.contains(&format!(
-            "const LIGHT_SOURCE_KIND_ENVIRONMENT = {}u;",
-            environment.kind
+            "const LIGHT_SOURCE_KIND_DIRECTIONAL = {}u;",
+            directional.kind
         )));
-        // The environment kind must still read as non-emissive-mesh in the shader's low-bit test.
-        assert_eq!(environment.kind & 1, 1);
-        assert_eq!(GpuLightSource::new_directional_light(0).kind & 1, 1);
         assert_eq!(GpuLightSource::new_emissive_mesh_light(0, 0).kind & 1, 0);
     }
 }

@@ -22,7 +22,6 @@ use bevy::{
         render_resource::TextureUsages,
         view::screenshot::{save_to_disk, Screenshot, ScreenshotCaptured},
     },
-    solari::prelude::SolariEnvironmentLight,
 };
 
 use crate::{
@@ -99,13 +98,6 @@ pub fn setup(
         options.sky_color.y,
         options.sky_color.z,
     );
-    commands.spawn((
-        Name::new("Sky (Solari environment)"),
-        SolariEnvironmentLight {
-            color: sky_color,
-            illuminance: options.sky_illuminance,
-        },
-    ));
     // Overrides the `GlobalAmbientLight::NONE` main inserts for the preview
     // only: it keeps the raster image lit while the BLASes build instead of
     // showing a black frame, and the warm-up zeroes it again when Solari

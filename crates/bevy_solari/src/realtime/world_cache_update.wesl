@@ -54,9 +54,6 @@ fn sample_gi(@builtin(workgroup_id) workgroup_id: vec3<u32>, @builtin(global_inv
     let ray_direction = sample_cosine_hemisphere(geometry_data.world_normal, &rng);
     let ray_origin = offset_ray_origin(geometry_data.world_position, geometry_data.world_normal, ray_direction, cell_ray_origin_bias(geometry_data));
     let ray = trace_ray(ray_origin, ray_direction, RAY_T_MIN, constants.world_cache_max_gi_ray_distance, RAY_FLAG_NONE);
-    // A miss adds nothing: sample_di already accumulates the environment for this cell over the
-    // whole hemisphere, with a full-range visibility ray. This ray is truncated at
-    // world_cache_max_gi_ray_distance, so a miss here does not even imply the sky is visible.
     if ray.kind != RAY_QUERY_INTERSECTION_NONE {
         let ray_hit = resolve_ray_hit_full(ray);
         let cell_life = atomicLoad(&world_cache.life[cell_index]);
