@@ -1,7 +1,7 @@
 use super::{meshlet_mesh_manager::MeshletMeshManager, MeshletMesh, MeshletMesh3d};
 use crate::{
-    meshlet::asset::MeshletAabb, MeshFlags, MeshTransforms, MeshUniform, PreviousGlobalTransform,
-    RenderMaterialInstances,
+    meshlet::asset::MeshletAabb, MeshFlags, MeshGeometryError, MeshTransforms, MeshUniform,
+    PreviousGlobalTransform, RenderMaterialInstances,
 };
 use bevy_asset::{AssetEvent, AssetServer, Assets, UntypedAssetId};
 use bevy_camera::visibility::RenderLayers;
@@ -101,6 +101,7 @@ impl InstanceManager {
         render_material_bindings: &RenderMaterialBindings,
         not_shadow_receiver: bool,
         not_shadow_caster: bool,
+        geometry_error: Option<&MeshGeometryError>,
     ) {
         // Build a MeshUniform for the instance
         let transform = transform.affine();
@@ -113,6 +114,7 @@ impl InstanceManager {
         if transform.matrix3.determinant().is_sign_positive() {
             flags |= MeshFlags::SIGN_DETERMINANT_MODEL_3X3;
         }
+        flags |= MeshFlags::from_geometry_error(geometry_error, &transform);
         let transforms = MeshTransforms {
             world_from_local: transform.into(),
             previous_world_from_local: previous_transform.into(),
@@ -210,6 +212,7 @@ pub fn extract_meshlet_mesh_entities(
                     Option<&RenderLayers>,
                     Has<NotShadowReceiver>,
                     Has<NotShadowCaster>,
+                    Option<&MeshGeometryError>,
                 )>,
                 Res<AssetServer>,
                 ResMut<Assets<MeshletMesh>>,
@@ -247,6 +250,7 @@ pub fn extract_meshlet_mesh_entities(
         render_layers,
         not_shadow_receiver,
         not_shadow_caster,
+        geometry_error,
     ) in &instances_query
     {
         // Skip instances with an unloaded MeshletMesh asset
@@ -274,6 +278,7 @@ pub fn extract_meshlet_mesh_entities(
             &render_material_bindings,
             not_shadow_receiver,
             not_shadow_caster,
+            geometry_error,
         );
     }
 }
