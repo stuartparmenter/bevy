@@ -80,6 +80,7 @@ pub fn init_meshlet_pipelines(
     let visibility_buffer_raster_shadow_view_layout = resource_manager
         .visibility_buffer_raster_shadow_view_bind_group_layout
         .clone();
+    let meshlet_pages_layout = resource_manager.meshlet_pages_bind_group_layout.clone();
     let resolve_depth_layout = resource_manager.resolve_depth_bind_group_layout.clone();
     let resolve_depth_shadow_view_layout = resource_manager
         .resolve_depth_shadow_view_bind_group_layout
@@ -162,48 +163,64 @@ pub fn init_meshlet_pipelines(
 
         first_bvh_cull: pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
             label: Some("meshlet_first_bvh_cull_pipeline".into()),
-            layout: vec![first_bvh_cull_bind_group_layout.clone()],
+            layout: vec![
+                first_bvh_cull_bind_group_layout.clone(),
+                meshlet_pages_layout.clone(),
+            ],
             immediate_size: 8,
             shader: cull_bvh.clone(),
             shader_defs: vec![
                 "MESHLET_BVH_CULLING_PASS".into(),
                 "MESHLET_FIRST_CULLING_PASS".into(),
+                "MESHLET_PAGE_ACCESS".into(),
             ],
             ..default()
         }),
 
         second_bvh_cull: pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
             label: Some("meshlet_second_bvh_cull_pipeline".into()),
-            layout: vec![second_bvh_cull_bind_group_layout.clone()],
+            layout: vec![
+                second_bvh_cull_bind_group_layout.clone(),
+                meshlet_pages_layout.clone(),
+            ],
             immediate_size: 8,
             shader: cull_bvh,
             shader_defs: vec![
                 "MESHLET_BVH_CULLING_PASS".into(),
                 "MESHLET_SECOND_CULLING_PASS".into(),
+                "MESHLET_PAGE_ACCESS".into(),
             ],
             ..default()
         }),
 
         first_meshlet_cull: pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
             label: Some("meshlet_first_meshlet_cull_pipeline".into()),
-            layout: vec![first_meshlet_cull_bind_group_layout.clone()],
+            layout: vec![
+                first_meshlet_cull_bind_group_layout.clone(),
+                meshlet_pages_layout.clone(),
+            ],
             immediate_size: 4,
             shader: cull_clusters.clone(),
             shader_defs: vec![
                 "MESHLET_CLUSTER_CULLING_PASS".into(),
                 "MESHLET_FIRST_CULLING_PASS".into(),
+                "MESHLET_PAGE_ACCESS".into(),
             ],
             ..default()
         }),
 
         second_meshlet_cull: pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
             label: Some("meshlet_second_meshlet_cull_pipeline".into()),
-            layout: vec![second_meshlet_cull_bind_group_layout.clone()],
+            layout: vec![
+                second_meshlet_cull_bind_group_layout.clone(),
+                meshlet_pages_layout.clone(),
+            ],
             immediate_size: 4,
             shader: cull_clusters,
             shader_defs: vec![
                 "MESHLET_CLUSTER_CULLING_PASS".into(),
                 "MESHLET_SECOND_CULLING_PASS".into(),
+                "MESHLET_PAGE_ACCESS".into(),
             ],
             ..default()
         }),
@@ -262,12 +279,16 @@ pub fn init_meshlet_pipelines(
         visibility_buffer_software_raster: pipeline_cache.queue_compute_pipeline(
             ComputePipelineDescriptor {
                 label: Some("meshlet_visibility_buffer_software_raster_pipeline".into()),
-                layout: vec![visibility_buffer_raster_layout.clone()],
+                layout: vec![
+                    visibility_buffer_raster_layout.clone(),
+                    meshlet_pages_layout.clone(),
+                ],
                 immediate_size: 0,
                 shader: visibility_buffer_software_raster.clone(),
                 shader_defs: vec![
                     "MESHLET_VISIBILITY_BUFFER_RASTER_PASS".into(),
                     "MESHLET_VISIBILITY_BUFFER_RASTER_PASS_OUTPUT".into(),
+                    "MESHLET_PAGE_ACCESS".into(),
                     if remap_1d_to_2d_dispatch_layout.is_some() {
                         "MESHLET_2D_DISPATCH"
                     } else {
@@ -284,11 +305,15 @@ pub fn init_meshlet_pipelines(
                 label: Some(
                     "meshlet_visibility_buffer_software_raster_shadow_view_pipeline".into(),
                 ),
-                layout: vec![visibility_buffer_raster_shadow_view_layout.clone()],
+                layout: vec![
+                    visibility_buffer_raster_shadow_view_layout.clone(),
+                    meshlet_pages_layout.clone(),
+                ],
                 immediate_size: 0,
                 shader: visibility_buffer_software_raster,
                 shader_defs: vec![
                     "MESHLET_VISIBILITY_BUFFER_RASTER_PASS".into(),
+                    "MESHLET_PAGE_ACCESS".into(),
                     if remap_1d_to_2d_dispatch_layout.is_some() {
                         "MESHLET_2D_DISPATCH"
                     } else {
@@ -300,16 +325,25 @@ pub fn init_meshlet_pipelines(
             },
         ),
 
+        // `primitive` is left at the default `cull_mode: None` here even though the software
+        // rasterizer culls backfaces. The two paths only need to agree on which face is nearest,
+        // which the depth test already decides, and a `Face::Back` cull would drop the backfaces
+        // that double-sided and open single-sided meshlet geometry relies on. Per-material cull
+        // modes are not plumbed into these shared raster pipelines.
         visibility_buffer_hardware_raster: pipeline_cache.queue_render_pipeline(
             RenderPipelineDescriptor {
                 label: Some("meshlet_visibility_buffer_hardware_raster_pipeline".into()),
-                layout: vec![visibility_buffer_raster_layout.clone()],
+                layout: vec![
+                    visibility_buffer_raster_layout.clone(),
+                    meshlet_pages_layout.clone(),
+                ],
                 immediate_size: 4,
                 vertex: VertexState {
                     shader: visibility_buffer_hardware_raster.clone(),
                     shader_defs: vec![
                         "MESHLET_VISIBILITY_BUFFER_RASTER_PASS".into(),
                         "MESHLET_VISIBILITY_BUFFER_RASTER_PASS_OUTPUT".into(),
+                        "MESHLET_PAGE_ACCESS".into(),
                     ],
                     ..default()
                 },
@@ -318,6 +352,7 @@ pub fn init_meshlet_pipelines(
                     shader_defs: vec![
                         "MESHLET_VISIBILITY_BUFFER_RASTER_PASS".into(),
                         "MESHLET_VISIBILITY_BUFFER_RASTER_PASS_OUTPUT".into(),
+                        "MESHLET_PAGE_ACCESS".into(),
                     ],
                     targets: vec![Some(ColorTargetState {
                         format: TextureFormat::R8Uint,
@@ -335,16 +370,25 @@ pub fn init_meshlet_pipelines(
                 label: Some(
                     "meshlet_visibility_buffer_hardware_raster_shadow_view_pipeline".into(),
                 ),
-                layout: vec![visibility_buffer_raster_shadow_view_layout.clone()],
+                layout: vec![
+                    visibility_buffer_raster_shadow_view_layout.clone(),
+                    meshlet_pages_layout.clone(),
+                ],
                 immediate_size: 4,
                 vertex: VertexState {
                     shader: visibility_buffer_hardware_raster.clone(),
-                    shader_defs: vec!["MESHLET_VISIBILITY_BUFFER_RASTER_PASS".into()],
+                    shader_defs: vec![
+                        "MESHLET_VISIBILITY_BUFFER_RASTER_PASS".into(),
+                        "MESHLET_PAGE_ACCESS".into(),
+                    ],
                     ..default()
                 },
                 fragment: Some(FragmentState {
                     shader: visibility_buffer_hardware_raster.clone(),
-                    shader_defs: vec!["MESHLET_VISIBILITY_BUFFER_RASTER_PASS".into()],
+                    shader_defs: vec![
+                        "MESHLET_VISIBILITY_BUFFER_RASTER_PASS".into(),
+                        "MESHLET_PAGE_ACCESS".into(),
+                    ],
                     targets: vec![Some(ColorTargetState {
                         format: TextureFormat::R8Uint,
                         blend: None,
@@ -362,16 +406,25 @@ pub fn init_meshlet_pipelines(
                     "meshlet_visibility_buffer_hardware_raster_shadow_view_unclipped_pipeline"
                         .into(),
                 ),
-                layout: vec![visibility_buffer_raster_shadow_view_layout],
+                layout: vec![
+                    visibility_buffer_raster_shadow_view_layout,
+                    meshlet_pages_layout,
+                ],
                 immediate_size: 4,
                 vertex: VertexState {
                     shader: visibility_buffer_hardware_raster.clone(),
-                    shader_defs: vec!["MESHLET_VISIBILITY_BUFFER_RASTER_PASS".into()],
+                    shader_defs: vec![
+                        "MESHLET_VISIBILITY_BUFFER_RASTER_PASS".into(),
+                        "MESHLET_PAGE_ACCESS".into(),
+                    ],
                     ..default()
                 },
                 fragment: Some(FragmentState {
                     shader: visibility_buffer_hardware_raster,
-                    shader_defs: vec!["MESHLET_VISIBILITY_BUFFER_RASTER_PASS".into()],
+                    shader_defs: vec![
+                        "MESHLET_VISIBILITY_BUFFER_RASTER_PASS".into(),
+                        "MESHLET_PAGE_ACCESS".into(),
+                    ],
                     targets: vec![Some(ColorTargetState {
                         format: TextureFormat::R8Uint,
                         blend: None,
