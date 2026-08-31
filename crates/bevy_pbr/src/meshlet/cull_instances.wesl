@@ -2,7 +2,8 @@ import package::meshlet::bindings::{
     InstancedOffset,
     constants,
     meshlet_view_instance_visibility,
-    meshlet_instance_aabbs,
+    meshlet_asset_aabbs,
+    meshlet_instance_asset_indices,
     meshlet_bvh_cull_count_write,
     meshlet_bvh_cull_dispatch,
     meshlet_bvh_cull_queue,
@@ -44,7 +45,7 @@ fn cull_instances(@builtin(global_invocation_id) global_invocation_id: vec3<u32>
     if dispatch_id >= instance_count() { return; }
 
     let instance_id = map_instance_id(dispatch_id);
-    let aabb = meshlet_instance_aabbs[instance_id];
+    let aabb = meshlet_asset_aabbs[meshlet_instance_asset_indices[instance_id]];
 
     // Visibility and frustum cull, but only in the first pass
     @if(MESHLET_FIRST_CULLING_PASS)

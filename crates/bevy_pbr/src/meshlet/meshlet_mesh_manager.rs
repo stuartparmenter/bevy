@@ -15,7 +15,8 @@ use bevy_ecs::{
 use bevy_platform::collections::HashMap;
 use bevy_render::{
     render_resource::{
-        Buffer, BufferAddress, BufferBinding, BufferDescriptor, BufferUsages, ShaderType,
+        BindingResource, Buffer, BufferAddress, BufferBinding, BufferDescriptor, BufferUsages,
+        ShaderType, StorageBuffer,
     },
     renderer::{RenderDevice, RenderQueue},
 };
@@ -53,7 +54,7 @@ struct MeshletAllocation {
     page_generation: u64,
     range: Range<BufferAddress>,
     descriptor: MeshletGpuDescriptor,
-    aabb: MeshletAabb,
+    asset_index: u32,
     bvh_depth: u32,
 }
 
@@ -189,6 +190,56 @@ pub struct MeshletMeshManager {
     allocations: HashMap<AssetId<MeshletMesh>, MeshletAllocation>,
     pending_uploads: Vec<PendingUpload>,
     failed_uploads: HashMap<AssetId<MeshletMesh>, UploadFailure>,
+    pub asset_aabbs: AssetAabbs,
+}
+
+/// Model-space AABB of each resident asset, in a slot that is stable for the asset's residency.
+///
+/// An AABB belongs to the asset, so it is held once here and reached through a per-instance slot
+/// rather than replicated across the instances that share the asset. Slots outlive a frame, so
+/// unlike the per-instance buffers this uploads only when the resident set changes.
+#[derive(Default)]
+pub struct AssetAabbs {
+    aabbs: StorageBuffer<Vec<MeshletAabb>>,
+    /// Slots whose asset has been dropped, available for the next one uploaded.
+    free: Vec<u32>,
+    /// Whether `aabbs` has changed since it was last uploaded.
+    dirty: bool,
+}
+
+impl AssetAabbs {
+    /// Reserve a slot for an asset, reusing one freed by a dropped asset.
+    fn claim(&mut self, aabb: MeshletAabb) -> u32 {
+        self.dirty = true;
+        match self.free.pop() {
+            Some(slot) => {
+                self.aabbs.get_mut()[slot as usize] = aabb;
+                slot
+            }
+            None => {
+                self.aabbs.get_mut().push(aabb);
+                self.aabbs.get().len() as u32 - 1
+            }
+        }
+    }
+
+    /// Return a dropped asset's slot. Its stale AABB is overwritten by whoever claims the slot next.
+    fn release(&mut self, slot: u32) {
+        self.free.push(slot);
+    }
+
+    /// Upload the table if an asset has claimed a slot since the last call.
+    fn write_buffer(&mut self, render_device: &RenderDevice, render_queue: &RenderQueue) {
+        if !self.dirty {
+            return;
+        }
+        self.aabbs.write_buffer(render_device, render_queue);
+        self.dirty = false;
+    }
+
+    pub fn binding(&self) -> Option<BindingResource<'_>> {
+        self.aabbs.binding()
+    }
 }
 
 pub fn init_meshlet_mesh_manager(mut commands: Commands, render_device: Res<RenderDevice>) {
@@ -221,11 +272,12 @@ pub fn init_meshlet_mesh_manager(mut commands: Commands, render_device: Res<Rend
         allocations: HashMap::default(),
         pending_uploads: Vec::new(),
         failed_uploads: HashMap::default(),
+        asset_aabbs: AssetAabbs::default(),
     });
 }
 
 impl MeshletMeshManager {
-    /// The GPU descriptor for an asset already resident in the page heap.
+    /// The GPU descriptor, AABB slot and BVH depth of an asset already resident in the page heap.
     ///
     /// An allocation exists only for an asset that loaded and has not since been modified or
     /// dropped, so a hit here answers "is this loaded?" without consulting the asset server - which
@@ -234,12 +286,17 @@ impl MeshletMeshManager {
     fn descriptor(
         &self,
         asset_id: AssetId<MeshletMesh>,
-    ) -> Option<(MeshletGpuDescriptor, MeshletAabb, u32)> {
+    ) -> Option<(MeshletGpuDescriptor, u32, u32)> {
         let allocation = self.allocations.get(&asset_id)?;
-        Some((allocation.descriptor, allocation.aabb, allocation.bvh_depth))
+        Some((
+            allocation.descriptor,
+            allocation.asset_index,
+            allocation.bvh_depth,
+        ))
     }
 
-    /// Queue an asset for upload if needed and return the immutable GPU descriptor for instances.
+    /// Queue an asset for upload if needed and return what an instance of it needs: its GPU
+    /// descriptor, its slot in [`Self::asset_aabbs`], and its BVH depth.
     ///
     /// `is_loaded` is consulted only for an asset that is not already resident, so a caller with
     /// one instance per frame per asset pays for its load check once rather than every frame.
@@ -252,7 +309,7 @@ impl MeshletMeshManager {
         is_loaded: impl FnOnce() -> bool,
         assets: &mut Assets<MeshletMesh>,
         render_device: &RenderDevice,
-    ) -> Option<(MeshletGpuDescriptor, MeshletAabb, u32)> {
+    ) -> Option<(MeshletGpuDescriptor, u32, u32)> {
         if let Some(resident) = self.descriptor(asset_id) {
             return Some(resident);
         }
@@ -333,12 +390,14 @@ impl MeshletMeshManager {
         add_allocation_base(&mut descriptor, range.start);
 
         let mesh = assets.remove_untracked(asset_id).unwrap();
+        let asset_index = self.asset_aabbs.claim(mesh.aabb);
+        let page = self.pages[page_id].as_mut().unwrap();
         let allocation = MeshletAllocation {
             page_id: page_id as u32,
             page_generation: page.generation,
             range: range.clone(),
             descriptor,
-            aabb: mesh.aabb,
+            asset_index,
             bvh_depth: mesh.bvh_depth,
         };
         self.pending_uploads.push(PendingUpload {
@@ -350,7 +409,7 @@ impl MeshletMeshManager {
         });
         self.allocations.insert(asset_id, allocation.clone());
         self.failed_uploads.remove(&asset_id);
-        Some((descriptor, allocation.aabb, allocation.bvh_depth))
+        Some((descriptor, allocation.asset_index, allocation.bvh_depth))
     }
 
     fn record_failed_upload(
@@ -382,9 +441,15 @@ impl MeshletMeshManager {
             .expect("live meshlet allocation referenced a vacant page");
         assert_eq!(page.generation, allocation.page_generation);
         page.allocator.free(allocation.range);
+        self.asset_aabbs.release(allocation.asset_index);
         // Reclamation is deferred to the post-write sweep. A Modified asset removed and re-added
         // in the same frame can therefore reuse this page and its GPU buffer, while an Unused
         // asset still releases its empty page at the end of the prepare-assets phase.
+    }
+
+    /// Upload the per-asset AABB table if it changed.
+    pub fn write_asset_aabbs(&mut self, render_device: &RenderDevice, render_queue: &RenderQueue) {
+        self.asset_aabbs.write_buffer(render_device, render_queue);
     }
 
     pub fn page_bindings(&self) -> Vec<BufferBinding<'_>> {
@@ -661,9 +726,60 @@ pub fn perform_pending_meshlet_mesh_writes(
 
 #[cfg(test)]
 mod tests {
+
+    fn aabb(center: f32) -> MeshletAabb {
+        MeshletAabb {
+            center: Vec3::splat(center),
+            half_extent: Vec3::ONE,
+        }
+    }
+
+    #[test]
+    fn asset_aabb_slots_are_dense_until_one_is_released() {
+        let mut table = AssetAabbs::default();
+
+        assert_eq!(table.claim(aabb(1.0)), 0);
+        assert_eq!(table.claim(aabb(2.0)), 1);
+        assert_eq!(table.claim(aabb(3.0)), 2);
+        assert_eq!(table.aabbs.get().len(), 3);
+    }
+
+    #[test]
+    fn a_released_slot_is_reused_and_overwritten() {
+        let mut table = AssetAabbs::default();
+        table.claim(aabb(1.0));
+        let released = table.claim(aabb(2.0));
+        table.claim(aabb(3.0));
+
+        table.release(released);
+
+        // The slot comes back rather than growing the table, carrying the new asset's AABB - a
+        // stale one here would cull the new asset against the dropped one's bounds.
+        assert_eq!(table.claim(aabb(4.0)), released);
+        assert_eq!(table.aabbs.get().len(), 3);
+        assert_eq!(
+            table.aabbs.get()[released as usize].center,
+            Vec3::splat(4.0)
+        );
+    }
+
+    #[test]
+    fn the_table_uploads_only_after_a_claim() {
+        let mut table = AssetAabbs::default();
+        assert!(!table.dirty);
+
+        table.claim(aabb(1.0));
+        assert!(table.dirty);
+
+        // Releasing leaves the buffer untouched; the slot's contents only matter once reclaimed.
+        table.dirty = false;
+        table.release(0);
+        assert!(!table.dirty);
+    }
     use super::*;
     use crate::meshlet::asset::{BvhNode, Meshlet, MeshletCullData};
     use alloc::vec;
+    use bevy_math::Vec3;
 
     #[test]
     fn descriptor_layout_is_exactly_eight_words() {

@@ -3,8 +3,8 @@ use super::{
     MeshletMesh, MeshletMesh3d,
 };
 use crate::{
-    meshlet::asset::MeshletAabb, MeshFlags, MeshGeometryError, MeshTransforms, MeshUniform,
-    PreviousGlobalTransform, RenderMaterialInstances,
+    MeshFlags, MeshGeometryError, MeshTransforms, MeshUniform, PreviousGlobalTransform,
+    RenderMaterialInstances,
 };
 use bevy_asset::{AssetEvent, AssetServer, Assets, UntypedAssetId};
 use bevy_camera::visibility::RenderLayers;
@@ -40,11 +40,15 @@ pub struct InstanceManager {
     pub instances: Vec<(MainEntity, RenderLayers, bool)>,
     /// Per-instance [`MeshUniform`].
     pub instance_uniforms: StorageBuffer<Vec<MeshUniform>>,
-    /// Per-instance model-space AABB.
-    pub instance_aabbs: StorageBuffer<Vec<MeshletAabb>>,
+    /// Per-instance slot in [`MeshletMeshManager::asset_aabbs`].
+    pub instance_asset_indices: StorageBuffer<Vec<u32>>,
     /// Per-instance material ID.
     pub instance_material_ids: StorageBuffer<Vec<u32>>,
     /// Per-instance page and asset-local section bases in the paged meshlet data heap.
+    ///
+    /// Kept per instance, unlike the AABB, even though the descriptor is also a property of the
+    /// asset: `resolve_vertex_output` indexes it per pixel from every material and prepass fragment
+    /// shader, where an extra dependent load would sit ahead of the descriptor read it feeds.
     pub instance_meshlet_descriptors: StorageBuffer<Vec<MeshletGpuDescriptor>>,
     /// Per-view per-instance visibility bit. Used for [`RenderLayers`] and [`NotShadowCaster`] support.
     pub view_instance_visibility: EntityHashMap<StorageBuffer<Vec<u32>>>,
@@ -74,9 +78,9 @@ impl InstanceManager {
                 buffer.set_label(Some("meshlet_instance_uniforms"));
                 buffer
             },
-            instance_aabbs: {
+            instance_asset_indices: {
                 let mut buffer = StorageBuffer::default();
-                buffer.set_label(Some("meshlet_instance_aabbs"));
+                buffer.set_label(Some("meshlet_instance_asset_indices"));
                 buffer
             },
             instance_material_ids: {
@@ -102,7 +106,7 @@ impl InstanceManager {
         &mut self,
         instance: MainEntity,
         meshlet_descriptor: MeshletGpuDescriptor,
-        aabb: MeshletAabb,
+        asset_index: u32,
         bvh_depth: u32,
         transform: &GlobalTransform,
         previous_transform: Option<&PreviousGlobalTransform>,
@@ -163,7 +167,7 @@ impl InstanceManager {
             not_shadow_caster,
         ));
         self.instance_uniforms.get_mut().push(mesh_uniform);
-        self.instance_aabbs.get_mut().push(aabb);
+        self.instance_asset_indices.get_mut().push(asset_index);
         self.instance_material_ids.get_mut().push(0);
         self.instance_meshlet_descriptors
             .get_mut()
@@ -199,7 +203,7 @@ impl InstanceManager {
 
         self.instances.clear();
         self.instance_uniforms.get_mut().clear();
-        self.instance_aabbs.get_mut().clear();
+        self.instance_asset_indices.get_mut().clear();
         self.instance_material_ids.get_mut().clear();
         self.instance_meshlet_descriptors.get_mut().clear();
         self.view_instance_visibility
@@ -279,7 +283,7 @@ pub fn extract_meshlet_mesh_entities(
         // Upload the instance's MeshletMesh asset data if not done already. The load check is a
         // closure because the manager only needs it for an asset it has not already uploaded, and
         // it costs two AssetServer lock acquisitions.
-        let Some((meshlet_descriptor, aabb, bvh_depth)) = meshlet_mesh_manager
+        let Some((meshlet_descriptor, asset_index, bvh_depth)) = meshlet_mesh_manager
             .queue_upload_if_needed(
                 meshlet_mesh.id(),
                 || {
@@ -298,7 +302,7 @@ pub fn extract_meshlet_mesh_entities(
         instance_manager.add_instance(
             instance.into(),
             meshlet_descriptor,
-            aabb,
+            asset_index,
             bvh_depth,
             transform,
             previous_transform,

@@ -171,6 +171,7 @@ impl ResourceManager {
                         storage_buffer_sized(false, None),
                         storage_buffer_sized(false, None),
                         storage_buffer_sized(false, None),
+                        storage_buffer_read_only_sized(false, None),
                     ),
                 ),
             ),
@@ -188,6 +189,7 @@ impl ResourceManager {
                         storage_buffer_sized(false, None),
                         storage_buffer_sized(false, None),
                         storage_buffer_sized(false, None),
+                        storage_buffer_read_only_sized(false, None),
                         storage_buffer_read_only_sized(false, None),
                         storage_buffer_read_only_sized(false, None),
                     ),
@@ -528,6 +530,7 @@ pub struct MeshletViewBindGroups {
 pub fn prepare_meshlet_per_frame_resources(
     mut resource_manager: ResMut<ResourceManager>,
     mut instance_manager: ResMut<InstanceManager>,
+    mut meshlet_mesh_manager: ResMut<MeshletMeshManager>,
     views: Query<(
         Entity,
         &ExtractedView,
@@ -559,8 +562,9 @@ pub fn prepare_meshlet_per_frame_resources(
         .instance_uniforms
         .write_buffer(&render_device, &render_queue);
     instance_manager
-        .instance_aabbs
+        .instance_asset_indices
         .write_buffer(&render_device, &render_queue);
+    meshlet_mesh_manager.write_asset_aabbs(&render_device, &render_queue);
     instance_manager
         .instance_material_ids
         .write_buffer(&render_device, &render_queue);
@@ -877,7 +881,7 @@ pub fn prepare_meshlet_view_bind_groups(
                 previous_view_uniforms.clone(),
                 instance_manager.instance_uniforms.binding().unwrap(),
                 view_resources.instance_visibility.as_entire_binding(),
-                instance_manager.instance_aabbs.binding().unwrap(),
+                meshlet_mesh_manager.asset_aabbs.binding().unwrap(),
                 view_resources
                     .first_bvh_cull_count_front
                     .as_entire_binding(),
@@ -888,6 +892,7 @@ pub fn prepare_meshlet_view_bind_groups(
                 view_resources.second_pass_count.as_entire_binding(),
                 view_resources.second_pass_dispatch.as_entire_binding(),
                 view_resources.second_pass_candidates.as_entire_binding(),
+                instance_manager.instance_asset_indices.binding().unwrap(),
             )),
         );
 
@@ -901,7 +906,7 @@ pub fn prepare_meshlet_view_bind_groups(
                 previous_view_uniforms.clone(),
                 instance_manager.instance_uniforms.binding().unwrap(),
                 view_resources.instance_visibility.as_entire_binding(),
-                instance_manager.instance_aabbs.binding().unwrap(),
+                meshlet_mesh_manager.asset_aabbs.binding().unwrap(),
                 view_resources
                     .second_bvh_cull_count_front
                     .as_entire_binding(),
@@ -911,6 +916,7 @@ pub fn prepare_meshlet_view_bind_groups(
                 view_resources.second_bvh_cull_queue.as_entire_binding(),
                 view_resources.second_pass_count.as_entire_binding(),
                 view_resources.second_pass_candidates.as_entire_binding(),
+                instance_manager.instance_asset_indices.binding().unwrap(),
             )),
         );
 
