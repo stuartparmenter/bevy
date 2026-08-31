@@ -49,6 +49,11 @@ pub struct InstanceManager {
     /// Per-view per-instance visibility bit. Used for [`RenderLayers`] and [`NotShadowCaster`] support.
     pub view_instance_visibility: EntityHashMap<StorageBuffer<Vec<u32>>>,
 
+    /// The material assets used by instances in the scene.
+    ///
+    /// Collected during extraction, where the material of every instance is looked up anyway, so
+    /// that the prepare systems never walk the whole scene's material instance list.
+    scene_material_assets: HashSet<UntypedAssetId>,
     /// Next material ID available.
     next_material_id: u32,
     /// Map of material asset to material ID.
@@ -86,6 +91,7 @@ impl InstanceManager {
             },
             view_instance_visibility: EntityHashMap::default(),
 
+            scene_material_assets: HashSet::default(),
             next_material_id: 0,
             material_id_lookup: HashMap::default(),
             material_ids_present_in_scene: HashSet::default(),
@@ -126,6 +132,9 @@ impl InstanceManager {
         };
 
         let mesh_material = mesh_material_ids.mesh_material(instance);
+        if let Some(mesh_material) = mesh_material {
+            self.scene_material_assets.insert(mesh_material);
+        }
         let mesh_material_binding_id = if let Some(mesh_material) = mesh_material {
             render_material_bindings
                 .get(&mesh_material)
@@ -175,6 +184,11 @@ impl InstanceManager {
             })
     }
 
+    /// The material assets used by instances in the scene, deduplicated.
+    pub fn scene_material_assets(&self) -> &HashSet<UntypedAssetId> {
+        &self.scene_material_assets
+    }
+
     pub fn material_present_in_scene(&self, material_id: &u32) -> bool {
         self.material_ids_present_in_scene.contains(material_id)
     }
@@ -194,6 +208,7 @@ impl InstanceManager {
             .values_mut()
             .for_each(|b| b.get_mut().clear());
 
+        self.scene_material_assets.clear();
         self.next_material_id = 0;
         self.material_id_lookup.clear();
         self.material_ids_present_in_scene.clear();
@@ -240,7 +255,8 @@ pub fn extract_meshlet_mesh_entities(
     // Reset per-frame data
     instance_manager.reset(render_entities);
 
-    // Free GPU buffer space for any modified or dropped MeshletMesh assets
+    // Free GPU buffer space for any modified or dropped MeshletMesh assets. This has to precede
+    // the instance walk below, which treats residency as proof that an asset is loaded.
     for asset_event in asset_events.read() {
         if let AssetEvent::Unused { id } | AssetEvent::Modified { id } = asset_event {
             meshlet_mesh_manager.remove(id);
@@ -260,19 +276,21 @@ pub fn extract_meshlet_mesh_entities(
         geometry_error,
     ) in &instances_query
     {
-        // Skip instances with an unloaded MeshletMesh asset
-        // TODO: This is a semi-expensive check
-        if asset_server.is_managed(meshlet_mesh.id())
-            && !asset_server.is_loaded_with_dependencies(meshlet_mesh.id())
-        {
-            continue;
-        }
-
-        // Upload the instance's MeshletMesh asset data if not done already done
+        // Upload the instance's MeshletMesh asset data if not done already. The load check is a
+        // closure because the manager only needs it for an asset it has not already uploaded, and
+        // it costs two AssetServer lock acquisitions.
         let Some((meshlet_descriptor, aabb, bvh_depth)) = meshlet_mesh_manager
-            .queue_upload_if_needed(meshlet_mesh.id(), &mut assets, &render_device)
+            .queue_upload_if_needed(
+                meshlet_mesh.id(),
+                || {
+                    !asset_server.is_managed(meshlet_mesh.id())
+                        || asset_server.is_loaded_with_dependencies(meshlet_mesh.id())
+                },
+                &mut assets,
+                &render_device,
+            )
         else {
-            // The asset is unusable or the meshlet heap is full. The manager logs why, once.
+            // The asset is still loading, unusable, or the heap is full. The manager logs why, once.
             continue;
         };
 
