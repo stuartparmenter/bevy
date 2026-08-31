@@ -2373,9 +2373,12 @@ fn main() {
     }
     if hud {
         // The GPU spans the overlay shows come from render diagnostics.
-        app.add_plugins(RenderDiagnosticsPlugin)
-            // Spawned beside the camera so the UI never lacks a render target.
-            .add_systems(OnEnter(ZorahState::ReleasingUnusedTextures), spawn_hud)
+        // `RenderPlugin` already adds the plugin when Tracy tracing is on.
+        if !app.is_plugin_added::<RenderDiagnosticsPlugin>() {
+            app.add_plugins(RenderDiagnosticsPlugin);
+        }
+        // Spawned beside the camera so the UI never lacks a render target.
+        app.add_systems(OnEnter(ZorahState::ReleasingUnusedTextures), spawn_hud)
             .add_systems(PostUpdate, update_hud.run_if(any_with_component::<HudText>));
     }
     app.init_state::<ZorahState>();
