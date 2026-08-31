@@ -191,6 +191,8 @@ pub struct MeshletMeshManager {
     pending_uploads: Vec<PendingUpload>,
     failed_uploads: HashMap<AssetId<MeshletMesh>, UploadFailure>,
     pub asset_aabbs: AssetAabbs,
+    /// Bumped whenever an asset becomes resident or stops being so.
+    residency_revision: u64,
 }
 
 /// Model-space AABB of each resident asset, in a slot that is stable for the asset's residency.
@@ -273,10 +275,27 @@ pub fn init_meshlet_mesh_manager(mut commands: Commands, render_device: Res<Rend
         pending_uploads: Vec::new(),
         failed_uploads: HashMap::default(),
         asset_aabbs: AssetAabbs::default(),
+        residency_revision: 0,
     });
 }
 
 impl MeshletMeshManager {
+    /// Bumped whenever an asset becomes resident or stops being so.
+    ///
+    /// A caller that caches per-instance data derived from residency can hold it while this holds
+    /// still.
+    pub fn residency_revision(&self) -> u64 {
+        self.residency_revision
+    }
+
+    /// Whether a `None` from [`Self::queue_upload_if_needed`] may succeed on a later frame.
+    ///
+    /// A permanently failed asset never will, so a caller that caches instance data must not treat
+    /// it as a reason to keep rebuilding.
+    pub fn upload_may_retry(&self, asset_id: AssetId<MeshletMesh>) -> bool {
+        self.failed_uploads.get(&asset_id) != Some(&UploadFailure::Permanent)
+    }
+
     /// The GPU descriptor, AABB slot and BVH depth of an asset already resident in the page heap.
     ///
     /// An allocation exists only for an asset that loaded and has not since been modified or
@@ -408,6 +427,7 @@ impl MeshletMeshManager {
             bytes,
         });
         self.allocations.insert(asset_id, allocation.clone());
+        self.residency_revision += 1;
         self.failed_uploads.remove(&asset_id);
         Some((descriptor, allocation.asset_index, allocation.bvh_depth))
     }
@@ -442,6 +462,7 @@ impl MeshletMeshManager {
         assert_eq!(page.generation, allocation.page_generation);
         page.allocator.free(allocation.range);
         self.asset_aabbs.release(allocation.asset_index);
+        self.residency_revision += 1;
         // Reclamation is deferred to the post-write sweep. A Modified asset removed and re-added
         // in the same frame can therefore reuse this page and its GPU buffer, while an Unused
         // asset still releases its empty page at the end of the prepare-assets phase.

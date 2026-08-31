@@ -558,19 +558,25 @@ pub fn prepare_meshlet_per_frame_resources(
     let instance_manager = instance_manager.as_mut();
 
     // TODO: Move this and the submit to a separate system and remove pub from the fields
-    instance_manager
-        .instance_uniforms
-        .write_buffer(&render_device, &render_queue);
-    instance_manager
-        .instance_asset_indices
-        .write_buffer(&render_device, &render_queue);
+    // The per-instance buffers hold last frame's contents unless extraction rebuilt them. The
+    // per-view visibility bitset below is deliberately not gated with them: it also depends on the
+    // view's own RenderLayers, which change independently of the instances.
+    if instance_manager.instance_data_dirty {
+        instance_manager
+            .instance_uniforms
+            .write_buffer(&render_device, &render_queue);
+        instance_manager
+            .instance_asset_indices
+            .write_buffer(&render_device, &render_queue);
+        instance_manager
+            .instance_material_ids
+            .write_buffer(&render_device, &render_queue);
+        instance_manager
+            .instance_meshlet_descriptors
+            .write_buffer(&render_device, &render_queue);
+        instance_manager.instance_data_dirty = false;
+    }
     meshlet_mesh_manager.write_asset_aabbs(&render_device, &render_queue);
-    instance_manager
-        .instance_material_ids
-        .write_buffer(&render_device, &render_queue);
-    instance_manager
-        .instance_meshlet_descriptors
-        .write_buffer(&render_device, &render_queue);
 
     let needed_buffer_size = 4 * instance_manager.scene_instance_count as u64;
     let second_pass_candidates = match &mut resource_manager.second_pass_candidates {
