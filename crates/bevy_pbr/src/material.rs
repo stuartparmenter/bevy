@@ -756,22 +756,45 @@ fn extract_mesh_materials<M: Material>(
         >,
     >,
 ) {
-    let last_change_tick = material_instances.current_change_tick;
+    let changed = {
+        // Written through `bypass_change_detection` so the resource reads as changed only when the
+        // instance set actually moves. See `late_sweep_material_instances`.
+        let material_instances = material_instances.bypass_change_detection();
+        let last_change_tick = material_instances.current_change_tick;
+        let mut changed = false;
 
-    for (entity, view_visibility, material) in &changed_meshes_query {
-        if view_visibility.get() {
-            material_instances.instances.insert(
-                entity.into(),
-                RenderMaterialInstance {
-                    asset_id: material.id().untyped(),
-                    last_change_tick,
-                },
-            );
-        } else {
-            material_instances
-                .instances
-                .remove(&MainEntity::from(entity));
+        for (entity, view_visibility, material) in &changed_meshes_query {
+            if view_visibility.get() {
+                let asset_id = material.id().untyped();
+                match material_instances.instances.entry(entity.into()) {
+                    Entry::Occupied(mut occupied_entry) => {
+                        let instance = occupied_entry.get_mut();
+                        // The query also fires on a visibility change, which leaves the material
+                        // as it was.
+                        changed |= instance.asset_id != asset_id;
+                        instance.asset_id = asset_id;
+                        instance.last_change_tick = last_change_tick;
+                    }
+                    Entry::Vacant(vacant_entry) => {
+                        vacant_entry.insert(RenderMaterialInstance {
+                            asset_id,
+                            last_change_tick,
+                        });
+                        changed = true;
+                    }
+                }
+            } else {
+                changed |= material_instances
+                    .instances
+                    .remove(&MainEntity::from(entity))
+                    .is_some();
+            }
         }
+        changed
+    };
+
+    if changed {
+        material_instances.set_changed();
     }
 }
 
@@ -795,15 +818,26 @@ fn early_sweep_material_instances<M>(
 ) where
     M: Material,
 {
-    let last_change_tick = material_instances.current_change_tick;
+    let mut changed = false;
+    {
+        let material_instances = material_instances.bypass_change_detection();
+        let last_change_tick = material_instances.current_change_tick;
 
-    for entity in removed_materials_query.read() {
-        if let Entry::Occupied(occupied_entry) = material_instances.instances.entry(entity.into()) {
-            // Only sweep the entry if it wasn't updated this frame.
-            if occupied_entry.get().last_change_tick != last_change_tick {
-                occupied_entry.remove();
+        for entity in removed_materials_query.read() {
+            if let Entry::Occupied(occupied_entry) =
+                material_instances.instances.entry(entity.into())
+            {
+                // Only sweep the entry if it wasn't updated this frame.
+                if occupied_entry.get().last_change_tick != last_change_tick {
+                    occupied_entry.remove();
+                    changed = true;
+                }
             }
         }
+    }
+
+    if changed {
+        material_instances.set_changed();
     }
 }
 
@@ -813,26 +847,41 @@ fn early_sweep_material_instances<M>(
 /// This runs after all invocations of `early_sweep_material_instances` and is
 /// responsible for bumping [`RenderMaterialInstances::current_change_tick`] in
 /// preparation for a new frame.
+///
+/// That bump happens every frame, so it goes through
+/// [`DetectChangesMut::bypass_change_detection`]: without it the resource would read as changed on
+/// every frame, and its change tick would tell a consumer nothing.
 pub fn late_sweep_material_instances(
     mut material_instances: ResMut<RenderMaterialInstances>,
     mut removed_meshes_query: Extract<RemovedComponents<Mesh3d>>,
 ) {
-    let last_change_tick = material_instances.current_change_tick;
+    let mut changed = false;
+    {
+        let material_instances = material_instances.bypass_change_detection();
+        let last_change_tick = material_instances.current_change_tick;
 
-    for entity in removed_meshes_query.read() {
-        if let Entry::Occupied(occupied_entry) = material_instances.instances.entry(entity.into()) {
-            // Only sweep the entry if it wasn't updated this frame. It's
-            // possible that a `ViewVisibility` component was removed and
-            // re-added in the same frame.
-            if occupied_entry.get().last_change_tick != last_change_tick {
-                occupied_entry.remove();
+        for entity in removed_meshes_query.read() {
+            if let Entry::Occupied(occupied_entry) =
+                material_instances.instances.entry(entity.into())
+            {
+                // Only sweep the entry if it wasn't updated this frame. It's
+                // possible that a `ViewVisibility` component was removed and
+                // re-added in the same frame.
+                if occupied_entry.get().last_change_tick != last_change_tick {
+                    occupied_entry.remove();
+                    changed = true;
+                }
             }
         }
+
+        material_instances
+            .current_change_tick
+            .set(last_change_tick.get() + 1);
     }
 
-    material_instances
-        .current_change_tick
-        .set(last_change_tick.get() + 1);
+    if changed {
+        material_instances.set_changed();
+    }
 }
 
 pub fn extract_entities_needs_specialization<M>(
