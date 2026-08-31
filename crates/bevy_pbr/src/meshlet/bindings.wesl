@@ -304,7 +304,7 @@ var<immediate> constants: Constants;
 // Per entity instance data
 @group(0) @binding(3) var<storage, read> meshlet_instance_uniforms: array<Mesh>;
 @group(0) @binding(4) var<storage, read> meshlet_view_instance_visibility: array<u32>; // 1 bit per entity instance, packed as a bitmask
-@group(0) @binding(5) var<storage, read> meshlet_instance_aabbs: array<MeshletAabb>;
+@group(0) @binding(5) var<storage, read> meshlet_asset_aabbs: array<MeshletAabb>;
 
 // BVH cull queue data
 @group(0) @binding(6) var<storage, read_write> meshlet_bvh_cull_count_write: atomic<u32>;
@@ -322,6 +322,13 @@ var<immediate> constants: Constants;
 @group(0) @binding(9) var<storage, read> meshlet_second_pass_instance_count: u32;
 @group(0) @binding(10) var<storage, read> meshlet_second_pass_instance_candidates: array<u32>;
 }
+
+// Per entity instance data, declared per variant because the two passes end at different bindings.
+// These are the last entry of each group's `BindGroupEntries::sequential` tuple in resource_manager.
+@if(MESHLET_INSTANCE_CULLING_PASS && MESHLET_FIRST_CULLING_PASS)
+@group(0) @binding(12) var<storage, read> meshlet_instance_asset_indices: array<u32>;
+@if(MESHLET_INSTANCE_CULLING_PASS && !MESHLET_FIRST_CULLING_PASS)
+@group(0) @binding(11) var<storage, read> meshlet_instance_asset_indices: array<u32>;
 
 @if(MESHLET_BVH_CULLING_PASS)
 struct Constants { read_from_front: u32, rightmost_slot: u32 }
