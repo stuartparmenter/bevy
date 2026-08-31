@@ -10,6 +10,7 @@ use bevy::{
         prepass::{DeferredPrepass, DepthPrepass},
         tonemapping::Tonemapping,
     },
+    diagnostic::{Diagnostic, DiagnosticPath, DiagnosticsStore, FrameTimeDiagnosticsPlugin},
     curve::cubic_splines::LinearSpline,
     math::ops,
     post_process::{
@@ -356,4 +357,75 @@ pub fn screenshot_after(
                 schedule.captured = true;
             },
         );
+}
+
+/// Marks the performance overlay's text.
+#[derive(Component)]
+pub struct HudText;
+
+/// Spawns the corner performance overlay, styled after the `solari` example's.
+pub fn spawn_hud(mut commands: Commands) {
+    commands.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            right: px(0.0),
+            padding: px(4.0).all(),
+            border_radius: BorderRadius::bottom_left(px(4.0)),
+            ..default()
+        },
+        BackgroundColor(Color::srgba(0.10, 0.10, 0.10, 0.8)),
+        children![(
+            HudText,
+            Text::default(),
+            TextFont {
+                font_size: FontSize::Px(8.0),
+                ..default()
+            },
+        )],
+    ));
+}
+
+/// Rewrites the overlay from the diagnostics store each frame: the frame rate,
+/// then whichever GPU spans report on the current path.
+pub fn update_hud(mut text: Single<&mut Text, With<HudText>>, diagnostics: Res<DiagnosticsStore>) {
+    text.0.clear();
+    if let Some(fps) = diagnostics
+        .get(&FrameTimeDiagnosticsPlugin::FPS)
+        .and_then(Diagnostic::smoothed)
+    {
+        text.push_str(&format!("{:17}  {fps:.1}\n", "FPS"));
+    }
+    if let Some(frame_ms) = diagnostics
+        .get(&FrameTimeDiagnosticsPlugin::FRAME_TIME)
+        .and_then(Diagnostic::smoothed)
+    {
+        text.push_str(&format!("{:17}  {frame_ms:.2} ms\n", "Frame"));
+    }
+
+    let mut total = 0.0;
+    let mut add_span = |name: &str, path: &'static str| {
+        let path = DiagnosticPath::new(path);
+        if let Some(value) = diagnostics.get(&path).and_then(Diagnostic::smoothed) {
+            text.push_str(&format!("{name:17}  {value:.2} ms\n"));
+            total += value;
+        }
+    };
+    (add_span)(
+        "Meshlet raster",
+        "render/meshlet_visibility_buffer_raster/elapsed_gpu",
+    );
+    (add_span)(
+        "Light tiles",
+        "render/solari_lighting/presample_light_tiles/elapsed_gpu",
+    );
+    (add_span)(
+        "World cache",
+        "render/solari_lighting/world_cache/elapsed_gpu",
+    );
+    (add_span)("Lighting", "render/solari_lighting/lighting/elapsed_gpu");
+    (add_span)("DLSS-RR", "render/dlss_ray_reconstruction/elapsed_gpu");
+    (add_span)("DLSS-SR", "render/dlss_super_resolution/elapsed_gpu");
+    if total > 0.0 {
+        text.push_str(&format!("{:17}  {total:.2} ms\n", "GPU measured"));
+    }
 }
