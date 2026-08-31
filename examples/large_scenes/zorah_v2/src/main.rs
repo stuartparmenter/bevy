@@ -39,6 +39,7 @@ use bevy::{
     pbr::{experimental::meshlet::MeshletPlugin, DefaultOpaqueRendererMethod},
     post_process::auto_exposure::AutoExposurePlugin,
     prelude::*,
+    render::diagnostic::RenderDiagnosticsPlugin,
     solari::prelude::SolariPlugins,
 };
 
@@ -121,6 +122,10 @@ struct Args {
     /// print Bevy's periodic frame-time diagnostics
     #[argh(switch)]
     diagnostics: bool,
+
+    /// hide the corner frame-rate overlay
+    #[argh(switch)]
+    no_hud: bool,
 
     /// camera position x,y,z in the export's metres (default the sidecar scene.json view)
     #[argh(option)]
@@ -660,11 +665,20 @@ fn run_app(args: &Args, prepared: Prepared) -> ExitCode {
         // registered for the asset type it serves.
         .init_asset::<ZorahPart>()
         .register_asset_loader(ZorahPartLoader { settings: lod });
+    if args.diagnostics || !args.no_hud {
+        app.add_plugins(FrameTimeDiagnosticsPlugin::default());
+    }
     if args.diagnostics {
-        app.add_plugins((
-            FrameTimeDiagnosticsPlugin::default(),
-            LogDiagnosticsPlugin::default(),
-        ));
+        app.add_plugins(LogDiagnosticsPlugin::default());
+    }
+    if !args.no_hud {
+        // The GPU spans the overlay shows come from render diagnostics.
+        app.add_plugins(RenderDiagnosticsPlugin)
+            .add_systems(Startup, setup::spawn_hud)
+            .add_systems(
+                PostUpdate,
+                setup::update_hud.run_if(any_with_component::<setup::HudText>),
+            );
     }
     if let Some(delay) = args.screenshot_after {
         app.insert_resource(ScreenshotAfter::new(delay.max(0.0)))

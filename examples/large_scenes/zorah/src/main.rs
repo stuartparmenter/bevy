@@ -21,7 +21,10 @@ use bevy::{
         prepass::{DeferredPrepass, DepthPrepass},
         tonemapping::Tonemapping,
     },
-    diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin},
+    diagnostic::{
+        Diagnostic, DiagnosticPath, DiagnosticsStore, FrameTimeDiagnosticsPlugin,
+        LogDiagnosticsPlugin,
+    },
     ecs::query::QueryItem,
     light::{
         atmosphere::{Falloff, PhaseFunction, ScatteringMedium, ScatteringTerm},
@@ -38,6 +41,7 @@ use bevy::{
     post_process::bloom::Bloom,
     prelude::*,
     render::{
+        diagnostic::RenderDiagnosticsPlugin,
         mesh::Indices,
         render_resource::{Face, PrimitiveTopology, TextureUsages},
         renderer::RenderDevice,
@@ -244,6 +248,10 @@ struct Args {
     /// print Bevy's periodic frame-time diagnostics
     #[argh(switch)]
     diagnostics: bool,
+
+    /// hide the corner frame-rate overlay
+    #[argh(switch)]
+    no_hud: bool,
 
     /// render the conventional deferred meshlet scene without building Solari BLASes
     #[argh(switch)]
@@ -2282,6 +2290,7 @@ fn pan_water_surfaces(
 fn main() {
     let args: Args = argh::from_env();
     let diagnostics = args.diagnostics;
+    let hud = !args.no_hud;
     let raster_only = args.raster_only;
     let camera_position = parse_vec3_arg("--camera-position", args.camera_position.as_deref());
     let camera_target = parse_vec3_arg("--camera-target", args.camera_target.as_deref());
@@ -2356,11 +2365,18 @@ fn main() {
     if !raster_only {
         app.add_plugins(SolariPlugins);
     }
+    if diagnostics || hud {
+        app.add_plugins(FrameTimeDiagnosticsPlugin::default());
+    }
     if diagnostics {
-        app.add_plugins((
-            FrameTimeDiagnosticsPlugin::default(),
-            LogDiagnosticsPlugin::default(),
-        ));
+        app.add_plugins(LogDiagnosticsPlugin::default());
+    }
+    if hud {
+        // The GPU spans the overlay shows come from render diagnostics.
+        app.add_plugins(RenderDiagnosticsPlugin)
+            // Spawned beside the camera so the UI never lacks a render target.
+            .add_systems(OnEnter(ZorahState::ReleasingUnusedTextures), spawn_hud)
+            .add_systems(PostUpdate, update_hud.run_if(any_with_component::<HudText>));
     }
     app.init_state::<ZorahState>();
     app.add_systems(Startup, report_data_layers);
@@ -6440,5 +6456,78 @@ mod tests {
     fn ue_sky_light_illuminance_sizes_the_raster_ambient_fallback() {
         assert!((ue_sky_light_illuminance(std::f32::consts::PI) - 251.32742).abs() < 1e-4);
         assert_eq!(ue_sky_light_illuminance(-1.0), 0.0);
+    }
+}
+
+/// Marks the performance overlay's text.
+#[derive(Component)]
+struct HudText;
+
+/// Spawns the corner performance overlay, styled after the `solari` example's.
+/// Runs beside `setup` so a camera exists for the UI from its first frame.
+fn spawn_hud(mut commands: Commands) {
+    commands.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            right: px(0.0),
+            padding: px(4.0).all(),
+            border_radius: BorderRadius::bottom_left(px(4.0)),
+            ..default()
+        },
+        BackgroundColor(Color::srgba(0.10, 0.10, 0.10, 0.8)),
+        children![(
+            HudText,
+            Text::default(),
+            TextFont {
+                font_size: FontSize::Px(8.0),
+                ..default()
+            },
+        )],
+    ));
+}
+
+/// Rewrites the overlay from the diagnostics store each frame: the frame rate,
+/// then whichever GPU spans report on the current path (the Solari spans are
+/// absent under `--raster-only`, the DLSS ones without the hardware).
+fn update_hud(mut text: Single<&mut Text, With<HudText>>, diagnostics: Res<DiagnosticsStore>) {
+    text.0.clear();
+    if let Some(fps) = diagnostics
+        .get(&FrameTimeDiagnosticsPlugin::FPS)
+        .and_then(Diagnostic::smoothed)
+    {
+        text.push_str(&format!("{:17}  {fps:.1}\n", "FPS"));
+    }
+    if let Some(frame_ms) = diagnostics
+        .get(&FrameTimeDiagnosticsPlugin::FRAME_TIME)
+        .and_then(Diagnostic::smoothed)
+    {
+        text.push_str(&format!("{:17}  {frame_ms:.2} ms\n", "Frame"));
+    }
+
+    let mut total = 0.0;
+    let mut add_span = |name: &str, path: &'static str| {
+        let path = DiagnosticPath::new(path);
+        if let Some(value) = diagnostics.get(&path).and_then(Diagnostic::smoothed) {
+            text.push_str(&format!("{name:17}  {value:.2} ms\n"));
+            total += value;
+        }
+    };
+    (add_span)(
+        "Meshlet raster",
+        "render/meshlet_visibility_buffer_raster/elapsed_gpu",
+    );
+    (add_span)(
+        "Light tiles",
+        "render/solari_lighting/presample_light_tiles/elapsed_gpu",
+    );
+    (add_span)(
+        "World cache",
+        "render/solari_lighting/world_cache/elapsed_gpu",
+    );
+    (add_span)("Lighting", "render/solari_lighting/lighting/elapsed_gpu");
+    (add_span)("DLSS-RR", "render/dlss_ray_reconstruction/elapsed_gpu");
+    (add_span)("DLSS-SR", "render/dlss_super_resolution/elapsed_gpu");
+    if total > 0.0 {
+        text.push_str(&format!("{:17}  {total:.2} ms\n", "GPU measured"));
     }
 }
