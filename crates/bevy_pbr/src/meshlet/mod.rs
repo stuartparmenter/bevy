@@ -46,7 +46,10 @@ use self::{
     visibility_buffer_raster_node::meshlet_visibility_buffer_raster,
 };
 use crate::render::{per_view_shadow_pass, EARLY_SHADOW_PASS};
-use crate::{meshlet::meshlet_mesh_manager::init_meshlet_mesh_manager, PreviousGlobalTransform};
+use crate::{
+    late_sweep_material_instances, meshlet::meshlet_mesh_manager::init_meshlet_mesh_manager,
+    MaterialExtractionSystems, PreviousGlobalTransform,
+};
 use bevy_app::{App, Plugin};
 use bevy_asset::{embedded_asset, AssetApp, AssetId, Handle};
 use bevy_camera::visibility::{self, Visibility, VisibilityClass};
@@ -188,7 +191,14 @@ impl Plugin for MeshletPlugin {
                 )
                     .chain(),
             )
-            .add_systems(ExtractSchedule, extract_meshlet_mesh_entities)
+            .add_systems(
+                ExtractSchedule,
+                // The rebuild test reads the change tick of `RenderMaterialInstances`, so it runs
+                // after every system that writes it.
+                extract_meshlet_mesh_entities
+                    .after(MaterialExtractionSystems)
+                    .after(late_sweep_material_instances),
+            )
             .add_systems(
                 Render,
                 (
