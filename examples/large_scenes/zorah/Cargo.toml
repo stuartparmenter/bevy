@@ -14,7 +14,10 @@ bevy = { path = "../../..", default-features = false, features = [
   # LinearSpline for the camera path.
   "bevy_curve",
   "bevy_solari",
+  # The frame-rate overlay (--no-hud disables it).
+  "bevy_ui_render",
   "default_app",
+  "default_font",
   "free_camera",
   "meshlet",
   # The candle flames build their shared 168-triangle lathe at startup rather

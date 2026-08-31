@@ -20,6 +20,9 @@ bevy = { path = "../../..", default-features = false, features = [
   "bevy_camera_controller",
   "free_camera",
   "default_app",
+  # The frame-rate overlay (--no-hud disables it).
+  "bevy_ui_render",
+  "default_font",
   "multi_threaded",
   "ktx2",
   "zstd_rust",
