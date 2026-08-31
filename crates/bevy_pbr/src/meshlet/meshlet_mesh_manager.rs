@@ -225,18 +225,40 @@ pub fn init_meshlet_mesh_manager(mut commands: Commands, render_device: Res<Rend
 }
 
 impl MeshletMeshManager {
+    /// The GPU descriptor for an asset already resident in the page heap.
+    ///
+    /// An allocation exists only for an asset that loaded and has not since been modified or
+    /// dropped, so a hit here answers "is this loaded?" without consulting the asset server - which
+    /// matters because [`Self::queue_upload_if_needed`] takes the asset out of `Assets` once it is
+    /// resident, leaving loaded and resident as disjoint phases of one lifecycle.
+    fn descriptor(
+        &self,
+        asset_id: AssetId<MeshletMesh>,
+    ) -> Option<(MeshletGpuDescriptor, MeshletAabb, u32)> {
+        let allocation = self.allocations.get(&asset_id)?;
+        Some((allocation.descriptor, allocation.aabb, allocation.bvh_depth))
+    }
+
     /// Queue an asset for upload if needed and return the immutable GPU descriptor for instances.
     ///
-    /// Returns `None` for an asset that cannot be uploaded: it is skipped instead of rendered, and
-    /// the reason is logged once.
+    /// `is_loaded` is consulted only for an asset that is not already resident, so a caller with
+    /// one instance per frame per asset pays for its load check once rather than every frame.
+    ///
+    /// Returns `None` for an asset that is still loading, and for one that cannot be uploaded: both
+    /// are skipped instead of rendered, and the latter is logged once.
     pub fn queue_upload_if_needed(
         &mut self,
         asset_id: AssetId<MeshletMesh>,
+        is_loaded: impl FnOnce() -> bool,
         assets: &mut Assets<MeshletMesh>,
         render_device: &RenderDevice,
     ) -> Option<(MeshletGpuDescriptor, MeshletAabb, u32)> {
-        if let Some(allocation) = self.allocations.get(&asset_id) {
-            return Some((allocation.descriptor, allocation.aabb, allocation.bvh_depth));
+        if let Some(resident) = self.descriptor(asset_id) {
+            return Some(resident);
+        }
+        // Still loading is not a failure - the asset gets another attempt next frame.
+        if !is_loaded() {
+            return None;
         }
         if self.failed_uploads.get(&asset_id) == Some(&UploadFailure::Permanent) {
             return None;
@@ -344,7 +366,9 @@ impl MeshletMeshManager {
     }
 
     pub fn remove(&mut self, asset_id: &AssetId<MeshletMesh>) {
-        // A modified asset gets a fresh attempt, including a fresh error report.
+        // A modified asset gets a fresh attempt, including a fresh error report. Dropping the
+        // allocation is also what returns the asset to the `is_loaded`-checked path in
+        // [`Self::queue_upload_if_needed`], which relies on residency to mean loaded.
         self.failed_uploads.remove(asset_id);
         let Some(allocation) = self.allocations.remove(asset_id) else {
             return;

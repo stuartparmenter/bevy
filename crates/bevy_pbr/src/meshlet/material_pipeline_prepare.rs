@@ -3,6 +3,7 @@ use super::{
     resource_manager::ResourceManager,
 };
 use crate::*;
+use bevy_asset::UntypedAssetId;
 use bevy_camera::{Camera3d, Projection};
 use bevy_core_pipeline::{
     prepass::{DeferredPrepass, DepthPrepass, MotionVectorPrepass, NormalPrepass},
@@ -19,7 +20,7 @@ use bevy_mesh::{
     Mesh, MeshAttributeCompressionFlags, MeshVertexBufferLayout, MeshVertexBufferLayoutRef,
     MeshVertexBufferLayouts,
 };
-use bevy_platform::collections::{HashMap, HashSet};
+use bevy_platform::collections::HashMap;
 use bevy_render::{camera::ExtractedCamera, erased_render_asset::ErasedRenderAssets};
 use bevy_render::{
     camera::TemporalJitter,
@@ -75,7 +76,6 @@ pub fn prepare_material_meshlet_meshes_main_opaque_pass(
     mesh_pipeline: Res<MeshPipeline>,
     render_materials: Res<ErasedRenderAssets<PreparedMaterial>>,
     meshlet_pipelines: Res<MeshletPipelines>,
-    render_material_instances: Res<RenderMaterialInstances>,
     mut mesh_vertex_buffer_layouts: ResMut<MeshVertexBufferLayouts>,
     mut views: Query<
         (
@@ -100,6 +100,13 @@ pub fn prepare_material_meshlet_meshes_main_opaque_pass(
         With<Camera3d>,
     >,
 ) {
+    let forward_materials = drawable_materials(&instance_manager, &render_materials, |material| {
+        material.properties.render_method == OpaqueRendererMethod::Forward
+    });
+    if forward_materials.is_empty() {
+        return;
+    }
+
     let fake_vertex_buffer_layout = &fake_vertex_buffer_layout(&mut mesh_vertex_buffer_layouts);
 
     for (
@@ -188,23 +195,7 @@ pub fn prepare_material_meshlet_meshes_main_opaque_pass(
             None,
         );
 
-        for material_id in render_material_instances
-            .instances
-            .values()
-            .map(|instance| instance.asset_id)
-            .collect::<HashSet<_>>()
-        {
-            let Some(material) = render_materials.get(material_id) else {
-                continue;
-            };
-
-            if material.properties.render_method != OpaqueRendererMethod::Forward
-                || material.properties.alpha_mode != AlphaMode::Opaque
-                || material.properties.reads_view_transmission_texture
-            {
-                continue;
-            }
-
+        for &(material_id, material) in &forward_materials {
             let type_id = material_id.type_id();
             let erased_key =
                 meshlet_material_pipeline_key(view_key, type_id, &material.properties.material_key);
@@ -285,6 +276,8 @@ pub fn prepare_material_meshlet_meshes_main_opaque_pass(
                 binding: material.binding.group,
             });
         }
+
+        sort_by_bind_group(&mut materials);
     }
 }
 
@@ -306,7 +299,6 @@ pub fn prepare_material_meshlet_meshes_prepass(
     prepass_pipeline: Res<PrepassPipeline>,
     render_materials: Res<ErasedRenderAssets<PreparedMaterial>>,
     meshlet_pipelines: Res<MeshletPipelines>,
-    render_material_instances: Res<RenderMaterialInstances>,
     mut mesh_vertex_buffer_layouts: ResMut<MeshVertexBufferLayouts>,
     mut views: Query<
         (
@@ -318,6 +310,11 @@ pub fn prepare_material_meshlet_meshes_prepass(
         With<Camera3d>,
     >,
 ) {
+    let prepass_materials = drawable_materials(&instance_manager, &render_materials, |_| true);
+    if prepass_materials.is_empty() {
+        return;
+    }
+
     let fake_vertex_buffer_layout = &fake_vertex_buffer_layout(&mut mesh_vertex_buffer_layouts);
 
     for (
@@ -342,22 +339,8 @@ pub fn prepare_material_meshlet_meshes_prepass(
             None,
         );
 
-        for material_id in render_material_instances
-            .instances
-            .values()
-            .map(|instance| instance.asset_id)
-            .collect::<HashSet<_>>()
-        {
-            let Some(material) = render_materials.get(material_id) else {
-                continue;
-            };
+        for &(material_id, material) in &prepass_materials {
             let type_id = material_id.type_id();
-
-            if material.properties.alpha_mode != AlphaMode::Opaque
-                || material.properties.reads_view_transmission_texture
-            {
-                continue;
-            }
 
             let material_wants_deferred = matches!(
                 material.properties.render_method,
@@ -474,7 +457,53 @@ pub fn prepare_material_meshlet_meshes_prepass(
                 materials.push(item);
             }
         }
+
+        sort_by_bind_group(&mut materials);
+        sort_by_bind_group(&mut deferred_materials);
     }
+}
+
+/// The scene's meshlet materials a pass can draw, paired with the prepared material to draw them
+/// with.
+///
+/// Eligibility is a property of the material asset rather than of the view, so both prepare systems
+/// resolve it once instead of per view. `accepts` adds the caller's own test to the shared one.
+fn drawable_materials<'a>(
+    instance_manager: &InstanceManager,
+    render_materials: &'a ErasedRenderAssets<PreparedMaterial>,
+    accepts: impl Fn(&PreparedMaterial) -> bool,
+) -> Vec<(UntypedAssetId, &'a PreparedMaterial)> {
+    instance_manager
+        .scene_material_assets()
+        .iter()
+        .filter_map(|&material_id| {
+            let material = render_materials.get(material_id)?;
+            (material.properties.alpha_mode == AlphaMode::Opaque
+                && !material.properties.reads_view_transmission_texture
+                && accepts(material))
+            .then_some((material_id, material))
+        })
+        .collect()
+}
+
+/// Order a pass's draws by material type and bind group, with the pipeline as a tiebreak, so that
+/// [`TrackedRenderPass`] elides the repeat binds.
+///
+/// This is [`BinnedPhaseItem::BinKey`]'s ordering contract, which meshlet materials have to restate
+/// because they are drawn from a plain list rather than binned into a render phase. Bind group
+/// leads because a pass holds one bind group per index: when the slab changes, the encoder pays one
+/// tracker merge and one memory-init walk per texture in it, while a repeated pipeline is O(1).
+///
+/// [`TrackedRenderPass`]: bevy_render::render_phase::TrackedRenderPass
+/// [`BinnedPhaseItem::BinKey`]: bevy_render::render_phase::BinnedPhaseItem::BinKey
+fn sort_by_bind_group(materials: &mut [MeshletViewMaterial]) {
+    materials.sort_unstable_by_key(|material| {
+        (
+            material.material_type,
+            material.binding.0,
+            material.pipeline,
+        )
+    });
 }
 
 fn meshlet_material_pipeline_key(
