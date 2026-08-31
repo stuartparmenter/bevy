@@ -673,8 +673,11 @@ fn run_app(args: &Args, prepared: Prepared) -> ExitCode {
     }
     if !args.no_hud {
         // The GPU spans the overlay shows come from render diagnostics.
-        app.add_plugins(RenderDiagnosticsPlugin)
-            .add_systems(Startup, setup::spawn_hud)
+        // `RenderPlugin` already adds the plugin when Tracy tracing is on.
+        if !app.is_plugin_added::<RenderDiagnosticsPlugin>() {
+            app.add_plugins(RenderDiagnosticsPlugin);
+        }
+        app.add_systems(Startup, setup::spawn_hud)
             .add_systems(
                 PostUpdate,
                 setup::update_hud.run_if(any_with_component::<setup::HudText>),
