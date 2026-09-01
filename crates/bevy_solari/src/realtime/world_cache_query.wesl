@@ -10,8 +10,9 @@ enable wgpu_ray_query;
 
 /// Maximum amount of frames a cell can live for without being queried
 const WORLD_CACHE_CELL_LIFETIME: u32 = 10u;
-/// Maximum amount of attempts to find a cache entry after a hash collision
-const WORLD_CACHE_MAX_SEARCH_STEPS: u32 = 3u;
+/// Maximum amount of attempts to find a cache entry after a hash collision;
+/// 8 keeps insertion failures rare below ~60% occupancy
+const WORLD_CACHE_MAX_SEARCH_STEPS: u32 = 8u;
 
 /// Marker value for an empty cell
 const WORLD_CACHE_EMPTY_CELL: u32 = 0u;
