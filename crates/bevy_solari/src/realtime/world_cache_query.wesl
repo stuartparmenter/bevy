@@ -74,6 +74,8 @@ fn query_world_cache(world_position_in: vec3<f32>, world_normal: vec3<f32>, ray_
         }
     }
 
+    // Probe window exhausted - tally for the world_cache_query_overflows diagnostic
+    atomicAdd(&world_cache.query_overflows, 1u);
     return vec3(0.0);
 }
 

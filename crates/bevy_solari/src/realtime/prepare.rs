@@ -51,9 +51,12 @@ const WORLD_CACHE_B_SIZE: u64 = (WORLD_CACHE_SIZE / 1024) * size_of::<u32>() as 
 /// Offset of `active_cells_count`.
 pub const WORLD_CACHE_ACTIVE_CELLS_COUNT_OFFSET: u64 =
     WORLD_CACHE_SIZE * WORLD_CACHE_ENTRY_SIZE + WORLD_CACHE_B_SIZE;
+/// Offset of `query_overflows`.
+pub const WORLD_CACHE_QUERY_OVERFLOWS_OFFSET: u64 =
+    WORLD_CACHE_ACTIVE_CELLS_COUNT_OFFSET + size_of::<u32>() as u64;
 /// Must stay under wgpu's default `max_storage_buffer_binding_size` (128 MiB or 2^27 bytes).
 pub const WORLD_CACHE_BUFFER_SIZE: u64 =
-    (WORLD_CACHE_ACTIVE_CELLS_COUNT_OFFSET + size_of::<u32>() as u64).next_multiple_of(16);
+    (WORLD_CACHE_QUERY_OVERFLOWS_OFFSET + size_of::<u32>() as u64).next_multiple_of(16);
 
 /// GPU representation of the user-configurable [`SolariLighting`] settings, plus
 /// per-frame state.
@@ -225,7 +228,7 @@ pub fn prepare_solari_lighting_resources(
         let world_cache = render_device.create_buffer(&BufferDescriptor {
             label: Some("solari_lighting_world_cache"),
             size: WORLD_CACHE_BUFFER_SIZE,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 

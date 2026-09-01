@@ -119,4 +119,6 @@ struct WorldCache {
     b: array<u32, 1024u>,
     active_cell_indices: array<u32, constants::WORLD_CACHE_SIZE>,
     active_cells_count: u32,
+    // Queries that exhausted the linear-probe window without finding or claiming a cell
+    query_overflows: atomic<u32>,
 }
