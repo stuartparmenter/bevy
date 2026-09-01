@@ -31,7 +31,12 @@ use tracing::warn;
 /// VRAM even when their final compacted acceleration structures would fit.
 const MAX_BUILD_VERTICES_PER_FRAME: u32 = 2_000_000;
 const MAX_COMPACTION_VERTICES_PER_FRAME: u32 = 2_000_000;
-const MAX_UNCOMPACTED_VERTICES: u32 = 8_000_000;
+/// Kept tight not only for the transient VRAM spike itself: every un-compacted BLAS in flight
+/// interleaves with permanent allocations in the allocator's memory blocks, and a block that
+/// picked up even one long-lived allocation is never returned to the driver when the doomed ones
+/// free. A large-scene load with a wide window has been measured leaving gigabytes of
+/// reserved-but-dead block space behind.
+const MAX_UNCOMPACTED_VERTICES: u32 = 4_000_000;
 
 /// How many frames a queued build may be rotated for missing mesh allocator slices before it is
 /// dropped. Progressive loading routinely takes a few frames; a mesh the allocator will never serve
