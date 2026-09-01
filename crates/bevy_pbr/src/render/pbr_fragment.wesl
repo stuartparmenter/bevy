@@ -108,8 +108,14 @@ fn pbr_input_from_standard_material(
     // Fill in the sample bias so we can sample from textures.
     var bias: SampleBias;
 @if(MESHLET_MESH_MATERIAL_PASS) {
-    bias.ddx_uv = in.ddx_uv;
-    bias.ddy_uv = in.ddy_uv;
+    // Meshlet shading samples with `textureSampleGrad`, which takes no bias
+    // operand, so fold `view.mip_bias` into the gradients: scaling both by
+    // `exp2(bias)` shifts the selected mip by `bias`. An upscaler asks for a
+    // negative bias to sharpen at a reduced render resolution, and without this
+    // the meshlet path is the one place that bias is silently dropped.
+    let mip_scale = exp2(view.mip_bias);
+    bias.ddx_uv = in.ddx_uv * mip_scale;
+    bias.ddy_uv = in.ddy_uv * mip_scale;
 }
 @else {
     bias.mip_bias = view.mip_bias;
