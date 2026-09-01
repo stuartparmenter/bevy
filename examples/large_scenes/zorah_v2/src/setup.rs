@@ -69,6 +69,12 @@ pub struct SetupOptions {
     pub exposure_bias: f32,
     pub fire_lumens: f32,
     pub solari_albedo: bool,
+    /// `--disable-dlss`: leave Ray Reconstruction off even where it is
+    /// supported, so the main pass renders at native resolution and nothing
+    /// denoises Solari's output. Nothing reads it in a build without DLSS,
+    /// where there is no Ray Reconstruction to leave off in the first place.
+    #[cfg_attr(not(feature = "dlss"), allow(dead_code))]
+    pub disable_dlss: bool,
     pub bake: BakeSettings,
     pub jobs: Vec<MeshJob>,
 }

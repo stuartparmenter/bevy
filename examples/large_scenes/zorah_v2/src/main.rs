@@ -186,6 +186,10 @@ struct Args {
     /// show base colour through the traced path: surfaces emit their albedo and reflect nothing
     #[argh(switch)]
     solari_albedo: bool,
+
+    /// leave DLSS Ray Reconstruction off: the main pass renders at native resolution and Solari's output is left undenoised
+    #[argh(switch)]
+    disable_dlss: bool,
 }
 
 impl Args {
@@ -604,6 +608,7 @@ fn run_app(args: &Args, prepared: Prepared) -> ExitCode {
         },
         fire_lumens: args.fire_lumens.max(0.0),
         solari_albedo: args.solari_albedo,
+        disable_dlss: args.disable_dlss,
         bake: settings,
         jobs,
     };

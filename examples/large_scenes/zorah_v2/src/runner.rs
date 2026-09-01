@@ -613,6 +613,7 @@ pub fn warm_up_raytracing(
     raytracing_status: Res<RaytracingSceneStatus>,
     camera: Single<Entity, With<ZorahCamera>>,
     mut next_state: ResMut<NextState<ZorahState>>,
+    #[cfg(feature = "dlss")] options: Res<crate::setup::SetupOptions>,
     #[cfg(feature = "dlss")] dlss_rr_supported: Option<Res<DlssRayReconstructionSupported>>,
 ) {
     // Solari enqueues a BLAS build per extracted compatible `Mesh` asset, so
@@ -691,7 +692,7 @@ pub fn warm_up_raytracing(
     // Ray Reconstruction consumes guide buffers produced by Solari, so enable
     // it at the same measured-ready transition rather than during BLAS warmup.
     #[cfg(feature = "dlss")]
-    if dlss_rr_supported.is_some() {
+    if dlss_rr_supported.is_some() && !options.disable_dlss {
         camera.insert(Dlss::<DlssRayReconstructionFeature> {
             perf_quality_mode: DlssPerfQualityMode::Auto,
             reset: Default::default(),
