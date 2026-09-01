@@ -42,19 +42,24 @@ const RESERVOIR_STRUCT_SIZE: u64 = 48;
 pub const LIGHT_TILE_BLOCKS: u64 = 128;
 pub const LIGHT_TILE_SAMPLES_PER_BLOCK: u64 = 1024;
 
-/// Amount of entries in the world cache (must be a power of 2, and >= 2^10)
-pub const WORLD_CACHE_SIZE: u64 = 2u64.pow(20);
+/// Amount of entries in the world cache (must be a power of 2, and a multiple of 2^20 so the
+/// single-workgroup block scan in `world_cache_compact.wesl` covers every 1024-cell block)
+pub const WORLD_CACHE_SIZE: u64 = 2u64.pow(21);
+const _: () = assert!(WORLD_CACHE_SIZE.is_power_of_two() && WORLD_CACHE_SIZE % (1024 * 1024) == 0);
+/// Number of 1024-cell compaction blocks
+pub const WORLD_CACHE_BLOCKS: u64 = WORLD_CACHE_SIZE / 1024;
 /// Sum of per-cell field sizes in `WorldCache`. Keep in sync with `realtime_bindings.wgsl`.
 const WORLD_CACHE_ENTRY_SIZE: u64 = 84;
 /// Size of the fixed `b` array (`array<u32, WORLD_CACHE_SIZE / 1024>`).
-const WORLD_CACHE_B_SIZE: u64 = (WORLD_CACHE_SIZE / 1024) * size_of::<u32>() as u64;
+const WORLD_CACHE_B_SIZE: u64 = WORLD_CACHE_BLOCKS * size_of::<u32>() as u64;
 /// Offset of `active_cells_count`.
 pub const WORLD_CACHE_ACTIVE_CELLS_COUNT_OFFSET: u64 =
     WORLD_CACHE_SIZE * WORLD_CACHE_ENTRY_SIZE + WORLD_CACHE_B_SIZE;
 /// Offset of `query_overflows`.
 pub const WORLD_CACHE_QUERY_OVERFLOWS_OFFSET: u64 =
     WORLD_CACHE_ACTIVE_CELLS_COUNT_OFFSET + size_of::<u32>() as u64;
-/// Must stay under wgpu's default `max_storage_buffer_binding_size` (128 MiB or 2^27 bytes).
+/// Exceeds wgpu's 128 MiB default `max_storage_buffer_binding_size`; `SolariLightingPlugin`
+/// checks the device's real limits before loading.
 pub const WORLD_CACHE_BUFFER_SIZE: u64 =
     (WORLD_CACHE_QUERY_OVERFLOWS_OFFSET + size_of::<u32>() as u64).next_multiple_of(16);
 

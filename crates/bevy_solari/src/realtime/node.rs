@@ -1,6 +1,6 @@
 use super::prepare::{
     SolariLightingResources, LIGHT_TILE_BLOCKS, WORLD_CACHE_ACTIVE_CELLS_COUNT_OFFSET,
-    WORLD_CACHE_QUERY_OVERFLOWS_OFFSET, WORLD_CACHE_SIZE,
+    WORLD_CACHE_BLOCKS, WORLD_CACHE_QUERY_OVERFLOWS_OFFSET, WORLD_CACHE_SIZE,
 };
 use crate::scene::RaytracingSceneBindings;
 #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
@@ -392,16 +392,16 @@ pub fn solari_lighting(
     pass.set_bind_group(2, &bind_group_world_cache_active_cells_dispatch, &[]);
 
     pass.set_pipeline(decay_world_cache_pipeline);
-    pass.dispatch_workgroups((WORLD_CACHE_SIZE / 1024) as u32, 1, 1);
+    pass.dispatch_workgroups(WORLD_CACHE_BLOCKS as u32, 1, 1);
 
     pass.set_pipeline(compact_world_cache_single_block_pipeline);
-    pass.dispatch_workgroups((WORLD_CACHE_SIZE / 1024) as u32, 1, 1);
+    pass.dispatch_workgroups(WORLD_CACHE_BLOCKS as u32, 1, 1);
 
     pass.set_pipeline(compact_world_cache_blocks_pipeline);
     pass.dispatch_workgroups(1, 1, 1);
 
     pass.set_pipeline(compact_world_cache_write_active_cells_pipeline);
-    pass.dispatch_workgroups((WORLD_CACHE_SIZE / 1024) as u32, 1, 1);
+    pass.dispatch_workgroups(WORLD_CACHE_BLOCKS as u32, 1, 1);
 
     pass.set_bind_group(2, None, &[]);
 

@@ -1,9 +1,15 @@
+import constants::WORLD_CACHE_SIZE;
 import package::realtime::world_cache_query::WORLD_CACHE_EMPTY_CELL;
 import package::realtime::bindings::{
     world_cache,
 };
 
 enable wgpu_ray_query;
+
+/// Number of 1024-cell blocks the cache splits into for compaction
+const WORLD_CACHE_BLOCKS: u32 = u32(WORLD_CACHE_SIZE) / 1024u;
+/// Blocks each thread of `compact_world_cache_blocks` totals serially
+const BLOCKS_PER_THREAD: u32 = WORLD_CACHE_BLOCKS / 1024u;
 
 @group(2) @binding(0) var<storage, read_write> world_cache_active_cells_dispatch: vec3<u32>;
 
@@ -43,9 +49,19 @@ fn compact_world_cache_single_block(
     if t < 512u { world_cache.a[cell_id.x] = w2[t]; } else { world_cache.a[cell_id.x] = w2[t] + w2[t - 512u]; }
 }
 
+// A block's total is its last cell's exclusive scan value plus that cell's own flag
+fn block_total(block: u32) -> u32 {
+    let last_cell = block * 1024u + 1023u;
+    return world_cache.a[last_cell] + u32(world_cache.life[last_cell] != 0u);
+}
+
 @compute @workgroup_size(1024, 1, 1)
 fn compact_world_cache_blocks(@builtin(local_invocation_index) t: u32) {
-    if t == 0u { w1[0u] = 0u; } else { w1[t] = world_cache.a[t * 1024u - 1u] + u32(world_cache.life[t * 1024u - 1u] != 0u); }; workgroupBarrier();
+    var chunk_total = 0u;
+    for (var i = 0u; i < BLOCKS_PER_THREAD; i++) {
+        chunk_total += block_total(t * BLOCKS_PER_THREAD + i);
+    }
+    w1[t] = chunk_total; workgroupBarrier();
     if t < 1u { w2[t] = w1[t]; } else { w2[t] = w1[t] + w1[t - 1u]; } workgroupBarrier();
     if t < 2u { w1[t] = w2[t]; } else { w1[t] = w2[t] + w2[t - 2u]; } workgroupBarrier();
     if t < 4u { w2[t] = w1[t]; } else { w2[t] = w1[t] + w1[t - 4u]; } workgroupBarrier();
@@ -55,7 +71,14 @@ fn compact_world_cache_blocks(@builtin(local_invocation_index) t: u32) {
     if t < 64u { w2[t] = w1[t]; } else { w2[t] = w1[t] + w1[t - 64u]; } workgroupBarrier();
     if t < 128u { w1[t] = w2[t]; } else { w1[t] = w2[t] + w2[t - 128u]; } workgroupBarrier();
     if t < 256u { w2[t] = w1[t]; } else { w2[t] = w1[t] + w1[t - 256u]; } workgroupBarrier();
-    if t < 512u { world_cache.b[t] = w2[t]; } else { world_cache.b[t] = w2[t] + w2[t - 512u]; }
+    var chunk_inclusive: u32;
+    if t < 512u { chunk_inclusive = w2[t]; } else { chunk_inclusive = w2[t] + w2[t - 512u]; }
+    var block_prefix = chunk_inclusive - chunk_total;
+    for (var i = 0u; i < BLOCKS_PER_THREAD; i++) {
+        let block = t * BLOCKS_PER_THREAD + i;
+        world_cache.b[block] = block_prefix;
+        block_prefix += block_total(block);
+    }
 }
 
 @compute @workgroup_size(1024, 1, 1)
@@ -71,7 +94,7 @@ fn compact_world_cache_write_active_cells(
         world_cache.active_cell_indices[compacted_index] = cell_id.x;
     }
 
-    if thread_index == 1023u && workgroup_id.x == 1023u {
+    if thread_index == 1023u && workgroup_id.x == WORLD_CACHE_BLOCKS - 1u {
         let active_cell_count = compacted_index + u32(cell_active);
         world_cache.active_cells_count = active_cell_count;
         world_cache_active_cells_dispatch = vec3((active_cell_count + 63u) / 64u, 1u, 1u);

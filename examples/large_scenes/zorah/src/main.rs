@@ -6542,9 +6542,7 @@ fn update_hud(mut text: Single<&mut Text, With<HudText>>, diagnostics: Res<Diagn
 /// that overflowed their probe window and shaded with no indirect light. Solari reads both
 /// counters back off the GPU itself, so these are plain diagnostic lookups.
 fn add_world_cache_occupancy(text: &mut Text, diagnostics: &DiagnosticsStore) {
-    // `bevy_solari`'s `WORLD_CACHE_SIZE` is private to the crate, so the
-    // capacity is restated here, as the `solari` example does.
-    const WORLD_CACHE_CELLS: f64 = 1_048_576.0;
+    const WORLD_CACHE_CELLS: f64 = bevy::solari::realtime::WORLD_CACHE_SIZE as f64;
     let Some(active_cells) = diagnostics
         .get(&DiagnosticPath::new(
             "render/solari_lighting/world_cache_active_cells_count",

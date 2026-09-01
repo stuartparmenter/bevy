@@ -1,6 +1,7 @@
 mod extract;
 mod node;
 mod prepare;
+pub use prepare::WORLD_CACHE_SIZE;
 
 use crate::{
     scene::{prepare_raytracing_scene_resources, RaytracingSceneBindings},
@@ -63,15 +64,22 @@ impl Plugin for SolariLightingPlugin {
     }
 
     fn finish(&self, app: &mut App) {
-        let features = app
-            .sub_app(RenderApp)
-            .world()
-            .resource::<RenderDevice>()
-            .features();
+        let render_device = app.sub_app(RenderApp).world().resource::<RenderDevice>();
+        let features = render_device.features();
         if !features.contains(SolariPlugins::required_wgpu_features()) {
             warn!(
                 "SolariLightingPlugin not loaded. GPU lacks support for required features: {:?}.",
                 SolariPlugins::required_wgpu_features().difference(features)
+            );
+            return;
+        }
+        let limits = render_device.limits();
+        if (limits.max_storage_buffer_binding_size as u64) < prepare::WORLD_CACHE_BUFFER_SIZE
+            || limits.max_buffer_size < prepare::WORLD_CACHE_BUFFER_SIZE
+        {
+            warn!(
+                "SolariLightingPlugin not loaded. GPU buffer limits cannot hold the {} byte world cache.",
+                prepare::WORLD_CACHE_BUFFER_SIZE
             );
             return;
         }
@@ -325,7 +333,8 @@ mod shader_source_tests {
         // plus that cell's own flag; dropping the flag collides compacted indices across block
         // boundaries and the colliding cells silently miss their update passes.
         let world_cache_compact = include_str!("world_cache_compact.wesl");
-        assert!(world_cache_compact.contains("u32(world_cache.life[t * 1024u - 1u] != 0u)"));
+        assert!(world_cache_compact
+            .contains("return world_cache.a[last_cell] + u32(world_cache.life[last_cell] != 0u);"));
         assert!(!world_cache_compact.contains("w1[t] = world_cache.a[t * 1024u - 1u];"));
     }
 
