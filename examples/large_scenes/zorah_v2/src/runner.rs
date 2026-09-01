@@ -687,6 +687,10 @@ pub fn warm_up_raytracing(
         // contributes nothing, leaving the large interiors short of bounce
         // energy.
         world_cache_max_gi_ray_distance: 200.0,
+        // Scene tuning: the lighting is mostly static, so a longer converged
+        // history halves the per-update jump in cell radiance; the adaptive
+        // blend still shortens it where lighting actually changes.
+        world_cache_max_temporal_samples: 64.0,
         ..default()
     });
     // Ray Reconstruction consumes guide buffers produced by Solari, so enable
