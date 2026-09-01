@@ -179,7 +179,11 @@ struct Args {
     #[argh(option, default = "4.0")]
     emissive_boost: f32,
 
-    /// luminous power of the emissive proxy sphere spawned at every fire node; 0 = none
+    /// luminous power of the emissive proxy sphere spawned at every fire node; 0 = none.
+    /// The proxies are this port's own addition: the export ships no lights (no
+    /// KHR_lights_punctual, no emissive_strength) and its RTXMG configuration lights the
+    /// scene with the envmap and an analytic sun alone, so the reference's fires are
+    /// decorative. 800 lm (a household bulb) is already brighter than the reference.
     #[argh(option, default = "800.0")]
     fire_lumens: f32,
 
