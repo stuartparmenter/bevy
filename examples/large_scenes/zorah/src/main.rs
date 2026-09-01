@@ -6544,16 +6544,11 @@ fn update_hud(mut text: Single<&mut Text, With<HudText>>, diagnostics: Res<Diagn
     add_world_cache_occupancy(&mut text, &diagnostics);
 }
 
-/// The world cache's live cells as a share of its fixed capacity. Solari reads
-/// the count back off the GPU itself, so this is a plain diagnostic lookup.
-///
-/// Once the cache is full, a query that collides past its few probe steps
-/// resolves to no indirect light at all, so this is the number that says
-/// whether a scene has outgrown the cache.
+/// The world cache's live cells as a share of its fixed capacity, and the queries per frame
+/// that overflowed their probe window and shaded with no indirect light. Solari reads both
+/// counters back off the GPU itself, so these are plain diagnostic lookups.
 fn add_world_cache_occupancy(text: &mut Text, diagnostics: &DiagnosticsStore) {
-    // `bevy_solari`'s `WORLD_CACHE_SIZE` is private to the crate, so the
-    // capacity is restated here, as the `solari` example does.
-    const WORLD_CACHE_CELLS: f64 = 1_048_576.0;
+    const WORLD_CACHE_CELLS: f64 = bevy::solari::realtime::WORLD_CACHE_SIZE as f64;
     let Some(active_cells) = diagnostics
         .get(&DiagnosticPath::new(
             "render/solari_lighting/world_cache_active_cells_count",
@@ -6568,4 +6563,16 @@ fn add_world_cache_occupancy(text: &mut Text, diagnostics: &DiagnosticsStore) {
         active_cells * 100.0 / WORLD_CACHE_CELLS,
         active_cells,
     ));
+
+    if let Some(overflows) = diagnostics
+        .get(&DiagnosticPath::new(
+            "render/solari_lighting/world_cache_query_overflows",
+        ))
+        .and_then(Diagnostic::smoothed)
+    {
+        text.push_str(&format!(
+            "{:17}  {:.0}/frame\n",
+            "Cache overflows", overflows,
+        ));
+    }
 }
