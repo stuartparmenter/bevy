@@ -123,6 +123,13 @@ impl RaytracingSceneBindings {
         self.lights.note_translations_consumed();
     }
 
+    /// True while neither TLAS structure has ever been allocated, so no submitted or future work
+    /// can reference any BLAS. Checked on the structures, not on `built`: an allocated structure
+    /// may reference BLASes from an in-flight build even before it is marked built.
+    pub fn no_tlas_allocated(&self) -> bool {
+        self.tlas.structures.iter().all(Option::is_none)
+    }
+
     /// The linear sampler the environment map is read with, also used to build its importance
     /// pyramid so the two see the same filtered radiance.
     pub(crate) fn environment_map_light_sampler(&self) -> &Sampler {

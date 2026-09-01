@@ -514,8 +514,20 @@ fn compact_raytracing_blas_inner(
 
 pub fn delete_raytracing_blas(
     mut blas_manager: ResMut<BlasManager>,
+    scene_bindings: Res<super::RaytracingSceneBindings>,
     render_queue: Res<RenderQueue>,
 ) {
+    // A frame with no TLAS allocated is as strong a release point as a TLAS build: nothing
+    // submitted or still to come can reference any BLAS, and the compaction copies are covered
+    // by the completion callback below. Without this, a scene that builds and compacts its
+    // BLASes before spawning its first raytracing instance never builds a TLAS, so not one
+    // retired original is freed for the whole load; thousands of doomed allocations then
+    // interleave with the load's permanent ones inside the allocator's shared memory blocks,
+    // measured stranding gigabytes of reserved-but-dead VRAM that never returns to the driver.
+    if scene_bindings.no_tlas_allocated() {
+        blas_manager.note_tlas_build();
+    }
+
     if blas_manager.pending_deletions.len() <= TLAS_BUILDS_BEFORE_DELETION_ALLOWED {
         return;
     }
