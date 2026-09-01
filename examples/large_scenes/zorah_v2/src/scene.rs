@@ -24,6 +24,10 @@ pub struct SceneInstance {
     pub node: usize,
     /// The node's name, empty when the file gives none.
     pub name: String,
+    /// Centre of the mesh's local POSITION bounds. The export bakes many
+    /// meshes' vertices far from their node origin, so the origin is not
+    /// where the prop sits.
+    pub local_center: Vec3,
     /// World transform in the export's own metres, Y-up space, flattened to
     /// TRS. Exact unless `chain` is non-empty.
     pub transform: Transform,
@@ -104,6 +108,7 @@ pub fn walk_scene(
         chain.push(local);
         if let Some(mesh) = node.mesh() {
             let name = node.name().unwrap_or_default().to_string();
+            let local_center = mesh_local_center(&mesh);
             let locals = instance_transforms(document, &node, get_buffer)?;
             for instance_local in locals {
                 let placed = world * instance_local.to_matrix();
@@ -119,6 +124,7 @@ pub fn walk_scene(
                     mesh: mesh.index(),
                     node: node.index(),
                     name: name.clone(),
+                    local_center,
                     transform,
                     chain,
                 });
@@ -127,6 +133,23 @@ pub fn walk_scene(
         stack.extend(node.children().map(|child| (child, world, chain.clone())));
     }
     Ok(instances)
+}
+
+/// Centre of the union of the mesh's primitive POSITION bounds, from the
+/// accessors' required min/max; zero if the mesh has no primitives.
+fn mesh_local_center(mesh: &gltf::Mesh) -> Vec3 {
+    let mut min = Vec3::MAX;
+    let mut max = Vec3::MIN;
+    for primitive in mesh.primitives() {
+        let bounds = primitive.bounding_box();
+        min = min.min(Vec3::from(bounds.min));
+        max = max.max(Vec3::from(bounds.max));
+    }
+    if min.cmple(max).all() {
+        (min + max) / 2.0
+    } else {
+        Vec3::ZERO
+    }
 }
 
 /// The local transforms an instanced node expands to; identity for a plain node.

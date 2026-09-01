@@ -30,7 +30,7 @@ use crate::{
 
 /// Node name fragments of the fire props that get an emissive proxy.
 const FIRE_NODE_NAMES: &[&str] = &["FirePot", "FireGrate", "Firewood_Coal"];
-/// The proxy sphere sits this far above the prop's origin, at this radius.
+/// The proxy sphere sits this far above the prop's bounds centre, at this radius.
 const FIRE_PROXY_HEIGHT: f32 = 0.3;
 const FIRE_PROXY_RADIUS: f32 = 0.15;
 /// A wood fire's colour temperature.
@@ -240,7 +240,8 @@ fn spawn_fire_proxies(
                 Name::new(format!("{} Solari emitter", instance.name)),
                 MeshMaterial3d(material.clone()),
                 Transform::from_translation(
-                    instance.transform.translation + Vec3::Y * FIRE_PROXY_HEIGHT,
+                    instance.transform.transform_point(instance.local_center)
+                        + Vec3::Y * FIRE_PROXY_HEIGHT,
                 )
                 .with_scale(Vec3::splat(FIRE_PROXY_RADIUS)),
             ))
