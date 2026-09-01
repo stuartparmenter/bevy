@@ -142,6 +142,11 @@ pub fn setup(
         tonemapping,
         Projection::Perspective(PerspectiveProjection {
             fov: options.view.fov_degrees.to_radians(),
+            // The collisionless FreeCamera walks right up to geometry, and the
+            // 0.1m default near plane clips a door wholesale a step before
+            // reaching it, leaving only the skybox. The reference camera runs
+            // at 0.02 (the sidecar's camerastring).
+            near: 0.02,
             ..default()
         }),
         ZorahCamera,
