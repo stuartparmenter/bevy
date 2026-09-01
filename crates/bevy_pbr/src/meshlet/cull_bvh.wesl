@@ -1,4 +1,6 @@
 import package::meshlet::bindings::{
+    dispatch_x_for,
+    dispatch_y_for,
     InstancedOffset,
     get_aabb,
     get_aabb_error,
@@ -29,9 +31,13 @@ enable wgpu_binding_array;
 
 @compute
 @workgroup_size(128, 1, 1) // 8 threads per node, 16 nodes per workgroup
-fn cull_bvh(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
+fn cull_bvh(
+    @builtin(global_invocation_id) global_invocation_id: vec3<u32>,
+    @builtin(workgroup_id) workgroup_id: vec3<u32>,
+    @builtin(num_workgroups) num_workgroups: vec3<u32>,
+) {
     // Calculate the queue ID for this thread
-    let dispatch_id = global_invocation_id.x;
+    let dispatch_id = global_invocation_id.x + workgroup_id.y * num_workgroups.x * 128u;
     var node = dispatch_id >> 3u;
     let subnode = dispatch_id & 7u;
     if node >= meshlet_bvh_cull_count_read { return; }
@@ -62,7 +68,9 @@ fn cull_bvh(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
             let id = atomicAdd(&meshlet_second_pass_bvh_count, 1u);
             meshlet_second_pass_bvh_queue[id] = value;
             if ((id & 15u) == 0u) {
-                atomicAdd(&meshlet_second_pass_bvh_dispatch.x, 1u);
+                let req = (id >> 4u) + 1u;
+                atomicMax(&meshlet_second_pass_bvh_dispatch.x, dispatch_x_for(req));
+                atomicMax(&meshlet_second_pass_bvh_dispatch.y, dispatch_y_for(req));
             }
         } else {
             let base = atomicAdd(&meshlet_meshlet_cull_count_late, child_count);
@@ -72,7 +80,8 @@ fn cull_bvh(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
                 value.offset += 1u;
             }
             let req = (base + child_count + 127u) >> 7u;
-            atomicMax(&meshlet_meshlet_cull_dispatch_late.x, req);
+            atomicMax(&meshlet_meshlet_cull_dispatch_late.x, dispatch_x_for(req));
+            atomicMax(&meshlet_meshlet_cull_dispatch_late.y, dispatch_y_for(req));
         }
         return;
     }
@@ -83,7 +92,9 @@ fn cull_bvh(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
         let index = select(constants.rightmost_slot - id, id, constants.read_from_front == 0u);
         meshlet_bvh_cull_queue[index] = value;
         if ((id & 15u) == 0u) {
-            atomicAdd(&meshlet_bvh_cull_dispatch.x, 1u);
+            let req = (id >> 4u) + 1u;
+            atomicMax(&meshlet_bvh_cull_dispatch.x, dispatch_x_for(req));
+            atomicMax(&meshlet_bvh_cull_dispatch.y, dispatch_y_for(req));
         }
     } else {
 @if(MESHLET_FIRST_CULLING_PASS) {
@@ -94,7 +105,8 @@ fn cull_bvh(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
             value.offset += 1u;
         }
         let req = (end + 127u) >> 7u;
-        atomicMax(&meshlet_meshlet_cull_dispatch_early.x, req);
+        atomicMax(&meshlet_meshlet_cull_dispatch_early.x, dispatch_x_for(req));
+        atomicMax(&meshlet_meshlet_cull_dispatch_early.y, dispatch_y_for(req));
 } @else {
         let base = atomicAdd(&meshlet_meshlet_cull_count_late, child_count);
         let start = constants.rightmost_slot - base;
@@ -103,7 +115,8 @@ fn cull_bvh(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
             value.offset += 1u;
         }
         let req = (base + child_count + 127u) >> 7u;
-        atomicMax(&meshlet_meshlet_cull_dispatch_late.x, req);
+        atomicMax(&meshlet_meshlet_cull_dispatch_late.x, dispatch_x_for(req));
+        atomicMax(&meshlet_meshlet_cull_dispatch_late.y, dispatch_y_for(req));
 }
     }
 }
