@@ -431,9 +431,38 @@ pub fn update_hud(mut text: Single<&mut Text, With<HudText>>, diagnostics: Res<D
         "render/solari_lighting/world_cache/elapsed_gpu",
     );
     (add_span)("Lighting", "render/solari_lighting/lighting/elapsed_gpu");
+    (add_span)("BLAS build", "render/blas_build/elapsed_gpu");
+    (add_span)("TLAS build", "render/tlas_build/elapsed_gpu");
     (add_span)("DLSS-RR", "render/dlss_ray_reconstruction/elapsed_gpu");
     (add_span)("DLSS-SR", "render/dlss_super_resolution/elapsed_gpu");
     if total > 0.0 {
         text.push_str(&format!("{:17}  {total:.2} ms\n", "GPU measured"));
     }
+    add_world_cache_occupancy(&mut text, &diagnostics);
+}
+
+/// The world cache's live cells as a share of its fixed capacity. Solari reads
+/// the count back off the GPU itself, so this is a plain diagnostic lookup.
+///
+/// Once the cache is full, a query that collides past its few probe steps
+/// resolves to no indirect light at all, so this is the number that says
+/// whether a scene has outgrown the cache.
+pub fn add_world_cache_occupancy(text: &mut Text, diagnostics: &DiagnosticsStore) {
+    // `bevy_solari`'s `WORLD_CACHE_SIZE` is private to the crate, so the
+    // capacity is restated here, as the `solari` example does.
+    const WORLD_CACHE_CELLS: f64 = 1_048_576.0;
+    let Some(active_cells) = diagnostics
+        .get(&DiagnosticPath::new(
+            "render/solari_lighting/world_cache_active_cells_count",
+        ))
+        .and_then(Diagnostic::smoothed)
+    else {
+        return;
+    };
+    text.push_str(&format!(
+        "{:17}  {:.1}% ({:.0})\n",
+        "World cache full",
+        active_cells * 100.0 / WORLD_CACHE_CELLS,
+        active_cells,
+    ));
 }
