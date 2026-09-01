@@ -290,6 +290,12 @@ impl LightState {
             .filter(|id| !live_directional_lights.contains(id))
             .collect();
         for id in stale {
+            if let Some(slot) = self.directional_slots.get(&id) {
+                // Zero the freed slot: the shaders walk the whole buffer and skip
+                // zero-luminance entries.
+                self.directional_lights
+                    .grow_and_set(slot, GpuDirectionalLight::zeroed());
+            }
             self.directional_slots.remove(&id);
             self.remove_light(id);
         }

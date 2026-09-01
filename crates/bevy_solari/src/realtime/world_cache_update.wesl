@@ -1,10 +1,11 @@
 import bevy_core_pipeline::tonemapping::tonemapping_luminance as luminance;
 import bevy_pbr::render::utils::{rand_f, rand_range_u, sample_cosine_hemisphere};
 import package::realtime::presample_light_tiles::unpack_resolved_light_sample;
-import package::scene::sampling::{calculate_resolved_light_contribution, isfinite, isfinite3, trace_visibility};
+import package::scene::sampling::{calculate_resolved_light_contribution, isfinite, isfinite3, light_sample_is_directional, sum_directional_light_contributions, trace_visibility};
 import package::scene::bindings::{trace_ray, resolve_ray_hit_full, offset_ray_origin, ray_origin_bias_with_raster_lod, RAY_T_MIN};
 import package::realtime::world_cache_query::query_world_cache;
 import package::realtime::bindings::{
+    light_tile_samples,
     light_tile_resolved_samples,
     pixel_world_size,
     view,
@@ -43,7 +44,11 @@ fn sample_di(@builtin(workgroup_id) workgroup_id: vec3<u32>, @builtin(global_inv
 
     if !should_update_cell(cell_index, &rng) { return; }
 
-    let new_radiance = sample_random_light_ris(geometry_data.world_position, geometry_data.world_normal, cell_ray_origin_bias(geometry_data), workgroup_id.xy, &rng);
+    // The resampled tile candidates skip directional lights and the deterministic sum covers
+    // only them, so the two estimators add over disjoint light sets.
+    let ray_origin_bias = cell_ray_origin_bias(geometry_data);
+    let new_radiance = sample_random_light_ris(geometry_data.world_position, geometry_data.world_normal, ray_origin_bias, workgroup_id.xy, &rng)
+        + sum_directional_light_contributions(geometry_data.world_position, geometry_data.world_normal, ray_origin_bias, &rng);
 
     world_cache.active_cells_new_radiance[active_cell_id.x] = new_radiance;
 }
@@ -129,6 +134,11 @@ fn sample_random_light_ris(world_position: vec3<f32>, world_normal: vec3<f32>, r
     let mis_weight = 1.0 / f32(constants.world_cache_direct_light_sample_count);
     for (var i = 0u; i < constants.world_cache_direct_light_sample_count; i++) {
         let tile_sample = light_tile_start + rand_range_u(1024u, rng);
+        // Directional lights are summed deterministically in sample_di; a tile candidate
+        // for one would double count, so it stands as a zero-weight draw instead.
+        if light_sample_is_directional(light_tile_samples[tile_sample]) {
+            continue;
+        }
         let resolved_light_sample = unpack_resolved_light_sample(light_tile_resolved_samples[tile_sample], view.exposure);
         let light_contribution = calculate_resolved_light_contribution(resolved_light_sample, world_position, world_normal);
 
