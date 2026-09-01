@@ -39,7 +39,11 @@ use bevy::{
     pbr::{experimental::meshlet::MeshletPlugin, DefaultOpaqueRendererMethod},
     post_process::auto_exposure::AutoExposurePlugin,
     prelude::*,
-    render::diagnostic::RenderDiagnosticsPlugin,
+    render::{
+        diagnostic::RenderDiagnosticsPlugin,
+        settings::{MemoryHints, WgpuSettings},
+        RenderPlugin,
+    },
     solari::prelude::SolariPlugins,
 };
 
@@ -647,14 +651,34 @@ fn run_app(args: &Args, prepared: Prepared) -> ExitCode {
             AssetSourceBuilder::platform_default(&root.cache_dir.to_string_lossy(), None),
         )
         .add_plugins((
-            DefaultPlugins.set(task_pool_plugin()).set(AssetPlugin {
-                // Textures load by the root glTF's own relative URIs.
-                file_path: root.dir.to_string_lossy().into_owned(),
-                // Thousands of textures and cache parts, none with a
-                // .meta file: skip the probe for each.
-                meta_check: AssetMetaCheck::Never,
-                ..default()
-            }),
+            DefaultPlugins
+                .set(task_pool_plugin())
+                .set(AssetPlugin {
+                    // Textures load by the root glTF's own relative URIs.
+                    file_path: root.dir.to_string_lossy().into_owned(),
+                    // Thousands of textures and cache parts, none with a
+                    // .meta file: skip the probe for each.
+                    meta_check: AssetMetaCheck::Never,
+                    ..default()
+                })
+                .set(RenderPlugin {
+                    render_creation: WgpuSettings {
+                        // Small suballocation blocks instead of wgpu's 256 MiB default. The
+                        // load interleaves thousands of doomed un-compacted BLASes with
+                        // permanent textures and compacted BLASes in the same blocks; the holes
+                        // they leave freeze in place once loading stops allocating. Small
+                        // blocks cap each frozen hole, let emptied blocks return to the
+                        // driver, and turn the 64 MiB meshlet pages into exact-size dedicated
+                        // allocations. Measured against the default this recovers gigabytes of
+                        // reserved-but-dead VRAM on the full scene.
+                        memory_hints: MemoryHints::Manual {
+                            suballocated_device_memory_block_size: (32 << 20)..(64 << 20),
+                        },
+                        ..default()
+                    }
+                    .into(),
+                    ..default()
+                }),
             MeshletPlugin {
                 // Zorah's instanced scene exceeds eight million leaf meshlets
                 // before hierarchy and candidate pressure; an undersized cull
