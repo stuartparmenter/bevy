@@ -720,6 +720,7 @@ fn run_app(args: &Args, prepared: Prepared) -> ExitCode {
             environment::install_environment_map.run_if(resource_exists::<EnvironmentMapLoad>),
         )
         .add_systems(Update, setup::dump_camera_and_screenshot)
+        .add_systems(Update, setup::log_vram_report)
         .run();
     ExitCode::SUCCESS
 }
