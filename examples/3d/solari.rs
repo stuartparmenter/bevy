@@ -675,7 +675,7 @@ fn update_performance_text(
         text.push_str(&format!(
             "\nWorld cache cells {} ({:.0}%)",
             world_cache_active_cells_count as u32,
-            (world_cache_active_cells_count * 100.0) / (2u64.pow(20) as f64)
+            (world_cache_active_cells_count * 100.0) / (bevy::solari::realtime::WORLD_CACHE_SIZE as f64)
         ));
     }
 }

@@ -1,6 +1,7 @@
 mod extract;
 mod node;
 mod prepare;
+pub use prepare::WORLD_CACHE_SIZE;
 
 use crate::{
     scene::{prepare_raytracing_scene_resources, RaytracingSceneBindings},
@@ -63,15 +64,22 @@ impl Plugin for SolariLightingPlugin {
     }
 
     fn finish(&self, app: &mut App) {
-        let features = app
-            .sub_app(RenderApp)
-            .world()
-            .resource::<RenderDevice>()
-            .features();
+        let render_device = app.sub_app(RenderApp).world().resource::<RenderDevice>();
+        let features = render_device.features();
         if !features.contains(SolariPlugins::required_wgpu_features()) {
             warn!(
                 "SolariLightingPlugin not loaded. GPU lacks support for required features: {:?}.",
                 SolariPlugins::required_wgpu_features().difference(features)
+            );
+            return;
+        }
+        let limits = render_device.limits();
+        if (limits.max_storage_buffer_binding_size as u64) < prepare::WORLD_CACHE_BUFFER_SIZE
+            || limits.max_buffer_size < prepare::WORLD_CACHE_BUFFER_SIZE
+        {
+            warn!(
+                "SolariLightingPlugin not loaded. GPU buffer limits cannot hold the {} byte world cache.",
+                prepare::WORLD_CACHE_BUFFER_SIZE
             );
             return;
         }
@@ -314,6 +322,35 @@ mod shader_source_tests {
     }
 
     #[test]
+    fn world_cache_query_overflows_are_counted() {
+        let world_cache_query = include_str!("world_cache_query.wesl");
+        assert!(world_cache_query.contains("atomicAdd(&world_cache.query_overflows, 1u);"));
+    }
+
+    #[test]
+    fn world_cache_new_cells_always_take_their_first_update() {
+        // A never-blended cell (sample count of zero) must not wait out the stochastic budget
+        // while returning black. Only sample_di and blend bootstrap - the first sample is
+        // DI-only so bootstraps cannot chain new cells through their GI-hit queries - and the
+        // two must agree on selection.
+        let world_cache_update = include_str!("world_cache_update.wesl");
+        assert!(world_cache_update
+            .contains("if world_cache.radiance[cell_index].a == 0.0 { return true; }"));
+        assert_eq!(
+            world_cache_update
+                .matches("if !should_update_cell(cell_index, &rng) { return; }")
+                .count(),
+            2
+        );
+        assert_eq!(
+            world_cache_update
+                .matches("if rand_f(&rng) >= f32(constants.world_cache_cell_updates_soft_target)")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn world_cache_updates_sample_directional_lights_exactly_once() {
         // The deterministic directional sum and the tile candidates must cover disjoint
         // lights: dropping the skip double counts the sun, dropping the sum re-enters it
@@ -331,7 +368,8 @@ mod shader_source_tests {
         // plus that cell's own flag; dropping the flag collides compacted indices across block
         // boundaries and the colliding cells silently miss their update passes.
         let world_cache_compact = include_str!("world_cache_compact.wesl");
-        assert!(world_cache_compact.contains("u32(world_cache.life[t * 1024u - 1u] != 0u)"));
+        assert!(world_cache_compact
+            .contains("return world_cache.a[last_cell] + u32(world_cache.life[last_cell] != 0u);"));
         assert!(!world_cache_compact.contains("w1[t] = world_cache.a[t * 1024u - 1u];"));
     }
 
