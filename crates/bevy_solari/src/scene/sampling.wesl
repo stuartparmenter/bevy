@@ -160,6 +160,13 @@ fn light_sample_is_environment(light_sample: LightSample) -> bool {
     return light_source_kind(light_sources[light_sample.light_id >> 16u]) == LIGHT_SOURCE_KIND_ENVIRONMENT;
 }
 
+fn light_sample_is_directional(light_sample: LightSample) -> bool {
+    if light_sample.light_id == NULL_LIGHT_ID {
+        return false;
+    }
+    return light_source_kind(light_sources[light_sample.light_id >> 16u]) == LIGHT_SOURCE_KIND_DIRECTIONAL;
+}
+
 fn emissive_light_first_triangle(light_source: LightSource) -> u32 {
     return light_source.kind >> LIGHT_SOURCE_KIND_BITS;
 }
@@ -184,6 +191,29 @@ fn sample_random_light(ray_origin: vec3<f32>, origin_world_normal: vec3<f32>, ra
     light_contribution.is_environment = light_sample_is_environment(sample.light_sample);
     light_contribution.radiance *= trace_visibility(ray_origin, origin_world_normal, sample.resolved_light_sample.world_position, ray_origin_bias);
     return light_contribution;
+}
+
+// Every directional light, sampled once each. A delta or narrow-cone light resamples poorly:
+// a one-in-light_count draw that wins a reservoir swings the estimate by the whole selection
+// odds. Freed buffer slots are zeroed and contribute nothing.
+fn sum_directional_light_contributions(world_position: vec3<f32>, world_normal: vec3<f32>, ray_origin_bias: f32, rng: ptr<function, u32>) -> vec3<f32> {
+    var radiance = vec3(0.0);
+    for (var slot = 0u; slot < arrayLength(&directional_lights); slot++) {
+        if all(directional_lights[slot].luminance == vec3(0.0)) {
+            continue;
+        }
+        let resolved = resolve_light_sample(
+            LightSample(0u, rand_u(rng)),
+            LightSource(LIGHT_SOURCE_KIND_DIRECTIONAL, slot),
+        );
+        let light_contribution = calculate_resolved_light_contribution(resolved, world_position, world_normal);
+        let visibility = trace_visibility(world_position, world_normal, resolved.world_position, ray_origin_bias);
+        radiance += light_contribution.radiance
+            * saturate(dot(light_contribution.wi, world_normal))
+            * visibility
+            * light_contribution.inverse_pdf;
+    }
+    return radiance;
 }
 
 fn random_emissive_light_pdf(hit: ResolvedRayHitFull, ray_distance: f32, NdotV: f32) -> f32 {
