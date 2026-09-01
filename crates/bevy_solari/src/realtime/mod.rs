@@ -314,6 +314,12 @@ mod shader_source_tests {
     }
 
     #[test]
+    fn world_cache_query_overflows_are_counted() {
+        let world_cache_query = include_str!("world_cache_query.wesl");
+        assert!(world_cache_query.contains("atomicAdd(&world_cache.query_overflows, 1u);"));
+    }
+
+    #[test]
     fn world_cache_block_totals_include_the_last_cell() {
         // `a` is a block-local exclusive scan, so a block's total is its last cell's scan value
         // plus that cell's own flag; dropping the flag collides compacted indices across block
