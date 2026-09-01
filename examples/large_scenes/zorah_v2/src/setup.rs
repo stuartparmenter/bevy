@@ -466,3 +466,49 @@ pub fn add_world_cache_occupancy(text: &mut Text, diagnostics: &DiagnosticsStore
         active_cells,
     ));
 }
+
+/// Dev key: `V` logs the wgpu allocator's totals and its biggest allocations, aggregated by
+/// label. Only covers memory wgpu allocates itself; driver-side allocations (DLSS internals,
+/// pipeline caches) show up in `nvidia-smi` but not here.
+pub fn log_vram_report(
+    keys: Res<ButtonInput<KeyCode>>,
+    render_device: Res<bevy::render::renderer::RenderDevice>,
+) {
+    if !keys.just_pressed(KeyCode::KeyV) {
+        return;
+    }
+
+    let Some(report) = render_device.wgpu_device().generate_allocator_report() else {
+        warn!("wgpu returned no allocator report on this backend");
+        return;
+    };
+
+    // Group by label with digits collapsed, so per-asset labels (every BLAS) aggregate.
+    let mut by_name: std::collections::HashMap<String, (u64, usize)> = default();
+    for allocation in &report.allocations {
+        let key: String = allocation
+            .name
+            .chars()
+            .map(|c| if c.is_ascii_digit() { '#' } else { c })
+            .collect();
+        let entry = by_name.entry(key).or_default();
+        entry.0 += allocation.size;
+        entry.1 += 1;
+    }
+    let mut rows: Vec<(String, (u64, usize))> = by_name.into_iter().collect();
+    rows.sort_by_key(|(_, (size, _))| std::cmp::Reverse(*size));
+
+    let gib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    let block_dead_space: u64 = report.total_reserved_bytes - report.total_allocated_bytes;
+    info!(
+        allocated_gib = format!("{:.2}", gib(report.total_allocated_bytes)),
+        reserved_gib = format!("{:.2}", gib(report.total_reserved_bytes)),
+        dead_gib = format!("{:.2}", gib(block_dead_space)),
+        allocations = report.allocations.len(),
+        blocks = report.blocks.len(),
+        "wgpu allocator report"
+    );
+    for (name, (size, count)) in rows.into_iter().take(25) {
+        info!("  {:>8.3} GiB x{:<6} {}", gib(size), count, name);
+    }
+}
