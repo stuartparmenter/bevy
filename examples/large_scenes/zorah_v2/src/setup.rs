@@ -47,6 +47,11 @@ const FIRE_TEMPERATURE_K: f32 = 1900.0;
 /// data of its own; this is where the reference's look comes from.
 const REFERENCE_METERING_FILTER: std::ops::RangeInclusive<f32> = 0.80..=0.95;
 const REFERENCE_EXPOSURE_COMPENSATION_EV: f32 = -0.5;
+/// donut's `eyeAdaptationSpeedUp`/`eyeAdaptationSpeedDown`, in EV per second.
+/// Bevy's defaults are 3.0 and 1.0, so the reference adapts markedly slower in
+/// both directions.
+const REFERENCE_ADAPTATION_SPEED_BRIGHTEN: f32 = 1.0;
+const REFERENCE_ADAPTATION_SPEED_DARKEN: f32 = 0.5;
 
 #[derive(Component)]
 pub struct ZorahCamera;
@@ -164,6 +169,8 @@ pub fn setup(
         camera.insert(AutoExposure {
             range,
             filter: REFERENCE_METERING_FILTER,
+            speed_brighten: REFERENCE_ADAPTATION_SPEED_BRIGHTEN,
+            speed_darken: REFERENCE_ADAPTATION_SPEED_DARKEN,
             compensation_curve: compensation_curves.add(compensation_curve),
             ..default()
         });
