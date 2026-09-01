@@ -328,6 +328,29 @@ mod shader_source_tests {
     }
 
     #[test]
+    fn world_cache_new_cells_always_take_their_first_update() {
+        // A never-blended cell (sample count of zero) must not wait out the stochastic budget
+        // while returning black. Only sample_di and blend bootstrap - the first sample is
+        // DI-only so bootstraps cannot chain new cells through their GI-hit queries - and the
+        // two must agree on selection.
+        let world_cache_update = include_str!("world_cache_update.wesl");
+        assert!(world_cache_update
+            .contains("if world_cache.radiance[cell_index].a == 0.0 { return true; }"));
+        assert_eq!(
+            world_cache_update
+                .matches("if !should_update_cell(cell_index, &rng) { return; }")
+                .count(),
+            2
+        );
+        assert_eq!(
+            world_cache_update
+                .matches("if rand_f(&rng) >= f32(constants.world_cache_cell_updates_soft_target)")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn world_cache_block_totals_include_the_last_cell() {
         // `a` is a block-local exclusive scan, so a block's total is its last cell's scan value
         // plus that cell's own flag; dropping the flag collides compacted indices across block
