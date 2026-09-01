@@ -1,6 +1,6 @@
 use super::prepare::{
     SolariLightingResources, LIGHT_TILE_BLOCKS, WORLD_CACHE_ACTIVE_CELLS_COUNT_OFFSET,
-    WORLD_CACHE_SIZE,
+    WORLD_CACHE_BLOCKS, WORLD_CACHE_QUERY_OVERFLOWS_OFFSET, WORLD_CACHE_SIZE,
 };
 use crate::scene::RaytracingSceneBindings;
 #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
@@ -339,6 +339,13 @@ pub fn solari_lighting(
 
     let command_encoder = ctx.command_encoder();
 
+    // Fresh overflow tally for this frame's queries; read back below.
+    command_encoder.clear_buffer(
+        &s.world_cache,
+        WORLD_CACHE_QUERY_OVERFLOWS_OFFSET,
+        Some(size_of::<u32>() as u64),
+    );
+
     // Clear the view target if we're the first node to write to it
     if matches!(view_target_attachment.ops.load, LoadOp::Clear(_)) {
         command_encoder.begin_render_pass(&RenderPassDescriptor {
@@ -386,16 +393,16 @@ pub fn solari_lighting(
     pass.set_bind_group(2, &bind_group_world_cache_active_cells_dispatch, &[]);
 
     pass.set_pipeline(decay_world_cache_pipeline);
-    pass.dispatch_workgroups((WORLD_CACHE_SIZE / 1024) as u32, 1, 1);
+    pass.dispatch_workgroups(WORLD_CACHE_BLOCKS as u32, 1, 1);
 
     pass.set_pipeline(compact_world_cache_single_block_pipeline);
-    pass.dispatch_workgroups((WORLD_CACHE_SIZE / 1024) as u32, 1, 1);
+    pass.dispatch_workgroups(WORLD_CACHE_BLOCKS as u32, 1, 1);
 
     pass.set_pipeline(compact_world_cache_blocks_pipeline);
     pass.dispatch_workgroups(1, 1, 1);
 
     pass.set_pipeline(compact_world_cache_write_active_cells_pipeline);
-    pass.dispatch_workgroups((WORLD_CACHE_SIZE / 1024) as u32, 1, 1);
+    pass.dispatch_workgroups(WORLD_CACHE_BLOCKS as u32, 1, 1);
 
     pass.set_bind_group(2, None, &[]);
 
@@ -448,14 +455,22 @@ pub fn solari_lighting(
 
     drop(pass);
 
-    // Active cell count readback.
-    diagnostics.record_u32(
-        ctx.command_encoder(),
-        &s.world_cache.slice(
-            WORLD_CACHE_ACTIVE_CELLS_COUNT_OFFSET
-                ..WORLD_CACHE_ACTIVE_CELLS_COUNT_OFFSET + size_of::<u32>() as u64,
-        ),
+    // World cache counter readbacks.
+    let mut record_u32_at = |offset: u64, name: &'static str| {
+        diagnostics.record_u32(
+            ctx.command_encoder(),
+            &s.world_cache
+                .slice(offset..offset + size_of::<u32>() as u64),
+            name,
+        );
+    };
+    record_u32_at(
+        WORLD_CACHE_ACTIVE_CELLS_COUNT_OFFSET,
         "solari_lighting/world_cache_active_cells_count",
+    );
+    record_u32_at(
+        WORLD_CACHE_QUERY_OVERFLOWS_OFFSET,
+        "solari_lighting/world_cache_query_overflows",
     );
 }
 

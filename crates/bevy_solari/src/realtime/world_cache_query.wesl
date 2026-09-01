@@ -8,10 +8,15 @@ import package::realtime::bindings::{
 
 enable wgpu_ray_query;
 
-/// Maximum amount of frames a cell can live for without being queried
+/// Maximum amount of frames a cell can live for without being queried.
+/// The unqueried tail scales with this: doubling it to 20 measured 91%
+/// occupancy on a 2^21 cache against 56% at 10, drowning the table in
+/// probe overflows, so re-seen stability has to come from cheap re-seeding
+/// rather than longer lifetimes
 const WORLD_CACHE_CELL_LIFETIME: u32 = 10u;
-/// Maximum amount of attempts to find a cache entry after a hash collision
-const WORLD_CACHE_MAX_SEARCH_STEPS: u32 = 3u;
+/// Maximum amount of attempts to find a cache entry after a hash collision;
+/// 8 keeps insertion failures rare below ~60% occupancy
+const WORLD_CACHE_MAX_SEARCH_STEPS: u32 = 8u;
 
 /// Marker value for an empty cell
 const WORLD_CACHE_EMPTY_CELL: u32 = 0u;
@@ -74,6 +79,8 @@ fn query_world_cache(world_position_in: vec3<f32>, world_normal: vec3<f32>, ray_
         }
     }
 
+    // Probe window exhausted - tally for the world_cache_query_overflows diagnostic
+    atomicAdd(&world_cache.query_overflows, 1u);
     return vec3(0.0);
 }
 
