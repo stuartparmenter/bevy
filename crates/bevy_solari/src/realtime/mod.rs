@@ -351,6 +351,18 @@ mod shader_source_tests {
     }
 
     #[test]
+    fn world_cache_updates_sample_directional_lights_exactly_once() {
+        // The deterministic directional sum and the tile candidates must cover disjoint
+        // lights: dropping the skip double counts the sun, dropping the sum re-enters it
+        // in the one-of-all-lights lottery.
+        let world_cache_update = include_str!("world_cache_update.wesl");
+        assert!(world_cache_update
+            .contains("if light_sample_is_directional(light_tile_samples[tile_sample])"));
+        assert!(world_cache_update
+            .contains("+ sum_directional_light_contributions(geometry_data.world_position"));
+    }
+
+    #[test]
     fn world_cache_block_totals_include_the_last_cell() {
         // `a` is a block-local exclusive scan, so a block's total is its last cell's scan value
         // plus that cell's own flag; dropping the flag collides compacted indices across block
