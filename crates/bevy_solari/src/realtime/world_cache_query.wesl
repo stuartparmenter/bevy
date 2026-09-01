@@ -8,8 +8,11 @@ import package::realtime::bindings::{
 
 enable wgpu_ray_query;
 
-/// Maximum amount of frames a cell can live for without being queried
-const WORLD_CACHE_CELL_LIFETIME: u32 = 10u;
+/// Maximum amount of frames a cell can live for without being queried;
+/// 10 frames is ~0.14s at 70fps, so cells died during a quick glance away
+/// and popped back from scratch. Longer lifetimes grow the unqueried tail
+/// of the active set, so this trades occupancy for re-seen stability
+const WORLD_CACHE_CELL_LIFETIME: u32 = 20u;
 /// Maximum amount of attempts to find a cache entry after a hash collision;
 /// 8 keeps insertion failures rare below ~60% occupancy
 const WORLD_CACHE_MAX_SEARCH_STEPS: u32 = 8u;
