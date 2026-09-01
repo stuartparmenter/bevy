@@ -26,6 +26,13 @@ fn cell_ray_origin_bias(geometry_data: WorldCacheGeometryData) -> f32 {
     );
 }
 
+// A cell that has never been blended (radiance.a is its sample count) returns black to every
+// query, so it always takes an update instead of waiting out the stochastic budget.
+fn should_update_cell(cell_index: u32, rng: ptr<function, u32>) -> bool {
+    if world_cache.radiance[cell_index].a == 0.0 { return true; }
+    return rand_f(rng) < f32(constants.world_cache_cell_updates_soft_target) / f32(world_cache.active_cells_count);
+}
+
 @compute @workgroup_size(64, 1, 1)
 fn sample_di(@builtin(workgroup_id) workgroup_id: vec3<u32>, @builtin(global_invocation_id) active_cell_id: vec3<u32>) {
     if active_cell_id.x >= world_cache.active_cells_count { return; }
@@ -34,7 +41,7 @@ fn sample_di(@builtin(workgroup_id) workgroup_id: vec3<u32>, @builtin(global_inv
     let geometry_data = world_cache.geometry_data[cell_index];
     var rng = cell_index + constants.frame_rng;
 
-    if rand_f(&rng) >= f32(constants.world_cache_cell_updates_soft_target) / f32(world_cache.active_cells_count) { return; }
+    if !should_update_cell(cell_index, &rng) { return; }
 
     let new_radiance = sample_random_light_ris(geometry_data.world_position, geometry_data.world_normal, cell_ray_origin_bias(geometry_data), workgroup_id.xy, &rng);
 
@@ -49,6 +56,8 @@ fn sample_gi(@builtin(workgroup_id) workgroup_id: vec3<u32>, @builtin(global_inv
     let geometry_data = world_cache.geometry_data[cell_index];
     var rng = cell_index + constants.frame_rng;
 
+    // No bootstrap: a new cell's first sample is DI-only, so bootstraps cannot chain further
+    // new cells through their GI-hit queries.
     if rand_f(&rng) >= f32(constants.world_cache_cell_updates_soft_target) / f32(world_cache.active_cells_count) { return; }
 
     let ray_direction = sample_cosine_hemisphere(geometry_data.world_normal, &rng);
@@ -72,7 +81,7 @@ fn blend_new_samples(@builtin(global_invocation_id) active_cell_id: vec3<u32>) {
     let cell_index = world_cache.active_cell_indices[active_cell_id.x];
     var rng = cell_index + constants.frame_rng;
 
-    if rand_f(&rng) >= f32(constants.world_cache_cell_updates_soft_target) / f32(world_cache.active_cells_count) { return; }
+    if !should_update_cell(cell_index, &rng) { return; }
 
     let old_radiance_raw = world_cache.radiance[cell_index];
     let old_radiance = select(vec4(0.0), old_radiance_raw, isfinite3(old_radiance_raw.rgb) && isfinite(old_radiance_raw.a));
