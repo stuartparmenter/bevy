@@ -13,10 +13,7 @@ use bevy::{
     diagnostic::{Diagnostic, DiagnosticPath, DiagnosticsStore, FrameTimeDiagnosticsPlugin},
     curve::cubic_splines::LinearSpline,
     math::ops,
-    post_process::{
-        auto_exposure::{AutoExposure, AutoExposureCompensationCurve},
-        bloom::Bloom,
-    },
+    post_process::auto_exposure::{AutoExposure, AutoExposureCompensationCurve},
     prelude::*,
     render::{
         render_resource::TextureUsages,
@@ -113,20 +110,18 @@ pub fn setup(
     let camera_position = options.camera_position.unwrap_or(options.view.position);
     let camera_target = options.camera_target.unwrap_or(options.view.target);
     let base_ev100 = options.base_ev100();
-    // An albedo capture wants the texture values themselves on screen, so it
-    // skips the filmic curve and the glare that would reshape them.
-    let (tonemapping, bloom) = if options.solari_albedo {
-        (
-            // `Linear` rather than `None`: the capture still wants the exposure
-            // correction and the sRGB transfer the tonemapping pass applies.
-            Tonemapping::Linear,
-            Bloom {
-                intensity: 0.0,
-                ..Bloom::NATURAL
-            },
-        )
+    // No bloom: the reference renderer's blit is ACES and the sRGB transfer and
+    // nothing else, so its highlights carry no glare. `Bloom::NATURAL` is also
+    // stronger than its name suggests here - its prefilter threshold is 0, so
+    // every pixel contributes, making it a 15% blurred copy of the whole frame
+    // rather than a highlight effect. An albedo capture wants the texture
+    // values themselves on screen, so it skips the filmic curve as well.
+    let tonemapping = if options.solari_albedo {
+        // `Linear` rather than `None`: the capture still wants the exposure
+        // correction and the sRGB transfer the tonemapping pass applies.
+        Tonemapping::Linear
     } else {
-        (Tonemapping::AcesFitted, Bloom::NATURAL)
+        Tonemapping::AcesFitted
     };
     let mut camera = commands.spawn((
         Name::new("Camera"),
@@ -144,7 +139,7 @@ pub fn setup(
         CameraMainTextureUsages::default().with(TextureUsages::STORAGE_BINDING),
         Msaa::Off,
         Exposure { ev100: base_ev100 },
-        (tonemapping, bloom),
+        tonemapping,
         Projection::Perspective(PerspectiveProjection {
             fov: options.view.fov_degrees.to_radians(),
             ..default()
