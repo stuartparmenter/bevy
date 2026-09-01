@@ -145,12 +145,17 @@ fn compute_average(@builtin(local_invocation_index) local_index: u32) {
 
     var count = 0u;
     var sum = 0.0;
-    for (var i=1u; i<64u; i+=1u) {
+    // The cumulative before bin 0 is zero, which clamps to first_index.
+    var previous = first_index;
+    for (var i=0u; i<64u; i+=1u) {
         // The number of pixels in the bin. The histogram values are clamped to
         // first_index and last_index to exclude the lowest and highest samples.
-        let bin_count =
-            clamp(atomicLoad(&histogram_shared[i]), first_index, last_index) -
-            clamp(atomicLoad(&histogram_shared[i - 1u]), first_index, last_index);
+        // Bin 0 is included at the histogram floor: its pixels count toward the
+        // percentile indices, so skipping it here would drop them from the
+        // average while they still displace brighter bins out of the kept band.
+        let cumulative = clamp(atomicLoad(&histogram_shared[i]), first_index, last_index);
+        let bin_count = cumulative - previous;
+        previous = cumulative;
 
         sum += f32(bin_count) * f32(i);
         count += bin_count;
