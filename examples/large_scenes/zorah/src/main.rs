@@ -32,7 +32,7 @@ use bevy::{
         NotShadowCaster, SunDisk,
     },
     curve::cubic_splines::LinearSpline,
-    math::{ops, primitives::Measured2d, Affine2},
+    math::{ops, Affine2},
     pbr::experimental::meshlet::{MeshletMesh, MeshletMesh3d, MeshletPlugin},
     pbr::{AtmosphereSettings, DefaultOpaqueRendererMethod, MeshMaterial3d},
     post_process::auto_exposure::{
