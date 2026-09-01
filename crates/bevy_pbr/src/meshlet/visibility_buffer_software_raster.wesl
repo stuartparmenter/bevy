@@ -85,13 +85,22 @@ fn rasterize_cluster(
     // interior pixel instead.
     let mirrored = (instance_uniform.flags & MESH_FLAGS_SIGN_DETERMINANT_MODEL_3X3_BIT) == 0u;
     let vertex_0 = viewport_vertices[vertex_ids[2]];
-    let vertex_1 = viewport_vertices[select(vertex_ids[1], vertex_ids[0], mirrored)];
-    let vertex_2 = viewport_vertices[select(vertex_ids[0], vertex_ids[1], mirrored)];
+    var vertex_1 = viewport_vertices[select(vertex_ids[1], vertex_ids[0], mirrored)];
+    var vertex_2 = viewport_vertices[select(vertex_ids[0], vertex_ids[1], mirrored)];
     let packed_ids = (cluster_id << 7u) | triangle_id;
 
-    // Backface culling (also rejects degenerate zero-area triangles)
-    let triangle_double_area = edge_function(vertex_0.xy, vertex_1.xy, vertex_2.xy);
-    if triangle_double_area <= 0.0 { return; }
+    // The hardware rasterizer draws both faces (cull_mode None), so this path must too;
+    // otherwise a back face appears and disappears as its cluster crosses the size threshold
+    // between the two rasterizers. Backfacing triangles have negative area: swap two vertices
+    // to restore positive winding and rasterize as normal. Zero area is degenerate; skip it.
+    var triangle_double_area = edge_function(vertex_0.xy, vertex_1.xy, vertex_2.xy);
+    if triangle_double_area == 0.0 { return; }
+    if triangle_double_area < 0.0 {
+        let backface_vertex = vertex_1;
+        vertex_1 = vertex_2;
+        vertex_2 = backface_vertex;
+        triangle_double_area = -triangle_double_area;
+    }
 
     // Setup triangle gradients
     let w_x = vec3(vertex_1.y - vertex_2.y, vertex_2.y - vertex_0.y, vertex_0.y - vertex_1.y);
