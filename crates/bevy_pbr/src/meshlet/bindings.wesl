@@ -268,8 +268,17 @@ fn get_aabb_child_offset(aabb: ptr<function, MeshletAabbErrorOffset>) -> u32 {
 
 struct DispatchIndirectArgs {
     x: atomic<u32>,
-    y: u32,
+    y: atomic<u32>,
     z: u32,
+}
+
+// 65535 workgroups per dimension is the guaranteed minimum limit, so spill into y past it
+const MAX_DISPATCH_DIMENSION: u32 = 65535u;
+fn dispatch_x_for(required: u32) -> u32 {
+    return min(required, MAX_DISPATCH_DIMENSION);
+}
+fn dispatch_y_for(required: u32) -> u32 {
+    return (required + MAX_DISPATCH_DIMENSION - 1u) / MAX_DISPATCH_DIMENSION;
 }
 
 struct DrawIndirectArgs {

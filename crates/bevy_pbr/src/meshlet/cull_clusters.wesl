@@ -1,4 +1,6 @@
 import package::meshlet::bindings::{
+    dispatch_x_for,
+    dispatch_y_for,
     InstancedOffset,
     get_aabb,
     get_aabb_error,
@@ -29,13 +31,18 @@ enable wgpu_binding_array;
 
 @compute
 @workgroup_size(128, 1, 1) // 1 cluster per thread
-fn cull_clusters(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
-    if global_invocation_id.x >= meshlet_meshlet_cull_count_read { return; }
+fn cull_clusters(
+    @builtin(global_invocation_id) global_invocation_id: vec3<u32>,
+    @builtin(workgroup_id) workgroup_id: vec3<u32>,
+    @builtin(num_workgroups) num_workgroups: vec3<u32>,
+) {
+    let dispatch_id = global_invocation_id.x + workgroup_id.y * num_workgroups.x * 128u;
+    if dispatch_id >= meshlet_meshlet_cull_count_read { return; }
 
     @if(MESHLET_FIRST_CULLING_PASS)
-    let meshlet_id = global_invocation_id.x;
+    let meshlet_id = dispatch_id;
     @else
-    let meshlet_id = constants.rightmost_slot - global_invocation_id.x;
+    let meshlet_id = constants.rightmost_slot - dispatch_id;
     let instanced_offset = meshlet_meshlet_cull_queue[meshlet_id];
     let instance_id = instanced_offset.instance_id;
     let descriptor = meshlet_instance_descriptors[instance_id];
@@ -57,8 +64,10 @@ fn cull_clusters(@builtin(global_invocation_id) global_invocation_id: vec3<u32>)
         let id = atomicAdd(&meshlet_meshlet_cull_count_write, 1u);
         let value = InstancedOffset(instance_id, instanced_offset.offset);
         meshlet_meshlet_cull_queue[constants.rightmost_slot - id] = value;
-        if ((id & 127u) == 0) {
-            atomicAdd(&meshlet_meshlet_cull_dispatch.x, 1u);
+        if ((id & 127u) == 0u) {
+            let req = (id >> 7u) + 1u;
+            atomicMax(&meshlet_meshlet_cull_dispatch.x, dispatch_x_for(req));
+            atomicMax(&meshlet_meshlet_cull_dispatch.y, dispatch_y_for(req));
         }
 }
         return;
