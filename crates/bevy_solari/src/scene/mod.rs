@@ -112,16 +112,22 @@ impl Plugin for RaytracingScenePlugin {
                     build_environment_importance_maps
                         .after(RenderSystems::PrepareBindGroups)
                         .before(RenderSystems::Render),
+                    // In `Cleanup`, not `RenderGraphSystems::Finish`: the render sets are only
+                    // weakly chained, so a `Finish` system with no data conflict against the submit
+                    // system can run before this frame's command buffers are submitted, and its
+                    // `on_submitted_work_done` then fails to cover the last submissions that
+                    // reference a retired BLAS. `render_system` is exclusive, so `Cleanup` really
+                    // does run after the graph has submitted. Destroying a BLAS a trace still
+                    // references is undefined behavior that can degrade the whole GPU for the rest
+                    // of the session, not just corrupt one frame.
+                    delete_raytracing_blas.in_set(RenderSystems::Cleanup),
                 ),
             )
             .add_systems(
                 RenderGraph,
-                (
-                    build_raytracing_tlas
-                        .after(update_sparse_buffers)
-                        .in_set(RenderGraphSystems::Begin),
-                    delete_raytracing_blas.in_set(RenderGraphSystems::Finish),
-                ),
+                build_raytracing_tlas
+                    .after(update_sparse_buffers)
+                    .in_set(RenderGraphSystems::Begin),
             );
     }
 }
