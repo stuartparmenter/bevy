@@ -97,7 +97,11 @@ fn blend_new_samples(@builtin(global_invocation_id) active_cell_id: vec3<u32>) {
         bool(constants.reset),
     );
     let alpha = abs(luminance_delta) / max(luminance(old_radiance.rgb), 0.001);
-    let max_sample_count = mix(constants.world_cache_max_temporal_samples, 1.0, pow(saturate(alpha), 1.0 / 8.0));
+    // Floor the reactive history at 8 samples. Collapsing all the way to 1 is a feedback loop:
+    // one high-variance sample spikes the luminance delta, the spike collapses the history,
+    // and the short history keeps the luminance jumping, pinning the cell at ~1-2 samples
+    // forever. A floor of 8 still reacts 8x faster than a converged cell without locking in.
+    let max_sample_count = mix(constants.world_cache_max_temporal_samples, 8.0, pow(saturate(alpha), 1.0 / 8.0));
     var blend_amount = 1.0 / min(sample_count, max_sample_count);
     if bool(constants.reset) {
         blend_amount = 1.0;
