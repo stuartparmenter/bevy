@@ -1,4 +1,6 @@
 import package::meshlet::bindings::{
+    dispatch_x_for,
+    dispatch_y_for,
     InstancedOffset,
     constants,
     meshlet_view_instance_visibility,
@@ -58,7 +60,9 @@ fn cull_instances(@builtin(global_invocation_id) global_invocation_id: vec3<u32>
         let id = atomicAdd(&meshlet_second_pass_instance_count, 1u);
         meshlet_second_pass_instance_candidates[id] = instance_id;
         if ((id & 127u) == 0u) {
-            atomicAdd(&meshlet_second_pass_instance_dispatch.x, 1u);
+            let req = (id >> 7u) + 1u;
+            atomicMax(&meshlet_second_pass_instance_dispatch.x, dispatch_x_for(req));
+            atomicMax(&meshlet_second_pass_instance_dispatch.y, dispatch_y_for(req));
         }
 }
         return;
@@ -68,6 +72,8 @@ fn cull_instances(@builtin(global_invocation_id) global_invocation_id: vec3<u32>
     let id = atomicAdd(&meshlet_bvh_cull_count_write, 1u);
     meshlet_bvh_cull_queue[id] = InstancedOffset(instance_id, 0u);
     if ((id & 15u) == 0u) {
-        atomicAdd(&meshlet_bvh_cull_dispatch.x, 1u);
+        let req = (id >> 4u) + 1u;
+        atomicMax(&meshlet_bvh_cull_dispatch.x, dispatch_x_for(req));
+        atomicMax(&meshlet_bvh_cull_dispatch.y, dispatch_y_for(req));
     }
 }
