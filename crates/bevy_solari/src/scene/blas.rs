@@ -440,8 +440,9 @@ pub fn prepare_raytracing_blas(
 ///
 /// `wgpu-core` 30's `Queue::compact_blas` acquires its pending-writes and command-index locks in
 /// the opposite order from `Queue::submit`. Running this as an exclusive system prevents a
-/// concurrent queue submission from deadlocking with BLAS compaction. Keep this exclusive until
-/// wgpu makes concurrent `compact_blas` and `submit` safe.
+/// concurrent queue submission from deadlocking with BLAS compaction. Fixed upstream just after
+/// wgpu 30.0.1 (gfx-rs/wgpu's compact_blas/submit lock-order fix); drop the exclusivity on the
+/// next wgpu upgrade.
 pub fn compact_raytracing_blas(world: &mut World) {
     let render_device = world.resource::<RenderDevice>().clone();
     let render_queue = world.resource::<RenderQueue>().clone();
