@@ -3597,37 +3597,48 @@ fn ue_auto_exposure_bias(post_process: &PostProcessRecord) -> f32 {
 }
 
 /// A volume's histogram metering, restated in the terms Bevy's [`AutoExposure`]
-/// takes: a flat exposure compensation in EV and the log-luminance band the
-/// histogram meters over, both relative to the camera's base exposure.
+/// takes: a flat exposure compensation in EV and the range the correction is
+/// clamped to, both relative to the camera's base exposure.
 #[derive(Clone, Debug, PartialEq)]
 struct HistogramMetering {
     /// Added to the metered correction; positive brightens.
     compensation_ev: f32,
-    /// The metered log luminance is bounded to this range, so the correction is
-    /// bounded to `compensation_ev - range`.
-    range: RangeInclusive<f32>,
+    /// The correction is clamped to this range: the volume's minimum and
+    /// maximum EV100 restated around the base, with the compensation already
+    /// applied over them the way UE biases after its clamp.
+    correction_range: RangeInclusive<f32>,
 }
 
-/// The narrowest histogram range Bevy can meter over: the bins span the range,
-/// so a zero-width one has no resolution at all.
-const MIN_HISTOGRAM_RANGE_EV: f32 = 0.1;
-
 impl HistogramMetering {
-    /// The `AutoExposure` this metering asks for. The compensation is a flat
-    /// curve over the metered range, since UE's bias is a constant offset.
+    /// The same metering with an extra trim: positive brightens. The trim is
+    /// more compensation, and the clamp moves with it since UE biases after
+    /// clamping.
+    fn trimmed(self, ev: f32) -> Self {
+        let (min, max) = self.correction_range.into_inner();
+        Self {
+            compensation_ev: self.compensation_ev + ev,
+            correction_range: (min + ev)..=(max + ev),
+        }
+    }
+
+    /// The `AutoExposure` this metering asks for. The histogram meters over
+    /// Bevy's default band with the compensation as a flat curve over it,
+    /// since UE's bias is a constant offset; the clamp is separate, so it
+    /// costs the meter no resolution however narrow the volume's range.
     fn auto_exposure(
         &self,
         compensation_curves: &mut Assets<AutoExposureCompensationCurve>,
     ) -> AutoExposure {
-        let (min, max) = self.range.clone().into_inner();
+        let range = AutoExposure::default().range;
         let compensation_curve = AutoExposureCompensationCurve::from_curve(LinearSpline::new([
-            Vec2::new(min, self.compensation_ev),
-            Vec2::new(max, self.compensation_ev),
+            Vec2::new(*range.start(), self.compensation_ev),
+            Vec2::new(*range.end(), self.compensation_ev),
         ]))
         .expect("a flat two-point curve is monotonic and continuous");
         AutoExposure {
-            range: self.range.clone(),
+            range,
             compensation_curve: compensation_curves.add(compensation_curve),
+            correction_range: self.correction_range.clone(),
             ..default()
         }
     }
@@ -3646,11 +3657,11 @@ impl HistogramMetering {
 /// -2.5 EV under UE's rule would put the average near 3%, two and a half stops
 /// under NVIDIA's own frames of the level, so the unit-average calibration is
 /// kept and `--exposure-bias` trims from there. UE clamps the metered EV100 to
-/// the volume's range before adding the bias, and the histogram's `range` is
-/// that clamp restated around `base_ev100`: the metered EV100 is the base plus
-/// the exposed image's log luminance, so `[min, max]` EV100 is the log
-/// luminance band `[min - base, max - base]`. ThroneRoom's 8..8 pins it, to
-/// within the bins' resolution, and GreenHouse's 4..5 leaves one stop.
+/// the volume's range before adding the bias, and `correction_range` is that
+/// clamp restated around `base_ev100`: the correction is the base less the
+/// EV100 the camera lands on, so `[min, max]` EV100 with the bias applied
+/// after it is the correction band `[base - max + bias, base - min + bias]`.
+/// ThroneRoom's 8..8 pins the exposure, and GreenHouse's 4..5 leaves one stop.
 fn histogram_auto_exposure(
     exposure_override: Option<f32>,
     post_process: Option<&PostProcessRecord>,
@@ -3677,16 +3688,9 @@ fn histogram_auto_exposure(
         .filter(|value| value.is_finite())
         .unwrap_or(UE_DEFAULT_AUTO_EXPOSURE_MAX_EV100)
         .max(min_ev100);
-    let mut min_log_lum = min_ev100 - base_ev100;
-    let mut max_log_lum = max_ev100 - base_ev100;
-    if max_log_lum - min_log_lum < MIN_HISTOGRAM_RANGE_EV {
-        let midpoint = 0.5 * (min_log_lum + max_log_lum);
-        min_log_lum = midpoint - 0.5 * MIN_HISTOGRAM_RANGE_EV;
-        max_log_lum = midpoint + 0.5 * MIN_HISTOGRAM_RANGE_EV;
-    }
     Some(HistogramMetering {
         compensation_ev: bias,
-        range: min_log_lum..=max_log_lum,
+        correction_range: (base_ev100 - max_ev100 + bias)..=(base_ev100 - min_ev100 + bias),
     })
 }
 
@@ -4017,20 +4021,20 @@ fn setup(
                 exposure_ev100,
             )
         })
-        .flatten();
+        .flatten()
+        // The metered target is independent of the base, so the extra bias has
+        // to enter the meter as well, as more compensation.
+        .map(|auto| auto.trimmed(options.exposure_bias));
     let exposure_mode = match &auto_exposure {
         Some(auto) => format!(
-            "histogram (compensation {:+.2} EV, metered band {:+.2}..{:+.2} EV)",
-            auto.compensation_ev + options.exposure_bias,
-            auto.range.start(),
-            auto.range.end()
+            "histogram (compensation {:+.2} EV, correction {:+.2}..{:+.2} EV)",
+            auto.compensation_ev,
+            auto.correction_range.start(),
+            auto.correction_range.end()
         ),
         None => "fixed".to_string(),
     };
-    if let Some(mut auto_exposure) = auto_exposure {
-        // The metered target is independent of the base, so the extra bias has
-        // to enter the meter as well, as more compensation.
-        auto_exposure.compensation_ev += options.exposure_bias;
+    if let Some(auto_exposure) = auto_exposure {
         camera.insert(auto_exposure.auto_exposure(&mut compensation_curves));
     }
     if has_atmosphere {
@@ -5929,27 +5933,29 @@ mod tests {
         let base = resolved_exposure_ev100(None, Some(&restir));
         let auto = histogram_auto_exposure(None, Some(&restir), base).expect("Restir meters");
         assert!((auto.compensation_ev + 2.5).abs() < 1e-6);
-        // UE's open -10..20 EV100 range restated around the base exposure.
-        assert!((auto.range.start() - (-10.0 - base)).abs() < 1e-5);
-        assert!((auto.range.end() - (20.0 - base)).abs() < 1e-5);
+        // UE's open -10..20 EV100 range restated as a correction band around
+        // the base exposure, with the bias applied after the clamp.
+        let correction_bounds =
+            |auto: &HistogramMetering| auto.correction_range.clone().into_inner();
+        let (min, max) = correction_bounds(&auto);
+        assert!((min - (base - 20.0 - 2.5)).abs() < 1e-5);
+        assert!((max - (base + 10.0 - 2.5)).abs() < 1e-5);
+        // A trim shifts the compensation and the clamp together.
+        let trimmed = auto.clone().trimmed(1.0);
+        assert!((trimmed.compensation_ev + 1.5).abs() < 1e-6);
+        let (trimmed_min, trimmed_max) = correction_bounds(&trimmed);
+        assert!((trimmed_min - (min + 1.0)).abs() < 1e-5);
+        assert!((trimmed_max - (max + 1.0)).abs() < 1e-5);
         // An explicit override is a fixed exposure.
         assert!(histogram_auto_exposure(Some(11.0), Some(&restir), 11.0).is_none());
-        // The correction is the compensation less the metered log luminance,
-        // so its bounds are the compensation less the band's ends.
-        let correction_bounds = |auto: &HistogramMetering| {
-            (
-                auto.compensation_ev - auto.range.end(),
-                auto.compensation_ev - auto.range.start(),
-            )
-        };
-        // ThroneRoom's 8..8 pins the correction at zero, to the histogram's
-        // minimum band width: effectively fixed.
+        // ThroneRoom's 8..8 pins the correction: its base is that EV100 less
+        // the bias, so the band collapses onto zero.
         let throne = legacy_zorah_post_process("ThroneRoom_Level").unwrap();
         let base = resolved_exposure_ev100(None, Some(&throne));
         let auto = histogram_auto_exposure(None, Some(&throne), base).unwrap();
         let (min, max) = correction_bounds(&auto);
-        assert!((min + 0.5 * MIN_HISTOGRAM_RANGE_EV).abs() < 1e-5);
-        assert!((max - 0.5 * MIN_HISTOGRAM_RANGE_EV).abs() < 1e-5);
+        assert!(min.abs() < 1e-5);
+        assert!(max.abs() < 1e-5);
         // GreenHouse's 4..5 leaves half a stop either side of its midpoint.
         let greenhouse = legacy_zorah_post_process("GreenHouse_Level").unwrap();
         let base = resolved_exposure_ev100(None, Some(&greenhouse));
