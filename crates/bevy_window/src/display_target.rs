@@ -227,6 +227,93 @@ impl DisplayTransfer {
     }
 }
 
+/// A set of [`DisplayTransfer`]s, stored as a bitset.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(
+    feature = "bevy_reflect",
+    derive(Reflect),
+    reflect(Default, Debug, PartialEq, Hash, Clone)
+)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    all(feature = "serialize", feature = "bevy_reflect"),
+    reflect(Serialize, Deserialize)
+)]
+pub struct DisplayTransfers(u8);
+
+impl DisplayTransfers {
+    /// The empty set.
+    pub const EMPTY: Self = Self(0);
+
+    /// The bit for `transfer`. A match rather than a cast, so adding a variant
+    /// cannot renumber existing bits.
+    const fn bit(transfer: DisplayTransfer) -> u8 {
+        match transfer {
+            DisplayTransfer::Srgb => 0b0001,
+            DisplayTransfer::ScRgbLinear => 0b0010,
+            DisplayTransfer::Pq => 0b0100,
+            DisplayTransfer::ExtendedSrgb => 0b1000,
+        }
+    }
+
+    /// Returns this set with `transfer` added.
+    pub const fn with(self, transfer: DisplayTransfer) -> Self {
+        Self(self.0 | Self::bit(transfer))
+    }
+
+    /// Returns `true` if `transfer` is a member.
+    pub const fn contains(self, transfer: DisplayTransfer) -> bool {
+        self.0 & Self::bit(transfer) != 0
+    }
+
+    /// Iterates the members in [`DisplayTransfer`] variant order.
+    pub fn iter(self) -> impl Iterator<Item = DisplayTransfer> {
+        [
+            DisplayTransfer::Srgb,
+            DisplayTransfer::ScRgbLinear,
+            DisplayTransfer::Pq,
+            DisplayTransfer::ExtendedSrgb,
+        ]
+        .into_iter()
+        .filter(move |&transfer| self.contains(transfer))
+    }
+}
+
+impl core::fmt::Debug for DisplayTransfers {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+/// The [`DisplayTransfer`] a window's surface uses, and the transfers it
+/// could use.
+///
+/// [`DisplayTarget::transfer`] is a request. The renderer downgrades it when
+/// the surface cannot provide it.
+///
+/// The renderer inserts and updates this component. Writing to it has no
+/// effect. It is one frame behind the surface and is absent until the
+/// surface is configured.
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "bevy_reflect",
+    derive(Reflect),
+    reflect(Component, Debug, PartialEq, Clone)
+)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    all(feature = "serialize", feature = "bevy_reflect"),
+    reflect(Serialize, Deserialize)
+)]
+pub struct WindowSurfaceTransfers {
+    /// The transfer the surface uses.
+    pub resolved: DisplayTransfer,
+    /// The transfers the surface can provide. [`DisplayTransfer::Srgb`] is
+    /// always included. A listed transfer can still be downgraded when the
+    /// surface lacks the requested gamut for it.
+    pub supported: DisplayTransfers,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,5 +353,18 @@ mod tests {
             target.sanitized_paper_white_nits(),
             DisplayTarget::MAX_PAPER_WHITE_NITS
         );
+    }
+
+    #[test]
+    fn transfer_set_membership() {
+        let set = DisplayTransfers::EMPTY
+            .with(DisplayTransfer::Srgb)
+            .with(DisplayTransfer::Pq);
+        assert!(set.contains(DisplayTransfer::Srgb));
+        assert!(set.contains(DisplayTransfer::Pq));
+        assert!(!set.contains(DisplayTransfer::ScRgbLinear));
+        assert!(!set.contains(DisplayTransfer::ExtendedSrgb));
+        assert!(!DisplayTransfers::EMPTY.contains(DisplayTransfer::Srgb));
+        assert_eq!(set.with(DisplayTransfer::Pq), set);
     }
 }

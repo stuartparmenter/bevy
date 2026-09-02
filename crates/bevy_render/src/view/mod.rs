@@ -1,4 +1,5 @@
 pub mod composition;
+pub mod display_target;
 pub mod visibility;
 pub mod window;
 
@@ -8,12 +9,14 @@ use bevy_camera::{
 };
 use bevy_diagnostic::FrameCount;
 pub use composition::*;
+pub use display_target::*;
 pub use visibility::*;
 pub use window::*;
 
 use crate::{
     camera::{ExtractedCamera, MipBias, NormalizedRenderTargetExt as _, TemporalJitter},
     extract_component::ExtractComponentPlugin,
+    extract_resource::ExtractResourcePlugin,
     occlusion_culling::OcclusionCulling,
     render_asset::RenderAssets,
     render_phase::ViewRangefinder3d,
@@ -176,10 +179,15 @@ impl Plugin for ViewPlugin {
             .add_plugins((
                 ExtractComponentPlugin::<Msaa>::default(),
                 ExtractComponentPlugin::<OcclusionCulling>::default(),
+                ExtractResourcePlugin::<ManualDisplayTargets>::default(),
                 RenderVisibilityRangePlugin,
-            ));
+            ))
+            .init_resource::<ManualDisplayTargets>();
 
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+            // Without this, `extract_resource` inserts the resource through
+            // `Commands`, too late for `extract_cameras` in the same frame.
+            render_app.init_resource::<ManualDisplayTargets>();
             render_app.configure_sets(
                 Render,
                 ResolveCompositingSpaces
@@ -207,6 +215,10 @@ impl Plugin for ViewPlugin {
                         .after(crate::render_asset::prepare_assets::<GpuImage>)
                         .ambiguous_with(crate::camera::sort_cameras), // doesn't use `sorted_camera_index_for_target`
                     prepare_view_uniforms.in_set(RenderSystems::PrepareResources),
+                    prepare_view_display_targets
+                        .in_set(RenderSystems::PrepareViews)
+                        .after(create_surfaces)
+                        .before(prepare_windows),
                     collect_visible_cpu_culled_entities.in_set(RenderSystems::PrepareAssets),
                 ),
             );
@@ -1360,7 +1372,9 @@ pub fn cleanup_view_targets_for_resize(
     for (entity, camera) in &cameras {
         if let Some(NormalizedRenderTarget::Window(window_ref)) = &camera.target
             && let Some((_, window)) = windows.iter().find(|(e, _)| *e == window_ref.entity())
-            && (window.size_changed || window.present_mode_changed)
+            && (window.size_changed
+                || window.present_mode_changed
+                || window.display_target_transfer_changed)
         {
             commands.entity(entity).remove::<ViewTarget>();
         }
