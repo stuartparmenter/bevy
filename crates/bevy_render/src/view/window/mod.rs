@@ -6,14 +6,16 @@ use crate::{
     renderer::{RenderAdapter, RenderDevice, RenderInstance},
     Extract, ExtractSchedule, MainWorld, Render, RenderApp, RenderSystems,
 };
-use bevy_app::{App, Plugin};
+use bevy_app::{App, Plugin, PostUpdate};
+use bevy_ecs::entity::EntityHashSet;
 use bevy_ecs::prelude::*;
 use bevy_ecs::system::RunSystemOnce;
 use bevy_log::{debug, info, warn, warn_once};
 use bevy_utils::default;
 use bevy_window::{
-    CompositeAlphaMode, DisplayGamut, DisplayTarget, DisplayTransfer, DisplayTransfers,
-    PresentMode, PrimaryWindow, RawHandleWrapper, Window, WindowClosing, WindowSurfaceTransfers,
+    CompositeAlphaMode, DisplayCalibrationPolicy, DisplayGamut, DisplayTarget, DisplayTransfer,
+    DisplayTransfers, EffectiveDisplayTarget, OnMonitor, PresentMode, PrimaryWindow,
+    RawHandleWrapper, Window, WindowClosing, WindowFocused, WindowMoved,
 };
 use core::num::NonZero;
 use wgpu::{
@@ -21,15 +23,19 @@ use wgpu::{
     TextureFormat, TextureUsages, TextureViewDescriptor,
 };
 
+mod display_state;
 pub mod screenshot;
 
+pub use display_state::resolve_calibration;
+use display_state::{poll_display_state, write_back_display_state, DisplayStateStore};
 use screenshot::ScreenshotPlugin;
 
 pub struct WindowRenderPlugin;
 
 impl Plugin for WindowRenderPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins(ScreenshotPlugin);
+        app.add_plugins(ScreenshotPlugin)
+            .add_systems(PostUpdate, resolve_calibration);
 
         // We need to sync the window entity in the render world
         // We can't use [`SyncComponentPlugin`] because it would introduce `bevy_render` as
@@ -53,11 +59,12 @@ impl Plugin for WindowRenderPlugin {
 
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
             render_app
+                .init_resource::<DisplayStateStore>()
                 .add_systems(
                     ExtractSchedule,
                     (
                         extract_windows.before(extract_cameras),
-                        write_back_surface_transfers.after(extract_windows),
+                        write_back_display_state.after(extract_windows),
                     ),
                 )
                 .add_systems(
@@ -66,7 +73,12 @@ impl Plugin for WindowRenderPlugin {
                         .run_if(need_surface_configuration)
                         .before(prepare_windows),
                 )
-                .add_systems(Render, prepare_windows.in_set(RenderSystems::PrepareViews));
+                .add_systems(
+                    Render,
+                    (prepare_windows, poll_display_state)
+                        .chain()
+                        .in_set(RenderSystems::PrepareViews),
+                );
         }
     }
 }
@@ -91,7 +103,7 @@ pub struct ExtractedWindow {
     pub size_changed: bool,
     pub present_mode_changed: bool,
     pub alpha_mode: CompositeAlphaMode,
-    /// The window's requested [`DisplayTarget`].
+    /// The window's [`EffectiveDisplayTarget::target`].
     pub display_target: DisplayTarget,
     /// Whether the surface must be reconfigured for a [`DisplayTarget`] change.
     /// The surface color space depends on [`DisplayTarget::transfer`], and under
@@ -100,6 +112,20 @@ pub struct ExtractedWindow {
     /// The [`DisplayTransfer`] the configured surface uses. `None` until
     /// [`create_surfaces`] has configured the surface.
     pub resolved_transfer: Option<DisplayTransfer>,
+    /// Set for one frame when the display behind the window may have changed,
+    /// after a window move, a focus regain, a monitor change, or a surface
+    /// renegotiation. `poll_display_state` reads the display state again in
+    /// response.
+    ///
+    /// A focus regain counts because the user may have changed the display's
+    /// brightness setting while the window did not have focus.
+    pub request_display_requery: bool,
+    /// Whether the window's [`DisplayCalibrationPolicy`] enables any field.
+    ///
+    /// When it is `false`, `poll_display_state` skips the per-frame read on
+    /// macOS, since the result could not change the window's
+    /// [`EffectiveDisplayTarget`].
+    pub display_calibration_auto: bool,
     /// Whether this window needs an initial buffer commit.
     ///
     /// On Wayland, windows must present at least once before they are shown.
@@ -148,21 +174,49 @@ fn extract_windows(
     mut closing: Extract<MessageReader<WindowClosing>>,
     windows: Extract<
         Query<(
+            Entity,
             RenderEntity,
             &Window,
-            Option<&DisplayTarget>,
+            Option<&EffectiveDisplayTarget>,
+            Option<&DisplayCalibrationPolicy>,
             &RawHandleWrapper,
             Has<PrimaryWindow>,
         )>,
     >,
+    mut moved: Extract<MessageReader<WindowMoved>>,
+    mut focused: Extract<MessageReader<WindowFocused>>,
+    changed_monitor: Extract<Query<Entity, Changed<OnMonitor>>>,
+    mut removed_monitor: Extract<RemovedComponents<OnMonitor>>,
     mut removed: Extract<RemovedComponents<RawHandleWrapper>>,
     mut removed_primary: Extract<RemovedComponents<PrimaryWindow>>,
     mapper: Extract<Query<&RenderEntity>>,
 ) {
-    for (render_entity, window, display_target, handle, is_primary) in windows.iter() {
+    let display_requery: EntityHashSet = moved
+        .read()
+        .map(|moved| moved.window)
+        .chain(focused.read().filter(|f| f.focused).map(|f| f.window))
+        .chain(changed_monitor.iter())
+        .chain(removed_monitor.read())
+        .collect();
+
+    for (
+        entity,
+        render_entity,
+        window,
+        effective_display_target,
+        calibration_policy,
+        handle,
+        is_primary,
+    ) in windows.iter()
+    {
         // A required component can still be removed. Fall back to the default
         // rather than drop the window.
-        let display_target = display_target.copied().unwrap_or_default();
+        let display_target = effective_display_target
+            .map(|effective| effective.target)
+            .unwrap_or_default();
+        let request_display_requery = display_requery.contains(&entity);
+        let display_calibration_auto =
+            calibration_policy.is_some_and(DisplayCalibrationPolicy::has_auto);
         if is_primary {
             commands.entity(render_entity).insert(PrimaryWindow);
         }
@@ -188,6 +242,8 @@ fn extract_windows(
                     alpha_mode: window.composite_alpha_mode,
                     display_target,
                     display_target_transfer_changed: false,
+                    request_display_requery,
+                    display_calibration_auto,
                     resolved_transfer: None,
                     needs_initial_present: true,
                 },
@@ -204,6 +260,9 @@ fn extract_windows(
         extracted_window.display_target_transfer_changed =
             transfer_changed || extended_srgb_gamut_changed;
         extracted_window.display_target = display_target;
+
+        extracted_window.request_display_requery = request_display_requery;
+        extracted_window.display_calibration_auto = display_calibration_auto;
 
         if extracted_window.swap_chain_texture.is_none() {
             // If we called present on the previous swap-chain texture last update,
@@ -270,26 +329,6 @@ fn insert_on_change<C: Component + PartialEq>(
     };
     if entity_mut.get::<C>() != Some(&value) {
         entity_mut.insert(value);
-    }
-}
-
-/// Writes each window's [`WindowSurfaceTransfers`] back to the main world.
-///
-/// It runs during extraction, so the main world sees the previous frame's
-/// result.
-fn write_back_surface_transfers(
-    mut main_world: ResMut<MainWorld>,
-    windows: Query<(MainEntity, &SurfaceData)>,
-) {
-    for (entity, surface_data) in windows.iter() {
-        insert_on_change(
-            &mut main_world,
-            entity,
-            WindowSurfaceTransfers {
-                resolved: surface_data.resolved_transfer,
-                supported: surface_data.supported_transfers,
-            },
-        );
     }
 }
 
@@ -458,6 +497,7 @@ pub fn prepare_windows(
                         window.display_target.gamut,
                     ) {
                         window.resolved_transfer = Some(surface_data.resolved_transfer);
+                        window.request_display_requery = true;
                     }
                 }
                 let surface = &surface_data.surface;
@@ -872,7 +912,7 @@ pub fn create_surfaces(
                     window.display_target.gamut,
                 ));
             } else {
-                data.renegotiate_if_color_space_lost(
+                window.request_display_requery |= data.renegotiate_if_color_space_lost(
                     &caps,
                     window.display_target.transfer,
                     window.display_target.gamut,
