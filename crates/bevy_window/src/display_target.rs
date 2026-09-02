@@ -22,6 +22,11 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
 /// when the window moves to another monitor. [`OnMonitor`](crate::OnMonitor)
 /// changes on such a move, so watch it to update this component yourself.
 ///
+/// Each enabled [`DisplayCalibrationPolicy`](crate::DisplayCalibrationPolicy)
+/// field takes the value the display reports. The renderer always reads
+/// [`EffectiveDisplayTarget`](crate::EffectiveDisplayTarget), which equals
+/// this component when no field is enabled.
+///
 /// [color space and HDR primer]: https://docs.rs/wgpu/30/wgpu/index.html#surface-color-spaces-and-hdr-output
 #[derive(Component, Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(
