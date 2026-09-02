@@ -6,8 +6,24 @@ use bevy_render::{
     sync_world::RenderEntity,
     Extract,
 };
+use bevy_utils::once;
+use tracing::warn;
 
 use super::{pipeline::AutoExposureUniform, AutoExposure};
+
+/// The correction range as the shader clamps with: ordered and free of NaN,
+/// or unbounded with a one-time warning when the configured one is not.
+pub(super) fn correction_bounds(settings: &AutoExposure) -> (f32, f32) {
+    let (min, max) = settings.correction_range.clone().into_inner();
+    if min <= max && !min.is_nan() && !max.is_nan() {
+        (min, max)
+    } else {
+        once!(warn!(
+            "AutoExposure::correction_range must be an ordered, non-NaN range; ignoring the configured value"
+        ));
+        (f32::MIN, f32::MAX)
+    }
+}
 
 #[derive(Resource, Default)]
 pub(super) struct AutoExposureBuffers {
@@ -46,9 +62,14 @@ pub(super) fn prepare_buffers(
     mut buffers: ResMut<AutoExposureBuffers>,
 ) {
     for (entity, settings) in extracted.changed.drain(..) {
+        let (correction_min, correction_max) = correction_bounds(&settings);
         let (min_log_lum, max_log_lum) = settings.range.into_inner();
         let (low_percent, high_percent) = settings.filter.into_inner();
-        let initial_state = 0.0f32.clamp(min_log_lum, max_log_lum);
+        // Start inside both bands, so a correction range far from zero does not
+        // begin at the band edge and fade towards its target.
+        let initial_state = 0.0f32
+            .clamp(min_log_lum, max_log_lum)
+            .clamp(correction_min, correction_max);
 
         let settings = AutoExposureUniform {
             min_log_lum,
@@ -59,6 +80,10 @@ pub(super) fn prepare_buffers(
             speed_up: settings.speed_brighten,
             speed_down: settings.speed_darken,
             exponential_transition_distance: settings.exponential_transition_distance,
+            correction_min,
+            correction_max,
+            pad_0: 0,
+            pad_1: 0,
         };
 
         match buffers.buffers.entry(entity) {

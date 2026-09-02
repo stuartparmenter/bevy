@@ -89,6 +89,18 @@ pub struct AutoExposure {
     /// The default value is a flat line at 0.0.
     /// For more information, see [`AutoExposureCompensationCurve`].
     pub compensation_curve: Handle<AutoExposureCompensationCurve>,
+
+    /// The range the adapted exposure correction is clamped to, in EV relative to the
+    /// camera's [`Exposure`](bevy_camera::Exposure): a correction of `+1.0` brightens the
+    /// frame by one stop over that base. This bounds where adaptation can take the
+    /// exposure, the way a physical camera's metering has a minimum and maximum EV100,
+    /// independently of the luminance band the histogram meters over. A narrow range
+    /// limits the swing, and an empty one (`0.0..=0.0`) pins the exposure at its base.
+    ///
+    /// The clamp applies after the smoothing, so the exposure also starts inside it.
+    ///
+    /// The default value is unbounded.
+    pub correction_range: RangeInclusive<f32>,
 }
 
 impl Default for AutoExposure {
@@ -101,6 +113,7 @@ impl Default for AutoExposure {
             exponential_transition_distance: 1.5,
             metering_mask: default(),
             compensation_curve: default(),
+            correction_range: f32::MIN..=f32::MAX,
         }
     }
 }
