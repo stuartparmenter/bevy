@@ -10,10 +10,10 @@ use crate::{
     sync_world::{MainEntity, MainEntityHashSet, RenderEntity, SyncToRenderWorld},
     texture::{GpuImage, ManualTextureViews},
     view::{
-        ColorGrading, ExtractedView, ExtractedWindow, Msaa, NoIndirectDrawing,
-        RenderExtractedVisibleEntities, RenderVisibleEntities, RenderVisibleEntitiesClass,
-        ResolvedCompositingSpace, RetainedViewEntity, ViewUniformOffset,
-        VisibilityExtractionSystemParam,
+        resolve_view_display_target, ColorGrading, ExtractedView, ExtractedWindow,
+        ManualDisplayTargets, Msaa, NoIndirectDrawing, RenderExtractedVisibleEntities,
+        RenderVisibleEntities, RenderVisibleEntitiesClass, ResolvedCompositingSpace,
+        RetainedViewEntity, ViewDisplayTarget, ViewUniformOffset, VisibilityExtractionSystemParam,
     },
     Extract, ExtractSchedule, Render, RenderApp, RenderSystems,
 };
@@ -104,7 +104,8 @@ impl Plugin for CameraPlugin {
                     ExtractSchedule,
                     (
                         extract_cameras
-                            .after(extract_resource::<ManualTextureViews, RenderApp, ()>),
+                            .after(extract_resource::<ManualTextureViews, RenderApp, ()>)
+                            .after(extract_resource::<ManualDisplayTargets, RenderApp, ()>),
                         clear_dirty_specializations.in_set(DirtySpecializationSystems::Clear),
                         clear_dirty_wireframe_specializations
                             .in_set(DirtySpecializationSystems::Clear),
@@ -454,7 +455,7 @@ pub fn camera_system(
 /// view comes from a camera. For example, views can come from lights,
 /// for drawing shadow maps.
 #[derive(Component, Debug)]
-#[require(RenderVisibleEntities)]
+#[require(RenderVisibleEntities, ViewDisplayTarget)]
 pub struct ExtractedCamera {
     pub target: Option<NormalizedRenderTarget>,
     pub physical_viewport_size: Option<UVec2>,
@@ -497,6 +498,7 @@ pub fn extract_cameras(
         )>,
     >,
     primary_window: Extract<Query<Entity, With<PrimaryWindow>>>,
+    manual_display_targets: Res<ManualDisplayTargets>,
     manual_texture_views: Res<ManualTextureViews>,
     images: Res<RenderAssets<GpuImage>>,
     mut existing_render_visible_entities_cpu_culling: Query<
@@ -616,7 +618,14 @@ pub fn extract_cameras(
                         .map(|format| normalize_bgra8(target, format))
                 })
                 .unwrap_or(TextureFormat::Rgba8UnormSrgb);
-            let target_format = if hdr {
+            // Last frame's negotiated transfer, like the swap chain format read
+            // above.
+            let view_display_target = resolve_view_display_target(
+                target.as_ref(),
+                extracted_swap_chains.iter(),
+                &manual_display_targets,
+            );
+            let target_format = if hdr || view_display_target.is_hdr_transfer() {
                 TextureFormat::Rgba16Float
             } else if compositing_space.is_some_and(|s| *s == CompositingSpace::Srgb) {
                 TextureFormat::Rgba8Unorm
