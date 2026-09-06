@@ -140,7 +140,7 @@ pub fn resolve_composition_spaces(
                 warn_once!(
                     "CompositingSpace::Oklab on views {entities:?} resolves to linear because \
                     the main texture format cannot store the signed Oklab channels. Add the Hdr \
-                    component to the camera to get an Rgba16Float main texture."
+                    component to the camera to get a main texture format that can."
                 );
             }
         }
