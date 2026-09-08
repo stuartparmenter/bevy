@@ -29,7 +29,7 @@ struct TextSectionView<'a> {
     index: usize,
     entity: Entity,
     text_item: TextElement<'a>,
-    font_size: f32,
+    logical_font_size: f32,
 }
 
 /// The `TextPipeline` is used to layout and render text blocks (see `Text`/`Text2d`).
@@ -157,7 +157,7 @@ impl TextPipeline {
                             entity,
                             index,
                             text_item: item,
-                            font_size,
+                            logical_font_size: font_size,
                         });
                     }
                     TextElement::Box(_inline_box) => {
@@ -171,7 +171,7 @@ impl TextPipeline {
                             entity,
                             index,
                             text_item: item,
-                            font_size: 0.,
+                            logical_font_size: 0.,
                         });
                     }
                 }
@@ -237,7 +237,10 @@ impl TextPipeline {
                             )),
                             range.clone(),
                         );
-                        builder.push(StyleProperty::FontSize(section.font_size), range.clone());
+                        builder.push(
+                            StyleProperty::FontSize(section.logical_font_size),
+                            range.clone(),
+                        );
                         builder.push(StyleProperty::LineHeight(line_height.eval()), range.clone());
                         builder.push(
                             StyleProperty::LetterSpacing(letter_spacing.eval(base_rem_size)),
