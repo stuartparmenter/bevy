@@ -215,10 +215,6 @@ impl Plugin for ViewPlugin {
                         .after(crate::render_asset::prepare_assets::<GpuImage>)
                         .ambiguous_with(crate::camera::sort_cameras), // doesn't use `sorted_camera_index_for_target`
                     prepare_view_uniforms.in_set(RenderSystems::PrepareResources),
-                    prepare_view_display_targets
-                        .in_set(RenderSystems::PrepareViews)
-                        .after(create_surfaces)
-                        .before(prepare_windows),
                     collect_visible_cpu_culled_entities.in_set(RenderSystems::PrepareAssets),
                 ),
             );
@@ -1374,7 +1370,7 @@ pub fn cleanup_view_targets_for_resize(
             && let Some((_, window)) = windows.iter().find(|(e, _)| *e == window_ref.entity())
             && (window.size_changed
                 || window.present_mode_changed
-                || window.display_target_transfer_changed)
+                || window.color_space_request_changed)
         {
             commands.entity(entity).remove::<ViewTarget>();
         }

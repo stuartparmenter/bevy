@@ -618,14 +618,14 @@ pub fn extract_cameras(
                         .map(|format| normalize_bgra8(target, format))
                 })
                 .unwrap_or(TextureFormat::Rgba8UnormSrgb);
-            // Last frame's negotiated transfer, like the swap chain format read
-            // above.
+            // Last frame's negotiated color space, like the swap chain format
+            // read above.
             let view_display_target = resolve_view_display_target(
                 target.as_ref(),
                 extracted_swap_chains.iter(),
                 &manual_display_targets,
             );
-            let target_format = if hdr || view_display_target.is_hdr_transfer() {
+            let target_format = if hdr || view_display_target.is_hdr() {
                 TextureFormat::Rgba16Float
             } else if compositing_space.is_some_and(|s| *s == CompositingSpace::Srgb) {
                 TextureFormat::Rgba8Unorm
@@ -654,6 +654,7 @@ pub fn extract_cameras(
                     hdr,
                 },
                 ResolvedCompositingSpace(compositing_space.copied()),
+                view_display_target,
                 ExtractedView {
                     retained_view_entity: RetainedViewEntity::new(main_entity.into(), None, 0),
                     clip_from_view: camera.clip_from_view(),

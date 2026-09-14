@@ -1,8 +1,9 @@
 //! Resolves the [`DisplayTarget`] each view encodes for.
 //!
 //! Windows have it as a required component. Other render targets register
-//! one in [`ManualDisplayTargets`]. [`prepare_view_display_targets`] writes
-//! the result to [`ViewDisplayTarget`] every frame.
+//! one in [`ManualDisplayTargets`].
+//! [`extract_cameras`](crate::camera::extract_cameras) writes the result to
+//! [`ViewDisplayTarget`] every frame.
 
 use bevy_camera::NormalizedRenderTarget;
 use bevy_derive::{Deref, DerefMut};
@@ -10,154 +11,115 @@ use bevy_ecs::prelude::*;
 use bevy_extract_macros::ExtractResource;
 use bevy_platform::collections::HashMap;
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
-use bevy_window::{DisplayTarget, DisplayTransfer};
+use bevy_window::{DisplayTarget, ResolvedDisplayTarget, SurfaceColorSpace};
 
-use super::{window::ExtractedWindow, ExtractedView};
-use crate::{camera::ExtractedCamera, sync_world::MainEntity, RenderApp};
+use super::window::ExtractedWindow;
+use crate::RenderApp;
 
 /// Resource that stores the [`DisplayTarget`] of each render target that is
 /// not a [`Window`](bevy_window::Window), keyed by [`NormalizedRenderTarget`].
 ///
-/// Insert into it from the main world. Views use the value as is, with no
-/// negotiation.
+/// Insert into it from the main world. These targets have no surface to
+/// negotiate with, so [`DisplayTarget::color_space_override`] is used as is
+/// and [`DisplayTarget::hdr`] alone cannot be honored: a target with `hdr`
+/// and no override resolves to [`SurfaceColorSpace::Srgb`].
 #[derive(Default, Clone, Debug, PartialEq, Resource, ExtractResource, Reflect, Deref, DerefMut)]
 #[reflect(Resource, Default, Debug, PartialEq, Clone)]
 #[extract_app(RenderApp)]
 pub struct ManualDisplayTargets(HashMap<NormalizedRenderTarget, DisplayTarget>);
 
-/// The [`DisplayTarget`] a view encodes for, after surface negotiation.
+/// The [`ResolvedDisplayTarget`] a view encodes for, after surface
+/// negotiation.
 ///
-/// Required by [`ExtractedCamera`]. [`prepare_view_display_targets`] updates
-/// it every frame. A target that cannot be resolved gets
-/// [`DisplayTarget::SDR_SRGB`], which is also the default.
+/// Required by [`ExtractedCamera`](crate::camera::ExtractedCamera).
+/// [`extract_cameras`](crate::camera::extract_cameras) inserts it every frame
+/// next to [`ExtractedView::target_format`](super::ExtractedView::target_format),
+/// and both describe the color space the window surface negotiated in the
+/// previous frame. A target that cannot be resolved gets the default: SDR
+/// sRGB at 100 nits.
 #[derive(Component, Debug, Clone, Copy, PartialEq, Deref, Default)]
-pub struct ViewDisplayTarget(pub DisplayTarget);
+pub struct ViewDisplayTarget(pub ResolvedDisplayTarget);
 
 impl ViewDisplayTarget {
-    /// Returns `true` if the transfer has high dynamic range. See
-    /// [`DisplayTransfer::is_hdr`].
-    pub fn is_hdr_transfer(&self) -> bool {
-        self.0.transfer.is_hdr()
+    /// Returns `true` if the color space has high dynamic range. See
+    /// [`SurfaceColorSpace::is_hdr`].
+    pub fn is_hdr(&self) -> bool {
+        self.0.color_space.is_hdr()
     }
 }
 
-/// Applies the transfer the surface uses to the requested [`DisplayTarget`].
-///
-/// A downgrade to sRGB replaces the whole target with
-/// [`DisplayTarget::SDR_SRGB`], so the view behaves like an SDR view. Any
-/// other differing transfer replaces only the transfer field. `None` means
-/// the surface is not configured yet.
-fn resolve_window_display_target(
-    requested: DisplayTarget,
-    surface_transfer: Option<DisplayTransfer>,
-) -> DisplayTarget {
-    match surface_transfer {
-        Some(DisplayTransfer::Srgb) if requested.transfer != DisplayTransfer::Srgb => {
-            DisplayTarget::SDR_SRGB
-        }
-        Some(transfer) if transfer != requested.transfer => DisplayTarget {
-            transfer,
-            ..requested
-        },
-        _ => requested,
-    }
+/// Resolves a [`DisplayTarget`] that has no surface to negotiate with.
+fn resolve_manual_display_target(display_target: &DisplayTarget) -> ResolvedDisplayTarget {
+    display_target.resolve(
+        display_target
+            .color_space_override
+            .unwrap_or(SurfaceColorSpace::Srgb),
+    )
 }
 
 /// Resolves the [`ViewDisplayTarget`] for a render target.
 ///
-/// A window uses [`ExtractedWindow::display_target`] with the negotiated
-/// transfer applied. An image or texture view looks up
+/// A window resolves [`ExtractedWindow::display_target`] with the color
+/// space the surface negotiated in the previous frame, or with
+/// [`SurfaceColorSpace::Srgb`] before the surface is configured. An image or
+/// texture view looks up
 /// [`ManualDisplayTargets`] by the whole [`NormalizedRenderTarget`], so an
 /// image entry must also match the scale factor. Anything else, including a
-/// missing entry, is [`DisplayTarget::SDR_SRGB`].
+/// missing entry, is [`DisplayTarget::default`] resolved as SDR sRGB.
 pub fn resolve_view_display_target<'a>(
     target: Option<&NormalizedRenderTarget>,
     windows: impl IntoIterator<Item = (Entity, &'a ExtractedWindow)>,
     manual_display_targets: &ManualDisplayTargets,
 ) -> ViewDisplayTarget {
-    let display_target = match target {
+    let resolved = match target {
         Some(NormalizedRenderTarget::Window(window_ref)) => windows
             .into_iter()
             .find(|(entity, _)| *entity == window_ref.entity())
             .map(|(_, window)| {
-                resolve_window_display_target(window.display_target, window.resolved_transfer)
-            })
-            .unwrap_or_default(),
+                window.display_target.resolve(
+                    window
+                        .resolved_color_space
+                        .unwrap_or(SurfaceColorSpace::Srgb),
+                )
+            }),
         Some(
             target @ (NormalizedRenderTarget::Image(_) | NormalizedRenderTarget::TextureView(_)),
         ) => manual_display_targets
             .get(target)
-            .copied()
-            .unwrap_or_default(),
-        Some(NormalizedRenderTarget::None { .. }) | None => DisplayTarget::SDR_SRGB,
+            .map(resolve_manual_display_target),
+        Some(NormalizedRenderTarget::None { .. }) | None => None,
     };
-    ViewDisplayTarget(display_target)
-}
-
-/// Resolves the [`ViewDisplayTarget`] of every view with an
-/// [`ExtractedCamera`].
-///
-/// Runs after [`create_surfaces`](super::window::create_surfaces), so it sees
-/// this frame's negotiated transfer.
-pub fn prepare_view_display_targets(
-    windows: Query<(MainEntity, &ExtractedWindow)>,
-    manual_display_targets: Res<ManualDisplayTargets>,
-    mut views: Query<(&ExtractedCamera, &mut ViewDisplayTarget), With<ExtractedView>>,
-) {
-    for (camera, mut target) in &mut views {
-        target.set_if_neq(resolve_view_display_target(
-            camera.target.as_ref(),
-            windows.iter(),
-            &manual_display_targets,
-        ));
-    }
+    ViewDisplayTarget(resolved.unwrap_or_default())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bevy_app::Main;
     use bevy_asset::Handle;
-    use bevy_camera::{
-        CameraOutputMode, ClearColorConfig, ImageRenderTarget, ManualTextureViewHandle,
-        MsaaWriteback,
-    };
-    use bevy_ecs::{schedule::ScheduleLabel, system::RunSystemOnce, world::World};
+    use bevy_camera::{ImageRenderTarget, ManualTextureViewHandle};
     use bevy_image::Image;
-    use bevy_math::{Mat4, UVec4};
-    use bevy_transform::components::GlobalTransform;
-    use bevy_window::DisplayGamut;
-    use wgpu::TextureFormat;
+    use bevy_window::{CompositeAlphaMode, PresentMode, WindowRef};
 
-    use crate::view::{ColorGrading, RetainedViewEntity};
-
-    fn extracted_camera(target: NormalizedRenderTarget) -> ExtractedCamera {
-        ExtractedCamera {
-            target: Some(target),
-            physical_viewport_size: None,
-            physical_target_size: None,
-            viewport: None,
-            schedule: Main.intern(),
-            order: 0,
-            output_mode: CameraOutputMode::default(),
-            msaa_writeback: MsaaWriteback::default(),
-            clear_color: ClearColorConfig::Default,
-            sorted_camera_index_for_target: 0,
-            exposure: 1.0,
-            hdr: false,
-        }
-    }
-
-    fn extracted_view() -> ExtractedView {
-        ExtractedView {
-            retained_view_entity: RetainedViewEntity::new(Entity::PLACEHOLDER.into(), None, 0),
-            clip_from_view: Mat4::IDENTITY,
-            world_from_view: GlobalTransform::default(),
-            clip_from_world: None,
-            target_format: TextureFormat::Rgba8UnormSrgb,
-            viewport: UVec4::ZERO,
-            color_grading: ColorGrading::default(),
-            invert_culling: false,
+    fn extracted_window(
+        display_target: DisplayTarget,
+        resolved_color_space: Option<SurfaceColorSpace>,
+    ) -> ExtractedWindow {
+        ExtractedWindow {
+            physical_width: 1,
+            physical_height: 1,
+            present_mode: PresentMode::AutoVsync,
+            desired_maximum_frame_latency: None,
+            swap_chain_texture_view: None,
+            swap_chain_texture: None,
+            swap_chain_texture_format: None,
+            swap_chain_texture_view_format: None,
+            size_changed: false,
+            present_mode_changed: false,
+            alpha_mode: CompositeAlphaMode::Auto,
+            display_target,
+            color_space_request_changed: false,
+            resolved_color_space,
+            needs_initial_present: false,
         }
     }
 
@@ -168,79 +130,77 @@ mod tests {
         })
     }
 
-    #[test]
-    fn view_display_target_resolved_per_view() {
-        let mut world = World::new();
-
-        let sdr_target = NormalizedRenderTarget::TextureView(ManualTextureViewHandle(0));
-        let hdr_target = NormalizedRenderTarget::TextureView(ManualTextureViewHandle(1));
-        let pq = DisplayTarget {
-            transfer: DisplayTransfer::Pq,
-            ..DisplayTarget::SDR_SRGB
-        };
-        let mut manual_targets = ManualDisplayTargets::default();
-        manual_targets.insert(hdr_target.clone(), pq);
-        world.insert_resource(manual_targets);
-
-        let sdr = world
-            .spawn((extracted_camera(sdr_target), extracted_view()))
-            .id();
-        let hdr = world
-            .spawn((extracted_camera(hdr_target), extracted_view()))
-            .id();
-
-        world.run_system_once(prepare_view_display_targets).unwrap();
-
-        let sdr_resolved = world.entity(sdr).get::<ViewDisplayTarget>().copied();
-        assert_eq!(
-            sdr_resolved,
-            Some(ViewDisplayTarget(DisplayTarget::SDR_SRGB))
-        );
-        assert!(!sdr_resolved.unwrap().is_hdr_transfer());
-
-        let hdr_resolved = world.entity(hdr).get::<ViewDisplayTarget>().copied();
-        assert_eq!(hdr_resolved, Some(ViewDisplayTarget(pq)));
-        assert!(hdr_resolved.unwrap().is_hdr_transfer());
+    fn pq_override() -> DisplayTarget {
+        DisplayTarget {
+            color_space_override: Some(SurfaceColorSpace::Pq),
+            ..Default::default()
+        }
     }
 
     #[test]
-    fn registered_manual_targets_resolve_to_the_authored_value() {
-        let pq = DisplayTarget::SDR_SRGB
-            .with_transfer(DisplayTransfer::Pq)
-            .with_gamut(DisplayGamut::Rec2020)
-            .with_peak_luminance(1000.0)
-            .with_paper_white(203.0)
-            .with_min_luminance(0.005);
-        let scrgb = DisplayTarget::SDR_SRGB.with_transfer(DisplayTransfer::ScRgbLinear);
+    fn view_display_target_resolved_per_target() {
+        let sdr_target = NormalizedRenderTarget::TextureView(ManualTextureViewHandle(0));
+        let hdr_target = NormalizedRenderTarget::TextureView(ManualTextureViewHandle(1));
+        let mut manual = ManualDisplayTargets::default();
+        manual.insert(hdr_target.clone(), pq_override());
+
+        let sdr = resolve_view_display_target(Some(&sdr_target), core::iter::empty(), &manual);
+        assert_eq!(sdr, ViewDisplayTarget::default());
+        assert!(!sdr.is_hdr());
+
+        let hdr = resolve_view_display_target(Some(&hdr_target), core::iter::empty(), &manual);
+        assert_eq!(
+            hdr,
+            ViewDisplayTarget(pq_override().resolve(SurfaceColorSpace::Pq))
+        );
+        assert!(hdr.is_hdr());
+    }
+
+    #[test]
+    fn manual_targets_resolve_with_the_override_and_ignore_hdr() {
+        let calibrated_pq = DisplayTarget {
+            color_space_override: Some(SurfaceColorSpace::Pq),
+            paper_white_nits: Some(203.0),
+            peak_luminance_nits: Some(1000.0),
+            min_luminance_nits: Some(0.005),
+            ..Default::default()
+        };
+        let hdr_only = DisplayTarget {
+            hdr: true,
+            ..Default::default()
+        };
 
         let image = image_target(1.0);
         let texture_view = NormalizedRenderTarget::TextureView(ManualTextureViewHandle(7));
         let mut manual = ManualDisplayTargets::default();
-        manual.insert(image.clone(), pq);
-        manual.insert(texture_view.clone(), scrgb);
+        manual.insert(image.clone(), calibrated_pq);
+        manual.insert(texture_view.clone(), hdr_only);
 
         assert_eq!(
             resolve_view_display_target(Some(&image), core::iter::empty(), &manual).0,
-            pq
+            ResolvedDisplayTarget {
+                color_space: SurfaceColorSpace::Pq,
+                paper_white_nits: 203.0,
+                peak_luminance_nits: 1000.0,
+                min_luminance_nits: 0.005,
+            }
         );
+        // There is no surface to negotiate an HDR color space with.
         assert_eq!(
             resolve_view_display_target(Some(&texture_view), core::iter::empty(), &manual).0,
-            scrgb
+            ResolvedDisplayTarget::default()
         );
     }
 
     #[test]
-    fn misses_fall_back_to_sdr_srgb() {
+    fn misses_fall_back_to_the_default() {
         let mut manual = ManualDisplayTargets::default();
-        manual.insert(
-            image_target(1.0),
-            DisplayTarget::SDR_SRGB.with_transfer(DisplayTransfer::Pq),
-        );
+        manual.insert(image_target(1.0), pq_override());
 
         // Same image handle, different scale factor: the whole key must match.
         assert_eq!(
-            resolve_view_display_target(Some(&image_target(2.0)), core::iter::empty(), &manual).0,
-            DisplayTarget::SDR_SRGB
+            resolve_view_display_target(Some(&image_target(2.0)), core::iter::empty(), &manual),
+            ViewDisplayTarget::default()
         );
         assert_eq!(
             resolve_view_display_target(
@@ -249,9 +209,8 @@ mod tests {
                 )),
                 core::iter::empty(),
                 &manual
-            )
-            .0,
-            DisplayTarget::SDR_SRGB
+            ),
+            ViewDisplayTarget::default()
         );
         assert_eq!(
             resolve_view_display_target(
@@ -261,57 +220,70 @@ mod tests {
                 }),
                 core::iter::empty(),
                 &manual
-            )
-            .0,
-            DisplayTarget::SDR_SRGB
+            ),
+            ViewDisplayTarget::default()
         );
         assert_eq!(
-            resolve_view_display_target(None, core::iter::empty(), &manual).0,
-            DisplayTarget::SDR_SRGB
+            resolve_view_display_target(None, core::iter::empty(), &manual),
+            ViewDisplayTarget::default()
+        );
+        // A window the render world has not extracted.
+        assert_eq!(
+            resolve_view_display_target(
+                Some(&NormalizedRenderTarget::Window(
+                    WindowRef::Primary
+                        .normalize(Some(Entity::PLACEHOLDER))
+                        .unwrap()
+                )),
+                core::iter::empty(),
+                &manual
+            ),
+            ViewDisplayTarget::default()
         );
     }
 
     #[test]
-    fn window_target_resolution() {
+    fn window_targets_resolve_with_the_negotiated_color_space() {
+        let window_entity = Entity::from_raw_u32(3).unwrap();
+        let target = NormalizedRenderTarget::Window(
+            WindowRef::Entity(window_entity).normalize(None).unwrap(),
+        );
+        let manual = ManualDisplayTargets::default();
         let requested = DisplayTarget {
-            paper_white_nits: 200.0,
-            peak_luminance_nits: 1000.0,
-            gamut: DisplayGamut::Rec2020,
-            transfer: DisplayTransfer::Pq,
-            ..DisplayTarget::SDR_SRGB
+            hdr: true,
+            paper_white_nits: Some(300.0),
+            ..Default::default()
         };
 
-        // A matching transfer or an unconfigured surface passes the request
-        // through unchanged.
+        // The negotiated color space fills the uncalibrated fields.
+        let window = extracted_window(requested, Some(SurfaceColorSpace::Pq));
         assert_eq!(
-            resolve_window_display_target(requested, Some(DisplayTransfer::Pq)),
-            requested
-        );
-        assert_eq!(resolve_window_display_target(requested, None), requested);
-
-        assert_eq!(
-            resolve_window_display_target(requested, Some(DisplayTransfer::Srgb)),
-            DisplayTarget::SDR_SRGB
-        );
-
-        // A different HDR transfer replaces only the transfer field.
-        assert_eq!(
-            resolve_window_display_target(requested, Some(DisplayTransfer::ScRgbLinear)),
-            DisplayTarget {
-                transfer: DisplayTransfer::ScRgbLinear,
-                ..requested
+            resolve_view_display_target(Some(&target), [(window_entity, &window)], &manual).0,
+            ResolvedDisplayTarget {
+                color_space: SurfaceColorSpace::Pq,
+                paper_white_nits: 300.0,
+                peak_luminance_nits: 1000.0,
+                min_luminance_nits: 0.0,
             }
         );
 
-        // An sRGB request against a surface still using an HDR transfer
-        // keeps the surface's transfer.
-        let sdr = DisplayTarget::SDR_SRGB;
+        // Before the surface is configured, the view is SDR.
+        let window = extracted_window(requested, None);
         assert_eq!(
-            resolve_window_display_target(sdr, Some(DisplayTransfer::Pq)),
-            DisplayTarget {
-                transfer: DisplayTransfer::Pq,
-                ..sdr
+            resolve_view_display_target(Some(&target), [(window_entity, &window)], &manual).0,
+            ResolvedDisplayTarget {
+                color_space: SurfaceColorSpace::Srgb,
+                paper_white_nits: 300.0,
+                peak_luminance_nits: 300.0,
+                min_luminance_nits: 0.0,
             }
+        );
+
+        // A surface that fell back to SDR resolves the request as SDR.
+        let window = extracted_window(requested, Some(SurfaceColorSpace::Srgb));
+        assert!(
+            !resolve_view_display_target(Some(&target), [(window_entity, &window)], &manual)
+                .is_hdr()
         );
     }
 }

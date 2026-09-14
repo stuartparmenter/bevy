@@ -9,16 +9,15 @@ use crate::{
 use bevy_app::{App, Plugin};
 use bevy_ecs::prelude::*;
 use bevy_ecs::system::RunSystemOnce;
-use bevy_log::{debug, info, warn, warn_once};
+use bevy_log::{debug, info, info_once, warn, warn_once};
 use bevy_utils::default;
 use bevy_window::{
-    CompositeAlphaMode, DisplayGamut, DisplayTarget, DisplayTransfer, DisplayTransfers,
-    PresentMode, PrimaryWindow, RawHandleWrapper, Window, WindowClosing, WindowSurfaceTransfers,
+    CompositeAlphaMode, DisplayTarget, PresentMode, PrimaryWindow, RawHandleWrapper,
+    SurfaceColorSpace, SurfaceColorSpaces, Window, WindowClosing, WindowSurfaceColorSpaces,
 };
 use core::num::NonZero;
 use wgpu::{
-    SurfaceColorSpace, SurfaceColorSpaces, SurfaceConfiguration, SurfaceTargetUnsafe,
-    TextureFormat, TextureUsages, TextureViewDescriptor,
+    SurfaceConfiguration, SurfaceTargetUnsafe, TextureFormat, TextureUsages, TextureViewDescriptor,
 };
 
 pub mod screenshot;
@@ -57,7 +56,7 @@ impl Plugin for WindowRenderPlugin {
                     ExtractSchedule,
                     (
                         extract_windows.before(extract_cameras),
-                        write_back_surface_transfers.after(extract_windows),
+                        write_back_surface_color_spaces.after(extract_windows),
                     ),
                 )
                 .add_systems(
@@ -85,21 +84,21 @@ pub struct ExtractedWindow {
     pub swap_chain_texture_format: Option<TextureFormat>,
     /// This is an srgb view of [`ExtractedWindow::swap_chain_texture_format`]
     /// so that in shaders we are always in linear space.
-    /// Under a negotiated HDR transfer it equals the surface format, with no
-    /// sRGB view.
+    /// Under an HDR color space it equals the surface format, with no sRGB
+    /// view.
     pub swap_chain_texture_view_format: Option<TextureFormat>,
     pub size_changed: bool,
     pub present_mode_changed: bool,
     pub alpha_mode: CompositeAlphaMode,
     /// The window's requested [`DisplayTarget`].
     pub display_target: DisplayTarget,
-    /// Whether the surface must be reconfigured for a [`DisplayTarget`] change.
-    /// The surface color space depends on [`DisplayTarget::transfer`], and under
-    /// [`DisplayTransfer::ExtendedSrgb`] also on [`DisplayTarget::gamut`].
-    pub display_target_transfer_changed: bool,
-    /// The [`DisplayTransfer`] the configured surface uses. `None` until
+    /// Whether [`DisplayTarget::hdr`] or [`DisplayTarget::color_space_override`]
+    /// changed, so the surface must be renegotiated. A luminance change does
+    /// not reconfigure the surface.
+    pub color_space_request_changed: bool,
+    /// The [`SurfaceColorSpace`] the configured surface uses. `None` until
     /// [`create_surfaces`] has configured the surface.
-    pub resolved_transfer: Option<DisplayTransfer>,
+    pub resolved_color_space: Option<SurfaceColorSpace>,
     /// Whether this window needs an initial buffer commit.
     ///
     /// On Wayland, windows must present at least once before they are shown.
@@ -187,8 +186,8 @@ fn extract_windows(
                     present_mode_changed: false,
                     alpha_mode: window.composite_alpha_mode,
                     display_target,
-                    display_target_transfer_changed: false,
-                    resolved_transfer: None,
+                    color_space_request_changed: false,
+                    resolved_color_space: None,
                     needs_initial_present: true,
                 },
                 handle.clone(),
@@ -196,13 +195,8 @@ fn extract_windows(
             continue;
         };
 
-        let previous = extracted_window.display_target;
-        let transfer_changed = previous.transfer != display_target.transfer;
-        let extended_srgb_gamut_changed = (previous.transfer == DisplayTransfer::ExtendedSrgb
-            || display_target.transfer == DisplayTransfer::ExtendedSrgb)
-            && previous.gamut != display_target.gamut;
-        extracted_window.display_target_transfer_changed =
-            transfer_changed || extended_srgb_gamut_changed;
+        extracted_window.color_space_request_changed =
+            color_space_request_changed(&extracted_window.display_target, &display_target);
         extracted_window.display_target = display_target;
 
         if extracted_window.swap_chain_texture.is_none() {
@@ -273,6 +267,14 @@ fn extract_windows(
     }
 }
 
+/// Returns `true` if the change from `previous` to `current` needs a surface
+/// renegotiation: [`DisplayTarget::hdr`] or
+/// [`DisplayTarget::color_space_override`] differ. A luminance change does
+/// not.
+fn color_space_request_changed(previous: &DisplayTarget, current: &DisplayTarget) -> bool {
+    previous.hdr != current.hdr || previous.color_space_override != current.color_space_override
+}
+
 /// Inserts `value` only if it differs from the current component, so change
 /// detection fires only on real changes. Does nothing if `entity` is gone.
 fn insert_on_change<C: Component + PartialEq>(
@@ -288,11 +290,11 @@ fn insert_on_change<C: Component + PartialEq>(
     }
 }
 
-/// Writes each window's [`WindowSurfaceTransfers`] back to the main world.
+/// Writes each window's [`WindowSurfaceColorSpaces`] back to the main world.
 ///
 /// It runs during extraction, so the main world sees the previous frame's
 /// result.
-fn write_back_surface_transfers(
+fn write_back_surface_color_spaces(
     mut main_world: ResMut<MainWorld>,
     windows: Query<(MainEntity, &SurfaceData)>,
 ) {
@@ -300,9 +302,9 @@ fn write_back_surface_transfers(
         insert_on_change(
             &mut main_world,
             entity,
-            WindowSurfaceTransfers {
-                resolved: surface_data.resolved_transfer,
-                supported: surface_data.supported_transfers,
+            WindowSurfaceColorSpaces {
+                resolved: surface_data.resolved_color_space,
+                supported: surface_data.supported_color_spaces,
             },
         );
     }
@@ -316,9 +318,11 @@ pub struct SurfaceData {
     surface: WgpuSurface,
     configuration: SurfaceConfiguration,
     texture_view_format: Option<TextureFormat>,
-    /// The [`DisplayTransfer`] the surface is configured for.
-    resolved_transfer: DisplayTransfer,
-    supported_transfers: DisplayTransfers,
+    /// The [`SurfaceColorSpace`] the surface is configured for.
+    resolved_color_space: SurfaceColorSpace,
+    /// The color spaces the surface can provide, refreshed by
+    /// [`SurfaceData::renegotiate`] whenever the surface is reconfigured.
+    supported_color_spaces: SurfaceColorSpaces,
 }
 
 impl SurfaceData {
@@ -327,39 +331,68 @@ impl SurfaceData {
         self.configuration.color_space = negotiated.color_space;
         self.texture_view_format = negotiated.texture_view_format();
         self.configuration.view_formats = Vec::from_iter(self.texture_view_format);
-        self.resolved_transfer = negotiated.resolved_transfer;
+        self.resolved_color_space = negotiated.resolved;
     }
 
-    /// Renegotiates the surface if `caps` no longer lists its color space.
+    /// Refreshes the supported color spaces from `caps` and renegotiates the
+    /// surface when needed. Returns `true` if the negotiation ran.
     ///
-    /// The capabilities can stop listing an explicit color space at runtime,
-    /// for example when the OS HDR setting changes. Configuring with it again
-    /// fails wgpu validation with `ConfigureSurfaceError::UnsupportedColorSpace`.
-    fn renegotiate_if_color_space_lost(
+    /// It runs when `request_changed`, when the set of supported color spaces
+    /// differs from the last configuration, or when `caps` stops listing the
+    /// configured color space for the configured format. The capabilities
+    /// change at runtime when the OS HDR setting changes. Configuring a lost
+    /// color space again fails wgpu validation with
+    /// `ConfigureSurfaceError::UnsupportedColorSpace`. The negotiation resolves
+    /// `display_target` again, so with [`DisplayTarget::hdr`] the surface moves
+    /// to the best supported color space in both directions: down to the next
+    /// best when one is lost, and up when a better one appears.
+    fn renegotiate(
         &mut self,
         caps: &wgpu::SurfaceCapabilities,
-        requested_transfer: DisplayTransfer,
-        requested_gamut: DisplayGamut,
+        display_target: &DisplayTarget,
+        request_changed: bool,
     ) -> bool {
-        let Some(flag) = self.configuration.color_space.to_color_spaces() else {
-            return false;
-        };
-        if caps.color_spaces(self.configuration.format).contains(flag) {
+        let supported = supported_color_spaces(caps);
+        let supported_changed = supported != self.supported_color_spaces;
+        self.supported_color_spaces = supported;
+        let lost = color_space_lost(
+            caps,
+            self.configuration.format,
+            self.configuration.color_space,
+        );
+        if !(request_changed || supported_changed || lost) {
             return false;
         }
-        warn_once!(
-            "Surface color space {:?} is no longer supported for {:?}. The OS HDR \
-            setting may have changed. Renegotiating the surface.",
-            self.configuration.color_space,
-            self.configuration.format
-        );
-        self.apply_negotiated(negotiate_surface_format(
-            caps,
-            requested_transfer,
-            requested_gamut,
-        ));
+        if lost {
+            warn_once!(
+                "Surface color space {:?} is not supported for {:?} any more. The OS HDR \
+                setting may have changed. Renegotiating the surface.",
+                self.configuration.color_space,
+                self.configuration.format
+            );
+        } else if supported_changed {
+            info!(
+                "Surface color spaces changed to {supported:?}. The OS HDR setting may have \
+                changed. Renegotiating the surface."
+            );
+        }
+        self.apply_negotiated(negotiate_surface_format(caps, display_target));
         true
     }
+}
+
+/// Returns `true` if `caps` does not list `color_space` for `format`.
+///
+/// [`wgpu::SurfaceColorSpace::Auto`] has no capabilities flag and is never
+/// lost.
+fn color_space_lost(
+    caps: &wgpu::SurfaceCapabilities,
+    format: TextureFormat,
+    color_space: wgpu::SurfaceColorSpace,
+) -> bool {
+    color_space
+        .to_color_spaces()
+        .is_some_and(|flag| !caps.color_spaces(format).contains(flag))
 }
 
 /// (re)configures window surfaces, and obtains a swapchain texture for rendering.
@@ -414,7 +447,7 @@ pub fn prepare_windows(
         if window.has_swapchain_texture()
             && !window.size_changed
             && !window.present_mode_changed
-            && !window.display_target_transfer_changed
+            && !window.color_space_request_changed
         {
             continue;
         }
@@ -460,20 +493,9 @@ pub fn prepare_windows(
             wgpu::CurrentSurfaceTexture::Outdated => {
                 // wgpu reports `Outdated` when the underlying surface changed, which
                 // includes its color spaces.
-                if surface_data
-                    .configuration
-                    .color_space
-                    .to_color_spaces()
-                    .is_some()
-                {
-                    let caps = surface_data.surface.get_capabilities(&render_adapter);
-                    if surface_data.renegotiate_if_color_space_lost(
-                        &caps,
-                        window.display_target.transfer,
-                        window.display_target.gamut,
-                    ) {
-                        window.resolved_transfer = Some(surface_data.resolved_transfer);
-                    }
+                let caps = surface_data.surface.get_capabilities(&render_adapter);
+                if surface_data.renegotiate(&caps, &window.display_target, false) {
+                    window.resolved_color_space = Some(surface_data.resolved_color_space);
                 }
                 let surface = &surface_data.surface;
                 render_device.configure_surface(surface, &surface_data.configuration);
@@ -505,7 +527,7 @@ pub fn need_surface_configuration(windows: Query<(&ExtractedWindow, Has<SurfaceD
         if !has_surface_data
             || window.size_changed
             || window.present_mode_changed
-            || window.display_target_transfer_changed
+            || window.color_space_request_changed
         {
             return true;
         }
@@ -517,24 +539,58 @@ pub fn need_surface_configuration(windows: Query<(&ExtractedWindow, Has<SurfaceD
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct NegotiatedSurface {
     format: TextureFormat,
-    /// [`SurfaceColorSpace::Auto`], or a color space the surface supports for
-    /// `format`. Anything else fails wgpu validation.
-    color_space: SurfaceColorSpace,
-    resolved_transfer: DisplayTransfer,
+    /// [`wgpu::SurfaceColorSpace::Auto`], or a color space the surface
+    /// supports for `format`. Anything else fails wgpu validation.
+    color_space: wgpu::SurfaceColorSpace,
+    /// The color space the surface presents in.
+    resolved: SurfaceColorSpace,
 }
 
 impl NegotiatedSurface {
     /// The sRGB view format to render through, or `None` to use the texture as
     /// is.
     ///
-    /// Only the sRGB transfer gets an sRGB view. An HDR negotiation can choose
-    /// an 8-bit format. Values written to it must already be encoded for its
+    /// Only SDR sRGB gets an sRGB view. An HDR negotiation can choose an
+    /// 8-bit format. Values written to it must already be encoded for its
     /// color space, and an sRGB view would encode them again.
     fn texture_view_format(&self) -> Option<TextureFormat> {
         let view_format = self.format.add_srgb_suffix();
-        (self.resolved_transfer == DisplayTransfer::Srgb && view_format != self.format)
+        (self.resolved == SurfaceColorSpace::Srgb && view_format != self.format)
             .then_some(view_format)
     }
+}
+
+/// The HDR color spaces Bevy tries for [`DisplayTarget::hdr`], best first.
+///
+/// PQ is the HDR10 signal every HDR display decodes. Linear scRGB is the
+/// desktop compositor path. Extended sRGB and extended Display P3 are the
+/// web path.
+const HDR_PREFERENCE: [SurfaceColorSpace; 4] = [
+    SurfaceColorSpace::Pq,
+    SurfaceColorSpace::ScRgbLinear,
+    SurfaceColorSpace::ExtendedSrgb,
+    SurfaceColorSpace::ExtendedDisplayP3,
+];
+
+/// Returns the wgpu color space of an HDR `color_space`, and the
+/// capabilities flag that reports it.
+///
+/// [`SurfaceColorSpace::Srgb`] is not an explicit color space: the SDR path
+/// configures the surface with [`wgpu::SurfaceColorSpace::Auto`].
+fn hdr_color_space(
+    color_space: SurfaceColorSpace,
+) -> Option<(wgpu::SurfaceColorSpace, wgpu::SurfaceColorSpaces)> {
+    let wgpu_color_space = match color_space {
+        SurfaceColorSpace::Srgb => return None,
+        SurfaceColorSpace::ScRgbLinear => wgpu::SurfaceColorSpace::ExtendedSrgbLinear,
+        SurfaceColorSpace::Pq => wgpu::SurfaceColorSpace::Bt2100Pq,
+        SurfaceColorSpace::ExtendedSrgb => wgpu::SurfaceColorSpace::ExtendedSrgb,
+        SurfaceColorSpace::ExtendedDisplayP3 => wgpu::SurfaceColorSpace::ExtendedDisplayP3,
+    };
+    let flag = wgpu_color_space
+        .to_color_spaces()
+        .expect("every explicit surface color space has a capabilities flag");
+    Some((wgpu_color_space, flag))
 }
 
 /// Returns the first of `preferred` that supports `flag`, else the first
@@ -544,7 +600,7 @@ impl NegotiatedSurface {
 /// must not add sRGB encoding on write.
 fn first_format_in(
     caps: &wgpu::SurfaceCapabilities,
-    flag: SurfaceColorSpaces,
+    flag: wgpu::SurfaceColorSpaces,
     preferred: &[TextureFormat],
 ) -> Option<TextureFormat> {
     let preferred = preferred
@@ -559,225 +615,156 @@ fn first_format_in(
     preferred.chain(any).next()
 }
 
-/// Negotiates an `Rgba16Float` surface in
-/// [`SurfaceColorSpace::ExtendedSrgbLinear`], linear scRGB, if the surface
-/// supports the pair.
+/// Negotiates a surface in `color_space`, if `caps` supports it.
 ///
-/// Linear values need float precision, so only `Rgba16Float` is tried.
-fn negotiate_scrgb_linear(caps: &wgpu::SurfaceCapabilities) -> Option<NegotiatedSurface> {
-    caps.color_spaces(TextureFormat::Rgba16Float)
-        .contains(SurfaceColorSpaces::EXTENDED_SRGB_LINEAR)
-        .then_some(NegotiatedSurface {
-            format: TextureFormat::Rgba16Float,
-            color_space: SurfaceColorSpace::ExtendedSrgbLinear,
-            resolved_transfer: DisplayTransfer::ScRgbLinear,
-        })
-}
-
-/// Negotiates a surface in [`SurfaceColorSpace::Bt2100Pq`], the HDR10 color
-/// space, if the surface supports it for any format.
+/// [`SurfaceColorSpace::Srgb`] takes the first sRGB format in `caps.formats`,
+/// else the first format there, with [`wgpu::SurfaceColorSpace::Auto`]. It
+/// is `None` only when `caps.formats` is empty.
 ///
-/// `Rgb10a2Unorm` is preferred, then `Rgba16Float`, then any other format
-/// that supports it. wgpu documents `Rgb10a2Unorm` as the typical format for
-/// this color space.
-fn negotiate_hdr10(caps: &wgpu::SurfaceCapabilities) -> Option<NegotiatedSurface> {
-    first_format_in(
-        caps,
-        SurfaceColorSpaces::BT2100_PQ,
-        &[TextureFormat::Rgb10a2Unorm, TextureFormat::Rgba16Float],
-    )
-    .map(|format| NegotiatedSurface {
-        format,
-        color_space: SurfaceColorSpace::Bt2100Pq,
-        resolved_transfer: DisplayTransfer::Pq,
-    })
-}
-
-/// Negotiates a surface for [`DisplayTransfer::ExtendedSrgb`], if the surface
-/// supports the color space `gamut` needs.
-///
-/// A `DisplayP3` gamut needs [`SurfaceColorSpace::ExtendedDisplayP3`]. Every
-/// other gamut uses [`SurfaceColorSpace::ExtendedSrgb`]. Both resolve to
-/// [`DisplayTransfer::ExtendedSrgb`], and the gamut stays in
-/// [`DisplayTarget::gamut`]. `Rgba16Float` is preferred.
-fn negotiate_extended_srgb(
+/// [`SurfaceColorSpace::Pq`] prefers `Rgb10a2Unorm`, then `Rgba16Float`,
+/// then any format that supports it. wgpu documents `Rgb10a2Unorm` as the
+/// typical format for HDR10. [`SurfaceColorSpace::ScRgbLinear`] needs float
+/// precision, so only `Rgba16Float` is tried. The extended sRGB color spaces
+/// prefer `Rgba16Float`, then any format that supports them.
+fn negotiate_color_space(
     caps: &wgpu::SurfaceCapabilities,
-    gamut: DisplayGamut,
+    color_space: SurfaceColorSpace,
 ) -> Option<NegotiatedSurface> {
-    let (flag, color_space) = match gamut {
-        DisplayGamut::DisplayP3 => (
-            SurfaceColorSpaces::EXTENDED_DISPLAY_P3,
-            SurfaceColorSpace::ExtendedDisplayP3,
-        ),
-        _ => (
-            SurfaceColorSpaces::EXTENDED_SRGB,
-            SurfaceColorSpace::ExtendedSrgb,
-        ),
+    let Some((wgpu_color_space, flag)) = hdr_color_space(color_space) else {
+        // Rgba8UnormSrgb and Bgra8UnormSrgb are the only sRGB formats wgpu
+        // exposes that we can use for surfaces.
+        let format = caps
+            .formats
+            .iter()
+            .copied()
+            .find(|format| {
+                matches!(
+                    format,
+                    TextureFormat::Rgba8UnormSrgb | TextureFormat::Bgra8UnormSrgb
+                )
+            })
+            .or_else(|| caps.formats.first().copied())?;
+        return Some(NegotiatedSurface {
+            format,
+            color_space: wgpu::SurfaceColorSpace::Auto,
+            resolved: SurfaceColorSpace::Srgb,
+        });
     };
-    first_format_in(caps, flag, &[TextureFormat::Rgba16Float]).map(|format| NegotiatedSurface {
+    let preferred: &[TextureFormat] = match color_space {
+        SurfaceColorSpace::Pq => &[TextureFormat::Rgb10a2Unorm, TextureFormat::Rgba16Float],
+        SurfaceColorSpace::ScRgbLinear => {
+            return caps
+                .color_spaces(TextureFormat::Rgba16Float)
+                .contains(flag)
+                .then_some(NegotiatedSurface {
+                    format: TextureFormat::Rgba16Float,
+                    color_space: wgpu_color_space,
+                    resolved: color_space,
+                });
+        }
+        _ => &[TextureFormat::Rgba16Float],
+    };
+    first_format_in(caps, flag, preferred).map(|format| NegotiatedSurface {
         format,
-        color_space,
-        resolved_transfer: DisplayTransfer::ExtendedSrgb,
+        color_space: wgpu_color_space,
+        resolved: color_space,
     })
 }
 
-/// Returns the [`DisplayTransfer`]s a surface with these capabilities can
-/// provide. [`DisplayTransfer::Srgb`] is always included. A listed transfer can
-/// still be downgraded when the surface lacks the requested gamut for it.
-fn supported_transfers(caps: &wgpu::SurfaceCapabilities) -> DisplayTransfers {
-    let mut transfers = DisplayTransfers::EMPTY.with(DisplayTransfer::Srgb);
-    if negotiate_scrgb_linear(caps).is_some() {
-        transfers = transfers.with(DisplayTransfer::ScRgbLinear);
-    }
-    if negotiate_extended_srgb(caps, DisplayGamut::Rec709).is_some()
-        || negotiate_extended_srgb(caps, DisplayGamut::DisplayP3).is_some()
-    {
-        transfers = transfers.with(DisplayTransfer::ExtendedSrgb);
-    }
-    if negotiate_hdr10(caps).is_some() {
-        transfers = transfers.with(DisplayTransfer::Pq);
-    }
-    transfers
+/// Returns the [`SurfaceColorSpace`]s a surface with these capabilities can
+/// provide. [`SurfaceColorSpace::Srgb`] is included when the surface has a
+/// format for [`wgpu::SurfaceColorSpace::Auto`].
+fn supported_color_spaces(caps: &wgpu::SurfaceCapabilities) -> SurfaceColorSpaces {
+    core::iter::once(SurfaceColorSpace::Srgb)
+        .chain(HDR_PREFERENCE)
+        .filter(|&color_space| negotiate_color_space(caps, color_space).is_some())
+        .fold(SurfaceColorSpaces::EMPTY, SurfaceColorSpaces::with)
 }
 
-/// Chooses the format and color space for a window surface from the
-/// requested [`DisplayTransfer`], downgrading when the surface cannot
-/// provide it. Each downgrade logs a warning.
+/// Resolves the [`SurfaceColorSpace`] for a [`DisplayTarget`] against what
+/// the surface supports.
 ///
-/// - [`DisplayTransfer::Pq`] falls back to linear scRGB, then to SDR.
-/// - [`DisplayTransfer::ExtendedSrgb`] with a `DisplayP3` gamut falls back
-///   to SDR, never to [`SurfaceColorSpace::ExtendedSrgb`].
-/// - Every other unmet request falls back to SDR.
-/// - If the surface lists no format for [`SurfaceColorSpace::Auto`], an HDR
-///   request takes the first explicit color space that fits `requested_gamut`.
+/// [`DisplayTarget::color_space_override`] wins: the surface uses it when it
+/// supports it, else SDR sRGB with a warning. Otherwise
+/// [`DisplayTarget::hdr`] takes the first entry of [`HDR_PREFERENCE`] the
+/// surface supports, else SDR sRGB. Without either, SDR sRGB.
+fn resolve_color_space(
+    caps: &wgpu::SurfaceCapabilities,
+    display_target: &DisplayTarget,
+) -> SurfaceColorSpace {
+    if let Some(requested) = display_target.color_space_override {
+        if !requested.is_hdr() || negotiate_color_space(caps, requested).is_some() {
+            return requested;
+        }
+        warn_once!(
+            "DisplayTarget::color_space_override requests {requested:?}, but this surface \
+            does not support it. The OS HDR setting may be off, or the backend may not \
+            support it. Using SDR sRGB."
+        );
+        return SurfaceColorSpace::Srgb;
+    }
+    if display_target.hdr {
+        if let Some(color_space) = HDR_PREFERENCE
+            .into_iter()
+            .find(|&color_space| negotiate_color_space(caps, color_space).is_some())
+        {
+            return color_space;
+        }
+        info_once!(
+            "DisplayTarget::hdr is set, but this surface has no HDR color space. Using SDR \
+            sRGB."
+        );
+    }
+    SurfaceColorSpace::Srgb
+}
+
+/// Chooses the format and color space for a window surface from its
+/// [`DisplayTarget`].
 ///
-/// The SDR path uses [`SurfaceColorSpace::Auto`], which keeps wgpu's own
-/// color space choice.
+/// [`resolve_color_space`] picks the color space. For
+/// [`DisplayTarget::hdr`] that is Bevy's choice, in the order of
+/// [`HDR_PREFERENCE`]: PQ, then linear scRGB, then extended sRGB, then
+/// extended Display P3. The surface is renegotiated when the color spaces it
+/// supports change at runtime, so with `hdr` the output moves to the best
+/// supported color space in both directions. [`negotiate_color_space`] picks
+/// the format.
+///
+/// When an HDR request resolves to SDR sRGB but the surface lists no format
+/// for [`wgpu::SurfaceColorSpace::Auto`], which wgpu documents some drivers
+/// do in OS HDR mode, the first HDR color space the surface supports is used
+/// instead, with a warning. Configuring those surfaces with `Auto` fails
+/// validation.
 ///
 /// # Panics
 ///
-/// Panics if the surface offers no format the request can use.
+/// Panics if the surface offers no format for the request: no format at all,
+/// or no format for `Auto` when the request is not HDR.
 fn negotiate_surface_format(
     caps: &wgpu::SurfaceCapabilities,
-    requested_transfer: DisplayTransfer,
-    requested_gamut: DisplayGamut,
+    display_target: &DisplayTarget,
 ) -> NegotiatedSurface {
-    match requested_transfer {
-        DisplayTransfer::Srgb => {}
-        DisplayTransfer::ScRgbLinear => {
-            if let Some(negotiated) = negotiate_scrgb_linear(caps) {
-                return negotiated;
-            }
-            warn_once!(
-                "DisplayTransfer::ScRgbLinear was requested, but this surface does not \
-                support Rgba16Float in the linear scRGB color space. Downgrading to SDR \
-                sRGB. On the web, request DisplayTransfer::ExtendedSrgb instead."
-            );
-        }
-        DisplayTransfer::ExtendedSrgb => {
-            if let Some(negotiated) = negotiate_extended_srgb(caps, requested_gamut) {
-                return negotiated;
-            }
-            warn_once!(
-                "DisplayTransfer::ExtendedSrgb was requested with the {requested_gamut:?} \
-                gamut, but this surface does not support an extended sRGB color space for \
-                it. Downgrading to SDR sRGB."
-            );
-        }
-        DisplayTransfer::Pq => {
-            if let Some(negotiated) = negotiate_hdr10(caps) {
-                return negotiated;
-            }
-            warn_once!(
-                "DisplayTransfer::Pq was requested, but this surface does not support \
-                the HDR10 color space. The OS HDR setting may be off, or the backend may \
-                not support it. Downgrading to linear scRGB if available, else SDR sRGB."
-            );
-            if let Some(negotiated) = negotiate_scrgb_linear(caps) {
-                return negotiated;
-            }
-            warn_once!(
-                "DisplayTransfer::Pq could not fall back to linear scRGB either. \
-                Downgrading to SDR sRGB."
-            );
-        }
+    let color_space = resolve_color_space(caps, display_target);
+    if let Some(negotiated) = negotiate_color_space(caps, color_space) {
+        return negotiated;
     }
-
-    // SDR path: prefer sRGB formats for surfaces, but fall back to the first
-    // available format if no sRGB formats are available.
-    if let Some(first) = caps.formats.first() {
-        let mut format = *first;
-        for available_format in &caps.formats {
-            // Rgba8UnormSrgb and Bgra8UnormSrgb and the only sRGB formats wgpu exposes that we can use for surfaces.
-            if *available_format == TextureFormat::Rgba8UnormSrgb
-                || *available_format == TextureFormat::Bgra8UnormSrgb
-            {
-                format = *available_format;
-                break;
-            }
-        }
-        return NegotiatedSurface {
-            format,
-            color_space: SurfaceColorSpace::Auto,
-            resolved_transfer: DisplayTransfer::Srgb,
-        };
-    }
-
-    if !requested_transfer.is_hdr() {
+    let requested_hdr = display_target.hdr
+        || display_target
+            .color_space_override
+            .is_some_and(|requested| requested.is_hdr());
+    if !requested_hdr {
         panic!("No supported formats for surface");
     }
-
-    // The request's own negotiation failed, and the surface lists formats only
-    // in explicit color spaces, which wgpu documents some drivers do in OS HDR
-    // mode. Configuring those with `Auto` fails validation, so take the first
-    // pair the surface supports.
-    for (flag, color_space, resolved_transfer) in [
-        (
-            SurfaceColorSpaces::EXTENDED_DISPLAY_P3,
-            SurfaceColorSpace::ExtendedDisplayP3,
-            DisplayTransfer::ExtendedSrgb,
-        ),
-        (
-            SurfaceColorSpaces::EXTENDED_SRGB,
-            SurfaceColorSpace::ExtendedSrgb,
-            DisplayTransfer::ExtendedSrgb,
-        ),
-        (
-            SurfaceColorSpaces::EXTENDED_SRGB_LINEAR,
-            SurfaceColorSpace::ExtendedSrgbLinear,
-            DisplayTransfer::ScRgbLinear,
-        ),
-        (
-            SurfaceColorSpaces::BT2100_PQ,
-            SurfaceColorSpace::Bt2100Pq,
-            DisplayTransfer::Pq,
-        ),
-    ] {
-        if color_space == SurfaceColorSpace::ExtendedDisplayP3
-            && requested_gamut != DisplayGamut::DisplayP3
-        {
-            continue;
-        }
-        if color_space == SurfaceColorSpace::ExtendedSrgb
-            && requested_gamut == DisplayGamut::DisplayP3
-        {
-            continue;
-        }
-        if let Some(format) = first_format_in(caps, flag, &[]) {
-            warn_once!(
-                "This surface has no format that works with the default color space. \
-                Using {format:?} in the {color_space:?} color space, resolved as \
-                {resolved_transfer:?}."
-            );
-            return NegotiatedSurface {
-                format,
-                color_space,
-                resolved_transfer,
-            };
-        }
-    }
-
-    panic!("No supported formats for surface");
+    let negotiated = HDR_PREFERENCE
+        .into_iter()
+        .find_map(|color_space| negotiate_color_space(caps, color_space))
+        .expect("No supported formats for surface");
+    warn_once!(
+        "This surface has no format that works with the default color space. Using {:?} \
+        in the {:?} color space.",
+        negotiated.format,
+        negotiated.resolved
+    );
+    negotiated
 }
 
 // 2 is wgpu's default/what we've been using so far.
@@ -818,12 +805,8 @@ pub fn create_surfaces(
             };
             let caps = surface.get_capabilities(&render_adapter);
             let present_mode = present_mode(&window, &caps);
-            let negotiated = negotiate_surface_format(
-                &caps,
-                window.display_target.transfer,
-                window.display_target.gamut,
-            );
-            let supported_transfers = supported_transfers(&caps);
+            let negotiated = negotiate_surface_format(&caps, &window.display_target);
+            let supported_color_spaces = supported_color_spaces(&caps);
             let texture_view_format = negotiated.texture_view_format();
             let configuration = SurfaceConfiguration {
                 format: negotiated.format,
@@ -849,21 +832,19 @@ pub fn create_surfaces(
             render_device.configure_surface(&surface, &configuration);
 
             // `SurfaceData` is inserted through commands, so systems later this
-            // frame read the transfer from the window.
-            window.resolved_transfer = Some(negotiated.resolved_transfer);
+            // frame read the color space from the window.
+            window.resolved_color_space = Some(negotiated.resolved);
             commands.entity(entity).insert(SurfaceData {
                 surface: WgpuSurface::new(surface),
                 configuration,
                 texture_view_format,
-                resolved_transfer: negotiated.resolved_transfer,
-                supported_transfers,
+                resolved_color_space: negotiated.resolved,
+                supported_color_spaces,
             });
             continue;
         };
 
-        if window.size_changed
-            || window.present_mode_changed
-            || window.display_target_transfer_changed
+        if window.size_changed || window.present_mode_changed || window.color_space_request_changed
         {
             // normally this is dropped on present but we double check here to be safe as failure to
             // drop it will cause validation errors in wgpu
@@ -878,25 +859,15 @@ pub fn create_surfaces(
             data.configuration.height = window.physical_height;
             let caps = data.surface.get_capabilities(&render_adapter);
             data.configuration.present_mode = present_mode(&window, &caps);
-            // Refreshed on every reconfigure, since the OS HDR setting can change.
-            data.supported_transfers = supported_transfers(&caps);
-            if window.display_target_transfer_changed {
-                data.apply_negotiated(negotiate_surface_format(
-                    &caps,
-                    window.display_target.transfer,
-                    window.display_target.gamut,
-                ));
-            } else {
-                data.renegotiate_if_color_space_lost(
-                    &caps,
-                    window.display_target.transfer,
-                    window.display_target.gamut,
-                );
-            }
+            data.renegotiate(
+                &caps,
+                &window.display_target,
+                window.color_space_request_changed,
+            );
             render_device.configure_surface(&data.surface, &data.configuration);
         }
 
-        window.resolved_transfer = Some(data.resolved_transfer);
+        window.resolved_color_space = Some(data.resolved_color_space);
     }
 }
 
@@ -946,9 +917,9 @@ fn present_mode(window: &ExtractedWindow, caps: &wgpu::SurfaceCapabilities) -> w
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wgpu::SurfaceFormatCapabilities;
+    use wgpu::{SurfaceColorSpaces as Flags, SurfaceFormatCapabilities};
 
-    fn fc(format: TextureFormat, color_spaces: SurfaceColorSpaces) -> SurfaceFormatCapabilities {
+    fn fc(format: TextureFormat, color_spaces: Flags) -> SurfaceFormatCapabilities {
         SurfaceFormatCapabilities {
             format,
             color_spaces,
@@ -966,12 +937,29 @@ mod tests {
         }
     }
 
-    /// [`negotiate_surface_format`] with the `Rec709` gamut.
-    fn negotiate(
+    /// [`negotiate_surface_format`] for `DisplayTarget { hdr: true }`.
+    fn negotiate_hdr(caps: &wgpu::SurfaceCapabilities) -> NegotiatedSurface {
+        negotiate_surface_format(
+            caps,
+            &DisplayTarget {
+                hdr: true,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// [`negotiate_surface_format`] with `color_space_override` set.
+    fn negotiate_override(
         caps: &wgpu::SurfaceCapabilities,
-        requested_transfer: DisplayTransfer,
+        color_space: SurfaceColorSpace,
     ) -> NegotiatedSurface {
-        negotiate_surface_format(caps, requested_transfer, DisplayGamut::Rec709)
+        negotiate_surface_format(
+            caps,
+            &DisplayTarget {
+                color_space_override: Some(color_space),
+                ..Default::default()
+            },
+        )
     }
 
     /// A Metal-like HDR-capable surface.
@@ -986,28 +974,22 @@ mod tests {
             vec![
                 fc(
                     TextureFormat::Bgra8UnormSrgb,
-                    SurfaceColorSpaces::SRGB | SurfaceColorSpaces::DISPLAY_P3,
+                    Flags::SRGB | Flags::DISPLAY_P3,
                 ),
-                fc(
-                    TextureFormat::Bgra8Unorm,
-                    SurfaceColorSpaces::SRGB | SurfaceColorSpaces::DISPLAY_P3,
-                ),
+                fc(TextureFormat::Bgra8Unorm, Flags::SRGB | Flags::DISPLAY_P3),
                 fc(
                     TextureFormat::Rgba16Float,
-                    SurfaceColorSpaces::SRGB
-                        | SurfaceColorSpaces::DISPLAY_P3
-                        | SurfaceColorSpaces::EXTENDED_SRGB_LINEAR
-                        | SurfaceColorSpaces::EXTENDED_SRGB
-                        | SurfaceColorSpaces::EXTENDED_DISPLAY_P3
-                        | SurfaceColorSpaces::BT2100_PQ
-                        | SurfaceColorSpaces::BT2100_HLG,
+                    Flags::SRGB
+                        | Flags::DISPLAY_P3
+                        | Flags::EXTENDED_SRGB_LINEAR
+                        | Flags::EXTENDED_SRGB
+                        | Flags::EXTENDED_DISPLAY_P3
+                        | Flags::BT2100_PQ
+                        | Flags::BT2100_HLG,
                 ),
                 fc(
                     TextureFormat::Rgb10a2Unorm,
-                    SurfaceColorSpaces::SRGB
-                        | SurfaceColorSpaces::DISPLAY_P3
-                        | SurfaceColorSpaces::BT2100_PQ
-                        | SurfaceColorSpaces::BT2100_HLG,
+                    Flags::SRGB | Flags::DISPLAY_P3 | Flags::BT2100_PQ | Flags::BT2100_HLG,
                 ),
             ],
         )
@@ -1022,14 +1004,14 @@ mod tests {
             vec![
                 fc(
                     TextureFormat::Bgra8UnormSrgb,
-                    SurfaceColorSpaces::SRGB | SurfaceColorSpaces::DISPLAY_P3,
+                    Flags::SRGB | Flags::DISPLAY_P3,
                 ),
                 fc(
                     TextureFormat::Rgba16Float,
-                    SurfaceColorSpaces::SRGB
-                        | SurfaceColorSpaces::DISPLAY_P3
-                        | SurfaceColorSpaces::EXTENDED_SRGB
-                        | SurfaceColorSpaces::EXTENDED_DISPLAY_P3,
+                    Flags::SRGB
+                        | Flags::DISPLAY_P3
+                        | Flags::EXTENDED_SRGB
+                        | Flags::EXTENDED_DISPLAY_P3,
                 ),
             ],
         )
@@ -1045,15 +1027,12 @@ mod tests {
                 TextureFormat::Rgba16Float,
             ],
             vec![
-                fc(TextureFormat::Bgra8UnormSrgb, SurfaceColorSpaces::SRGB),
-                fc(TextureFormat::Bgra8Unorm, SurfaceColorSpaces::SRGB),
-                fc(
-                    TextureFormat::Rgba16Float,
-                    SurfaceColorSpaces::EXTENDED_SRGB_LINEAR,
-                ),
+                fc(TextureFormat::Bgra8UnormSrgb, Flags::SRGB),
+                fc(TextureFormat::Bgra8Unorm, Flags::SRGB),
+                fc(TextureFormat::Rgba16Float, Flags::EXTENDED_SRGB_LINEAR),
                 fc(
                     TextureFormat::Rgb10a2Unorm,
-                    SurfaceColorSpaces::BT2100_PQ | SurfaceColorSpaces::BT2100_HLG,
+                    Flags::BT2100_PQ | Flags::BT2100_HLG,
                 ),
             ],
         )
@@ -1064,11 +1043,19 @@ mod tests {
         caps(
             vec![TextureFormat::Bgra8UnormSrgb, TextureFormat::Rgba16Float],
             vec![
-                fc(TextureFormat::Bgra8UnormSrgb, SurfaceColorSpaces::SRGB),
-                fc(
-                    TextureFormat::Rgba16Float,
-                    SurfaceColorSpaces::EXTENDED_SRGB_LINEAR,
-                ),
+                fc(TextureFormat::Bgra8UnormSrgb, Flags::SRGB),
+                fc(TextureFormat::Rgba16Float, Flags::EXTENDED_SRGB_LINEAR),
+            ],
+        )
+    }
+
+    /// A surface whose only HDR color space is extended Display P3.
+    fn extended_p3_only() -> wgpu::SurfaceCapabilities {
+        caps(
+            vec![TextureFormat::Bgra8UnormSrgb, TextureFormat::Rgba16Float],
+            vec![
+                fc(TextureFormat::Bgra8UnormSrgb, Flags::SRGB),
+                fc(TextureFormat::Rgba16Float, Flags::EXTENDED_DISPLAY_P3),
             ],
         )
     }
@@ -1078,66 +1065,148 @@ mod tests {
         caps(
             vec![TextureFormat::Bgra8UnormSrgb, TextureFormat::Bgra8Unorm],
             vec![
-                fc(TextureFormat::Bgra8UnormSrgb, SurfaceColorSpaces::SRGB),
-                fc(TextureFormat::Bgra8Unorm, SurfaceColorSpaces::SRGB),
+                fc(TextureFormat::Bgra8UnormSrgb, Flags::SRGB),
+                fc(TextureFormat::Bgra8Unorm, Flags::SRGB),
             ],
         )
     }
 
-    fn sdr_selection(format: TextureFormat) -> NegotiatedSurface {
+    fn sdr(format: TextureFormat) -> NegotiatedSurface {
         NegotiatedSurface {
             format,
-            color_space: SurfaceColorSpace::Auto,
-            resolved_transfer: DisplayTransfer::Srgb,
+            color_space: wgpu::SurfaceColorSpace::Auto,
+            resolved: SurfaceColorSpace::Srgb,
         }
     }
 
+    fn pq(format: TextureFormat) -> NegotiatedSurface {
+        NegotiatedSurface {
+            format,
+            color_space: wgpu::SurfaceColorSpace::Bt2100Pq,
+            resolved: SurfaceColorSpace::Pq,
+        }
+    }
+
+    const SCRGB_LINEAR: NegotiatedSurface = NegotiatedSurface {
+        format: TextureFormat::Rgba16Float,
+        color_space: wgpu::SurfaceColorSpace::ExtendedSrgbLinear,
+        resolved: SurfaceColorSpace::ScRgbLinear,
+    };
+
+    const EXTENDED_SRGB: NegotiatedSurface = NegotiatedSurface {
+        format: TextureFormat::Rgba16Float,
+        color_space: wgpu::SurfaceColorSpace::ExtendedSrgb,
+        resolved: SurfaceColorSpace::ExtendedSrgb,
+    };
+
+    const EXTENDED_P3: NegotiatedSurface = NegotiatedSurface {
+        format: TextureFormat::Rgba16Float,
+        color_space: wgpu::SurfaceColorSpace::ExtendedDisplayP3,
+        resolved: SurfaceColorSpace::ExtendedDisplayP3,
+    };
+
     #[test]
-    fn srgb_default_selects_srgb_format_with_auto() {
+    fn default_selects_an_srgb_format_with_auto() {
+        let default = DisplayTarget::default();
         assert_eq!(
-            negotiate(&metal_like(), DisplayTransfer::Srgb),
-            sdr_selection(TextureFormat::Bgra8UnormSrgb)
+            negotiate_surface_format(&metal_like(), &default),
+            sdr(TextureFormat::Bgra8UnormSrgb)
         );
         assert_eq!(
-            negotiate(&sdr_only(), DisplayTransfer::Srgb),
-            sdr_selection(TextureFormat::Bgra8UnormSrgb)
+            negotiate_surface_format(&sdr_only(), &default),
+            sdr(TextureFormat::Bgra8UnormSrgb)
         );
         assert_eq!(
-            negotiate(
+            negotiate_surface_format(
                 &caps(
                     vec![TextureFormat::Bgra8Unorm, TextureFormat::Rgba16Float],
                     vec![]
                 ),
-                DisplayTransfer::Srgb
+                &default
             ),
-            sdr_selection(TextureFormat::Bgra8Unorm)
+            sdr(TextureFormat::Bgra8Unorm)
         );
         assert_eq!(
-            negotiate(
+            negotiate_surface_format(
                 &caps(
                     vec![TextureFormat::Rgba8UnormSrgb, TextureFormat::Bgra8UnormSrgb],
                     vec![]
                 ),
-                DisplayTransfer::Srgb
+                &default
             ),
-            sdr_selection(TextureFormat::Rgba8UnormSrgb)
+            sdr(TextureFormat::Rgba8UnormSrgb)
+        );
+    }
+
+    #[test]
+    fn only_sdr_gets_an_srgb_view_format() {
+        assert_eq!(
+            sdr(TextureFormat::Bgra8Unorm).texture_view_format(),
+            Some(TextureFormat::Bgra8UnormSrgb)
+        );
+        assert_eq!(
+            sdr(TextureFormat::Bgra8UnormSrgb).texture_view_format(),
+            None
+        );
+        assert_eq!(pq(TextureFormat::Bgra8Unorm).texture_view_format(), None);
+        assert_eq!(SCRGB_LINEAR.texture_view_format(), None);
+    }
+
+    #[test]
+    fn hdr_takes_the_first_supported_color_space_in_preference_order() {
+        assert_eq!(
+            negotiate_hdr(&metal_like()),
+            pq(TextureFormat::Rgb10a2Unorm)
+        );
+        assert_eq!(
+            negotiate_hdr(&vulkan_hdr_like()),
+            pq(TextureFormat::Rgb10a2Unorm)
+        );
+        assert_eq!(negotiate_hdr(&scrgb_only()), SCRGB_LINEAR);
+        assert_eq!(negotiate_hdr(&web_like()), EXTENDED_SRGB);
+        assert_eq!(negotiate_hdr(&extended_p3_only()), EXTENDED_P3);
+    }
+
+    #[test]
+    fn hdr_without_an_hdr_color_space_is_sdr() {
+        assert_eq!(
+            negotiate_hdr(&sdr_only()),
+            sdr(TextureFormat::Bgra8UnormSrgb)
+        );
+    }
+
+    #[test]
+    fn override_wins_over_hdr() {
+        let target = DisplayTarget {
+            hdr: true,
+            color_space_override: Some(SurfaceColorSpace::ScRgbLinear),
+            ..Default::default()
+        };
+        assert_eq!(
+            negotiate_surface_format(&metal_like(), &target),
+            SCRGB_LINEAR
+        );
+
+        let target = DisplayTarget {
+            hdr: true,
+            color_space_override: Some(SurfaceColorSpace::Srgb),
+            ..Default::default()
+        };
+        assert_eq!(
+            negotiate_surface_format(&metal_like(), &target),
+            sdr(TextureFormat::Bgra8UnormSrgb)
         );
     }
 
     #[test]
     fn scrgb_picks_rgba16float_with_extended_srgb_linear() {
-        let expected = NegotiatedSurface {
-            format: TextureFormat::Rgba16Float,
-            color_space: SurfaceColorSpace::ExtendedSrgbLinear,
-            resolved_transfer: DisplayTransfer::ScRgbLinear,
-        };
         assert_eq!(
-            negotiate(&metal_like(), DisplayTransfer::ScRgbLinear),
-            expected
+            negotiate_override(&metal_like(), SurfaceColorSpace::ScRgbLinear),
+            SCRGB_LINEAR
         );
         assert_eq!(
-            negotiate(&vulkan_hdr_like(), DisplayTransfer::ScRgbLinear),
-            expected
+            negotiate_override(&vulkan_hdr_like(), SurfaceColorSpace::ScRgbLinear),
+            SCRGB_LINEAR
         );
     }
 
@@ -1148,27 +1217,28 @@ mod tests {
         let caps = caps(
             vec![TextureFormat::Bgra8UnormSrgb, TextureFormat::Rgba16Float],
             vec![
-                fc(TextureFormat::Bgra8UnormSrgb, SurfaceColorSpaces::SRGB),
-                fc(TextureFormat::Rgba16Float, SurfaceColorSpaces::SRGB),
+                fc(TextureFormat::Bgra8UnormSrgb, Flags::SRGB),
+                fc(TextureFormat::Rgba16Float, Flags::SRGB),
             ],
         );
         assert_eq!(
-            negotiate(&caps, DisplayTransfer::ScRgbLinear),
-            sdr_selection(TextureFormat::Bgra8UnormSrgb)
+            negotiate_override(&caps, SurfaceColorSpace::ScRgbLinear),
+            sdr(TextureFormat::Bgra8UnormSrgb)
         );
     }
 
     #[test]
-    fn pq_negotiates_hdr10_preferring_rgb10a2unorm() {
-        let expected = NegotiatedSurface {
-            format: TextureFormat::Rgb10a2Unorm,
-            color_space: SurfaceColorSpace::Bt2100Pq,
-            resolved_transfer: DisplayTransfer::Pq,
-        };
-        assert_eq!(negotiate(&vulkan_hdr_like(), DisplayTransfer::Pq), expected);
+    fn pq_prefers_rgb10a2unorm() {
+        assert_eq!(
+            negotiate_override(&vulkan_hdr_like(), SurfaceColorSpace::Pq),
+            pq(TextureFormat::Rgb10a2Unorm)
+        );
         // Metal-like: both formats advertise HDR10, and Rgb10a2Unorm is chosen
         // even though Rgba16Float is listed first.
-        assert_eq!(negotiate(&metal_like(), DisplayTransfer::Pq), expected);
+        assert_eq!(
+            negotiate_override(&metal_like(), SurfaceColorSpace::Pq),
+            pq(TextureFormat::Rgb10a2Unorm)
+        );
     }
 
     #[test]
@@ -1176,20 +1246,16 @@ mod tests {
         let caps = caps(
             vec![TextureFormat::Bgra8UnormSrgb, TextureFormat::Rgba16Float],
             vec![
-                fc(TextureFormat::Bgra8UnormSrgb, SurfaceColorSpaces::SRGB),
+                fc(TextureFormat::Bgra8UnormSrgb, Flags::SRGB),
                 fc(
                     TextureFormat::Rgba16Float,
-                    SurfaceColorSpaces::EXTENDED_SRGB_LINEAR | SurfaceColorSpaces::BT2100_PQ,
+                    Flags::EXTENDED_SRGB_LINEAR | Flags::BT2100_PQ,
                 ),
             ],
         );
         assert_eq!(
-            negotiate(&caps, DisplayTransfer::Pq),
-            NegotiatedSurface {
-                format: TextureFormat::Rgba16Float,
-                color_space: SurfaceColorSpace::Bt2100Pq,
-                resolved_transfer: DisplayTransfer::Pq,
-            }
+            negotiate_override(&caps, SurfaceColorSpace::Pq),
+            pq(TextureFormat::Rgba16Float)
         );
     }
 
@@ -1199,261 +1265,244 @@ mod tests {
         let caps = caps(
             vec![TextureFormat::Bgra8UnormSrgb, TextureFormat::Bgra8Unorm],
             vec![
-                fc(TextureFormat::Bgra8UnormSrgb, SurfaceColorSpaces::SRGB),
-                fc(
-                    TextureFormat::Bgra8Unorm,
-                    SurfaceColorSpaces::SRGB | SurfaceColorSpaces::BT2100_PQ,
-                ),
+                fc(TextureFormat::Bgra8UnormSrgb, Flags::SRGB),
+                fc(TextureFormat::Bgra8Unorm, Flags::SRGB | Flags::BT2100_PQ),
             ],
         );
         assert_eq!(
-            negotiate(&caps, DisplayTransfer::Pq),
-            NegotiatedSurface {
-                format: TextureFormat::Bgra8Unorm,
-                color_space: SurfaceColorSpace::Bt2100Pq,
-                resolved_transfer: DisplayTransfer::Pq,
-            }
+            negotiate_override(&caps, SurfaceColorSpace::Pq),
+            pq(TextureFormat::Bgra8Unorm)
         );
     }
 
     #[test]
-    fn pq_downgrades_through_scrgb_to_sdr() {
+    fn extended_srgb_and_display_p3_are_distinct_color_spaces() {
         assert_eq!(
-            negotiate(&scrgb_only(), DisplayTransfer::Pq),
-            NegotiatedSurface {
-                format: TextureFormat::Rgba16Float,
-                color_space: SurfaceColorSpace::ExtendedSrgbLinear,
-                resolved_transfer: DisplayTransfer::ScRgbLinear,
-            }
+            negotiate_override(&web_like(), SurfaceColorSpace::ExtendedSrgb),
+            EXTENDED_SRGB
         );
         assert_eq!(
-            negotiate(&sdr_only(), DisplayTransfer::Pq),
-            sdr_selection(TextureFormat::Bgra8UnormSrgb)
-        );
-    }
-
-    #[test]
-    fn empty_auto_formats_fall_back_to_an_explicit_color_space() {
-        // A driver in OS HDR mode that lists formats only in explicit color
-        // spaces. Each request's own negotiation fails first.
-        let pq_only = caps(
-            vec![],
-            vec![fc(
-                TextureFormat::Rgb10a2Unorm,
-                SurfaceColorSpaces::BT2100_PQ,
-            )],
-        );
-        let expected = NegotiatedSurface {
-            format: TextureFormat::Rgb10a2Unorm,
-            color_space: SurfaceColorSpace::Bt2100Pq,
-            resolved_transfer: DisplayTransfer::Pq,
-        };
-        assert_eq!(negotiate(&pq_only, DisplayTransfer::ScRgbLinear), expected);
-        assert_eq!(
-            negotiate_surface_format(
-                &pq_only,
-                DisplayTransfer::ExtendedSrgb,
-                DisplayGamut::Rec709
-            ),
-            expected
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "No supported formats for surface")]
-    fn empty_auto_formats_panic_for_an_srgb_request() {
-        let pq_only = caps(
-            vec![],
-            vec![fc(
-                TextureFormat::Rgb10a2Unorm,
-                SurfaceColorSpaces::BT2100_PQ,
-            )],
-        );
-        negotiate(&pq_only, DisplayTransfer::Srgb);
-    }
-
-    #[test]
-    fn extended_srgb_rec709_negotiates_extended_srgb() {
-        let expected = NegotiatedSurface {
-            format: TextureFormat::Rgba16Float,
-            color_space: SurfaceColorSpace::ExtendedSrgb,
-            resolved_transfer: DisplayTransfer::ExtendedSrgb,
-        };
-        assert_eq!(
-            negotiate_surface_format(
-                &web_like(),
-                DisplayTransfer::ExtendedSrgb,
-                DisplayGamut::Rec709
-            ),
-            expected
+            negotiate_override(&web_like(), SurfaceColorSpace::ExtendedDisplayP3),
+            EXTENDED_P3
         );
         assert_eq!(
-            negotiate_surface_format(
-                &metal_like(),
-                DisplayTransfer::ExtendedSrgb,
-                DisplayGamut::Rec709
-            ),
-            expected
+            negotiate_override(&metal_like(), SurfaceColorSpace::ExtendedSrgb),
+            EXTENDED_SRGB
         );
-    }
-
-    #[test]
-    fn extended_srgb_displayp3_negotiates_extended_display_p3() {
-        // The resolved transfer is still `ExtendedSrgb`. The gamut stays in
-        // `DisplayTarget::gamut`.
-        let expected = NegotiatedSurface {
-            format: TextureFormat::Rgba16Float,
-            color_space: SurfaceColorSpace::ExtendedDisplayP3,
-            resolved_transfer: DisplayTransfer::ExtendedSrgb,
-        };
+        // Neither stands in for the other.
         assert_eq!(
-            negotiate_surface_format(
-                &web_like(),
-                DisplayTransfer::ExtendedSrgb,
-                DisplayGamut::DisplayP3
-            ),
-            expected
+            negotiate_override(&extended_p3_only(), SurfaceColorSpace::ExtendedSrgb),
+            sdr(TextureFormat::Bgra8UnormSrgb)
         );
-    }
-
-    #[test]
-    fn extended_srgb_displayp3_without_p3_support_downgrades_straight_to_sdr() {
-        let caps = caps(
+        let extended_srgb_only = caps(
             vec![TextureFormat::Bgra8UnormSrgb, TextureFormat::Rgba16Float],
             vec![
-                fc(TextureFormat::Bgra8UnormSrgb, SurfaceColorSpaces::SRGB),
-                fc(
-                    TextureFormat::Rgba16Float,
-                    SurfaceColorSpaces::EXTENDED_SRGB,
-                ),
+                fc(TextureFormat::Bgra8UnormSrgb, Flags::SRGB),
+                fc(TextureFormat::Rgba16Float, Flags::EXTENDED_SRGB),
             ],
         );
         assert_eq!(
-            negotiate_surface_format(
-                &caps,
-                DisplayTransfer::ExtendedSrgb,
-                DisplayGamut::DisplayP3
-            ),
-            sdr_selection(TextureFormat::Bgra8UnormSrgb)
+            negotiate_override(&extended_srgb_only, SurfaceColorSpace::ExtendedDisplayP3),
+            sdr(TextureFormat::Bgra8UnormSrgb)
         );
     }
 
     #[test]
-    fn extended_srgb_without_support_downgrades_to_sdr() {
+    fn an_unsupported_override_is_sdr_not_another_hdr_color_space() {
         assert_eq!(
-            negotiate_surface_format(
-                &sdr_only(),
-                DisplayTransfer::ExtendedSrgb,
-                DisplayGamut::Rec709
-            ),
-            sdr_selection(TextureFormat::Bgra8UnormSrgb)
+            negotiate_override(&scrgb_only(), SurfaceColorSpace::Pq),
+            sdr(TextureFormat::Bgra8UnormSrgb)
         );
-    }
-
-    #[test]
-    fn scrgb_linear_does_not_fall_back_to_extended_srgb() {
-        // A web-like surface advertises the encoded `ExtendedSrgb` but not
-        // `ExtendedSrgbLinear`. On the web, request `ExtendedSrgb` instead.
         assert_eq!(
-            negotiate(&web_like(), DisplayTransfer::ScRgbLinear),
-            sdr_selection(TextureFormat::Bgra8UnormSrgb)
+            negotiate_override(&web_like(), SurfaceColorSpace::Pq),
+            sdr(TextureFormat::Bgra8UnormSrgb)
         );
-    }
-
-    #[test]
-    fn pq_does_not_fall_back_to_extended_srgb() {
-        // PQ falls back to linear scRGB, then SDR, never to `ExtendedSrgb`. A
-        // web-like surface has neither PQ nor linear scRGB.
         assert_eq!(
-            negotiate(&web_like(), DisplayTransfer::Pq),
-            sdr_selection(TextureFormat::Bgra8UnormSrgb)
+            negotiate_override(&web_like(), SurfaceColorSpace::ScRgbLinear),
+            sdr(TextureFormat::Bgra8UnormSrgb)
+        );
+        assert_eq!(
+            negotiate_override(&sdr_only(), SurfaceColorSpace::ExtendedSrgb),
+            sdr(TextureFormat::Bgra8UnormSrgb)
         );
     }
 
-    #[test]
-    fn empty_auto_formats_fall_back_to_extended_srgb_spaces() {
-        // A driver reporting only an encoded extended-sRGB space, no Auto
-        // format. PQ and its fallbacks find nothing on either surface.
-        let extended_srgb_only = caps(
+    /// A driver in OS HDR mode that lists formats only in explicit color
+    /// spaces.
+    fn pq_only() -> wgpu::SurfaceCapabilities {
+        caps(
             vec![],
-            vec![fc(
-                TextureFormat::Rgba16Float,
-                SurfaceColorSpaces::EXTENDED_SRGB,
-            )],
-        );
+            vec![fc(TextureFormat::Rgb10a2Unorm, Flags::BT2100_PQ)],
+        )
+    }
+
+    #[test]
+    fn empty_auto_formats_fall_back_to_an_explicit_color_space_for_hdr_requests() {
+        assert_eq!(negotiate_hdr(&pq_only()), pq(TextureFormat::Rgb10a2Unorm));
         assert_eq!(
-            negotiate(&extended_srgb_only, DisplayTransfer::Pq),
-            NegotiatedSurface {
-                format: TextureFormat::Rgba16Float,
-                color_space: SurfaceColorSpace::ExtendedSrgb,
-                resolved_transfer: DisplayTransfer::ExtendedSrgb,
-            }
+            negotiate_override(&pq_only(), SurfaceColorSpace::ScRgbLinear),
+            pq(TextureFormat::Rgb10a2Unorm)
         );
+
         let extended_p3_only = caps(
             vec![],
-            vec![fc(
-                TextureFormat::Rgba16Float,
-                SurfaceColorSpaces::EXTENDED_DISPLAY_P3,
-            )],
+            vec![fc(TextureFormat::Rgba16Float, Flags::EXTENDED_DISPLAY_P3)],
         );
-        assert_eq!(
-            negotiate_surface_format(
-                &extended_p3_only,
-                DisplayTransfer::Pq,
-                DisplayGamut::DisplayP3
-            ),
-            NegotiatedSurface {
-                format: TextureFormat::Rgba16Float,
-                color_space: SurfaceColorSpace::ExtendedDisplayP3,
-                resolved_transfer: DisplayTransfer::ExtendedSrgb,
-            }
-        );
+        assert_eq!(negotiate_hdr(&extended_p3_only), EXTENDED_P3);
     }
 
     #[test]
     #[should_panic(expected = "No supported formats for surface")]
-    fn empty_auto_formats_never_give_a_rec709_request_the_extended_p3_fallback() {
-        let extended_p3_only = caps(
-            vec![],
-            vec![fc(
-                TextureFormat::Rgba16Float,
-                SurfaceColorSpaces::EXTENDED_DISPLAY_P3,
-            )],
+    fn empty_auto_formats_panic_for_a_default_request() {
+        negotiate_surface_format(&pq_only(), &DisplayTarget::default());
+    }
+
+    #[test]
+    #[should_panic(expected = "No supported formats for surface")]
+    fn empty_auto_formats_panic_for_an_srgb_override() {
+        negotiate_override(&pq_only(), SurfaceColorSpace::Srgb);
+    }
+
+    #[test]
+    #[should_panic(expected = "No supported formats for surface")]
+    fn no_formats_at_all_panics() {
+        negotiate_surface_format(&caps(vec![], vec![]), &DisplayTarget::default());
+    }
+
+    #[test]
+    fn srgb_is_supported_only_with_a_format_for_auto() {
+        assert!(supported_color_spaces(&sdr_only()).contains(SurfaceColorSpace::Srgb));
+        assert!(supported_color_spaces(&pq_only())
+            .iter()
+            .eq([SurfaceColorSpace::Pq]));
+    }
+
+    #[test]
+    fn a_lost_color_space_renegotiates_to_the_next_best() {
+        let pq_surface = pq(TextureFormat::Rgb10a2Unorm);
+
+        // The OS HDR setting is turned off: HDR10 is gone, and `hdr` falls
+        // back to SDR.
+        assert!(color_space_lost(
+            &sdr_only(),
+            pq_surface.format,
+            pq_surface.color_space
+        ));
+        assert_eq!(
+            negotiate_hdr(&sdr_only()),
+            sdr(TextureFormat::Bgra8UnormSrgb)
         );
-        negotiate_surface_format(
-            &extended_p3_only,
-            DisplayTransfer::ExtendedSrgb,
-            DisplayGamut::Rec709,
+
+        // HDR10 is gone but scRGB remains: `hdr` moves to the next best.
+        assert!(color_space_lost(
+            &scrgb_only(),
+            pq_surface.format,
+            pq_surface.color_space
+        ));
+        assert_eq!(negotiate_hdr(&scrgb_only()), SCRGB_LINEAR);
+
+        // An override does not move to another HDR color space.
+        assert_eq!(
+            negotiate_override(&scrgb_only(), SurfaceColorSpace::Pq),
+            sdr(TextureFormat::Bgra8UnormSrgb)
         );
     }
 
     #[test]
-    fn supported_transfers_matches_negotiable_set() {
-        use DisplayTransfer::{ExtendedSrgb, Pq, ScRgbLinear, Srgb};
+    fn a_supported_color_space_is_not_lost() {
+        let pq_surface = pq(TextureFormat::Rgb10a2Unorm);
+        assert!(!color_space_lost(
+            &metal_like(),
+            pq_surface.format,
+            pq_surface.color_space
+        ));
+        assert!(!color_space_lost(
+            &scrgb_only(),
+            SCRGB_LINEAR.format,
+            SCRGB_LINEAR.color_space
+        ));
+    }
+
+    #[test]
+    fn auto_is_never_lost() {
+        let sdr_surface = sdr(TextureFormat::Bgra8UnormSrgb);
+        for fixture in [metal_like(), sdr_only(), pq_only(), caps(vec![], vec![])] {
+            assert!(!color_space_lost(
+                &fixture,
+                sdr_surface.format,
+                sdr_surface.color_space
+            ));
+        }
+    }
+
+    #[test]
+    fn only_hdr_and_override_changes_need_renegotiation() {
+        let default = DisplayTarget::default();
+        let hdr = DisplayTarget {
+            hdr: true,
+            ..Default::default()
+        };
+        let pq_override = DisplayTarget {
+            color_space_override: Some(SurfaceColorSpace::Pq),
+            ..Default::default()
+        };
+        let scrgb_override = DisplayTarget {
+            color_space_override: Some(SurfaceColorSpace::ScRgbLinear),
+            ..Default::default()
+        };
+        let calibrated = DisplayTarget {
+            paper_white_nits: Some(300.0),
+            peak_luminance_nits: Some(1500.0),
+            min_luminance_nits: Some(0.01),
+            ..Default::default()
+        };
+
+        assert!(color_space_request_changed(&default, &hdr));
+        assert!(color_space_request_changed(&pq_override, &scrgb_override));
+        assert!(color_space_request_changed(&pq_override, &default));
+        assert!(!color_space_request_changed(&default, &calibrated));
+        assert!(!color_space_request_changed(&default, &default));
+        assert!(!color_space_request_changed(&pq_override, &pq_override));
+    }
+
+    #[test]
+    fn supported_color_spaces_matches_negotiable_set() {
+        use SurfaceColorSpace::{ExtendedDisplayP3, ExtendedSrgb, Pq, ScRgbLinear, Srgb};
 
         let cases: [(
             &str,
             fn() -> wgpu::SurfaceCapabilities,
-            Vec<DisplayTransfer>,
-        ); 5] = [
+            Vec<SurfaceColorSpace>,
+        ); 6] = [
             (
                 "metal_like",
                 metal_like,
-                vec![Srgb, ScRgbLinear, Pq, ExtendedSrgb],
+                vec![Srgb, ScRgbLinear, Pq, ExtendedSrgb, ExtendedDisplayP3],
             ),
-            ("web_like", web_like, vec![Srgb, ExtendedSrgb]),
+            (
+                "web_like",
+                web_like,
+                vec![Srgb, ExtendedSrgb, ExtendedDisplayP3],
+            ),
             (
                 "vulkan_hdr_like",
                 vulkan_hdr_like,
                 vec![Srgb, ScRgbLinear, Pq],
             ),
             ("scrgb_only", scrgb_only, vec![Srgb, ScRgbLinear]),
+            (
+                "extended_p3_only",
+                extended_p3_only,
+                vec![Srgb, ExtendedDisplayP3],
+            ),
             ("sdr_only", sdr_only, vec![Srgb]),
         ];
 
         for (name, fixture, expected) in cases {
             assert_eq!(
-                supported_transfers(&fixture()).iter().collect::<Vec<_>>(),
+                supported_color_spaces(&fixture())
+                    .iter()
+                    .collect::<Vec<_>>(),
                 expected,
                 "{name}"
             );
