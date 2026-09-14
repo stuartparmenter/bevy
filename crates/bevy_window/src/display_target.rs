@@ -1,4 +1,6 @@
+use bevy_color::RgbPrimaries;
 use bevy_ecs::prelude::Component;
+use bevy_platform::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(feature = "bevy_reflect")]
 use {
@@ -9,26 +11,42 @@ use {
 #[cfg(all(feature = "serialize", feature = "bevy_reflect"))]
 use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
 
-/// The display output a [`Window`](crate::Window) requests: a transfer
-/// function, a gamut, and the luminance the renderer encodes for.
+/// The display output a [`Window`](crate::Window) requests: a dynamic range
+/// or color space, and the luminance values the app has calibrated.
 ///
-/// This is a request. The surface the window presents to may not support the
-/// transfer function or gamut, and the output it gets can differ from what is
-/// requested. The wgpu [color space and HDR primer] explains what each
-/// backend can present.
+/// This is a request. The surface the window presents to may not support it,
+/// and the output it gets can differ from the request. The wgpu [color space
+/// and HDR primer] explains what each backend can present.
 ///
-/// A required component of [`Window`](crate::Window). The default is
-/// [`DisplayTarget::SDR_SRGB`]. Bevy never changes the values you set, even
-/// when the window moves to another monitor. [`OnMonitor`](crate::OnMonitor)
-/// changes on such a move, so watch it to update this component yourself.
+/// A luminance field is `None` unless the app has calibrated it. Bevy then
+/// uses what the display reports, or a default for the color space.
 ///
-/// Each enabled [`DisplayCalibrationPolicy`](crate::DisplayCalibrationPolicy)
-/// field takes the value the display reports. The renderer always reads
-/// [`EffectiveDisplayTarget`](crate::EffectiveDisplayTarget), which equals
-/// this component when no field is enabled.
+/// A required component of [`Window`](crate::Window). The default requests
+/// SDR sRGB. Bevy never writes this component.
 ///
-/// [color space and HDR primer]: https://docs.rs/wgpu/30/wgpu/index.html#surface-color-spaces-and-hdr-output
-#[derive(Component, Debug, Clone, Copy, PartialEq)]
+/// This is independent of the `Hdr` component on a camera, which selects the
+/// format of the texture the camera renders to.
+///
+/// # Example
+///
+/// Request HDR output. The color space it gets depends on the platform and
+/// the display:
+///
+/// ```
+/// # use bevy_ecs::world::World;
+/// # use bevy_window::{DisplayTarget, Window};
+/// # let mut world = World::new();
+/// world.spawn((
+///     Window::default(),
+///     DisplayTarget {
+///         hdr: true,
+///         ..Default::default()
+///     },
+/// ));
+/// ```
+///
+/// [color space and HDR primer]: https://docs.rs/wgpu/latest/wgpu/index.html#surface-color-spaces-and-hdr-output
+#[derive(Component, Debug, Clone, Copy, PartialEq, Default)]
 #[cfg_attr(
     feature = "bevy_reflect",
     derive(Reflect),
@@ -40,199 +58,330 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
     reflect(Serialize, Deserialize)
 )]
 pub struct DisplayTarget {
+    /// Request HDR output. Bevy picks the best HDR color space the surface
+    /// supports. When the surface supports none, the output is SDR.
+    pub hdr: bool,
+    /// Request one color space instead. When `Some`, [`hdr`](Self::hdr) is
+    /// ignored. When the surface does not support it, the output is SDR.
+    pub color_space_override: Option<SurfaceColorSpace>,
     /// The luminance of paper white, in nits.
     ///
     /// Paper white is the luminance of a plain white UI element. A tonemapped
-    /// value of `1.0` maps to it. [`SDR_SRGB`](Self::SDR_SRGB) uses 100 nits.
-    /// [ITU-R BT.2408] recommends 203 nits for HDR television.
+    /// value of `1.0` maps to it. SDR uses 100 nits. [ITU-R BT.2408]
+    /// recommends 203 nits for HDR television.
     ///
     /// [ITU-R BT.2408]: https://www.itu.int/pub/R-REP-BT.2408
-    pub paper_white_nits: f32,
+    pub paper_white_nits: Option<f32>,
     /// The highest luminance the display can show, in nits.
     ///
-    /// On SDR displays this equals [`paper_white_nits`](Self::paper_white_nits).
-    /// On HDR displays this is higher, so highlights can exceed paper white.
-    pub peak_luminance_nits: f32,
+    /// On SDR displays this equals paper white. On HDR displays it is higher,
+    /// so highlights can exceed paper white.
+    pub peak_luminance_nits: Option<f32>,
     /// The lowest luminance the display can show, in nits.
-    pub min_luminance_nits: f32,
-    /// The requested color gamut.
-    pub gamut: DisplayGamut,
-    /// The requested transfer function.
-    pub transfer: DisplayTransfer,
+    pub min_luminance_nits: Option<f32>,
 }
 
-impl DisplayTarget {
-    /// An sRGB display with standard dynamic range.
-    pub const SDR_SRGB: Self = Self {
-        paper_white_nits: 100.0,
-        peak_luminance_nits: 100.0,
-        min_luminance_nits: 0.0,
-        gamut: DisplayGamut::Rec709,
-        transfer: DisplayTransfer::Srgb,
-    };
-
-    /// Returns `self` with [`paper_white_nits`](Self::paper_white_nits) set to
-    /// `nits`.
-    pub const fn with_paper_white(mut self, nits: f32) -> Self {
-        self.paper_white_nits = nits;
-        self
-    }
-
-    /// Returns `self` with [`peak_luminance_nits`](Self::peak_luminance_nits)
-    /// set to `nits`.
-    pub const fn with_peak_luminance(mut self, nits: f32) -> Self {
-        self.peak_luminance_nits = nits;
-        self
-    }
-
-    /// Returns `self` with [`min_luminance_nits`](Self::min_luminance_nits)
-    /// set to `nits`.
-    pub const fn with_min_luminance(mut self, nits: f32) -> Self {
-        self.min_luminance_nits = nits;
-        self
-    }
-
-    /// Returns `self` with [`gamut`](Self::gamut) set to `gamut`.
-    pub const fn with_gamut(mut self, gamut: DisplayGamut) -> Self {
-        self.gamut = gamut;
-        self
-    }
-
-    /// Returns `self` with [`transfer`](Self::transfer) set to `transfer`.
-    pub const fn with_transfer(mut self, transfer: DisplayTransfer) -> Self {
-        self.transfer = transfer;
-        self
-    }
-
-    /// The 10000 nit maximum of PQ (SMPTE ST 2084), and the largest value
-    /// [`sanitized_paper_white_nits`] returns.
+/// A color space a surface can present in: a set of primaries, a transfer
+/// function, and a range.
+///
+/// Each variant corresponds to a wgpu [`SurfaceColorSpace`][wgpu], whose docs
+/// describe the encoding and the backends that support it. HLG is left out
+/// because it needs a scene-referred signal, which Bevy does not produce.
+///
+/// [wgpu]: https://docs.rs/wgpu/latest/wgpu/enum.SurfaceColorSpace.html
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(
+    feature = "bevy_reflect",
+    derive(Reflect),
+    reflect(Default, Debug, PartialEq, Hash, Clone)
+)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    all(feature = "serialize", feature = "bevy_reflect"),
+    reflect(Serialize, Deserialize)
+)]
+pub enum SurfaceColorSpace {
+    /// [sRGB](https://registry.color.org/rgb-registry/srgb) of IEC 61966-2-1:
+    /// the BT.709 primaries with the sRGB transfer function, in standard
+    /// dynamic range. wgpu's [`SurfaceColorSpace::Srgb`].
     ///
-    /// [`sanitized_paper_white_nits`]: Self::sanitized_paper_white_nits
-    pub const MAX_PAPER_WHITE_NITS: f32 = 10000.0;
-
-    /// Returns [`paper_white_nits`](Self::paper_white_nits) sanitized for
-    /// luminance math.
+    /// [`SurfaceColorSpace::Srgb`]: https://docs.rs/wgpu/latest/wgpu/enum.SurfaceColorSpace.html#variant.Srgb
+    #[default]
+    Srgb,
+    /// Linear [scRGB] of IEC 61966-2-2: the BT.709 primaries with a linear
+    /// transfer function. A value of `1.0` is 80 nits, and values above `1.0`
+    /// and below `0.0` are valid. Colors outside BT.709 are encoded as
+    /// out-of-range values. wgpu's [`SurfaceColorSpace::ExtendedSrgbLinear`].
     ///
-    /// Non-finite and non-positive values fall back to the 100 nits of
-    /// [`SDR_SRGB`](Self::SDR_SRGB), since scaling by them would give a black
-    /// or `NaN` frame. Values above
-    /// [`MAX_PAPER_WHITE_NITS`](Self::MAX_PAPER_WHITE_NITS) clamp to it. Other
-    /// values return unchanged. This method does not warn.
-    pub const fn sanitized_paper_white_nits(&self) -> f32 {
-        if !self.paper_white_nits.is_finite() || self.paper_white_nits <= 0.0 {
-            Self::SDR_SRGB.paper_white_nits
-        } else {
-            self.paper_white_nits.min(Self::MAX_PAPER_WHITE_NITS)
+    /// [scRGB]: https://en.wikipedia.org/wiki/ScRGB
+    /// [`SurfaceColorSpace::ExtendedSrgbLinear`]: https://docs.rs/wgpu/latest/wgpu/enum.SurfaceColorSpace.html#variant.ExtendedSrgbLinear
+    ScRgbLinear,
+    /// HDR10 of [ITU-R BT.2100]: the BT.2020 primaries with the [perceptual
+    /// quantizer] of SMPTE ST 2084. PQ encodes absolute luminance, with `1.0`
+    /// at 10000 nits. wgpu's [`SurfaceColorSpace::Bt2100Pq`].
+    ///
+    /// [perceptual quantizer]: https://en.wikipedia.org/wiki/Perceptual_quantizer
+    /// [ITU-R BT.2100]: https://www.itu.int/rec/R-REC-BT.2100
+    /// [`SurfaceColorSpace::Bt2100Pq`]: https://docs.rs/wgpu/latest/wgpu/enum.SurfaceColorSpace.html#variant.Bt2100Pq
+    Pq,
+    /// Extended-range sRGB of IEC 61966-2-2: the BT.709 primaries with the
+    /// sRGB transfer function continued above `1.0` for colors brighter than
+    /// SDR white and mirrored below `0.0` for colors outside the gamut. This
+    /// is the web HDR path. wgpu's [`SurfaceColorSpace::ExtendedSrgb`].
+    ///
+    /// [`SurfaceColorSpace::ExtendedSrgb`]: https://docs.rs/wgpu/latest/wgpu/enum.SurfaceColorSpace.html#variant.ExtendedSrgb
+    ExtendedSrgb,
+    /// [`ExtendedSrgb`](Self::ExtendedSrgb) with the Display P3 primaries.
+    /// wgpu's [`SurfaceColorSpace::ExtendedDisplayP3`].
+    ///
+    /// [`SurfaceColorSpace::ExtendedDisplayP3`]: https://docs.rs/wgpu/latest/wgpu/enum.SurfaceColorSpace.html#variant.ExtendedDisplayP3
+    ExtendedDisplayP3,
+}
+
+impl SurfaceColorSpace {
+    /// Returns the primaries of this color space.
+    pub const fn primaries(&self) -> RgbPrimaries {
+        match self {
+            Self::Srgb | Self::ScRgbLinear | Self::ExtendedSrgb => RgbPrimaries::BT709,
+            Self::Pq => RgbPrimaries::BT2020,
+            Self::ExtendedDisplayP3 => RgbPrimaries::DISPLAY_P3,
+        }
+    }
+
+    /// Returns the transfer function of this color space.
+    pub const fn transfer_function(&self) -> TransferFunction {
+        match self {
+            Self::Srgb => TransferFunction::Srgb,
+            Self::ScRgbLinear => TransferFunction::Linear,
+            Self::Pq => TransferFunction::Pq,
+            Self::ExtendedSrgb | Self::ExtendedDisplayP3 => TransferFunction::ExtendedSrgb,
+        }
+    }
+
+    /// Returns `true` if this color space has high dynamic range. Every color
+    /// space except [`Srgb`](Self::Srgb) does.
+    pub const fn is_hdr(&self) -> bool {
+        !matches!(self, Self::Srgb)
+    }
+}
+
+/// The transfer function of a [`SurfaceColorSpace`]: how linear color maps
+/// to the signal the display decodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(
+    feature = "bevy_reflect",
+    derive(Reflect),
+    reflect(Debug, PartialEq, Hash, Clone)
+)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    all(feature = "serialize", feature = "bevy_reflect"),
+    reflect(Serialize, Deserialize)
+)]
+pub enum TransferFunction {
+    /// The sRGB transfer function of IEC 61966-2-1, over `0.0` to `1.0`.
+    Srgb,
+    /// No transfer function. The signal is linear light, and values above
+    /// `1.0` and below `0.0` are valid.
+    Linear,
+    /// The perceptual quantizer of SMPTE ST 2084, over absolute luminance up
+    /// to 10000 nits.
+    Pq,
+    /// The sRGB transfer function continued above `1.0` and mirrored below
+    /// `0.0`.
+    ExtendedSrgb,
+}
+
+/// Logs a warning once per call site.
+///
+/// `bevy_window` has no dependency on `bevy_log`, so this is a local guard
+/// over [`log::warn!`].
+macro_rules! warn_once {
+    ($($arg:tt)+) => {{
+        static FIRED: AtomicBool = AtomicBool::new(false);
+        if !FIRED.swap(true, Ordering::Relaxed) {
+            log::warn!($($arg)+);
+        }
+    }};
+}
+
+/// The paper white of SDR, in nits. sRGB reference viewing conditions specify
+/// 80 nits and [ITU-R BT.2035] specifies 100 nits, and 100 is the common
+/// choice for SDR content on desktop displays.
+///
+/// [ITU-R BT.2035]: https://www.itu.int/rec/R-REC-BT.2035
+pub const SDR_PAPER_WHITE_NITS: f32 = 100.0;
+
+/// The paper white [ITU-R BT.2408] recommends for PQ, in nits.
+///
+/// [ITU-R BT.2408]: https://www.itu.int/pub/R-REP-BT.2408
+pub const PQ_PAPER_WHITE_NITS: f32 = 203.0;
+
+/// The luminance of signal `1.0` in scRGB and extended sRGB, in nits. The OS
+/// maps this signal to its own SDR white, so a paper white of 80 nits means
+/// "match the OS SDR white".
+pub const SCRGB_REFERENCE_WHITE_NITS: f32 = 80.0;
+
+/// The peak luminance an HDR color space gets when the app has not
+/// calibrated it, in nits. Most HDR displays reach at least this.
+pub const HDR_PEAK_LUMINANCE_NITS: f32 = 1000.0;
+
+/// The highest luminance a [`DisplayTarget`] field can resolve to, in nits.
+/// It is the top of the PQ curve, and no display exceeds it.
+pub const MAX_LUMINANCE_NITS: f32 = 10000.0;
+
+impl SurfaceColorSpace {
+    /// Returns the paper white this color space uses when the app has not
+    /// calibrated it, in nits.
+    ///
+    /// SDR uses [`SDR_PAPER_WHITE_NITS`]. PQ uses [`PQ_PAPER_WHITE_NITS`]. The
+    /// other HDR color spaces use [`SCRGB_REFERENCE_WHITE_NITS`], so
+    /// tonemapped white lands on the OS SDR white.
+    pub const fn default_paper_white_nits(&self) -> f32 {
+        match self {
+            Self::Srgb => SDR_PAPER_WHITE_NITS,
+            Self::Pq => PQ_PAPER_WHITE_NITS,
+            Self::ScRgbLinear | Self::ExtendedSrgb | Self::ExtendedDisplayP3 => {
+                SCRGB_REFERENCE_WHITE_NITS
+            }
+        }
+    }
+
+    /// Returns the peak luminance this color space uses when the app has not
+    /// calibrated it, in nits. SDR peaks at paper white. HDR uses
+    /// [`HDR_PEAK_LUMINANCE_NITS`].
+    pub const fn default_peak_luminance_nits(&self) -> f32 {
+        match self {
+            Self::Srgb => SDR_PAPER_WHITE_NITS,
+            _ => HDR_PEAK_LUMINANCE_NITS,
+        }
+    }
+
+    /// Returns the minimum luminance this color space uses when the app has
+    /// not calibrated it, in nits. It is `0.0` for every color space.
+    pub const fn default_min_luminance_nits(&self) -> f32 {
+        0.0
+    }
+}
+
+/// A [`DisplayTarget`] after surface negotiation: the color space the output
+/// uses and the luminance values the renderer encodes for.
+///
+/// [`DisplayTarget::resolve`] builds it. Each luminance is the calibrated
+/// value when the app set one, else the default for the color space. The
+/// default is SDR sRGB at 100 nits.
+#[derive(Component, Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(
+    feature = "bevy_reflect",
+    derive(Reflect),
+    reflect(Component, Default, Debug, PartialEq, Clone)
+)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    all(feature = "serialize", feature = "bevy_reflect"),
+    reflect(Serialize, Deserialize)
+)]
+pub struct ResolvedDisplayTarget {
+    /// The color space the output uses.
+    pub color_space: SurfaceColorSpace,
+    /// The luminance of paper white, in nits. See
+    /// [`DisplayTarget::paper_white_nits`].
+    pub paper_white_nits: f32,
+    /// The highest luminance the display can show, in nits. It is at least
+    /// [`paper_white_nits`](Self::paper_white_nits).
+    pub peak_luminance_nits: f32,
+    /// The lowest luminance the display can show, in nits. It is at most
+    /// [`paper_white_nits`](Self::paper_white_nits).
+    pub min_luminance_nits: f32,
+}
+
+impl Default for ResolvedDisplayTarget {
+    fn default() -> Self {
+        Self {
+            color_space: SurfaceColorSpace::Srgb,
+            paper_white_nits: SDR_PAPER_WHITE_NITS,
+            peak_luminance_nits: SDR_PAPER_WHITE_NITS,
+            min_luminance_nits: 0.0,
         }
     }
 }
 
-impl Default for DisplayTarget {
-    fn default() -> Self {
-        Self::SDR_SRGB
+/// Resolves one luminance field of a [`DisplayTarget`].
+///
+/// `Some` passes through unless it is not finite, fails `is_valid`, or is
+/// above [`MAX_LUMINANCE_NITS`]. `None` takes `default`. Each problem warns
+/// once, naming the field.
+macro_rules! resolve_luminance {
+    ($field:ident, $value:expr, $default:expr, $is_valid:expr) => {{
+        let default: f32 = $default;
+        let is_valid: fn(f32) -> bool = $is_valid;
+        match $value {
+            None => default,
+            Some(value) if !value.is_finite() || !is_valid(value) => {
+                warn_once!(
+                    "DisplayTarget::{} is {value}, which is not a valid luminance. Using \
+                    the default of {default} nits.",
+                    stringify!($field)
+                );
+                default
+            }
+            Some(value) if value > MAX_LUMINANCE_NITS => {
+                warn_once!(
+                    "DisplayTarget::{} is {value}, above the {MAX_LUMINANCE_NITS} nits a \
+                    display can show. Clamping it.",
+                    stringify!($field)
+                );
+                MAX_LUMINANCE_NITS
+            }
+            Some(value) => value,
+        }
+    }};
+}
+
+impl DisplayTarget {
+    /// Resolves this request for the color space the surface negotiated.
+    ///
+    /// A calibrated luminance is used as is, unless it is not finite or not
+    /// positive (the default is used, with a warning) or above
+    /// [`MAX_LUMINANCE_NITS`] (it is clamped, with a warning). A minimum
+    /// luminance of `0.0` is valid. An uncalibrated luminance takes the
+    /// default of `color_space`: see
+    /// [`SurfaceColorSpace::default_paper_white_nits`],
+    /// [`SurfaceColorSpace::default_peak_luminance_nits`] and
+    /// [`SurfaceColorSpace::default_min_luminance_nits`]. The peak luminance
+    /// is raised to at least the paper white, and the minimum luminance is
+    /// lowered to at most the paper white.
+    pub fn resolve(&self, color_space: SurfaceColorSpace) -> ResolvedDisplayTarget {
+        let paper_white_nits = resolve_luminance!(
+            paper_white_nits,
+            self.paper_white_nits,
+            color_space.default_paper_white_nits(),
+            |value| value > 0.0
+        );
+        let peak_luminance_nits = resolve_luminance!(
+            peak_luminance_nits,
+            self.peak_luminance_nits,
+            color_space.default_peak_luminance_nits(),
+            |value| value > 0.0
+        )
+        .max(paper_white_nits);
+        let min_luminance_nits = resolve_luminance!(
+            min_luminance_nits,
+            self.min_luminance_nits,
+            color_space.default_min_luminance_nits(),
+            |value| value >= 0.0
+        )
+        .min(paper_white_nits);
+        ResolvedDisplayTarget {
+            color_space,
+            paper_white_nits,
+            peak_luminance_nits,
+            min_luminance_nits,
+        }
     }
 }
 
-/// The color gamut of a display.
-///
-/// A gamut is the range of colors a display can show. It is set by the
-/// display's red, green, and blue primaries, the exact colors its RGB values
-/// refer to. Each gamut here uses the D65 white point.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
-#[cfg_attr(
-    feature = "bevy_reflect",
-    derive(Reflect),
-    reflect(Default, Debug, PartialEq, Hash, Clone)
-)]
-#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(
-    all(feature = "serialize", feature = "bevy_reflect"),
-    reflect(Serialize, Deserialize)
-)]
-pub enum DisplayGamut {
-    /// The [ITU-R BT.709](https://registry.color.org/rgb-registry/bt709)
-    /// primaries. sRGB uses the same primaries.
-    #[default]
-    Rec709,
-    /// The [Display P3](https://registry.color.org/rgb-registry/displayp3)
-    /// primaries, the DCI-P3 primaries with a D65 white point. Wider than
-    /// [`Rec709`](Self::Rec709) and narrower than [`Rec2020`](Self::Rec2020).
-    DisplayP3,
-    /// The [ITU-R BT.2020](https://registry.color.org/rgb-registry/bt2020)
-    /// primaries, also known as Rec. 2020. HDR10 uses this gamut.
-    Rec2020,
-}
-
-/// The transfer function that encodes the output for a display.
-///
-/// A transfer function maps linear color to the signal the display decodes.
-/// Each variant corresponds to a wgpu [`SurfaceColorSpace`], whose docs
-/// describe the encoding and the backends that support it.
-///
-/// [`SurfaceColorSpace`]: https://docs.rs/wgpu/30/wgpu/enum.SurfaceColorSpace.html
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
-#[cfg_attr(
-    feature = "bevy_reflect",
-    derive(Reflect),
-    reflect(Default, Debug, PartialEq, Hash, Clone)
-)]
-#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(
-    all(feature = "serialize", feature = "bevy_reflect"),
-    reflect(Serialize, Deserialize)
-)]
-pub enum DisplayTransfer {
-    /// The [sRGB](https://registry.color.org/rgb-registry/srgb) transfer
-    /// function of IEC 61966-2-1, with standard dynamic range. wgpu's
-    /// [`SurfaceColorSpace::Srgb`].
-    ///
-    /// [`SurfaceColorSpace::Srgb`]: https://docs.rs/wgpu/30/wgpu/enum.SurfaceColorSpace.html#variant.Srgb
-    #[default]
-    Srgb,
-    /// Linear [scRGB], the linear encoding of IEC 61966-2-2. A value of `1.0`
-    /// is 80 nits, and values above `1.0` and below `0.0` are valid. wgpu's
-    /// [`SurfaceColorSpace::ExtendedSrgbLinear`].
-    ///
-    /// scRGB always uses the BT.709 primaries, so [`DisplayTarget::gamut`]
-    /// does not apply to this transfer. Colors outside BT.709 are encoded as
-    /// out-of-range values.
-    ///
-    /// [scRGB]: https://en.wikipedia.org/wiki/ScRGB
-    /// [`SurfaceColorSpace::ExtendedSrgbLinear`]: https://docs.rs/wgpu/30/wgpu/enum.SurfaceColorSpace.html#variant.ExtendedSrgbLinear
-    ScRgbLinear,
-    /// The [perceptual quantizer] of SMPTE ST 2084 and [ITU-R BT.2100], used
-    /// by HDR10. PQ encodes absolute luminance, with `1.0` at 10000 nits.
-    /// HDR10 uses the BT.2020 gamut, so this transfer pairs with
-    /// [`DisplayGamut::Rec2020`]. wgpu's [`SurfaceColorSpace::Bt2100Pq`].
-    ///
-    /// [perceptual quantizer]: https://en.wikipedia.org/wiki/Perceptual_quantizer
-    /// [ITU-R BT.2100]: https://www.itu.int/rec/R-REC-BT.2100
-    /// [`SurfaceColorSpace::Bt2100Pq`]: https://docs.rs/wgpu/30/wgpu/enum.SurfaceColorSpace.html#variant.Bt2100Pq
-    Pq,
-    /// Extended-range sRGB, the encoded form of IEC 61966-2-2. The sRGB curve
-    /// continues above `1.0` for colors brighter than SDR white and mirrors
-    /// below `0.0` for colors outside the gamut.
-    ///
-    /// Unlike [`ScRgbLinear`](Self::ScRgbLinear), this transfer uses
-    /// [`DisplayTarget::gamut`]. With [`DisplayGamut::Rec709`] it is wgpu's
-    /// [`SurfaceColorSpace::ExtendedSrgb`], and with
-    /// [`DisplayGamut::DisplayP3`] it is [`SurfaceColorSpace::ExtendedDisplayP3`].
-    /// wgpu has no extended-range color space for [`DisplayGamut::Rec2020`].
-    ///
-    /// [`SurfaceColorSpace::ExtendedSrgb`]: https://docs.rs/wgpu/30/wgpu/enum.SurfaceColorSpace.html#variant.ExtendedSrgb
-    /// [`SurfaceColorSpace::ExtendedDisplayP3`]: https://docs.rs/wgpu/30/wgpu/enum.SurfaceColorSpace.html#variant.ExtendedDisplayP3
-    ExtendedSrgb,
-}
-
-impl DisplayTransfer {
-    /// Returns `true` if this transfer function has high dynamic range. Every
-    /// transfer function except [`Srgb`](Self::Srgb) does.
-    pub const fn is_hdr(&self) -> bool {
-        matches!(self, Self::ScRgbLinear | Self::Pq | Self::ExtendedSrgb)
-    }
-}
-
-/// A set of [`DisplayTransfer`]s, stored as a bitset.
+/// A set of [`SurfaceColorSpace`]s, stored as a bitset.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
 #[cfg_attr(
     feature = "bevy_reflect",
@@ -244,57 +393,62 @@ impl DisplayTransfer {
     all(feature = "serialize", feature = "bevy_reflect"),
     reflect(Serialize, Deserialize)
 )]
-pub struct DisplayTransfers(u8);
+pub struct SurfaceColorSpaces(u8);
 
-impl DisplayTransfers {
+impl SurfaceColorSpaces {
     /// The empty set.
     pub const EMPTY: Self = Self(0);
 
-    /// The bit for `transfer`. A match rather than a cast, so adding a variant
-    /// cannot renumber existing bits.
-    const fn bit(transfer: DisplayTransfer) -> u8 {
-        match transfer {
-            DisplayTransfer::Srgb => 0b0001,
-            DisplayTransfer::ScRgbLinear => 0b0010,
-            DisplayTransfer::Pq => 0b0100,
-            DisplayTransfer::ExtendedSrgb => 0b1000,
+    /// Every color space, in declaration order.
+    const ALL: [SurfaceColorSpace; 5] = [
+        SurfaceColorSpace::Srgb,
+        SurfaceColorSpace::ScRgbLinear,
+        SurfaceColorSpace::Pq,
+        SurfaceColorSpace::ExtendedSrgb,
+        SurfaceColorSpace::ExtendedDisplayP3,
+    ];
+
+    /// The bit for `color_space`. A match rather than a cast, so adding a
+    /// variant cannot renumber existing bits.
+    const fn bit(color_space: SurfaceColorSpace) -> u8 {
+        match color_space {
+            SurfaceColorSpace::Srgb => 0b00001,
+            SurfaceColorSpace::ScRgbLinear => 0b00010,
+            SurfaceColorSpace::Pq => 0b00100,
+            SurfaceColorSpace::ExtendedSrgb => 0b01000,
+            SurfaceColorSpace::ExtendedDisplayP3 => 0b10000,
         }
     }
 
-    /// Returns this set with `transfer` added.
-    pub const fn with(self, transfer: DisplayTransfer) -> Self {
-        Self(self.0 | Self::bit(transfer))
+    /// Returns this set with `color_space` added.
+    pub const fn with(self, color_space: SurfaceColorSpace) -> Self {
+        Self(self.0 | Self::bit(color_space))
     }
 
-    /// Returns `true` if `transfer` is a member.
-    pub const fn contains(self, transfer: DisplayTransfer) -> bool {
-        self.0 & Self::bit(transfer) != 0
+    /// Returns `true` if `color_space` is a member.
+    pub const fn contains(self, color_space: SurfaceColorSpace) -> bool {
+        self.0 & Self::bit(color_space) != 0
     }
 
-    /// Iterates the members in [`DisplayTransfer`] variant order.
-    pub fn iter(self) -> impl Iterator<Item = DisplayTransfer> {
-        [
-            DisplayTransfer::Srgb,
-            DisplayTransfer::ScRgbLinear,
-            DisplayTransfer::Pq,
-            DisplayTransfer::ExtendedSrgb,
-        ]
-        .into_iter()
-        .filter(move |&transfer| self.contains(transfer))
+    /// Iterates the members in [`SurfaceColorSpace`] declaration order.
+    pub fn iter(self) -> impl Iterator<Item = SurfaceColorSpace> {
+        Self::ALL
+            .into_iter()
+            .filter(move |&color_space| self.contains(color_space))
     }
 }
 
-impl core::fmt::Debug for DisplayTransfers {
+impl core::fmt::Debug for SurfaceColorSpaces {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_list().entries(self.iter()).finish()
     }
 }
 
-/// The [`DisplayTransfer`] a window's surface uses, and the transfers it
-/// could use.
+/// The [`SurfaceColorSpace`] a window's surface uses, and the color spaces
+/// it could use.
 ///
-/// [`DisplayTarget::transfer`] is a request. The renderer downgrades it when
-/// the surface cannot provide it.
+/// [`DisplayTarget`] is a request. The renderer resolves it against what the
+/// surface supports and reports the result here.
 ///
 /// The renderer inserts and updates this component. Writing to it has no
 /// effect. It is one frame behind the surface and is absent until the
@@ -310,13 +464,15 @@ impl core::fmt::Debug for DisplayTransfers {
     all(feature = "serialize", feature = "bevy_reflect"),
     reflect(Serialize, Deserialize)
 )]
-pub struct WindowSurfaceTransfers {
-    /// The transfer the surface uses.
-    pub resolved: DisplayTransfer,
-    /// The transfers the surface can provide. [`DisplayTransfer::Srgb`] is
-    /// always included. A listed transfer can still be downgraded when the
-    /// surface lacks the requested gamut for it.
-    pub supported: DisplayTransfers,
+pub struct WindowSurfaceColorSpaces {
+    /// The color space the surface uses.
+    pub resolved: SurfaceColorSpace,
+    /// The color spaces the surface can provide.
+    /// [`SurfaceColorSpace::Srgb`] is included when the surface has a format
+    /// for the default (automatic) wgpu color space, which is every surface
+    /// outside an OS HDR mode that lists formats only in explicit color
+    /// spaces.
+    pub supported: SurfaceColorSpaces,
 }
 
 #[cfg(test)]
@@ -324,52 +480,241 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sanitized_paper_white_passes_valid_values_through_bit_for_bit() {
-        for nits in [0.001, 80.0, 100.0, 203.0, 1000.0, 10000.0] {
+    fn default_requests_sdr() {
+        let target = DisplayTarget::default();
+        assert!(!target.hdr);
+        assert_eq!(target.color_space_override, None);
+    }
+
+    #[test]
+    fn only_srgb_is_not_hdr() {
+        assert!(!SurfaceColorSpace::Srgb.is_hdr());
+        assert!(SurfaceColorSpace::ScRgbLinear.is_hdr());
+        assert!(SurfaceColorSpace::Pq.is_hdr());
+        assert!(SurfaceColorSpace::ExtendedSrgb.is_hdr());
+        assert!(SurfaceColorSpace::ExtendedDisplayP3.is_hdr());
+    }
+
+    #[test]
+    fn each_color_space_has_primaries_and_a_transfer_function() {
+        let expected = [
+            (
+                SurfaceColorSpace::Srgb,
+                RgbPrimaries::BT709,
+                TransferFunction::Srgb,
+            ),
+            (
+                SurfaceColorSpace::ScRgbLinear,
+                RgbPrimaries::BT709,
+                TransferFunction::Linear,
+            ),
+            (
+                SurfaceColorSpace::Pq,
+                RgbPrimaries::BT2020,
+                TransferFunction::Pq,
+            ),
+            (
+                SurfaceColorSpace::ExtendedSrgb,
+                RgbPrimaries::BT709,
+                TransferFunction::ExtendedSrgb,
+            ),
+            (
+                SurfaceColorSpace::ExtendedDisplayP3,
+                RgbPrimaries::DISPLAY_P3,
+                TransferFunction::ExtendedSrgb,
+            ),
+        ];
+        for (color_space, primaries, transfer_function) in expected {
+            assert_eq!(color_space.primaries(), primaries);
+            assert_eq!(color_space.transfer_function(), transfer_function);
+        }
+    }
+
+    #[test]
+    fn color_space_set_membership() {
+        let set = SurfaceColorSpaces::EMPTY
+            .with(SurfaceColorSpace::Srgb)
+            .with(SurfaceColorSpace::Pq);
+        assert!(set.contains(SurfaceColorSpace::Srgb));
+        assert!(set.contains(SurfaceColorSpace::Pq));
+        assert!(!set.contains(SurfaceColorSpace::ScRgbLinear));
+        assert!(!set.contains(SurfaceColorSpace::ExtendedSrgb));
+        assert!(!set.contains(SurfaceColorSpace::ExtendedDisplayP3));
+        assert!(!SurfaceColorSpaces::EMPTY.contains(SurfaceColorSpace::Srgb));
+        assert_eq!(set.with(SurfaceColorSpace::Pq), set);
+    }
+
+    #[test]
+    fn color_space_set_iterates_in_declaration_order() {
+        let set = SurfaceColorSpaces::EMPTY
+            .with(SurfaceColorSpace::ExtendedDisplayP3)
+            .with(SurfaceColorSpace::Srgb)
+            .with(SurfaceColorSpace::Pq);
+        assert!(set.iter().eq([
+            SurfaceColorSpace::Srgb,
+            SurfaceColorSpace::Pq,
+            SurfaceColorSpace::ExtendedDisplayP3,
+        ]));
+    }
+
+    #[test]
+    fn resolve_none_fills_defaults_per_color_space() {
+        let expected = [
+            (SurfaceColorSpace::Srgb, 100.0, 100.0),
+            (SurfaceColorSpace::ScRgbLinear, 80.0, 1000.0),
+            (SurfaceColorSpace::Pq, 203.0, 1000.0),
+            (SurfaceColorSpace::ExtendedSrgb, 80.0, 1000.0),
+            (SurfaceColorSpace::ExtendedDisplayP3, 80.0, 1000.0),
+        ];
+        for (color_space, paper_white_nits, peak_luminance_nits) in expected {
+            assert_eq!(
+                DisplayTarget::default().resolve(color_space),
+                ResolvedDisplayTarget {
+                    color_space,
+                    paper_white_nits,
+                    peak_luminance_nits,
+                    min_luminance_nits: 0.0,
+                },
+                "{color_space:?}"
+            );
+        }
+        assert_eq!(
+            DisplayTarget::default().resolve(SurfaceColorSpace::Srgb),
+            ResolvedDisplayTarget::default()
+        );
+    }
+
+    #[test]
+    fn resolve_some_passes_through_bit_for_bit() {
+        let target = DisplayTarget {
+            paper_white_nits: Some(150.25),
+            peak_luminance_nits: Some(1234.5678),
+            min_luminance_nits: Some(0.0051),
+            ..Default::default()
+        };
+        let resolved = target.resolve(SurfaceColorSpace::Pq);
+        assert_eq!(resolved.paper_white_nits.to_bits(), 150.25f32.to_bits());
+        assert_eq!(
+            resolved.peak_luminance_nits.to_bits(),
+            1234.5678f32.to_bits()
+        );
+        assert_eq!(resolved.min_luminance_nits.to_bits(), 0.0051f32.to_bits());
+
+        // Zero is a valid minimum luminance.
+        let zero_min = DisplayTarget {
+            min_luminance_nits: Some(0.0),
+            ..Default::default()
+        };
+        assert_eq!(
+            zero_min.resolve(SurfaceColorSpace::Srgb).min_luminance_nits,
+            0.0
+        );
+    }
+
+    #[test]
+    fn resolve_degenerate_some_falls_back_to_the_default() {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0, -1.0] {
             let target = DisplayTarget {
-                paper_white_nits: nits,
-                ..DisplayTarget::SDR_SRGB
+                paper_white_nits: Some(bad),
+                peak_luminance_nits: Some(bad),
+                ..Default::default()
             };
             assert_eq!(
-                target.sanitized_paper_white_nits().to_bits(),
-                nits.to_bits()
+                target.resolve(SurfaceColorSpace::Pq),
+                DisplayTarget::default().resolve(SurfaceColorSpace::Pq),
+                "{bad}"
+            );
+        }
+        for bad in [f32::NAN, f32::INFINITY, -1.0] {
+            let target = DisplayTarget {
+                min_luminance_nits: Some(bad),
+                ..Default::default()
+            };
+            assert_eq!(
+                target.resolve(SurfaceColorSpace::Srgb).min_luminance_nits,
+                0.0,
+                "{bad}"
             );
         }
     }
 
     #[test]
-    fn sanitized_paper_white_replaces_degenerate_values() {
-        for nits in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0, -0.0, -50.0] {
-            let target = DisplayTarget {
-                paper_white_nits: nits,
-                ..DisplayTarget::SDR_SRGB
-            };
-            assert_eq!(target.sanitized_paper_white_nits(), 100.0);
-        }
-    }
-
-    #[test]
-    fn sanitized_paper_white_clamps_to_pq_maximum() {
+    fn resolve_clamps_to_the_maximum_luminance() {
         let target = DisplayTarget {
-            paper_white_nits: 20000.0,
-            ..DisplayTarget::SDR_SRGB
+            paper_white_nits: Some(20000.0),
+            peak_luminance_nits: Some(f32::MAX),
+            min_luminance_nits: Some(10001.0),
+            ..Default::default()
         };
         assert_eq!(
-            target.sanitized_paper_white_nits(),
-            DisplayTarget::MAX_PAPER_WHITE_NITS
+            target.resolve(SurfaceColorSpace::ScRgbLinear),
+            ResolvedDisplayTarget {
+                color_space: SurfaceColorSpace::ScRgbLinear,
+                paper_white_nits: MAX_LUMINANCE_NITS,
+                peak_luminance_nits: MAX_LUMINANCE_NITS,
+                min_luminance_nits: MAX_LUMINANCE_NITS,
+            }
         );
     }
 
     #[test]
-    fn transfer_set_membership() {
-        let set = DisplayTransfers::EMPTY
-            .with(DisplayTransfer::Srgb)
-            .with(DisplayTransfer::Pq);
-        assert!(set.contains(DisplayTransfer::Srgb));
-        assert!(set.contains(DisplayTransfer::Pq));
-        assert!(!set.contains(DisplayTransfer::ScRgbLinear));
-        assert!(!set.contains(DisplayTransfer::ExtendedSrgb));
-        assert!(!DisplayTransfers::EMPTY.contains(DisplayTransfer::Srgb));
-        assert_eq!(set.with(DisplayTransfer::Pq), set);
+    fn resolve_raises_peak_to_paper_white() {
+        let target = DisplayTarget {
+            paper_white_nits: Some(500.0),
+            peak_luminance_nits: Some(200.0),
+            ..Default::default()
+        };
+        assert_eq!(
+            target.resolve(SurfaceColorSpace::Pq).peak_luminance_nits,
+            500.0
+        );
+
+        // An uncalibrated peak is raised past its default too.
+        let target = DisplayTarget {
+            paper_white_nits: Some(300.0),
+            ..Default::default()
+        };
+        assert_eq!(
+            target.resolve(SurfaceColorSpace::Srgb).peak_luminance_nits,
+            300.0
+        );
+
+        // A calibrated peak below the default paper white is raised to it.
+        let target = DisplayTarget {
+            peak_luminance_nits: Some(150.0),
+            ..Default::default()
+        };
+        assert_eq!(
+            target.resolve(SurfaceColorSpace::Pq).peak_luminance_nits,
+            203.0
+        );
+    }
+
+    #[test]
+    fn resolve_keeps_a_calibrated_peak_above_the_sdr_paper_white() {
+        let target = DisplayTarget {
+            peak_luminance_nits: Some(400.0),
+            ..Default::default()
+        };
+        let resolved = target.resolve(SurfaceColorSpace::Srgb);
+        assert_eq!(resolved.paper_white_nits, 100.0);
+        assert_eq!(resolved.peak_luminance_nits, 400.0);
+    }
+
+    #[test]
+    fn resolve_lowers_min_to_paper_white() {
+        let target = DisplayTarget {
+            min_luminance_nits: Some(500.0),
+            ..Default::default()
+        };
+        assert_eq!(
+            target.resolve(SurfaceColorSpace::Srgb),
+            ResolvedDisplayTarget {
+                color_space: SurfaceColorSpace::Srgb,
+                paper_white_nits: 100.0,
+                peak_luminance_nits: 100.0,
+                min_luminance_nits: 100.0,
+            }
+        );
     }
 }
