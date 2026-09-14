@@ -1,17 +1,17 @@
 //! Reads what the display behind each window surface reports, writes it back
-//! to the main world, and resolves each window's [`EffectiveDisplayTarget`].
+//! to the main world, and resolves each window's [`ResolvedDisplayTarget`].
 //!
 //! `bevy_window` does not depend on wgpu, so everything that reads a
 //! [`DisplayHdrInfo`] is here.
 
+use bevy_color::RgbPrimaries;
 use bevy_ecs::entity::EntityHashMap;
 use bevy_ecs::prelude::*;
 use bevy_window::{
-    DisplayCalibrationPolicy, DisplayGamut, DisplayProvenance, DisplayTarget,
-    EffectiveDisplayTarget, FieldProvenance, MonitorDisplayCapability, OnMonitor, Window,
-    WindowDisplayState, WindowSurfaceTransfers,
+    DisplayTarget, MonitorDisplayCapability, OnMonitor, ResolvedDisplayTarget, SurfaceColorSpace,
+    Window, WindowDisplayState, WindowSurfaceColorSpaces,
 };
-use wgpu::{DisplayGamut as WgpuDisplayGamut, DisplayHdrInfo};
+use wgpu::{DisplayGamut, DisplayHdrInfo};
 
 use crate::renderer::RenderAdapter;
 use crate::sync_world::MainEntity;
@@ -19,14 +19,15 @@ use crate::MainWorld;
 
 use super::{ExtractedWindow, SurfaceData};
 
-/// [`Srgb`](WgpuDisplayGamut::Srgb) and any variant wgpu adds later map to
-/// [`DisplayGamut::Rec709`], the narrowest gamut, so the result is never wider
+/// Maps a coarse wgpu gamut bucket to its primaries.
+/// [`Srgb`](DisplayGamut::Srgb) and any variant wgpu adds later map to
+/// [`RgbPrimaries::BT709`], the narrowest set, so the result is never wider
 /// than what the display covers.
-fn map_gamut(g: WgpuDisplayGamut) -> DisplayGamut {
-    match g {
-        WgpuDisplayGamut::DisplayP3 => DisplayGamut::DisplayP3,
-        WgpuDisplayGamut::Rec2020 => DisplayGamut::Rec2020,
-        _ => DisplayGamut::Rec709,
+fn map_gamut(gamut: DisplayGamut) -> RgbPrimaries {
+    match gamut {
+        DisplayGamut::DisplayP3 => RgbPrimaries::DISPLAY_P3,
+        DisplayGamut::Rec2020 => RgbPrimaries::BT2020,
+        _ => RgbPrimaries::BT709,
     }
 }
 
@@ -39,9 +40,12 @@ fn finite_positive(v: f32) -> Option<f32> {
 /// Whether the platform reported a value this module uses. `false` means
 /// unknown, not SDR.
 fn reports_anything(info: &DisplayHdrInfo) -> bool {
-    info.luminance
-        .is_some_and(|l| l.max_nits.is_some() || l.sdr_white_nits.is_some())
-        || info.headroom.is_some()
+    info.luminance.is_some_and(|l| {
+        l.max_nits.is_some()
+            || l.max_full_frame_nits.is_some()
+            || l.min_nits.is_some()
+            || l.sdr_white_nits.is_some()
+    }) || info.headroom.is_some()
         || info.coarse.is_some()
 }
 
@@ -72,6 +76,23 @@ fn read_display_state(
     Some((state, capability))
 }
 
+/// Returns `true` if a headroom the display reports means the OS HDR setting
+/// is off.
+///
+/// Windows lists the PQ color space on the surface even when the OS HDR
+/// toggle is off, so the surface capabilities over-report there. The live
+/// tone-map headroom disambiguates: it is `1.0` for a display in SDR mode.
+/// Other platforms report the color spaces accurately, so the gate is Windows
+/// only.
+pub(super) fn display_reports_sdr(state: Option<&WindowDisplayState>) -> bool {
+    cfg!(target_os = "windows") && headroom_reports_sdr(state.and_then(|s| s.tone_map_headroom))
+}
+
+/// [`display_reports_sdr`] without the platform check.
+fn headroom_reports_sdr(tone_map_headroom: Option<f32>) -> bool {
+    tone_map_headroom.is_some_and(|headroom| headroom <= 1.0)
+}
+
 /// Relative change below which a new reading counts as unchanged, so read
 /// noise does not trigger change detection in the main world.
 const EPSILON_REL: f32 = 0.01;
@@ -90,6 +111,37 @@ struct SurfaceDisplayState {
 /// The last display state read for each window, keyed by render world entity.
 #[derive(Resource, Default)]
 pub struct DisplayStateStore(EntityHashMap<SurfaceDisplayState>);
+
+impl DisplayStateStore {
+    /// The last [`WindowDisplayState`] stored for `entity`, if the display
+    /// behind its surface has reported anything.
+    pub(super) fn state(&self, entity: Entity) -> Option<&WindowDisplayState> {
+        self.0.get(&entity).and_then(|s| s.state.as_ref())
+    }
+
+    /// Reads the display state behind `surface` and stores it for `entity`,
+    /// so [`write_back_display_state`] and
+    /// [`display_reports_sdr`] see it. A surface that reports nothing still
+    /// gets an entry, so it is not read again every frame, and keeps any
+    /// earlier values.
+    ///
+    /// On Apple platforms this must run on the main thread. The Metal backend
+    /// returns nothing from any other thread.
+    pub(super) fn read(
+        &mut self,
+        entity: Entity,
+        surface: &wgpu::Surface,
+        adapter: &RenderAdapter,
+    ) {
+        let info = surface.display_hdr_info(adapter);
+        match read_display_state(&info) {
+            Some((state, capability)) => commit(self, entity, state, capability),
+            None => {
+                self.0.entry(entity).or_default();
+            }
+        }
+    }
+}
 
 fn rel_changed(old: Option<f32>, new: Option<f32>) -> bool {
     match (old, new) {
@@ -121,48 +173,78 @@ fn commit(
     entry.capability = Some(capability);
 }
 
+/// Returns `true` if any luminance field of `target` is `None`, so a new
+/// reading can change the window's [`ResolvedDisplayTarget`].
+fn has_uncalibrated_luminance(target: &DisplayTarget) -> bool {
+    target.paper_white_nits.is_none()
+        || target.peak_luminance_nits.is_none()
+        || target.min_luminance_nits.is_none()
+}
+
+/// Returns `true` if [`poll_display_state`] reads the display behind a window
+/// surface this frame.
+///
+/// It reads a surface the store has no entry for, a surface whose color
+/// space request changed, and a surface whose window has
+/// [`ExtractedWindow::request_display_requery`] set. On a platform where the
+/// headroom changes from frame to frame (`continuous_platform`), it also
+/// reads an HDR surface whose [`DisplayTarget`] leaves any luminance field
+/// uncalibrated.
+fn should_poll(
+    continuous_platform: bool,
+    first_time: bool,
+    extracted: &ExtractedWindow,
+    resolved_color_space: SurfaceColorSpace,
+) -> bool {
+    let continuous = continuous_platform
+        && resolved_color_space.is_hdr()
+        && has_uncalibrated_luminance(&extracted.display_target);
+    first_time
+        || extracted.color_space_request_changed
+        || extracted.request_display_requery
+        || continuous
+}
+
 /// Reads the display state behind each window surface when it may have
 /// changed, and stores it for [`write_back_display_state`].
+///
+/// It reads on surface creation, on a surface reconfiguration or
+/// renegotiation, and when [`ExtractedWindow::request_display_requery`] is
+/// set. On macOS the headroom changes with brightness, ambient light and
+/// battery, so an HDR surface whose [`DisplayTarget`] leaves any luminance
+/// field uncalibrated is read every frame there. See [`should_poll`].
+///
+/// [`create_surfaces`](super::create_surfaces) reads a new surface before
+/// it is configured, so the entry for a new window is usually there already.
 ///
 /// On Apple platforms this runs on the main thread. The Metal backend returns
 /// nothing from any other thread.
 pub fn poll_display_state(
     #[cfg(any(target_os = "macos", target_os = "ios"))] _marker: bevy_ecs::system::NonSendMarker,
     windows: Query<(Entity, &ExtractedWindow, &SurfaceData)>,
+    extracted_windows: Query<(), With<ExtractedWindow>>,
     render_adapter: Res<RenderAdapter>,
     mut store: ResMut<DisplayStateStore>,
 ) {
-    store.0.retain(|e, _| windows.contains(*e));
+    // `SurfaceData` is inserted through commands, so a window whose surface
+    // was created this frame may not match `windows` yet. Its entry is kept.
+    store.0.retain(|e, _| extracted_windows.contains(*e));
 
     for (entity, extracted, surface_data) in windows.iter() {
         let first_time = !store.0.contains_key(&entity);
-        let reconfigured = extracted.display_target_transfer_changed;
-        let event_requery = extracted.request_display_requery;
-
-        let resolved = surface_data.resolved_transfer;
-
-        // On macOS the headroom changes with brightness, ambient light and
-        // battery, so it is read every frame there.
-        let continuous =
-            cfg!(target_os = "macos") && resolved.is_hdr() && extracted.display_calibration_auto;
-
-        if !(first_time || reconfigured || event_requery || continuous) {
+        if !should_poll(
+            cfg!(target_os = "macos"),
+            first_time,
+            extracted,
+            surface_data.resolved_color_space,
+        ) {
             continue;
         }
-
-        let info = surface_data.surface.display_hdr_info(&render_adapter);
-        let Some((state, capability)) = read_display_state(&info) else {
-            // Nothing was reported. Record the surface so it is not read again
-            // every frame, and keep any earlier values.
-            store.0.entry(entity).or_default();
-            continue;
-        };
-
-        commit(&mut store, entity, state, capability);
+        store.read(entity, &surface_data.surface, &render_adapter);
     }
 }
 
-/// Writes each window's [`WindowSurfaceTransfers`], [`WindowDisplayState`],
+/// Writes each window's [`WindowSurfaceColorSpaces`], [`WindowDisplayState`],
 /// and [`MonitorDisplayCapability`] back to the main world. The capability goes
 /// on the window's monitor entity.
 ///
@@ -177,14 +259,14 @@ pub fn write_back_display_state(
         super::insert_on_change(
             &mut main_world,
             main_entity,
-            WindowSurfaceTransfers {
-                resolved: surface_data.resolved_transfer,
-                supported: surface_data.supported_transfers,
+            WindowSurfaceColorSpaces {
+                resolved: surface_data.resolved_color_space,
+                supported: surface_data.supported_color_spaces,
             },
         );
 
-        if let Some(state) = store.0.get(&entity).and_then(|s| s.state) {
-            super::insert_on_change(&mut main_world, main_entity, state);
+        if let Some(state) = store.state(entity) {
+            super::insert_on_change(&mut main_world, main_entity, *state);
         }
 
         let Some(capability) = store.0.get(&entity).and_then(|s| s.capability) else {
@@ -200,114 +282,55 @@ pub fn write_back_display_state(
     }
 }
 
-/// Resolves each window's [`EffectiveDisplayTarget`] from its
-/// [`DisplayTarget`], its [`DisplayCalibrationPolicy`], and what the display
-/// reports.
+/// Resolves each window's [`ResolvedDisplayTarget`] from its
+/// [`DisplayTarget`], the color space in its [`WindowSurfaceColorSpaces`],
+/// and what the display reports in [`WindowDisplayState`] and the monitor's
+/// [`MonitorDisplayCapability`].
+///
+/// Before the surface is configured the color space is
+/// [`SurfaceColorSpace::Srgb`]. The component is inserted on the first run
+/// and written only when the result changes, so change detection fires only
+/// on real changes.
 ///
 /// It runs in the main world so the first extracted frame already has the
 /// resolved target.
-pub fn resolve_calibration(
+pub fn resolve_display_targets(
+    mut commands: Commands,
     mut windows: Query<
         (
+            Entity,
             Option<&DisplayTarget>,
-            Option<&DisplayCalibrationPolicy>,
+            Option<&WindowSurfaceColorSpaces>,
             Option<&WindowDisplayState>,
             Option<&OnMonitor>,
-            &mut EffectiveDisplayTarget,
+            Option<&mut ResolvedDisplayTarget>,
         ),
         With<Window>,
     >,
     monitors: Query<&MonitorDisplayCapability>,
 ) {
-    for (target, policy, live, on_monitor, mut effective) in &mut windows {
+    for (entity, target, surface, state, on_monitor, resolved) in &mut windows {
+        // A required component can still be removed. Fall back to the default
+        // rather than skip the window.
         let target = target.copied().unwrap_or_default();
-        let policy = policy.copied().unwrap_or_default();
+        let color_space = surface.map_or(SurfaceColorSpace::Srgb, |surface| surface.resolved);
         let capability = on_monitor.and_then(|m| monitors.get(m.0).ok());
-        let sensed = SensedInputs { capability, live };
-        effective.set_if_neq(resolve_effective_target(target, policy, sensed));
-    }
-}
-
-#[derive(Default, Clone, Copy)]
-struct SensedInputs<'a> {
-    capability: Option<&'a MonitorDisplayCapability>,
-    live: Option<&'a WindowDisplayState>,
-}
-
-/// Resolves one [`EffectiveDisplayTarget`].
-fn resolve_effective_target(
-    target: DisplayTarget,
-    policy: DisplayCalibrationPolicy,
-    sensed: SensedInputs,
-) -> EffectiveDisplayTarget {
-    let mut out = target;
-    let mut prov = DisplayProvenance::default();
-
-    // Paper white resolves first because the peak may be derived from it.
-    (out.paper_white_nits, prov.paper_white) = resolve_field(
-        policy.auto_paper_white,
-        target.paper_white_nits,
-        sensed.live.and_then(|l| l.sdr_white_nits),
-    );
-    (out.peak_luminance_nits, prov.peak_luminance) = resolve_field(
-        policy.auto_peak_luminance,
-        target.peak_luminance_nits,
-        os_peak(&sensed, out.paper_white_nits, out.transfer.is_hdr()),
-    );
-    (out.min_luminance_nits, prov.min_luminance) = resolve_field(
-        policy.auto_min_luminance,
-        target.min_luminance_nits,
-        sensed.capability.and_then(|c| c.min_nits),
-    );
-    (out.gamut, prov.gamut) = resolve_field(
-        policy.auto_gamut,
-        target.gamut,
-        sensed.capability.and_then(|c| c.gamut_hint),
-    );
-
-    EffectiveDisplayTarget {
-        target: out,
-        provenance: prov,
-    }
-}
-
-/// The peak luminance the display reports, in nits. `None` for an SDR target,
-/// which has no HDR peak.
-///
-/// Uses [`MonitorDisplayCapability::max_nits`] when reported, else
-/// `paper_white_nits` times [`WindowDisplayState::tone_map_headroom`].
-fn os_peak(sensed: &SensedInputs, paper_white_nits: f32, surface_is_hdr: bool) -> Option<f32> {
-    if !surface_is_hdr {
-        return None;
-    }
-    sensed
-        .capability
-        .and_then(|c| c.max_nits)
-        .and_then(finite_positive)
-        .or_else(|| {
-            let headroom = sensed
-                .live
-                .and_then(|l| l.tone_map_headroom)
-                .and_then(finite_positive)?;
-            let paper_white = finite_positive(paper_white_nits)?;
-            // The product can overflow to infinity.
-            finite_positive(paper_white * headroom)
-        })
-}
-
-fn resolve_field<T>(auto: bool, authored: T, sensed: Option<T>) -> (T, FieldProvenance) {
-    match (auto, sensed) {
-        (false, _) => (authored, FieldProvenance::User),
-        (true, Some(v)) => (v, FieldProvenance::Os),
-        (true, None) => (authored, FieldProvenance::Fallback),
+        let next = target.resolve_with_display(color_space, capability, state);
+        match resolved {
+            Some(mut resolved) => {
+                resolved.set_if_neq(next);
+            }
+            None => {
+                commands.entity(entity).insert(next);
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bevy_window::DisplayTransfer;
-    use wgpu::{DisplayHeadroom, DisplayLuminance};
+    use wgpu::{DisplayCoarseRange, DisplayHeadroom, DisplayLuminance};
 
     fn luminance(
         max_nits: Option<f32>,
@@ -369,8 +392,46 @@ mod tests {
     }
 
     #[test]
+    fn gamut_hint_maps_to_primaries() {
+        for (gamut, primaries) in [
+            (DisplayGamut::Srgb, RgbPrimaries::BT709),
+            (DisplayGamut::DisplayP3, RgbPrimaries::DISPLAY_P3),
+            (DisplayGamut::Rec2020, RgbPrimaries::BT2020),
+        ] {
+            let info = DisplayHdrInfo {
+                coarse: Some(DisplayCoarseRange {
+                    high_dynamic_range: None,
+                    gamut: Some(gamut),
+                }),
+                ..Default::default()
+            };
+            let (_, capability) = read_display_state(&info).unwrap();
+            assert_eq!(capability.gamut_hint, Some(primaries), "{gamut:?}");
+        }
+    }
+
+    #[test]
     fn none_stays_none_never_sdr() {
         assert!(read_display_state(&DisplayHdrInfo::default()).is_none());
+    }
+
+    #[test]
+    fn a_minimum_alone_counts_as_reported() {
+        let info = DisplayHdrInfo {
+            luminance: Some(luminance(None, None, Some(0.02), None)),
+            ..Default::default()
+        };
+        let (state, capability) = read_display_state(&info).unwrap();
+        assert_eq!(capability.min_nits, Some(0.02));
+        assert_eq!(capability.max_nits, None);
+        assert_eq!(state, WindowDisplayState::default());
+
+        let info = DisplayHdrInfo {
+            luminance: Some(luminance(None, Some(600.0), None, None)),
+            ..Default::default()
+        };
+        let (_, capability) = read_display_state(&info).unwrap();
+        assert_eq!(capability.max_full_frame_nits, Some(600.0));
     }
 
     #[test]
@@ -384,6 +445,16 @@ mod tests {
         assert_eq!(capability.max_nits, None);
         assert_eq!(state.sdr_white_nits, None);
         assert_eq!(state.tone_map_headroom, None);
+    }
+
+    #[test]
+    fn a_headroom_of_one_or_less_reports_sdr() {
+        assert!(headroom_reports_sdr(Some(1.0)));
+        assert!(headroom_reports_sdr(Some(0.5)));
+        assert!(!headroom_reports_sdr(Some(1.01)));
+        assert!(!headroom_reports_sdr(Some(4.0)));
+        // Not reported never means SDR.
+        assert!(!headroom_reports_sdr(None));
     }
 
     #[test]
@@ -452,218 +523,193 @@ mod tests {
         );
     }
 
-    fn cap_with_peak(max_nits: f32) -> MonitorDisplayCapability {
-        MonitorDisplayCapability {
-            max_nits: Some(max_nits),
-            ..Default::default()
+    fn extracted_window(
+        display_target: DisplayTarget,
+        color_space_request_changed: bool,
+        request_display_requery: bool,
+    ) -> ExtractedWindow {
+        ExtractedWindow {
+            physical_width: 1,
+            physical_height: 1,
+            present_mode: bevy_window::PresentMode::AutoVsync,
+            desired_maximum_frame_latency: None,
+            swap_chain_texture_view: None,
+            swap_chain_texture: None,
+            swap_chain_texture_format: None,
+            swap_chain_texture_view_format: None,
+            size_changed: false,
+            present_mode_changed: false,
+            alpha_mode: bevy_window::CompositeAlphaMode::Auto,
+            display_target,
+            resolved_display_target: display_target.resolve(SurfaceColorSpace::Srgb),
+            display_reports_sdr: false,
+            color_space_request_changed,
+            resolved_color_space: None,
+            request_display_requery,
+            needs_initial_present: false,
         }
     }
 
     #[test]
-    fn default_policy_returns_target_unchanged() {
-        // The capability would override the peak if that field were enabled.
-        let target = DisplayTarget::SDR_SRGB
-            .with_peak_luminance(1000.0)
-            .with_paper_white(200.0)
-            .with_transfer(DisplayTransfer::Pq);
-        let cap = cap_with_peak(4000.0);
-        let e = resolve_effective_target(
-            target,
-            DisplayCalibrationPolicy::default(),
-            SensedInputs {
-                capability: Some(&cap),
+    fn poll_triggers() {
+        let hdr = DisplayTarget {
+            hdr: true,
+            ..Default::default()
+        };
+        let idle = extracted_window(hdr, false, false);
+
+        // The first read, a reconfiguration, and a requery each trigger a
+        // read on every platform.
+        for continuous_platform in [false, true] {
+            assert!(should_poll(
+                continuous_platform,
+                true,
+                &idle,
+                SurfaceColorSpace::Srgb
+            ));
+            assert!(should_poll(
+                continuous_platform,
+                false,
+                &extracted_window(hdr, true, false),
+                SurfaceColorSpace::Srgb
+            ));
+            assert!(should_poll(
+                continuous_platform,
+                false,
+                &extracted_window(hdr, false, true),
+                SurfaceColorSpace::Srgb
+            ));
+        }
+
+        // Nothing happened: no read, except on a platform whose headroom
+        // changes from frame to frame, for an HDR surface with an
+        // uncalibrated luminance.
+        assert!(!should_poll(false, false, &idle, SurfaceColorSpace::Pq));
+        assert!(should_poll(true, false, &idle, SurfaceColorSpace::Pq));
+        assert!(!should_poll(true, false, &idle, SurfaceColorSpace::Srgb));
+
+        let calibrated = extracted_window(
+            DisplayTarget {
+                hdr: true,
+                paper_white_nits: Some(200.0),
+                peak_luminance_nits: Some(1000.0),
+                min_luminance_nits: Some(0.0),
                 ..Default::default()
             },
+            false,
+            false,
         );
-        assert_eq!(e.target, target);
-        assert_eq!(e.provenance, DisplayProvenance::default());
+        assert!(!should_poll(
+            true,
+            false,
+            &calibrated,
+            SurfaceColorSpace::Pq
+        ));
     }
 
     #[test]
-    fn auto_peak_takes_reported_max_nits() {
-        // `os_peak` resolves only for an HDR transfer.
-        let target = DisplayTarget::SDR_SRGB
-            .with_peak_luminance(1000.0)
-            .with_transfer(DisplayTransfer::Pq);
-        let policy = DisplayCalibrationPolicy {
-            auto_peak_luminance: true,
-            ..Default::default()
-        };
-        let cap = cap_with_peak(4000.0);
-        let e = resolve_effective_target(
-            target,
-            policy,
-            SensedInputs {
-                capability: Some(&cap),
+    fn resolve_display_targets_inserts_once_and_writes_only_on_change() {
+        use bevy_ecs::change_detection::DetectChanges;
+        use bevy_ecs::system::RunSystemOnce;
+
+        let mut world = World::new();
+        let monitor = world
+            .spawn(MonitorDisplayCapability {
+                max_nits: Some(1000.0),
+                min_nits: Some(0.01),
                 ..Default::default()
-            },
-        );
-        assert_eq!(e.target.peak_luminance_nits, 4000.0);
-        assert_eq!(e.provenance.peak_luminance, FieldProvenance::Os);
-    }
+            })
+            .id();
+        let requested = DisplayTarget {
+            hdr: true,
+            paper_white_nits: Some(300.0),
+            ..Default::default()
+        };
+        let on_monitor = world
+            .spawn((Window::default(), requested, OnMonitor(monitor)))
+            .id();
+        let alone = world.spawn((Window::default(), requested)).id();
 
-    #[test]
-    fn auto_peak_skipped_on_sdr_target() {
-        // An SDR target keeps its own peak even when the display reports one.
-        let target = DisplayTarget::SDR_SRGB.with_peak_luminance(1000.0); // Srgb transfer
-        let policy = DisplayCalibrationPolicy {
-            auto_peak_luminance: true,
-            ..Default::default()
-        };
-        let cap = cap_with_peak(270.0);
-        let e = resolve_effective_target(
-            target,
-            policy,
-            SensedInputs {
-                capability: Some(&cap),
-                ..Default::default()
-            },
-        );
-        assert_eq!(e.target.peak_luminance_nits, 1000.0);
-        assert_eq!(e.provenance.peak_luminance, FieldProvenance::Fallback);
-    }
+        assert!(world.get::<ResolvedDisplayTarget>(on_monitor).is_none());
+        world.run_system_once(resolve_display_targets).unwrap();
 
-    #[test]
-    fn auto_with_nothing_sensed_falls_back_to_authored_tagged_fallback() {
-        let target = DisplayTarget::SDR_SRGB.with_peak_luminance(1000.0);
-        let policy = DisplayCalibrationPolicy {
-            auto_peak_luminance: true,
-            ..Default::default()
-        };
-        let e = resolve_effective_target(target, policy, SensedInputs::default());
-        assert_eq!(e.target.peak_luminance_nits, 1000.0);
-        assert_eq!(e.provenance.peak_luminance, FieldProvenance::Fallback);
-    }
-
-    #[test]
-    fn transfer_is_never_resolved() {
-        let target = DisplayTarget::SDR_SRGB.with_transfer(DisplayTransfer::Pq);
-        let policy = DisplayCalibrationPolicy {
-            auto_paper_white: true,
-            auto_peak_luminance: true,
-            auto_min_luminance: true,
-            auto_gamut: true,
-        };
-        let cap = cap_with_peak(4000.0);
-        let e = resolve_effective_target(
-            target,
-            policy,
-            SensedInputs {
-                capability: Some(&cap),
-                ..Default::default()
-            },
-        );
-        assert_eq!(e.target.transfer, DisplayTransfer::Pq);
-    }
-
-    #[test]
-    fn auto_paper_white_takes_live_sdr_white() {
-        let target = DisplayTarget::SDR_SRGB.with_paper_white(203.0);
-        let policy = DisplayCalibrationPolicy {
-            auto_paper_white: true,
-            ..Default::default()
-        };
-        let live = WindowDisplayState {
-            sdr_white_nits: Some(80.0),
-            ..Default::default()
-        };
-        let e = resolve_effective_target(
-            target,
-            policy,
-            SensedInputs {
-                live: Some(&live),
-                ..Default::default()
-            },
-        );
-        assert_eq!(e.target.paper_white_nits, 80.0);
-        assert_eq!(e.provenance.paper_white, FieldProvenance::Os);
-    }
-
-    #[test]
-    fn auto_peak_is_paper_white_times_headroom_when_no_max_nits() {
-        // No peak in nits, so the peak is paper white times headroom, 100 * 5.
-        let target = DisplayTarget::SDR_SRGB
-            .with_peak_luminance(1000.0)
-            .with_transfer(DisplayTransfer::ScRgbLinear);
-        let policy = DisplayCalibrationPolicy {
-            auto_peak_luminance: true,
-            ..Default::default()
-        };
-        let live = WindowDisplayState {
-            tone_map_headroom: Some(5.0),
-            ..Default::default()
-        };
-        let e = resolve_effective_target(
-            target,
-            policy,
-            SensedInputs {
-                live: Some(&live),
-                ..Default::default()
-            },
-        );
-        assert_eq!(e.target.peak_luminance_nits, 500.0);
-        assert_eq!(e.provenance.peak_luminance, FieldProvenance::Os);
-    }
-
-    #[test]
-    fn auto_peak_uses_fallback_paper_white_when_no_sdr_white() {
-        // No SDR white reported, so paper white falls back to the `DisplayTarget`
-        // value, and the peak is still derived from it.
-        let target = DisplayTarget::SDR_SRGB.with_transfer(DisplayTransfer::ScRgbLinear);
-        let policy = DisplayCalibrationPolicy {
-            auto_paper_white: true,
-            auto_peak_luminance: true,
-            ..Default::default()
-        };
-        let live = WindowDisplayState {
-            tone_map_headroom: Some(4.0),
-            ..Default::default()
-        };
-        let e = resolve_effective_target(
-            target,
-            policy,
-            SensedInputs {
-                live: Some(&live),
-                ..Default::default()
-            },
+        // Before the surface is configured the color space is SDR sRGB. The
+        // capability is found through `OnMonitor`, and only the minimum
+        // applies on SDR.
+        assert_eq!(
+            *world.get::<ResolvedDisplayTarget>(on_monitor).unwrap(),
+            requested.resolve_with_display(
+                SurfaceColorSpace::Srgb,
+                Some(&MonitorDisplayCapability {
+                    max_nits: Some(1000.0),
+                    min_nits: Some(0.01),
+                    ..Default::default()
+                }),
+                None
+            )
         );
         assert_eq!(
-            e.target.paper_white_nits,
-            DisplayTarget::SDR_SRGB.paper_white_nits
+            world
+                .get::<ResolvedDisplayTarget>(on_monitor)
+                .unwrap()
+                .min_luminance_nits,
+            0.01
         );
-        assert_eq!(e.provenance.paper_white, FieldProvenance::Fallback);
+        // A window without a monitor resolves with no capability.
         assert_eq!(
-            e.target.peak_luminance_nits,
-            DisplayTarget::SDR_SRGB.paper_white_nits * 4.0
+            *world.get::<ResolvedDisplayTarget>(alone).unwrap(),
+            requested.resolve(SurfaceColorSpace::Srgb)
         );
-        assert_eq!(e.provenance.peak_luminance, FieldProvenance::Os);
+
+        let first_change = world
+            .entity(on_monitor)
+            .get_ref::<ResolvedDisplayTarget>()
+            .unwrap()
+            .last_changed();
+        world.increment_change_tick();
+
+        // An identical result leaves the change tick alone.
+        world.run_system_once(resolve_display_targets).unwrap();
+        assert_eq!(
+            world
+                .entity(on_monitor)
+                .get_ref::<ResolvedDisplayTarget>()
+                .unwrap()
+                .last_changed(),
+            first_change
+        );
+
+        // The surface negotiates PQ: the result changes and is written.
+        world
+            .entity_mut(on_monitor)
+            .insert(WindowSurfaceColorSpaces {
+                resolved: SurfaceColorSpace::Pq,
+                supported: bevy_window::SurfaceColorSpaces::EMPTY.with(SurfaceColorSpace::Pq),
+            });
+        world.increment_change_tick();
+        world.run_system_once(resolve_display_targets).unwrap();
+        let resolved = world
+            .entity(on_monitor)
+            .get_ref::<ResolvedDisplayTarget>()
+            .unwrap();
+        assert_ne!(resolved.last_changed(), first_change);
+        assert_eq!(resolved.color_space, SurfaceColorSpace::Pq);
+        assert_eq!(resolved.peak_luminance_nits, 1000.0);
     }
 
     #[test]
-    fn peak_uses_the_resolved_paper_white_not_the_authored_one() {
-        // The peak must use the resolved paper white, 120 * 3, not the
-        // `DisplayTarget` value of 100. The fixture omits the peak in nits to
-        // force the headroom branch.
-        let target = DisplayTarget::SDR_SRGB.with_transfer(DisplayTransfer::ScRgbLinear);
-        let policy = DisplayCalibrationPolicy {
-            auto_paper_white: true,
-            auto_peak_luminance: true,
+    fn any_none_luminance_field_is_uncalibrated() {
+        assert!(has_uncalibrated_luminance(&DisplayTarget::default()));
+        let calibrated = DisplayTarget {
+            paper_white_nits: Some(200.0),
+            peak_luminance_nits: Some(1000.0),
+            min_luminance_nits: Some(0.0),
             ..Default::default()
         };
-        let live = WindowDisplayState {
-            sdr_white_nits: Some(120.0),
-            tone_map_headroom: Some(3.0),
-        };
-        let e = resolve_effective_target(
-            target,
-            policy,
-            SensedInputs {
-                live: Some(&live),
-                ..Default::default()
-            },
-        );
-        assert_eq!(e.target.paper_white_nits, 120.0);
-        assert_eq!(e.target.peak_luminance_nits, 360.0);
-        assert_eq!(e.provenance.peak_luminance, FieldProvenance::Os);
+        assert!(!has_uncalibrated_luminance(&calibrated));
+        assert!(has_uncalibrated_luminance(&DisplayTarget {
+            min_luminance_nits: None,
+            ..calibrated
+        }));
     }
 }
