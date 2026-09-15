@@ -13,6 +13,8 @@ import bevy_render::maths::PI;
 @if(TONEMAP_IN_SHADER)
 import bevy_core_pipeline::tonemapping::approximate_inverse_tone_mapping;
 
+override SCREEN_SPACE_SPECULAR_TRANSMISSION_BLUR_TAPS: i32 = 8;
+
 @if (VIEW_TRANSMISSION_TEXTURE) {
 
 /// The IOR impacts how much a single microfacet refracts incoming light. In turn this changes how
@@ -109,10 +111,7 @@ fn fetch_transmissive_background(offset_position: vec2<f32>, frag_coord: vec3<f3
     // - proportional to the inverse of view z
     let blur_intensity = (transmission_roughness * transmission_roughness) / view_z;
 
-    @if(SCREEN_SPACE_SPECULAR_TRANSMISSION_BLUR_TAPS)
-    let num_taps = constants::SCREEN_SPACE_SPECULAR_TRANSMISSION_BLUR_TAPS; // Controlled by the `ScreenSpaceTransmission::quality` property
-    @else
-    let num_taps = 8; // Fallback to 8 taps, if not specified
+    let num_taps = SCREEN_SPACE_SPECULAR_TRANSMISSION_BLUR_TAPS; // Controlled by the `ScreenSpaceTransmission::quality` property
     let num_spirals = i32(ceil(f32(num_taps) / 8.0));
     @if(TEMPORAL_JITTER)
     let random_angle = interleaved_gradient_noise(frag_coord.xy, view_bindings::globals.frame_count);

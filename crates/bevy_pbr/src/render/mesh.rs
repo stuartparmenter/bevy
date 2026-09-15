@@ -2706,6 +2706,12 @@ pub fn collect_meshes_for_gpu_building(
     previous_input_buffer.ensure_nonempty();
 }
 
+/// Pipeline constant key for the blur tap count override in the `bevy_pbr::transmission` module.
+/// [`MeshPipeline`] sets it on the fragment stage from [`ScreenSpaceTransmissionQuality`](crate::ScreenSpaceTransmissionQuality);
+/// custom pipelines that import the module without going through it set it themselves.
+pub const SCREEN_SPACE_SPECULAR_TRANSMISSION_BLUR_TAPS: &str =
+    "bevy_pbr::transmission::SCREEN_SPACE_SPECULAR_TRANSMISSION_BLUR_TAPS";
+
 /// All data needed to construct a pipeline for rendering 3D meshes.
 #[derive(Resource, Clone)]
 pub struct MeshPipeline {
@@ -3656,16 +3662,13 @@ impl SpecializedMeshPipeline for MeshPipeline {
         let blur_quality =
             key.intersection(MeshPipelineKey::SCREEN_SPACE_SPECULAR_TRANSMISSION_RESERVED_BITS);
 
-        shader_defs.push(ShaderDefVal::Int(
-            "SCREEN_SPACE_SPECULAR_TRANSMISSION_BLUR_TAPS".into(),
-            match blur_quality {
-                MeshPipelineKey::SCREEN_SPACE_SPECULAR_TRANSMISSION_LOW => 4,
-                MeshPipelineKey::SCREEN_SPACE_SPECULAR_TRANSMISSION_MEDIUM => 8,
-                MeshPipelineKey::SCREEN_SPACE_SPECULAR_TRANSMISSION_HIGH => 16,
-                MeshPipelineKey::SCREEN_SPACE_SPECULAR_TRANSMISSION_ULTRA => 32,
-                _ => unreachable!(), // Not possible, since the mask is 2 bits, and we've covered all 4 cases
-            },
-        ));
+        let blur_taps: i32 = match blur_quality {
+            MeshPipelineKey::SCREEN_SPACE_SPECULAR_TRANSMISSION_LOW => 4,
+            MeshPipelineKey::SCREEN_SPACE_SPECULAR_TRANSMISSION_MEDIUM => 8,
+            MeshPipelineKey::SCREEN_SPACE_SPECULAR_TRANSMISSION_HIGH => 16,
+            MeshPipelineKey::SCREEN_SPACE_SPECULAR_TRANSMISSION_ULTRA => 32,
+            _ => unreachable!(), // Not possible, since the mask is 2 bits, and we've covered all 4 cases
+        };
 
         if key.contains(MeshPipelineKey::VISIBILITY_RANGE_DITHER) {
             shader_defs.push("VISIBILITY_RANGE_DITHER".into());
@@ -3722,6 +3725,10 @@ impl SpecializedMeshPipeline for MeshPipeline {
                     blend,
                     write_mask: ColorWrites::ALL,
                 })],
+                constants: vec![(
+                    SCREEN_SPACE_SPECULAR_TRANSMISSION_BLUR_TAPS.into(),
+                    f64::from(blur_taps),
+                )],
                 ..default()
             }),
             layout: bind_group_layout,
