@@ -409,6 +409,15 @@ pub fn build_raytracing_geometry_blas(
             if !entry.pending_build {
                 return None;
             }
+            // Producers may replace or resize buffers after prepare. Skip mismatched
+            // builds to avoid invalidating the shared command buffer. Leave the entry
+            // pending so the next prepare reallocates it.
+            if entry.buffer_ids != (buffers.vertex_buffer.id(), buffers.index_buffer.id())
+                || entry.size.vertex_count != buffers.vertex_count
+                || entry.size.index_count != Some(buffers.index_count)
+            {
+                return None;
+            }
             built.push(entity);
             Some(BlasBuildEntry {
                 blas: &entry.blas,
