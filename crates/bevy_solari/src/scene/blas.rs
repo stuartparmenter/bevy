@@ -272,6 +272,9 @@ struct GeometryBlasEntry {
     size: BlasTriangleGeometrySizeDescriptor,
     /// Buffer IDs used to detect replacements, even when the counts are unchanged.
     buffer_ids: (BufferId, BufferId),
+    /// The mode used to allocate the BLAS. A mode change requires reallocation
+    /// because the build flags differ and `RebuildEveryFrame` needs two BLASes.
+    update_mode: RaytracingGeometryUpdateMode,
     /// Whether this BLAS still needs to be built.
     /// Keep it pending if the producer buffers are unavailable.
     pending_build: bool,
@@ -349,7 +352,8 @@ pub fn prepare_raytracing_geometry_blas(
             Some(entry)
                 if entry.size.vertex_count == buffers.vertex_count
                     && entry.size.index_count == Some(buffers.index_count)
-                    && entry.buffer_ids == buffer_ids =>
+                    && entry.buffer_ids == buffer_ids
+                    && entry.update_mode == buffers.update_mode =>
             {
                 // A pending build already swapped BLASes. Swapping again would build
                 // into the BLAS referenced by the previous TLAS.
@@ -374,6 +378,7 @@ pub fn prepare_raytracing_geometry_blas(
                         previous_blas,
                         size,
                         buffer_ids,
+                        update_mode: buffers.update_mode,
                         pending_build: true,
                     },
                 );
