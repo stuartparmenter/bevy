@@ -68,7 +68,6 @@ pub fn extract_raytracing_scene_structural(
                 &RaytracingMesh3d,
                 &MeshMaterial3d<StandardMaterial>,
                 &GlobalTransform,
-                Option<&PreviousGlobalTransform>,
             ),
             Added<RaytracingMesh3d>,
         >,
@@ -79,7 +78,6 @@ pub fn extract_raytracing_scene_structural(
                 RenderEntity,
                 &MeshMaterial3d<StandardMaterial>,
                 &GlobalTransform,
-                Option<&PreviousGlobalTransform>,
             ),
             Added<RaytracingGeometry>,
         >,
@@ -104,14 +102,17 @@ pub fn extract_raytracing_scene_structural(
         }
     }
 
-    for (render_entity, mesh, material, transform, previous_frame_transform) in &new_instances {
+    // Both paths seed a zero-motion previous transform rather than reading
+    // the main world's: a newly appearing instance was absent from last
+    // frame's TLAS, and a main-world `PreviousGlobalTransform` can hold a
+    // stale value from before the component was (re-)added. The `PreUpdate`
+    // maintainers take over from the next frame.
+    for (render_entity, mesh, material, transform) in &new_instances {
         commands.entity(render_entity).insert((
             mesh.clone(),
             material.clone(),
             *transform,
-            previous_frame_transform
-                .cloned()
-                .unwrap_or(PreviousGlobalTransform(transform.affine())),
+            PreviousGlobalTransform(transform.affine()),
         ));
     }
 
@@ -119,14 +120,12 @@ pub fn extract_raytracing_scene_structural(
     // The vertex/index buffers live in `RaytracingGeometryBuffers`, inserted
     // separately on the render entity by the producer. Transform and material
     // updates ride the retained update systems below, like mesh instances.
-    for (render_entity, material, transform, previous_frame_transform) in &new_geometry_instances {
+    for (render_entity, material, transform) in &new_geometry_instances {
         commands.entity(render_entity).insert((
             RaytracingGeometry,
             material.clone(),
             *transform,
-            previous_frame_transform
-                .cloned()
-                .unwrap_or(PreviousGlobalTransform(transform.affine())),
+            PreviousGlobalTransform(transform.affine()),
         ));
     }
 }
