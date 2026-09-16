@@ -23,7 +23,7 @@ use tracing::info_span;
 pub struct BindGroupCacheState {
     cached: [Option<BindGroup>; 2],
     pub invalid: bool,
-    last_buffer_ids: [Option<BufferId>; 10],
+    last_buffer_ids: [Option<BufferId>; 11],
     last_light_count: u32,
     last_dfg_ids: Option<(TextureViewId, SamplerId)>,
     last_environment_map_light_id: Option<TextureViewId>,
@@ -43,7 +43,7 @@ impl BindGroupCacheState {
         Self {
             cached: [None, None],
             invalid: true,
-            last_buffer_ids: [None; 10],
+            last_buffer_ids: [None; 11],
             last_light_count: 0,
             last_dfg_ids: None,
             last_environment_map_light_id: None,
@@ -64,7 +64,7 @@ fn buffer_bindings<'a>(
 
 impl RaytracingSceneBindings {
     /// Each sparse buffer's GPU buffer id, or `None` where it has not been created yet.
-    fn buffer_ids(&self) -> [Option<BufferId>; 10] {
+    fn buffer_ids(&self) -> [Option<BufferId>; 11] {
         [
             self.assets.materials.buffer().map(Buffer::id),
             self.instances.transforms.buffer().map(Buffer::id),
@@ -82,6 +82,10 @@ impl RaytracingSceneBindings {
                 .buffer()
                 .map(Buffer::id),
             self.environment_map_light_buffer.buffer().map(Buffer::id),
+            self.instances
+                .previous_frame_id_translations
+                .buffer()
+                .map(Buffer::id),
         ]
     }
 
@@ -211,6 +215,12 @@ impl RaytracingSceneBindings {
             .buffer()
             .unwrap()
             .as_entire_buffer_binding();
+        let instance_translations = self
+            .instances
+            .previous_frame_id_translations
+            .buffer()
+            .unwrap()
+            .as_entire_buffer_binding();
 
         let current = self.tlas.structures[current_index].as_ref().unwrap();
         let previous = self.tlas.structures[current_index ^ 1]
@@ -241,6 +251,7 @@ impl RaytracingSceneBindings {
                 environment_map_light,
                 &self.environment_map_light_sampler,
                 &self.environment_map_light_buffer,
+                instance_translations,
             )),
         )
     }
@@ -419,6 +430,9 @@ fn prepare_sparse_uploads(
         .prepare_to_populate_buffers(device, cache, jobs, groups, pipelines);
     instances
         .material_ids
+        .prepare_to_populate_buffers(device, cache, jobs, groups, pipelines);
+    instances
+        .previous_frame_id_translations
         .prepare_to_populate_buffers(device, cache, jobs, groups, pipelines);
     if bindings.tlas.uses_raw_build() {
         instances
