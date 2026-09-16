@@ -70,7 +70,6 @@ pub fn extract_raytracing_scene_structural(
                 &RaytracingMesh3d,
                 &MeshMaterial3d<StandardMaterial>,
                 &GlobalTransform,
-                Option<&PreviousGlobalTransform>,
                 Option<&InheritedVisibility>,
             ),
             Or<(Added<RaytracingMesh3d>, Changed<InheritedVisibility>)>,
@@ -82,7 +81,6 @@ pub fn extract_raytracing_scene_structural(
                 RenderEntity,
                 &MeshMaterial3d<StandardMaterial>,
                 &GlobalTransform,
-                Option<&PreviousGlobalTransform>,
             ),
             Added<RaytracingGeometry>,
         >,
@@ -107,15 +105,9 @@ pub fn extract_raytracing_scene_structural(
         }
     }
 
-    for (
-        render_entity,
-        mesh,
-        material,
-        transform,
-        previous_frame_transform,
-        inherited_visibility,
-    ) in &new_instances
-    {
+    // New instances were absent from the previous TLAS. Start with zero motion
+    // instead of a potentially stale main-world previous transform.
+    for (render_entity, mesh, material, transform, inherited_visibility) in &new_instances {
         if let Some(visibility) = inherited_visibility
             && !visibility.get()
         {
@@ -127,21 +119,17 @@ pub fn extract_raytracing_scene_structural(
             mesh.clone(),
             material.clone(),
             *transform,
-            previous_frame_transform
-                .cloned()
-                .unwrap_or(PreviousGlobalTransform(transform.affine())),
+            PreviousGlobalTransform(transform.affine()),
         ));
     }
 
     // The producer inserts the geometry buffers separately on the render entity.
-    for (render_entity, material, transform, previous_frame_transform) in &new_geometry_instances {
+    for (render_entity, material, transform) in &new_geometry_instances {
         commands.entity(render_entity).insert((
             RaytracingGeometry,
             material.clone(),
             *transform,
-            previous_frame_transform
-                .cloned()
-                .unwrap_or(PreviousGlobalTransform(transform.affine())),
+            PreviousGlobalTransform(transform.affine()),
         ));
     }
 }
