@@ -134,6 +134,10 @@ struct ResolvedMaterial {
 
 struct ResolvedRayHitFull {
     world_position: vec3<f32>,
+    /// Rigid motion only: the previous-frame transform applied to CURRENT
+    /// vertex positions. Vertex buffers are not double-buffered, so deformation
+    /// (skinning, in-place-refilled RebuildEveryFrame geometry) contributes no
+    /// motion here.
     previous_frame_world_position: vec3<f32>,
     world_normal: vec3<f32>,
     geometric_world_normal: vec3<f32>,
@@ -212,6 +216,8 @@ fn resolve_triangle_data_full(instance_id: u32, triangle_id: u32, barycentrics: 
     let world_vertices = transform_positions(transform, vertices);
     let world_position = mat3x3(world_vertices[0], world_vertices[1], world_vertices[2]) * barycentrics;
 
+    // Uses this frame's vertices: previous_frame_world_position carries rigid
+    // motion only (see ResolvedRayHitFull).
     let previous_frame_world_vertices = transform_positions(previous_frame_transform, vertices);
     let previous_frame_world_position = mat3x3(previous_frame_world_vertices[0], previous_frame_world_vertices[1], previous_frame_world_vertices[2]) * barycentrics;
 

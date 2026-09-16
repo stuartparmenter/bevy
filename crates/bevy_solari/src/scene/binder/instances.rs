@@ -2,8 +2,10 @@ use super::{
     allocator::{IndexAllocator, RetainedBindingArray},
     assets::AssetState,
     lights::{GpuLightSource, LightSourceId, LightState},
-    BlasManager, RaytracingMesh3d, RaytracingSceneBindings,
+    BlasManager, RaytracingGeometry, RaytracingGeometryBuffers, RaytracingMesh3d,
+    RaytracingSceneBindings,
 };
+use crate::scene::blas::GeometryBlasManager;
 use bevy_asset::AssetId;
 use bevy_ecs::{
     entity::{Entity, EntityHashMap, EntityHashSet},
@@ -68,11 +70,30 @@ fn storage_buffer<T: AtomicPod>(label: &str) -> AtomicSparseBufferVec<T> {
     AtomicSparseBufferVec::new(BufferUsages::STORAGE, label.into())
 }
 
+/// Where an instance's triangles and acceleration structure come from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum InstanceSource {
+    /// A [`RaytracingMesh3d`]: slices of the mesh allocator's slabs and a BLAS keyed by the asset.
+    Mesh(AssetId<Mesh>),
+    /// A [`RaytracingGeometry`]: the producer's whole [`RaytracingGeometryBuffers`] and a BLAS
+    /// keyed by the entity.
+    Geometry,
+}
+
+impl InstanceSource {
+    fn mesh(self) -> Option<AssetId<Mesh>> {
+        match self {
+            Self::Mesh(mesh) => Some(mesh),
+            Self::Geometry => None,
+        }
+    }
+}
+
 /// Everything tracked per raytracing instance.
 #[derive(Clone, Copy)]
 struct Instance {
     slot: u32,
-    mesh: AssetId<Mesh>,
+    source: InstanceSource,
     material: AssetId<StandardMaterial>,
     buffers: Option<(BufferId, BufferId)>,
 }
@@ -113,16 +134,22 @@ impl InstanceState {
         }
     }
 
-    /// Every drawable instance's slot, mesh and world-from-local transform.
+    /// Every drawable instance's entity, slot, source and world-from-local transform.
     ///
     /// Only the `wgpu-core` TLAS build path needs this, to fill in the instance descriptors that
     /// the raw path sets up on the GPU. Slots with a null acceleration structure reference are not
     /// currently drawable, and are left out.
-    pub fn drawable(&self) -> impl Iterator<Item = (u32, AssetId<Mesh>, [f32; 12])> + '_ {
-        self.records.values().filter_map(|instance| {
+    pub fn drawable(&self) -> impl Iterator<Item = (Entity, u32, InstanceSource, [f32; 12])> + '_ {
+        self.records.iter().filter_map(|(entity, instance)| {
             let slot = instance.slot;
-            (self.blas_refs.get(slot) != GpuBlasRef::NONE)
-                .then(|| (slot, instance.mesh, self.transforms.get(slot).rows()))
+            (self.blas_refs.get(slot) != GpuBlasRef::NONE).then(|| {
+                (
+                    *entity,
+                    slot,
+                    instance.source,
+                    self.transforms.get(slot).rows(),
+                )
+            })
         })
     }
 
@@ -135,16 +162,21 @@ impl InstanceState {
 }
 
 pub type InstanceQueryData<'w> = (
-    &'w RaytracingMesh3d,
+    Option<&'w RaytracingMesh3d>,
+    Option<&'w RaytracingGeometryBuffers>,
     &'w MeshMaterial3d<StandardMaterial>,
     &'w GlobalTransform,
     &'w PreviousGlobalTransform,
 );
 
+/// Filter matching both kinds of raytracing instance.
+pub type InstanceQueryFilter = Or<(With<RaytracingMesh3d>, With<RaytracingGeometry>)>;
+
 pub type ChangedInstanceFilter = (
-    With<RaytracingMesh3d>,
+    InstanceQueryFilter,
     Or<(
         Changed<RaytracingMesh3d>,
+        Changed<RaytracingGeometryBuffers>,
         Changed<MeshMaterial3d<StandardMaterial>>,
     )>,
 );
@@ -153,7 +185,18 @@ pub type ChangedInstanceFilter = (
 pub struct InstanceInputs<'a> {
     pub assets: &'a AssetState,
     pub blas_manager: &'a BlasManager,
+    pub geometry_blas_manager: &'a GeometryBlasManager,
     pub mesh_allocator: &'a MeshAllocator,
+}
+
+/// An instance's triangles and acceleration structure, resolved against this frame's scene state.
+struct ResolvedGeometry<'a> {
+    vertex_buffer: &'a Buffer,
+    vertex_buffer_offset: u32,
+    index_buffer: &'a Buffer,
+    index_buffer_offset: u32,
+    triangle_count: u32,
+    blas_address: u64,
 }
 
 fn unlink<K: Eq + Hash>(map: &mut HashMap<K, EntityHashSet>, key: &K, entity: Entity) {
@@ -170,15 +213,17 @@ fn relink<K: Copy + Eq + Hash>(
     map: &mut HashMap<K, EntityHashSet>,
     entity: Entity,
     previous: Option<K>,
-    key: K,
+    key: Option<K>,
 ) {
-    if previous == Some(key) {
+    if previous == key {
         return;
     }
     if let Some(previous) = previous {
         unlink(map, &previous, entity);
     }
-    map.entry(key).or_default().insert(entity);
+    if let Some(key) = key {
+        map.entry(key).or_default().insert(entity);
+    }
 }
 
 impl InstanceState {
@@ -197,13 +242,14 @@ impl InstanceState {
         &mut self,
         inputs: &InstanceInputs,
         lights: &mut LightState,
-        instances: &Query<InstanceQueryData>,
+        instances: &Query<InstanceQueryData, InstanceQueryFilter>,
         changed_instances: &Query<Entity, ChangedInstanceFilter>,
     ) {
         let _span = info_span!("refresh_instances").entered();
 
         let mut refresh = core::mem::take(&mut self.pending_refresh);
         refresh.extend(changed_instances.iter());
+        refresh.extend(inputs.geometry_blas_manager.changed_entities());
 
         let moved_meshes = inputs.mesh_allocator.meshes_displaced_by_slab_growth();
         for mesh_id in inputs
@@ -238,23 +284,26 @@ impl InstanceState {
         inputs: &InstanceInputs,
         lights: &mut LightState,
         entity: Entity,
-        (mesh, material, transform, previous_frame_transform): InstanceQueryData,
+        (mesh, geometry, material, transform, previous_frame_transform): InstanceQueryData,
     ) {
-        let mesh_id = mesh.id();
+        let source = match mesh {
+            Some(mesh) => InstanceSource::Mesh(mesh.id()),
+            None => InstanceSource::Geometry,
+        };
         let material_id = material.id();
         let previous = self.records.get(&entity).copied();
 
         relink(
             &mut self.mesh_instances,
             entity,
-            previous.map(|instance| instance.mesh),
-            mesh_id,
+            previous.and_then(|instance| instance.source.mesh()),
+            source.mesh(),
         );
         relink(
             &mut self.material_instances,
             entity,
             previous.map(|instance| instance.material),
-            material_id,
+            Some(material_id),
         );
 
         let slot = match previous {
@@ -270,15 +319,50 @@ impl InstanceState {
 
         let mut instance = Instance {
             slot,
-            mesh: mesh_id,
+            source,
             material: material_id,
             buffers: previous.and_then(|instance| instance.buffers),
         };
-        let resolved = self.resolve_instance(inputs, lights, entity, &mut instance);
+        let resolved = self.resolve_instance(inputs, lights, entity, &mut instance, geometry);
 
         self.records.insert(entity, instance);
         if !resolved {
             self.pending_refresh.insert(entity);
+        }
+    }
+
+    fn resolve_geometry<'a>(
+        inputs: &InstanceInputs<'a>,
+        entity: Entity,
+        source: InstanceSource,
+        geometry: Option<&'a RaytracingGeometryBuffers>,
+    ) -> Option<ResolvedGeometry<'a>> {
+        match source {
+            InstanceSource::Mesh(mesh) => {
+                let vertex_slice = inputs.mesh_allocator.mesh_vertex_slice(&mesh)?;
+                let index_slice = inputs.mesh_allocator.mesh_index_slice(&mesh)?;
+                Some(ResolvedGeometry {
+                    vertex_buffer: vertex_slice.buffer,
+                    vertex_buffer_offset: vertex_slice.range.start,
+                    index_buffer: index_slice.buffer,
+                    index_buffer_offset: index_slice.range.start,
+                    triangle_count: (index_slice.range.len() / 3) as u32,
+                    blas_address: inputs.blas_manager.device_address(&mesh)?,
+                })
+            }
+            // The producer's buffers are bound whole, and the BLAS is the entity's own. Until the
+            // producer has inserted the buffers there is nothing to point the slot at.
+            InstanceSource::Geometry => {
+                let buffers = geometry?;
+                Some(ResolvedGeometry {
+                    vertex_buffer: &buffers.vertex_buffer,
+                    vertex_buffer_offset: 0,
+                    index_buffer: &buffers.index_buffer,
+                    index_buffer_offset: 0,
+                    triangle_count: buffers.index_count / 3,
+                    blas_address: inputs.geometry_blas_manager.device_address(&entity)?,
+                })
+            }
         }
     }
 
@@ -288,20 +372,19 @@ impl InstanceState {
         lights: &mut LightState,
         entity: Entity,
         instance: &mut Instance,
+        geometry: Option<&RaytracingGeometryBuffers>,
     ) -> bool {
         let slot = instance.slot;
-        let (Some(vertex_slice), Some(index_slice), Some(material_slot), Some(blas_address)) = (
-            inputs.mesh_allocator.mesh_vertex_slice(&instance.mesh),
-            inputs.mesh_allocator.mesh_index_slice(&instance.mesh),
+        let (Some(resolved), Some(material_slot)) = (
+            Self::resolve_geometry(inputs, entity, instance.source, geometry),
             inputs.assets.material_slots.get(&instance.material),
-            inputs.blas_manager.device_address(&instance.mesh),
         ) else {
             self.deactivate_instance(lights, entity, instance);
             return false;
         };
 
-        let vertex_buffer_key = vertex_slice.buffer.id();
-        let index_buffer_key = index_slice.buffer.id();
+        let vertex_buffer_key = resolved.vertex_buffer.id();
+        let index_buffer_key = resolved.index_buffer.id();
         let capacity = MAX_MESH_SLAB_COUNT.get();
         if !self.vertex_buffers.has_room(&vertex_buffer_key, capacity)
             || !self.index_buffers.has_room(&index_buffer_key, capacity)
@@ -318,28 +401,30 @@ impl InstanceState {
         let previous_buffers = instance.buffers.take();
         let vertex_buffer_id = self
             .vertex_buffers
-            .acquire(vertex_buffer_key, capacity, || vertex_slice.buffer.clone())
+            .acquire(vertex_buffer_key, capacity, || {
+                resolved.vertex_buffer.clone()
+            })
             .expect("vertex slab binding array had room but handed out no slot");
         let index_buffer_id = self
             .index_buffers
-            .acquire(index_buffer_key, capacity, || index_slice.buffer.clone())
+            .acquire(index_buffer_key, capacity, || resolved.index_buffer.clone())
             .expect("index slab binding array had room but handed out no slot");
         instance.buffers = Some((vertex_buffer_key, index_buffer_key));
         self.release_buffers(previous_buffers);
 
-        let triangle_count = (index_slice.range.len() / 3) as u32;
+        let triangle_count = resolved.triangle_count;
         self.geometry_ids.grow_and_set(
             slot,
             GpuInstanceGeometryIds {
                 vertex_buffer_id,
-                vertex_buffer_offset: vertex_slice.range.start,
+                vertex_buffer_offset: resolved.vertex_buffer_offset,
                 index_buffer_id,
-                index_buffer_offset: index_slice.range.start,
+                index_buffer_offset: resolved.index_buffer_offset,
                 triangle_count,
             },
         );
         self.material_ids.grow_and_set(slot, material_slot);
-        self.set_blas_ref(slot, GpuBlasRef(blas_address));
+        self.set_blas_ref(slot, GpuBlasRef(resolved.blas_address));
 
         let is_emissive = inputs
             .assets
@@ -414,7 +499,9 @@ impl InstanceState {
         self.deactivate_instance(lights, entity, &mut instance);
         self.slots.release(instance.slot);
         self.pending_refresh.remove(&entity);
-        unlink(&mut self.mesh_instances, &instance.mesh, entity);
+        if let Some(mesh) = instance.source.mesh() {
+            unlink(&mut self.mesh_instances, &mesh, entity);
+        }
         unlink(&mut self.material_instances, &instance.material, entity);
     }
 }
