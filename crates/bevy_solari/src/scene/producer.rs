@@ -14,7 +14,7 @@ use bevy_render::{
 /// Producers record their passes here during [`RenderSystems::PrepareResources`]
 /// instead of finishing and submitting their own encoders. The geometry BLAS
 /// builds that consume their output are recorded into the same encoder after
-/// them, and [`submit_raytracing_producers`] submits the lot once, ahead of the
+/// them, and `submit_raytracing_producers` submits the lot once, ahead of the
 /// render graph's TLAS build. Command order within the encoder guarantees the
 /// compute output is visible to the builds, and `queue.write_buffer` data
 /// staged by producers is flushed at the head of this same submit — so

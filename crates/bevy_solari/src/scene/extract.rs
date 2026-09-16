@@ -122,8 +122,9 @@ pub fn extract_raytracing_scene_structural(
 
     // GPU-authored geometry: extract only the marker + material + transform.
     // The vertex/index buffers live in `RaytracingGeometryBuffers`, inserted
-    // separately on the render entity by the producer. Transform and material
-    // updates ride the retained update systems below, like mesh instances.
+    // separately on the render entity by the producer. Material updates ride
+    // the retained update systems below; `extract_raytracing_scene_transforms`
+    // keeps the render entity's `GlobalTransform` current for producers.
     for (render_entity, material, transform) in &new_geometry_instances {
         commands.entity(render_entity).insert((
             RaytracingGeometry,
@@ -136,6 +137,11 @@ pub fn extract_raytracing_scene_structural(
 
 /// Copies the transforms of moved raytracing instances from the main world
 /// straight into their GPU buffers.
+///
+/// [`RaytracingGeometry`] render entities also keep a current
+/// [`GlobalTransform`] component: producers that write entity-local vertices
+/// invert it, so it has to be the same value as the world-from-local row the
+/// TLAS instance applies that frame.
 pub fn extract_raytracing_scene_transforms(
     main_instances: Extract<
         Query<
@@ -150,6 +156,13 @@ pub fn extract_raytracing_scene_transforms(
             ),
         >,
     >,
+    moved_geometry: Extract<
+        Query<
+            (RenderEntity, &GlobalTransform),
+            (Changed<GlobalTransform>, With<RaytracingGeometry>),
+        >,
+    >,
+    mut render_geometry: Query<&mut GlobalTransform, With<RaytracingGeometry>>,
     bindings: Res<RaytracingSceneBindings>,
 ) {
     main_instances
@@ -161,6 +174,14 @@ pub fn extract_raytracing_scene_transforms(
 
             bindings.move_instance(render_entity, transform, &previous_frame_transform);
         });
+
+    // An entity whose marker was added this frame has no render-world
+    // transform yet; the structural extract inserts this same value for it.
+    for (render_entity, transform) in &moved_geometry {
+        if let Ok(mut render_transform) = render_geometry.get_mut(render_entity) {
+            *render_transform = *transform;
+        }
+    }
 }
 
 /// Updates the mesh and material of existing raytracing instances in the render world.

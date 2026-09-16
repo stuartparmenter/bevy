@@ -32,6 +32,11 @@ pub struct RaytracingMesh3d(pub Handle<Mesh>);
 /// `RenderSystems::PrepareResources`. Solari builds the BLASes into the same
 /// encoder and submits it once in `RenderSystems::PrepareBindGroups`.
 ///
+/// The render entity carries this entity's current
+/// [`GlobalTransform`](bevy_transform::components::GlobalTransform), which
+/// is also the TLAS instance's world-from-local. Producers may write vertices
+/// in entity-local space and rely on the two agreeing every frame.
+///
 /// [`RaytracingProducerEncoder`]: super::RaytracingProducerEncoder
 ///
 /// Remove by despawning the entity or removing this component.
