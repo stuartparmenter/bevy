@@ -175,8 +175,8 @@ impl Plugin for DlssPlugin {
             .add_systems(
                 ExtractSchedule,
                 (
-                    extract::extract_dlss::<DlssSuperResolutionFeature>,
-                    extract::extract_dlss::<DlssRayReconstructionFeature>,
+                    extract::extract_dlss::<DlssSuperResolutionFeature, DlssRayReconstructionFeature>,
+                    extract::extract_dlss::<DlssRayReconstructionFeature, DlssSuperResolutionFeature>,
                 ),
             )
             .add_systems(
