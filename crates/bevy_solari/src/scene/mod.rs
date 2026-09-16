@@ -7,7 +7,9 @@ use bevy_asset::embedded_asset;
 use bevy_shader::load_shader_library;
 pub use binder::prepare_raytracing_scene_resources;
 pub use binder::{RaytracingSceneBindings, RaytracingSceneNeedsPreviousFrameData};
-pub use types::RaytracingMesh3d;
+pub use types::{
+    RaytracingGeometry, RaytracingGeometryBuffers, RaytracingGeometryUpdateMode, RaytracingMesh3d,
+};
 
 use crate::SolariPlugins;
 use bevy_app::{App, Plugin};
@@ -25,7 +27,10 @@ use bevy_render::{
 use binder::{
     build_raytracing_tlas, prepare_raytracing_scene_bind_group, TlasInstanceSetupPipeline,
 };
-use blas::{compact_raytracing_blas, delete_raytracing_blas, prepare_raytracing_blas, BlasManager};
+use blas::{
+    build_raytracing_geometry_blas, compact_raytracing_blas, delete_raytracing_blas,
+    prepare_raytracing_blas, prepare_raytracing_geometry_blas, BlasManager, GeometryBlasManager,
+};
 use extract::{
     extract_raytracing_environment_map_light, extract_raytracing_material_assets,
     extract_raytracing_scene_meshes_and_materials, extract_raytracing_scene_structural,
@@ -65,6 +70,7 @@ impl Plugin for RaytracingScenePlugin {
         render_app
             .init_resource::<ExtractedEnvironmentMapLight>()
             .init_gpu_resource::<BlasManager>()
+            .init_gpu_resource::<GeometryBlasManager>()
             .init_gpu_resource::<StandardMaterialAssets>()
             .init_gpu_resource::<RaytracingSceneBindings>()
             .init_gpu_resource::<TlasInstanceSetupPipeline>()
@@ -88,7 +94,13 @@ impl Plugin for RaytracingScenePlugin {
                     compact_raytracing_blas
                         .in_set(RenderSystems::PrepareAssets)
                         .after(prepare_raytracing_blas),
+                    // Allocate before binding instances; build after producers fill their buffers.
+                    prepare_raytracing_geometry_blas
+                        .in_set(RenderSystems::PrepareResources)
+                        .before(prepare_raytracing_scene_resources),
                     prepare_raytracing_scene_resources.in_set(RenderSystems::PrepareResources),
+                    // Build after producer submissions and before the render graph builds the TLAS.
+                    build_raytracing_geometry_blas.in_set(RenderSystems::PrepareBindGroups),
                     prepare_raytracing_scene_bind_group.in_set(RenderSystems::PrepareBindGroups),
                 ),
             )

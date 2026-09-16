@@ -1,7 +1,9 @@
 use super::{
-    bind_group::BindGroupCacheState, instances::InstanceState, tlas_build, BlasManager,
-    RaytracingSceneBindings,
+    bind_group::BindGroupCacheState,
+    instances::{InstanceSource, InstanceState},
+    tlas_build, BlasManager, RaytracingSceneBindings,
 };
+use crate::scene::blas::GeometryBlasManager;
 use bevy_asset::load_embedded_asset;
 use bevy_ecs::{
     resource::Resource,
@@ -332,6 +334,7 @@ impl TlasState {
 pub fn build_raytracing_tlas(
     mut bindings: ResMut<RaytracingSceneBindings>,
     mut blas_manager: ResMut<BlasManager>,
+    geometry_blas_manager: Res<GeometryBlasManager>,
     pipeline_cache: Res<PipelineCache>,
     pipeline: Res<TlasInstanceSetupPipeline>,
     mut render_context: RenderContext,
@@ -344,7 +347,12 @@ pub fn build_raytracing_tlas(
             setup_tlas_instances(bindings, &pipeline_cache, &pipeline, &mut render_context)
                 && build_tlas_raw(bindings, backend, &mut render_context)
         }
-        None => build_tlas_through_wgpu_core(bindings, &blas_manager, &mut render_context),
+        None => build_tlas_through_wgpu_core(
+            bindings,
+            &blas_manager,
+            &geometry_blas_manager,
+            &mut render_context,
+        ),
     };
 
     if built {
@@ -480,6 +488,7 @@ fn build_tlas_raw(
 fn build_tlas_through_wgpu_core(
     bindings: &mut RaytracingSceneBindings,
     blas_manager: &BlasManager,
+    geometry_blas_manager: &GeometryBlasManager,
     render_context: &mut RenderContext,
 ) -> bool {
     // An empty scene leaves the index unswapped, so whatever is here belongs to an earlier frame
@@ -500,10 +509,14 @@ fn build_tlas_through_wgpu_core(
         let capacity = tlas.get().len();
         tlas[0..capacity].iter_mut().for_each(|entry| *entry = None);
 
-        for (slot, mesh, transform) in bindings.instances.drawable() {
+        for (entity, slot, source, transform) in bindings.instances.drawable() {
             // A mesh can lose its acceleration structure after the instance resolved against it,
             // which leaves the slot with nothing to point at for a frame
-            let Some(blas) = blas_manager.get(&mesh) else {
+            let blas = match source {
+                InstanceSource::Mesh(mesh) => blas_manager.get(&mesh),
+                InstanceSource::Geometry => geometry_blas_manager.get(&entity),
+            };
+            let Some(blas) = blas else {
                 continue;
             };
             tlas[slot as usize] = Some(TlasInstance::new(blas, transform, slot, 0xFF));

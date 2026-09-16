@@ -1,4 +1,4 @@
-use super::{RaytracingMesh3d, RaytracingSceneBindings};
+use super::{RaytracingGeometry, RaytracingMesh3d, RaytracingSceneBindings};
 use bevy_asset::{AssetEvent, AssetId, Assets, Handle};
 use bevy_camera::Camera;
 use bevy_ecs::{
@@ -18,6 +18,9 @@ use bevy_transform::components::GlobalTransform;
 use bevy_utils::once;
 use tracing::warn;
 
+/// Filter matching both kinds of raytracing instance.
+type RaytracingInstanceFilter = Or<(With<RaytracingMesh3d>, With<RaytracingGeometry>)>;
+
 /// Creates or removes components in the render world related to raytracing instances.
 pub fn extract_raytracing_scene_structural(
     new_instances: Extract<
@@ -32,7 +35,19 @@ pub fn extract_raytracing_scene_structural(
             Added<RaytracingMesh3d>,
         >,
     >,
+    new_geometry_instances: Extract<
+        Query<
+            (
+                RenderEntity,
+                &MeshMaterial3d<StandardMaterial>,
+                &GlobalTransform,
+                Option<&PreviousGlobalTransform>,
+            ),
+            Added<RaytracingGeometry>,
+        >,
+    >,
     mut removed_raytracing_meshes: Extract<RemovedComponents<RaytracingMesh3d>>,
+    mut removed_raytracing_geometry: Extract<RemovedComponents<RaytracingGeometry>>,
     render_entities: Extract<Query<RenderEntity>>,
     mut commands: Commands,
 ) {
@@ -43,9 +58,29 @@ pub fn extract_raytracing_scene_structural(
         }
     }
 
+    for main_entity in removed_raytracing_geometry.read() {
+        if let Ok(render_entity) = render_entities.get(main_entity) {
+            commands
+                .entity(render_entity)
+                .remove::<RaytracingGeometry>();
+        }
+    }
+
     for (render_entity, mesh, material, transform, previous_frame_transform) in &new_instances {
         commands.entity(render_entity).insert((
             mesh.clone(),
+            material.clone(),
+            *transform,
+            previous_frame_transform
+                .cloned()
+                .unwrap_or(PreviousGlobalTransform(transform.affine())),
+        ));
+    }
+
+    // The producer inserts the geometry buffers separately on the render entity.
+    for (render_entity, material, transform, previous_frame_transform) in &new_geometry_instances {
+        commands.entity(render_entity).insert((
+            RaytracingGeometry,
             material.clone(),
             *transform,
             previous_frame_transform
@@ -67,7 +102,7 @@ pub fn extract_raytracing_scene_transforms(
             ),
             (
                 Or<(Changed<GlobalTransform>, Changed<PreviousGlobalTransform>)>,
-                With<RaytracingMesh3d>,
+                RaytracingInstanceFilter,
             ),
         >,
     >,
@@ -90,20 +125,31 @@ pub fn extract_raytracing_scene_meshes_and_materials(
         Query<
             (
                 RenderEntity,
-                &RaytracingMesh3d,
+                Option<&RaytracingMesh3d>,
                 &MeshMaterial3d<StandardMaterial>,
             ),
-            Or<(
-                Changed<RaytracingMesh3d>,
-                Changed<MeshMaterial3d<StandardMaterial>>,
-            )>,
+            (
+                Or<(
+                    Changed<RaytracingMesh3d>,
+                    Changed<MeshMaterial3d<StandardMaterial>>,
+                )>,
+                RaytracingInstanceFilter,
+            ),
         >,
     >,
-    mut render_instances: Query<(&mut RaytracingMesh3d, &mut MeshMaterial3d<StandardMaterial>)>,
+    mut render_instances: Query<
+        (
+            Option<&mut RaytracingMesh3d>,
+            &mut MeshMaterial3d<StandardMaterial>,
+        ),
+        RaytracingInstanceFilter,
+    >,
 ) {
     for (render_entity, new_mesh, new_material) in &main_instances {
-        if let Ok((mut mesh, mut material)) = render_instances.get_mut(render_entity) {
-            *mesh = new_mesh.clone();
+        if let Ok((mesh, mut material)) = render_instances.get_mut(render_entity) {
+            if let (Some(mut mesh), Some(new_mesh)) = (mesh, new_mesh) {
+                *mesh = new_mesh.clone();
+            }
             *material = new_material.clone();
         }
     }
