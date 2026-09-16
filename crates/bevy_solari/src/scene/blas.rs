@@ -1,4 +1,7 @@
-use super::{RaytracingGeometry, RaytracingGeometryBuffers, RaytracingGeometryUpdateMode};
+use super::{
+    RaytracingGeometry, RaytracingGeometryBuffers, RaytracingGeometryUpdateMode,
+    RaytracingProducerEncoder,
+};
 use alloc::collections::VecDeque;
 use bevy_asset::AssetId;
 use bevy_ecs::{
@@ -393,15 +396,17 @@ pub fn prepare_raytracing_geometry_blas(
     }
 }
 
-/// Builds every pending geometry BLAS from its producer-filled buffers.
+/// Records a build of every pending geometry BLAS from its producer-filled
+/// buffers into the shared producer encoder, after the producers' own passes.
 ///
-/// Runs after producers have submitted their fill work and before the render
-/// graph builds the TLAS that references these BLASes.
+/// [`submit_raytracing_producers`](super::producer::submit_raytracing_producers)
+/// then submits the lot, before the render graph builds the TLAS that
+/// references these BLASes.
 pub fn build_raytracing_geometry_blas(
     mut geometry_blas_manager: ResMut<GeometryBlasManager>,
     geometry: Query<(Entity, &RaytracingGeometryBuffers), With<RaytracingGeometry>>,
     render_device: Res<RenderDevice>,
-    render_queue: Res<RenderQueue>,
+    mut producer_encoder: ResMut<RaytracingProducerEncoder>,
     mut diagnostics: Option<ResMut<DiagnosticsRecorder>>,
 ) {
     let mut built = Vec::new();
@@ -432,17 +437,14 @@ pub fn build_raytracing_geometry_blas(
         return;
     }
 
-    let mut command_encoder = render_device.create_command_encoder(&CommandEncoderDescriptor {
-        label: Some("geometry_blas_build_command_encoder"),
-    });
+    let command_encoder = producer_encoder.encoder(&render_device);
     let time_span = diagnostics
         .as_mut()
-        .map(|diagnostics| diagnostics.time_span(&mut command_encoder, "geometry_blas_build"));
+        .map(|diagnostics| diagnostics.time_span(command_encoder, "geometry_blas_build"));
     command_encoder.build_acceleration_structures(&build_entries, &[]);
     if let Some(time_span) = time_span {
-        time_span.end(&mut command_encoder);
+        time_span.end(command_encoder);
     }
-    render_queue.submit([command_encoder.finish()]);
 
     drop(build_entries);
     for entity in built {
