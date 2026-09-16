@@ -277,6 +277,11 @@ struct GeometryBlasEntry {
     /// Which buffers the BLAS was built from. Swapping in new buffers (even
     /// with the same counts) must trigger a fresh build.
     buffer_ids: (BufferId, BufferId),
+    /// The mode the BLAS was allocated for. A mode flip must reallocate: the
+    /// modes use different build flags, and `RebuildEveryFrame` needs
+    /// `previous_blas` provisioned — reusing a `BuildOnce` entry would
+    /// rebuild in place against the retained previous-frame TLAS.
+    update_mode: RaytracingGeometryUpdateMode,
     /// Whether [`build_raytracing_geometry_blas`] must build this BLAS this
     /// frame. Cleared only once the build is submitted, so a build that
     /// found no buffers to read stays pending and is retried.
@@ -357,7 +362,8 @@ pub fn prepare_raytracing_geometry_blas(
             Some(entry)
                 if entry.size.vertex_count == buffers.vertex_count
                     && entry.size.index_count == Some(buffers.index_count)
-                    && entry.buffer_ids == buffer_ids =>
+                    && entry.buffer_ids == buffer_ids
+                    && entry.update_mode == buffers.update_mode =>
             {
                 // A build still pending from last frame already swapped;
                 // swapping again would target the BLAS the retained
@@ -370,9 +376,9 @@ pub fn prepare_raytracing_geometry_blas(
                     entry.pending_build = true;
                 }
             }
-            // New, resized, or re-buffered geometry: allocate fresh. The old
-            // BLAS (if any) is retired through the deferred deletion the
-            // retained previous-frame TLAS relies on.
+            // New, resized, re-buffered, or mode-flipped geometry: allocate
+            // fresh. The old BLAS (if any) is retired through the deferred
+            // deletion the retained previous-frame TLAS relies on.
             _ => {
                 let (blas, size) = allocate_geometry_blas(buffers, &render_device);
                 let previous_blas =
@@ -384,6 +390,7 @@ pub fn prepare_raytracing_geometry_blas(
                         previous_blas,
                         size,
                         buffer_ids,
+                        update_mode: buffers.update_mode,
                         pending_build: true,
                     },
                 );
