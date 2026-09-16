@@ -28,9 +28,11 @@ pub struct RaytracingMesh3d(pub Handle<Mesh>);
 ///
 /// This is just the marker. The producer inserts [`RaytracingGeometryBuffers`]
 /// on the render entity and fills the buffers with its own compute pass,
-/// which must be submitted before solari builds BLASes in
-/// `RenderSystems::PrepareBindGroups` — a `PrepareResources` system with its
-/// own `queue.submit` works.
+/// recorded into the shared [`RaytracingProducerEncoder`] during
+/// `RenderSystems::PrepareResources`. Solari builds the BLASes into the same
+/// encoder and submits it once in `RenderSystems::PrepareBindGroups`.
+///
+/// [`RaytracingProducerEncoder`]: super::RaytracingProducerEncoder
 ///
 /// Remove by despawning the entity or removing this component.
 /// `Visibility::Hidden` is ignored, like [`RaytracingMesh3d`].
