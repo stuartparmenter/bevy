@@ -25,9 +25,12 @@ pub struct RaytracingMesh3d(pub Handle<Mesh>);
 /// A component for raytracing geometry generated on the GPU.
 ///
 /// The producer inserts [`RaytracingGeometryBuffers`] on the render entity and fills
-/// the vertex and index buffers with a compute pass. Submit this pass before
-/// Solari builds BLASes in `RenderSystems::PrepareBindGroups`, for example from a
-/// system in `RenderSystems::PrepareResources`.
+/// the vertex and index buffers with a compute pass. Record this pass in
+/// [`RaytracingProducerEncoder`] during `RenderSystems::PrepareResources`.
+/// Solari records the BLAS builds afterward and submits the encoder in
+/// `RenderSystems::PrepareBindGroups`.
+///
+/// [`RaytracingProducerEncoder`]: super::RaytracingProducerEncoder
 ///
 /// Remove the component or despawn the entity to remove its geometry.
 /// Like [`RaytracingMesh3d`], this component ignores `Visibility::Hidden`.
