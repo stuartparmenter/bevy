@@ -181,10 +181,15 @@ impl Plugin for DlssPlugin {
             )
             .add_systems(
                 Render,
+                // Chained so ray reconstruction deterministically wins the
+                // shared MainPassResolutionOverride and TemporalJitter when a
+                // camera holds both features, matching the node-side rule
+                // (the SR node yields to RR).
                 (
                     prepare::prepare_dlss::<DlssSuperResolutionFeature>,
                     prepare::prepare_dlss::<DlssRayReconstructionFeature>,
                 )
+                    .chain()
                     .in_set(RenderSystems::PrepareViews)
                     .before(prepare_view_targets),
             );
