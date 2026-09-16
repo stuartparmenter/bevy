@@ -29,6 +29,9 @@ use tracing::{info_span, warn};
 
 pub const MAX_MESH_SLAB_COUNT: NonZeroU32 = NonZeroU32::new(500).unwrap();
 
+/// Translation for an instance that is no longer present in its previous slot.
+const INSTANCE_NOT_PRESENT_THIS_FRAME: u32 = u32::MAX;
+
 #[derive(Clone, Copy, Default, PartialEq, Pod, Zeroable)]
 #[repr(C)]
 pub struct GpuInstanceGeometryIds {
@@ -106,12 +109,20 @@ pub struct InstanceState {
     pub geometry_ids: AtomicSparseBufferVec<GpuInstanceGeometryIds>,
     pub material_ids: AtomicSparseBufferVec<u32>,
     pub blas_refs: AtomicSparseBufferVec<GpuBlasRef>,
+    /// Maps instance slots from the last consumed frame to the current frame.
+    /// Removed instances map to [`INSTANCE_NOT_PRESENT_THIS_FRAME`].
+    pub previous_frame_id_translations: AtomicSparseBufferVec<u32>,
     pub slots: IndexAllocator,
     records: EntityHashMap<Instance>,
     pub live_count: u32,
     pub pending_refresh: EntityHashSet,
     mesh_instances: HashMap<AssetId<Mesh>, EntityHashSet>,
     pub material_instances: HashMap<AssetId<StandardMaterial>, EntityHashSet>,
+    /// Live instance slots from the last consumed frame.
+    previous_slots: EntityHashMap<u32>,
+    /// Instances whose liveness changed since the last consumed frame.
+    liveness_changed: EntityHashSet,
+    nonidentity_translations: Vec<u32>,
 }
 
 impl InstanceState {
@@ -124,12 +135,73 @@ impl InstanceState {
             geometry_ids: storage_buffer("solari_geometry_ids"),
             material_ids: storage_buffer("solari_material_ids"),
             blas_refs: storage_buffer("solari_blas_refs"),
+            previous_frame_id_translations: storage_buffer(
+                "solari_previous_frame_instance_id_translations",
+            ),
             slots: IndexAllocator::new(),
             records: EntityHashMap::default(),
             live_count: 0,
             pending_refresh: EntityHashSet::default(),
             mesh_instances: HashMap::default(),
             material_instances: HashMap::default(),
+            previous_slots: EntityHashMap::default(),
+            liveness_changed: EntityHashSet::default(),
+            nonidentity_translations: Vec::new(),
+        }
+    }
+
+    /// The slot of `entity` while it is drawable.
+    fn live_slot(&self, entity: Entity) -> Option<u32> {
+        let slot = self.records.get(&entity)?.slot;
+        (self.blas_refs.get(slot) != GpuBlasRef::NONE).then_some(slot)
+    }
+
+    /// Starts a new translation frame. Advance the snapshot only after the previous
+    /// table was consumed, matching [`LightState::begin_frame`].
+    pub fn begin_frame(&mut self, translations_consumed: bool) {
+        for index in core::mem::take(&mut self.nonidentity_translations) {
+            self.previous_frame_id_translations
+                .grow_and_set(index, index);
+        }
+
+        if translations_consumed {
+            for entity in core::mem::take(&mut self.liveness_changed) {
+                match self.live_slot(entity) {
+                    Some(slot) => self.previous_slots.insert(entity, slot),
+                    None => self.previous_slots.remove(&entity),
+                };
+            }
+        }
+    }
+
+    /// Writes translations for instances that moved to another slot or became inactive.
+    pub fn write_instance_id_translations(&mut self) {
+        let changed: Vec<Entity> = self.liveness_changed.iter().copied().collect();
+        for entity in changed {
+            // Instances that first appeared since the last read table have no previous slot
+            let Some(&previous) = self.previous_slots.get(&entity) else {
+                continue;
+            };
+            let current = self
+                .live_slot(entity)
+                .unwrap_or(INSTANCE_NOT_PRESENT_THIS_FRAME);
+
+            if current != previous {
+                self.previous_frame_id_translations
+                    .grow_and_set(previous, current);
+                self.nonidentity_translations.push(previous);
+            }
+        }
+
+        // Initialize new slots with identity translations
+        let slot_count = self.slots.high_water_mark();
+        let translations = &mut self.previous_frame_id_translations;
+        if translations.len() < slot_count {
+            let start = translations.len();
+            translations.grow(slot_count);
+            for index in start..slot_count {
+                translations.set(index, index);
+            }
         }
     }
 
@@ -422,7 +494,7 @@ impl InstanceState {
             },
         );
         self.material_ids.grow_and_set(slot, material_slot);
-        self.set_blas_ref(slot, GpuBlasRef(resolved.blas_address));
+        self.set_blas_ref(entity, slot, GpuBlasRef(resolved.blas_address));
 
         let is_emissive = inputs
             .assets
@@ -455,8 +527,8 @@ impl InstanceState {
         );
     }
 
-    /// Points a slot at an acceleration structure, or at nothing, keeping `live_count` in step.
-    fn set_blas_ref(&mut self, slot: u32, reference: GpuBlasRef) {
+    /// Updates a slot's BLAS reference, live count, and instance translation state.
+    fn set_blas_ref(&mut self, entity: Entity, slot: u32, reference: GpuBlasRef) {
         self.blas_refs.grow(slot + 1);
         let previous = self.blas_refs.get(slot);
         if previous == reference {
@@ -466,8 +538,10 @@ impl InstanceState {
 
         if previous == GpuBlasRef::NONE {
             self.live_count += 1;
+            self.liveness_changed.insert(entity);
         } else if reference == GpuBlasRef::NONE {
             self.live_count -= 1;
+            self.liveness_changed.insert(entity);
         }
     }
 
@@ -477,7 +551,7 @@ impl InstanceState {
         entity: Entity,
         instance: &mut Instance,
     ) {
-        self.set_blas_ref(instance.slot, GpuBlasRef::NONE);
+        self.set_blas_ref(entity, instance.slot, GpuBlasRef::NONE);
         lights.remove_light(LightSourceId::EmissiveMesh(entity));
         self.release_buffers(instance.buffers.take());
     }

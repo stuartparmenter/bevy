@@ -199,9 +199,9 @@ pub fn solari_lighting(
         return;
     };
 
-    // Past every bail-out, so this view's reservoirs will be brought up to this frame's light ids
+    // This pass will translate the reservoirs to the current light and instance IDs
     if restir.is_some() {
-        scene_bindings.note_light_translations_consumed();
+        scene_bindings.note_translations_consumed();
     }
 
     let view_target_attachment = view_target.get_unsampled_color_attachment();
