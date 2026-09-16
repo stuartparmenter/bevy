@@ -10,25 +10,26 @@ use self::assets::{AssetState, MAX_TEXTURE_COUNT};
 pub use self::bind_group::prepare_raytracing_scene_bind_group;
 use self::bind_group::{BindGroupCacheState, GpuEnvironmentMapLight};
 use self::instances::{
-    ChangedInstanceFilter, InstanceInputs, InstanceQueryData, InstanceState, MAX_MESH_SLAB_COUNT,
+    ChangedInstanceFilter, InstanceInputs, InstanceQueryData, InstanceQueryFilter, InstanceState,
+    MAX_MESH_SLAB_COUNT,
 };
 use self::lights::LightState;
 use self::tlas::TlasState;
 pub use self::tlas::{build_raytracing_tlas, TlasInstanceSetupPipeline};
 use super::{
-    blas::{BlasKey, BlasManager, BlasOpacity},
+    blas::{BlasKey, BlasManager, BlasOpacity, GeometryBlasManager},
     extract::{
         ExtractedRaytracingDirectionalLight, ExtractedRaytracingPointLight,
         ExtractedRaytracingRectLight, ExtractedRaytracingSpotLight, StandardMaterialAssets,
     },
-    RaytracingMesh3d,
+    RaytracingGeometry, RaytracingGeometryBuffers, RaytracingMesh3d,
 };
 use bevy_ecs::{
     entity::Entity,
     lifecycle::RemovedComponents,
     query::Changed,
     resource::Resource,
-    system::{Query, Res, ResMut},
+    system::{Query, Res, ResMut, SystemParam},
     world::{FromWorld, World},
 };
 use bevy_render::{
@@ -132,11 +133,19 @@ impl FromWorld for RaytracingSceneBindings {
     }
 }
 
+/// This frame's raytracing instances, and which of them changed or went away.
+#[derive(SystemParam)]
+pub struct InstanceChanges<'w, 's> {
+    instances: Query<'w, 's, InstanceQueryData<'static>, InstanceQueryFilter>,
+    changed_instances: Query<'w, 's, Entity, ChangedInstanceFilter>,
+    removed_instances: RemovedComponents<'w, 's, RaytracingMesh3d>,
+    removed_geometry: RemovedComponents<'w, 's, RaytracingGeometry>,
+    removed_geometry_buffers: RemovedComponents<'w, 's, RaytracingGeometryBuffers>,
+}
+
 /// Applies this frame's scene changes to the retained buffers, binding arrays and TLAS.
 pub fn prepare_raytracing_scene_resources(
-    instances: Query<InstanceQueryData>,
-    changed_instances: Query<Entity, ChangedInstanceFilter>,
-    mut removed_instances: RemovedComponents<RaytracingMesh3d>,
+    mut instance_changes: InstanceChanges,
     (
         changed_directional_lights,
         mut removed_directional_lights,
@@ -162,6 +171,7 @@ pub fn prepare_raytracing_scene_resources(
     needs_previous_frame_data: Option<Res<RaytracingSceneNeedsPreviousFrameData>>,
     mesh_allocator: Res<MeshAllocator>,
     blas_manager: Res<BlasManager>,
+    geometry_blas_manager: Res<GeometryBlasManager>,
     material_assets: Res<StandardMaterialAssets>,
     texture_assets: Res<RenderAssets<GpuImage>>,
     extracted_images: Res<ExtractedAssets<GpuImage>>,
@@ -190,19 +200,29 @@ pub fn prepare_raytracing_scene_resources(
     );
 
     // Apply structural instance changes, now that asset slots are current
+    bindings.instances.remove_instances(
+        &mut bindings.lights,
+        instance_changes
+            .removed_instances
+            .read()
+            .chain(instance_changes.removed_geometry.read()),
+    );
+    // Deactivate geometry with removed buffers until the producer supplies them again
     bindings
         .instances
-        .remove_instances(&mut bindings.lights, removed_instances.read());
+        .pending_refresh
+        .extend(instance_changes.removed_geometry_buffers.read());
     let inputs = InstanceInputs {
         assets: &bindings.assets,
         blas_manager: &blas_manager,
+        geometry_blas_manager: &geometry_blas_manager,
         mesh_allocator: &mesh_allocator,
     };
     bindings.instances.refresh_instances(
         &inputs,
         &mut bindings.lights,
-        &instances,
-        &changed_instances,
+        &instance_changes.instances,
+        &instance_changes.changed_instances,
     );
 
     // Update the light set, now that emissive instances are resolved
