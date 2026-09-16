@@ -4,7 +4,7 @@ use super::{
 };
 use bevy_camera::MainPassResolutionOverride;
 use bevy_core_pipeline::prepass::ViewPrepassTextures;
-use bevy_ecs::system::Res;
+use bevy_ecs::{query::Without, system::Res};
 use bevy_render::{
     camera::TemporalJitter,
     diagnostic::RecordDiagnostics,
@@ -19,14 +19,18 @@ use dlss_wgpu::{
 };
 
 pub fn dlss_super_resolution(
-    view: ViewQuery<(
-        &Dlss<DlssSuperResolutionFeature>,
-        &DlssRenderContext<DlssSuperResolutionFeature>,
-        &MainPassResolutionOverride,
-        &TemporalJitter,
-        &ViewTarget,
-        &ViewPrepassTextures,
-    )>,
+    // Only run RR when both features are present to avoid upscaling twice.
+    view: ViewQuery<
+        (
+            &Dlss<DlssSuperResolutionFeature>,
+            &DlssRenderContext<DlssSuperResolutionFeature>,
+            &MainPassResolutionOverride,
+            &TemporalJitter,
+            &ViewTarget,
+            &ViewPrepassTextures,
+        ),
+        Without<Dlss<DlssRayReconstructionFeature>>,
+    >,
     adapter: Res<RenderAdapter>,
     mut ctx: RenderContext,
 ) {
