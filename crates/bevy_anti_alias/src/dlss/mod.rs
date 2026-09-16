@@ -181,10 +181,13 @@ impl Plugin for DlssPlugin {
             )
             .add_systems(
                 Render,
+                // RR must prepare last to own the shared resolution and jitter when both features
+                // are present. The SR node also skips these cameras.
                 (
                     prepare::prepare_dlss::<DlssSuperResolutionFeature>,
                     prepare::prepare_dlss::<DlssRayReconstructionFeature>,
                 )
+                    .chain()
                     .in_set(RenderSystems::PrepareViews)
                     .before(prepare_view_targets),
             );
