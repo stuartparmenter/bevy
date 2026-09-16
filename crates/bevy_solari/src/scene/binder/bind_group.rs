@@ -23,7 +23,7 @@ use tracing::info_span;
 pub struct BindGroupCacheState {
     cached: [Option<BindGroup>; 2],
     pub invalid: bool,
-    last_buffer_ids: Option<[BufferId; 11]>,
+    last_buffer_ids: Option<[BufferId; 12]>,
     last_dfg_ids: Option<(TextureViewId, SamplerId)>,
     last_light_count: u32,
     last_environment_map_light_id: Option<TextureViewId>,
@@ -64,7 +64,7 @@ fn buffer_bindings<'a>(
 
 impl RaytracingSceneBindings {
     /// The id of each buffer in the bind group.
-    fn buffer_ids(&self) -> [BufferId; 11] {
+    fn buffer_ids(&self) -> [BufferId; 12] {
         [
             self.assets.materials.buffer(),
             self.instances.transforms.buffer(),
@@ -77,6 +77,7 @@ impl RaytracingSceneBindings {
             self.lights.rect_lights.buffer(),
             self.environment_map_light_buffer.buffer(),
             self.lights.previous_frame_id_translations.buffer(),
+            self.instances.previous_frame_id_translations.buffer(),
         ]
         .map(|buffer| {
             buffer
@@ -200,6 +201,10 @@ impl RaytracingSceneBindings {
                 &self.environment_map_light_sampler,
                 &self.environment_map_light_buffer,
                 self.lights
+                    .previous_frame_id_translations
+                    .binding()
+                    .unwrap(),
+                self.instances
                     .previous_frame_id_translations
                     .binding()
                     .unwrap(),
@@ -381,6 +386,9 @@ fn prepare_sparse_uploads(
         .prepare_to_populate_buffers(device, cache, jobs, groups, pipelines);
     instances
         .material_ids
+        .prepare_to_populate_buffers(device, cache, jobs, groups, pipelines);
+    instances
+        .previous_frame_id_translations
         .prepare_to_populate_buffers(device, cache, jobs, groups, pipelines);
     if bindings.tlas.uses_raw_build() {
         instances
