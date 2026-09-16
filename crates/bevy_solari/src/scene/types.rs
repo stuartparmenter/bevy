@@ -4,7 +4,7 @@ use bevy_ecs::{component::Component, prelude::ReflectComponent, template::FromTe
 use bevy_mesh::Mesh;
 use bevy_pbr::{MeshMaterial3d, StandardMaterial};
 use bevy_reflect::{prelude::ReflectDefault, Reflect};
-use bevy_render::sync_world::SyncToRenderWorld;
+use bevy_render::{render_resource::Buffer, sync_world::SyncToRenderWorld};
 use bevy_transform::components::Transform;
 use derive_more::derive::From;
 
@@ -21,3 +21,63 @@ use derive_more::derive::From;
 #[reflect(Component, Default, Clone, PartialEq)]
 #[require(MeshMaterial3d<StandardMaterial>, Transform, SyncToRenderWorld)]
 pub struct RaytracingMesh3d(pub Handle<Mesh>);
+
+/// A component for raytracing geometry generated on the GPU.
+///
+/// The producer inserts [`RaytracingGeometryBuffers`] on the render entity and fills
+/// the vertex and index buffers with a compute pass. Submit this pass before
+/// Solari builds BLASes in `RenderSystems::PrepareBindGroups`, for example from a
+/// system in `RenderSystems::PrepareResources`.
+///
+/// Remove the component or despawn the entity to remove its geometry.
+/// Like [`RaytracingMesh3d`], this component ignores `Visibility::Hidden`.
+///
+/// The material must be [`MeshMaterial3d<StandardMaterial>`]. An emissive material
+/// makes the geometry an area light.
+#[derive(Component, Clone, Copy, Debug, Default, Reflect, PartialEq, Eq)]
+#[reflect(Component, Default, Clone, PartialEq)]
+#[require(MeshMaterial3d<StandardMaterial>, Transform, SyncToRenderWorld)]
+pub struct RaytracingGeometry;
+
+/// How Solari maintains the BLAS for a [`RaytracingGeometry`] entity.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Reflect)]
+pub enum RaytracingGeometryUpdateMode {
+    /// Build the BLAS once using `PREFER_FAST_TRACE`.
+    ///
+    /// For geometry that does not change after the initial build. Replace the buffers
+    /// or use [`RebuildEveryFrame`](Self::RebuildEveryFrame) to update the geometry.
+    #[default]
+    BuildOnce,
+    /// Rebuild the BLAS every frame using `PREFER_FAST_BUILD`.
+    /// For geometry whose buffer contents change each frame, such as skinned meshes.
+    RebuildEveryFrame,
+}
+
+/// The vertex and index buffers for a [`RaytracingGeometry`] render entity.
+///
+/// The producer creates and fills these buffers. Solari builds the BLAS and adds
+/// the TLAS instance. Both buffers must have `STORAGE | BLAS_INPUT` usage.
+/// With [`RaytracingGeometryUpdateMode::RebuildEveryFrame`], the producer can update
+/// the buffer contents in place each frame.
+///
+/// Solari does not double-buffer vertex data. Previous positions use the current
+/// vertices with the previous transform, so motion vectors capture rigid motion
+/// but not deformation.
+#[derive(Component, Clone)]
+pub struct RaytracingGeometryBuffers {
+    /// `array<PackedVertex>`, [`VERTEX_STRIDE`](Self::VERTEX_STRIDE) bytes each.
+    pub vertex_buffer: Buffer,
+    /// `array<u32>` triangle-list indices.
+    pub index_buffer: Buffer,
+    /// Number of vertices in `vertex_buffer`.
+    pub vertex_count: u32,
+    /// Number of indices in `index_buffer` (a multiple of 3).
+    pub index_count: u32,
+    /// Whether the BLAS is built once or rebuilt every frame.
+    pub update_mode: RaytracingGeometryUpdateMode,
+}
+
+impl RaytracingGeometryBuffers {
+    /// Size of a packed vertex: position `vec3`, normal `vec3`, UV `vec2`, tangent `vec4`.
+    pub const VERTEX_STRIDE: u64 = 48;
+}
