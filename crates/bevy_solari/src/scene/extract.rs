@@ -2,15 +2,18 @@ use super::{RaytracingGeometry, RaytracingMesh3d, RaytracingSceneBindings};
 use bevy_asset::{AssetEvent, AssetId, Assets, Handle};
 use bevy_camera::Camera;
 use bevy_ecs::{
+    change_detection::{DetectChanges, Ref},
+    entity::Entity,
     lifecycle::RemovedComponents,
     message::MessageReader,
-    query::{Added, Changed, Or, With},
+    query::{Added, Changed, Or, With, Without},
     resource::Resource,
     system::{Commands, Query, Res, ResMut},
 };
 use bevy_image::Image;
 use bevy_light::{EnvironmentMapLight, GeneratedEnvironmentMapLight};
 use bevy_math::Quat;
+use bevy_mesh::Mesh3d;
 use bevy_pbr::{MeshMaterial3d, PreviousGlobalTransform, StandardMaterial};
 use bevy_platform::collections::HashMap;
 use bevy_render::{sync_world::RenderEntity, Extract};
@@ -20,6 +23,41 @@ use tracing::warn;
 
 /// Filter matching both kinds of raytracing instance.
 type RaytracingInstanceFilter = Or<(With<RaytracingMesh3d>, With<RaytracingGeometry>)>;
+
+/// Maintains [`PreviousGlobalTransform`] for raytracing instances without a
+/// [`Mesh3d`]: `bevy_pbr` only maintains it for rasterized meshes, but solari
+/// needs last frame's transform for motion vectors and temporal reuse on
+/// raytracing-only entities (notably [`RaytracingGeometry`]).
+///
+/// Runs in `PreUpdate` alongside `update_mesh_previous_global_transforms`:
+/// at the start of each frame, last frame's [`GlobalTransform`] becomes this
+/// frame's [`PreviousGlobalTransform`].
+pub fn update_raytracing_previous_global_transforms(
+    mut commands: Commands,
+    new_instances: Query<
+        (Entity, &GlobalTransform),
+        (
+            RaytracingInstanceFilter,
+            Without<Mesh3d>,
+            Without<PreviousGlobalTransform>,
+        ),
+    >,
+    mut instances: Query<
+        (Ref<GlobalTransform>, &mut PreviousGlobalTransform),
+        (RaytracingInstanceFilter, Without<Mesh3d>),
+    >,
+) {
+    for (entity, transform) in &new_instances {
+        commands
+            .entity(entity)
+            .try_insert(PreviousGlobalTransform(transform.affine()));
+    }
+    for (transform, mut previous) in &mut instances {
+        if transform.is_changed_after(previous.last_changed()) {
+            *previous = PreviousGlobalTransform(transform.affine());
+        }
+    }
+}
 
 /// Creates or removes components in the render world related to raytracing instances.
 pub fn extract_raytracing_scene_structural(
