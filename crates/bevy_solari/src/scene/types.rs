@@ -32,6 +32,10 @@ pub struct RaytracingMesh3d(pub Handle<Mesh>);
 ///
 /// [`RaytracingProducerEncoder`]: super::RaytracingProducerEncoder
 ///
+/// The render entity's [`GlobalTransform`](bevy_transform::components::GlobalTransform)
+/// is kept in sync with the TLAS instance transform, so producers can use it to
+/// convert vertices to entity-local space.
+///
 /// Remove the component or despawn the entity to remove its geometry.
 /// Like [`RaytracingMesh3d`], this component ignores `Visibility::Hidden`.
 ///
