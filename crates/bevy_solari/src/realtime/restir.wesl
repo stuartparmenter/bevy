@@ -4,7 +4,7 @@ import bevy_core_pipeline::tonemapping::tonemapping_luminance as luminance;
 import bevy_pbr::render::utils::{rand_f, rand_u, sample_disk};
 import bevy_render::utils::octahedral_decode;
 import package::scene::brdf::{brdf_pdf, evaluate_brdf, F_AB};
-import package::realtime::gbuffer_utils::{gpixel_resolve, permute_pixel, pixel_dissimilar};
+import package::realtime::gbuffer_utils::{gpixel_resolve, permute_pixel, pixel_dissimilar, pixel_dissimilar_motion_compensated, temporal_object_motion_slack};
 import package::realtime::initial_path::{generate_initial_path, InitialSamplingResult};
 import package::realtime::bindings::{depth_buffer, empty_reservoir, gbuffer, motion_vectors, previous_depth_buffer, previous_gbuffer, previous_view, reservoirs_a, reservoirs_b, Reservoir, constants, view, view_output};
 import package::scene::sampling::{balance_heuristic, calculate_resolved_light_contribution, isinf, isnan, LightSample, NULL_LIGHT_ID, power_heuristic, resolve_light_sample, ResolvedLightSample, trace_visibility, trace_visibility_previous_frame};
@@ -84,17 +84,24 @@ fn load_temporal_reservoir(pixel_id: vec2<u32>, depth: f32, world_position: vec3
     // dropping history. The dissimilarity check below still validates the surface, and a same-pixel
     // guess that passes it beats restarting from a confidence-1 reservoir at the screen edge.
     var point_temporal_pixel_id = pixel_id;
+    var reprojection_on_screen = false;
     if all(temporal_pixel_id_float >= vec2(0.0)) && all(temporal_pixel_id_float < view.main_pass_viewport.zw) {
         point_temporal_pixel_id = vec2<u32>(temporal_pixel_id_float);
+        reprojection_on_screen = true;
     }
 
     var permute_rng = constants.frame_rng;
     let permuted_temporal_pixel_id = permute_pixel(point_temporal_pixel_id, rand_u(&permute_rng), view.main_pass_viewport.zw);
 
-    // Check if the pixel features have changed heavily between the current and previous frame
+    // Allow the surface's estimated motion when validating temporal history.
+    // Keep the same-pixel off-screen fallback strict: it may contain background history.
+    var plane_slack = 0.0;
+    if reprojection_on_screen {
+        plane_slack = temporal_object_motion_slack(pixel_id, depth, world_position, motion_vector, view, previous_view.unjittered_clip_from_world);
+    }
     let temporal_depth = textureLoad(previous_depth_buffer, permuted_temporal_pixel_id, 0);
     let temporal_surface = gpixel_resolve(textureLoad(previous_gbuffer, permuted_temporal_pixel_id, 0), temporal_depth, permuted_temporal_pixel_id, view.main_pass_viewport.zw, previous_view.world_from_clip);
-    if pixel_dissimilar(depth, world_position, temporal_surface.world_position, world_normal, temporal_surface.world_normal, view) {
+    if pixel_dissimilar_motion_compensated(depth, world_position, temporal_surface.world_position, world_normal, temporal_surface.world_normal, plane_slack, view) {
         return NeighborInfo(empty_reservoir(), vec3(0.0), vec3(0.0), empty_material());
     }
 
