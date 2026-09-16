@@ -2,13 +2,13 @@
 
 import bevy_core_pipeline::tonemapping::tonemapping_luminance as luminance;
 import bevy_pbr::render::utils::{rand_f, rand_u, sample_disk};
-import bevy_render::utils::octahedral_decode;
+import bevy_render::utils::{octahedral_decode, octahedral_encode};
 import package::scene::brdf::{brdf_pdf, evaluate_brdf, F_AB};
 import package::realtime::gbuffer_utils::{gpixel_resolve, permute_pixel, pixel_dissimilar, pixel_dissimilar_motion_compensated, temporal_object_motion_slack};
 import package::realtime::initial_path::{generate_initial_path, InitialSamplingResult};
-import package::realtime::bindings::{depth_buffer, empty_reservoir, gbuffer, load_motion_vector, previous_depth_buffer, previous_gbuffer, previous_view, reservoirs_a, reservoirs_b, Reservoir, constants, view, view_output};
+import package::realtime::bindings::{depth_buffer, empty_reservoir, gbuffer, load_motion_vector, NO_SAMPLE_POINT_INSTANCE, previous_depth_buffer, previous_gbuffer, previous_view, reservoirs_a, reservoirs_b, Reservoir, constants, view, view_output};
 import package::scene::sampling::{balance_heuristic, calculate_resolved_light_contribution, isinf, isnan, LightSample, NULL_LIGHT_ID, power_heuristic, resolve_light_sample, ResolvedLightSample, trace_visibility, trace_visibility_previous_frame};
-import package::scene::bindings::{light_sources, LIGHT_NOT_PRESENT_THIS_FRAME, previous_frame_light_id_translations, RAY_T_MAX, RAY_T_MIN, ResolvedMaterial};
+import package::scene::bindings::{geometry_ids, INSTANCE_NOT_PRESENT_THIS_FRAME, light_sources, LIGHT_NOT_PRESENT_THIS_FRAME, previous_frame_instance_id_translations, previous_frame_light_id_translations, RAY_T_MAX, RAY_T_MIN, resolve_sample_point, ResolvedMaterial};
 import package::realtime::world_cache_query::{query_world_cache, WORLD_CACHE_CELL_LIFETIME};
 
 enable wgpu_ray_query;
@@ -117,6 +117,32 @@ fn load_temporal_reservoir(pixel_id: vec2<u32>, depth: f32, world_position: vec3
             return NeighborInfo(empty_reservoir(), vec3(0.0), vec3(0.0), empty_material());
         }
         temporal.reservoir.light_sample.light_id = (light_id << 16u) | triangle_id;
+    }
+
+    // Resolve GI anchors against current geometry so they follow motion and deformation.
+    if temporal.reservoir.light_sample.light_id == NULL_LIGHT_ID && temporal.reservoir.sample_point_instance_id != NO_SAMPLE_POINT_INSTANCE {
+        let instance_id = previous_frame_instance_id_translations[temporal.reservoir.sample_point_instance_id];
+        if instance_id == INSTANCE_NOT_PRESENT_THIS_FRAME {
+            return NeighborInfo(empty_reservoir(), vec3(0.0), vec3(0.0), empty_material());
+        }
+        if temporal.reservoir.sample_point_triangle_id >= geometry_ids[instance_id].triangle_count {
+            return NeighborInfo(empty_reservoir(), vec3(0.0), vec3(0.0), empty_material());
+        }
+        temporal.reservoir.sample_point_instance_id = instance_id;
+
+        let barycentrics = vec3(
+            1.0 - temporal.reservoir.sample_point_barycentrics.x - temporal.reservoir.sample_point_barycentrics.y,
+            temporal.reservoir.sample_point_barycentrics,
+        );
+        let sample_point = resolve_sample_point(instance_id, temporal.reservoir.sample_point_triangle_id, barycentrics);
+        // Preserve the stored position and normal-mapped normal when the anchor has not moved.
+        // The tolerance accounts for differences between ray-hit and interpolated positions.
+        let anchor_delta = sample_point.world_position - temporal.reservoir.sample_point_world_position;
+        let reanchor_epsilon = max(0.001, 0.001 * distance(world_position, sample_point.world_position));
+        if dot(anchor_delta, anchor_delta) > reanchor_epsilon * reanchor_epsilon {
+            temporal.reservoir.sample_point_world_position = sample_point.world_position;
+            temporal.reservoir.sample_point_world_normal = octahedral_encode(sample_point.world_normal);
+        }
     }
 
     temporal.reservoir.confidence_weight = min(temporal.reservoir.confidence_weight, constants.confidence_weight_cap);
@@ -295,6 +321,9 @@ fn merge_reservoirs(
     if rand_f(rng) * weight_sum < other_sample_resampling_weight {
         combined_reservoir.sample_point_world_position = other_reservoir.sample_point_world_position;
         combined_reservoir.sample_point_world_normal = other_reservoir.sample_point_world_normal;
+        combined_reservoir.sample_point_instance_id = other_reservoir.sample_point_instance_id;
+        combined_reservoir.sample_point_triangle_id = other_reservoir.sample_point_triangle_id;
+        combined_reservoir.sample_point_barycentrics = other_reservoir.sample_point_barycentrics;
         combined_reservoir.radiance = other_reservoir.radiance;
         combined_reservoir.light_sample = other_reservoir.light_sample;
 
@@ -305,6 +334,9 @@ fn merge_reservoirs(
     } else {
         combined_reservoir.sample_point_world_position = canonical_reservoir.sample_point_world_position;
         combined_reservoir.sample_point_world_normal = canonical_reservoir.sample_point_world_normal;
+        combined_reservoir.sample_point_instance_id = canonical_reservoir.sample_point_instance_id;
+        combined_reservoir.sample_point_triangle_id = canonical_reservoir.sample_point_triangle_id;
+        combined_reservoir.sample_point_barycentrics = canonical_reservoir.sample_point_barycentrics;
         combined_reservoir.radiance = canonical_reservoir.radiance;
         combined_reservoir.light_sample = canonical_reservoir.light_sample;
 

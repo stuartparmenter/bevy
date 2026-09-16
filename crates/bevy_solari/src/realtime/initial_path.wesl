@@ -4,7 +4,7 @@ import bevy_render::maths::PI;
 import bevy_render::utils::octahedral_encode;
 import package::scene::brdf::{brdf_pdf, evaluate_and_sample_brdf, evaluate_brdf, EvaluateAndSampleBrdfResult, F_AB};
 import package::realtime::presample_light_tiles::unpack_resolved_light_sample;
-import package::realtime::bindings::{empty_reservoir, light_tile_resolved_samples, light_tile_samples, Reservoir, constants, view};
+import package::realtime::bindings::{empty_reservoir, light_tile_resolved_samples, light_tile_samples, NO_SAMPLE_POINT_INSTANCE, Reservoir, constants, view};
 import package::scene::sampling::{calculate_resolved_light_contribution, isinf, LightSample, NULL_LIGHT_ID, power_heuristic, trace_visibility, sample_environment_map_light};
 import package::scene::bindings::{light_sources, RAY_T_MAX, RAY_T_MIN, resolve_ray_hit_full, ResolvedMaterial, ResolvedRayHitFull, trace_ray};
 import package::realtime::world_cache_query::{get_cell_size, query_world_cache, WORLD_CACHE_CELL_LIFETIME};
@@ -42,6 +42,10 @@ struct PathState {
     /// Reconnection vertex x2, the first BRDF-sampled hit shared by every length >= 2 candidate
     @if(RESTIR) x2_position: vec3<f32>,
     @if(RESTIR) x2_normal: vec3<f32>,
+    /// Geometry anchor for x2, used to follow motion and deformation during temporal reuse
+    @if(RESTIR) x2_instance_id: u32,
+    @if(RESTIR) x2_triangle_id: u32,
+    @if(RESTIR) x2_barycentrics: vec2<f32>,
     /// If false, candidates built on x2 are shaded directly into radiance instead of
     /// published to the reservoir
     @if(RESTIR) x2_reusable: bool,
@@ -66,6 +70,9 @@ fn new_path_state(world_position: vec3<f32>, world_normal: vec3<f32>, wo: vec3<f
         path.x1_brdf = vec3(0.0);
         path.x2_position = vec3(0.0);
         path.x2_normal = vec3(0.0);
+        path.x2_instance_id = NO_SAMPLE_POINT_INSTANCE;
+        path.x2_triangle_id = 0u;
+        path.x2_barycentrics = vec2(0.0);
         path.x2_reusable = false;
         path.reservoir = empty_reservoir();
         path.reservoir.confidence_weight = 1.0;
@@ -144,6 +151,9 @@ fn generate_initial_path(world_position: vec3<f32>, world_normal: vec3<f32>, mat
             @if(RESTIR) {
                 path.x2_position = ray_hit.world_position;
                 path.x2_normal = ray_hit.world_normal;
+                path.x2_instance_id = ray.instance_custom_data;
+                path.x2_triangle_id = ray.primitive_index;
+                path.x2_barycentrics = ray.barycentrics;
 
                 path.x1_brdf = evaluate_brdf(wo, next_bounce.wi, world_normal, material, primary_F_ab);
 
@@ -343,6 +353,9 @@ fn generate_emissive_candidate(
                 (*path).reservoir.light_sample = LightSample(NULL_LIGHT_ID, bitcast<u32>(area_pdf));
                 (*path).reservoir.sample_point_world_position = (*path).x2_position;
                 (*path).reservoir.sample_point_world_normal = octahedral_encode((*path).x2_normal);
+                (*path).reservoir.sample_point_instance_id = (*path).x2_instance_id;
+                (*path).reservoir.sample_point_triangle_id = (*path).x2_triangle_id;
+                (*path).reservoir.sample_point_barycentrics = (*path).x2_barycentrics;
                 (*path).reservoir.radiance = ray_hit.material.emissive;
                 (*path).selected_target_function = target_function;
             }
@@ -388,6 +401,8 @@ fn generate_environment_map_light_candidate(
             (*path).reservoir.light_sample = LightSample(NULL_LIGHT_ID, 0u);
             (*path).reservoir.sample_point_world_position = (*path).ray_origin + next_bounce.wi * RAY_T_MAX;
             (*path).reservoir.sample_point_world_normal = octahedral_encode(-next_bounce.wi);
+            // Sky samples have no geometry anchor
+            (*path).reservoir.sample_point_instance_id = NO_SAMPLE_POINT_INSTANCE;
             (*path).reservoir.radiance = environment_map_light_radiance;
             (*path).selected_target_function = target_function;
         }
@@ -452,6 +467,9 @@ fn resample_reconnection_candidate(path: ptr<function, PathState>, L_at_reconnec
         (*path).reservoir.light_sample = LightSample(NULL_LIGHT_ID, 0u);
         (*path).reservoir.sample_point_world_position = (*path).x2_position;
         (*path).reservoir.sample_point_world_normal = octahedral_encode((*path).x2_normal);
+        (*path).reservoir.sample_point_instance_id = (*path).x2_instance_id;
+        (*path).reservoir.sample_point_triangle_id = (*path).x2_triangle_id;
+        (*path).reservoir.sample_point_barycentrics = (*path).x2_barycentrics;
         (*path).reservoir.radiance = L_at_reconnection;
         (*path).selected_target_function = target_function;
     }
