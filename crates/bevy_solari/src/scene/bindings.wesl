@@ -205,6 +205,24 @@ fn transform_positions(transform: mat4x4<f32>, vertices: array<Vertex, 3>) -> ar
     );
 }
 
+struct ResolvedSamplePoint {
+    world_position: vec3<f32>,
+    world_normal: vec3<f32>,
+}
+
+/// Geometry-only subset of resolve_triangle_data_full, for re-resolving a stored sample point
+/// against the current frame's transforms and vertex buffers. Skips material and texture work,
+/// so the normal is the interpolated vertex normal without normal mapping.
+fn resolve_sample_point(instance_id: u32, triangle_id: u32, barycentrics: vec3<f32>) -> ResolvedSamplePoint {
+    let transform = affine3_to_square(transforms[instance_id]);
+    let vertices = load_vertices(geometry_ids[instance_id], triangle_id);
+    let world_vertices = transform_positions(transform, vertices);
+    let world_position = mat3x3(world_vertices[0], world_vertices[1], world_vertices[2]) * barycentrics;
+    let local_normal = mat3x3(vertices[0].normal, vertices[1].normal, vertices[2].normal) * barycentrics;
+    let world_normal = normalize(mat3x3(transform[0].xyz, transform[1].xyz, transform[2].xyz) * local_normal);
+    return ResolvedSamplePoint(world_position, world_normal);
+}
+
 fn resolve_triangle_data_full(instance_id: u32, triangle_id: u32, barycentrics: vec3<f32>) -> ResolvedRayHitFull {
     let material_id = material_ids[instance_id];
     let material = materials[material_id];
