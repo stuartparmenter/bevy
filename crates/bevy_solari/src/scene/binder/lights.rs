@@ -10,7 +10,6 @@ use bevy_platform::collections::{HashMap, HashSet};
 use bevy_render::render_resource::{AtomicSparseBufferVec, BufferUsages};
 use bevy_render::{impl_atomic_pod, render_resource::AtomicPod};
 use bytemuck::{Pod, Zeroable};
-use core::sync::atomic::{AtomicBool, Ordering};
 use core::{f32::consts::TAU, hash::Hash};
 use tracing::info_span;
 
@@ -145,8 +144,6 @@ pub struct LightState {
     previous_index: HashMap<LightSourceId, u32>,
     nonidentity_translations: Vec<u32>,
     directional_slots: SlotAllocator<Entity>,
-    /// Set by the lighting node once it has recorded work reading the translation table.
-    translations_consumed: AtomicBool,
 }
 
 impl LightState {
@@ -168,7 +165,6 @@ impl LightState {
             previous_index: HashMap::default(),
             nonidentity_translations: Vec::new(),
             directional_slots: SlotAllocator::new(),
-            translations_consumed: AtomicBool::new(false),
         }
     }
 
@@ -226,18 +222,17 @@ impl LightState {
 
     /// Rolls the translation table over for a new frame.
     ///
-    /// `previous_index` and `changed` only advance once the shader has read the table. The
-    /// lighting node bails out while its pipelines compile, and the reservoirs keep the older ids
-    /// across such a gap, so the next table has to translate from those instead. `has_consumers`
-    /// is false when no view runs Solari lighting, where deferring forever would grow both
-    /// without bound.
-    pub fn begin_frame(&mut self, has_consumers: bool) {
+    /// `previous_index` and `changed` only advance while `translations_consumed`: the shader has
+    /// read the table, or nothing reads it at all. The lighting node bails out while its
+    /// pipelines compile, and the reservoirs keep the older ids across such a gap, so the next
+    /// table has to translate from those instead.
+    pub fn begin_frame(&mut self, translations_consumed: bool) {
         for index in core::mem::take(&mut self.nonidentity_translations) {
             self.previous_frame_id_translations
                 .grow_and_set(index, index);
         }
 
-        if !has_consumers || self.translations_consumed.swap(false, Ordering::Relaxed) {
+        if translations_consumed {
             for id in core::mem::take(&mut self.index.changed) {
                 match self.index.get(&id) {
                     Some(index) => self.previous_index.insert(id, index),
@@ -245,11 +240,6 @@ impl LightState {
                 };
             }
         }
-    }
-
-    /// Records that the lighting shader read this frame's translation table.
-    pub fn note_translations_consumed(&self) {
-        self.translations_consumed.store(true, Ordering::Relaxed);
     }
 
     /// Records where each light that moved or disappeared this frame ended up, so that reservoirs

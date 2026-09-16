@@ -36,10 +36,11 @@ use bevy_render::{
     renderer::{RenderDevice, RenderQueue},
     texture::GpuImage,
 };
+use core::sync::atomic::{AtomicBool, Ordering};
 use tracing::info_span;
 
 /// Insert this resource into the render world to make the raytracing scene retain the previous
-/// frame's TLAS and the light id translation table that maps into it.
+/// frame's TLAS and the light and instance id translation tables that map into it.
 ///
 /// This is useful for temporal techniques that need last frame's data. Retaining it costs a second
 /// TLAS allocation and rebuild, so the scene only does so while something asks for it.
@@ -57,13 +58,16 @@ pub struct RaytracingSceneBindings {
     bind_groups: BindGroupCacheState,
     environment_map_light_sampler: Sampler,
     environment_map_light_buffer: StorageBuffer<GpuEnvironmentMapLight>,
+    /// Set by the lighting node once it has recorded work reading the translation tables.
+    translations_consumed: AtomicBool,
 }
 
 impl RaytracingSceneBindings {
-    /// Records that a lighting pass read `previous_frame_light_id_translations`, so the next
-    /// frame's table translates from this frame's light ids rather than older ones.
-    pub fn note_light_translations_consumed(&self) {
-        self.lights.note_translations_consumed();
+    /// Records that a lighting pass read `previous_frame_light_id_translations` and
+    /// `previous_frame_instance_id_translations`, so the next frame's tables translate from this
+    /// frame's ids rather than older ones.
+    pub fn note_translations_consumed(&self) {
+        self.translations_consumed.store(true, Ordering::Relaxed);
     }
 }
 
@@ -96,6 +100,7 @@ impl FromWorld for RaytracingSceneBindings {
                     texture_cube(TextureSampleType::Float { filterable: true }),
                     sampler(SamplerBindingType::Filtering),
                     storage_buffer_read_only_sized(false, None),
+                    storage_buffer_read_only_sized(false, None),
                 ),
             ),
         );
@@ -124,6 +129,7 @@ impl FromWorld for RaytracingSceneBindings {
             bind_groups: BindGroupCacheState::new(render_device),
             environment_map_light_sampler,
             environment_map_light_buffer,
+            translations_consumed: AtomicBool::new(false),
         }
     }
 }
@@ -158,8 +164,15 @@ pub fn prepare_raytracing_scene_resources(
     let bindings = &mut *bindings;
     let needs_previous_frame_data = needs_previous_frame_data.is_some();
 
-    // Roll light ids over before any removal or compaction writes this frame's translations
-    bindings.lights.begin_frame(needs_previous_frame_data);
+    // Roll light and instance ids over before any removal or compaction writes this frame's
+    // translations. The snapshots only advance once the shader has read the tables; with no
+    // consumer at all, deferring forever would grow the change sets without bound.
+    let translations_consumed = !needs_previous_frame_data
+        || bindings
+            .translations_consumed
+            .swap(false, Ordering::Relaxed);
+    bindings.lights.begin_frame(translations_consumed);
+    bindings.instances.begin_frame(translations_consumed);
 
     // Update material and texture assets
     bindings
@@ -200,6 +213,9 @@ pub fn prepare_raytracing_scene_resources(
 
     // Update the light set, now that emissive instances are resolved
     bindings.lights.update(&directional_lights);
+
+    // Record which instance slots the reservoirs still reference no longer hold their geometry
+    bindings.instances.write_instance_id_translations();
 
     // Upload the above writes
     write_sparse_buffers(bindings, &render_device, &render_queue);
@@ -243,6 +259,10 @@ fn write_sparse_buffers(
     instances.geometry_ids.write_buffers(device, queue);
     instances.material_ids.grow(1);
     instances.material_ids.write_buffers(device, queue);
+    instances.previous_frame_id_translations.grow(1);
+    instances
+        .previous_frame_id_translations
+        .write_buffers(device, queue);
     if bindings.tlas.uses_raw_build() {
         instances.blas_refs.grow(1);
         instances.blas_refs.write_buffers(device, queue);
