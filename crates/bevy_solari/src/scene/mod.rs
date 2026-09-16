@@ -1,12 +1,14 @@
 mod binder;
 mod blas;
 mod extract;
+mod producer;
 mod types;
 
 use bevy_asset::embedded_asset;
 use bevy_shader::load_shader_library;
 pub use binder::prepare_raytracing_scene_resources;
 pub use binder::{RaytracingSceneBindings, RaytracingSceneNeedsPreviousFrameData};
+pub use producer::RaytracingProducerEncoder;
 pub use types::{
     RaytracingGeometry, RaytracingGeometryBuffers, RaytracingGeometryUpdateMode, RaytracingMesh3d,
 };
@@ -36,6 +38,7 @@ use extract::{
     extract_raytracing_scene_meshes_and_materials, extract_raytracing_scene_structural,
     extract_raytracing_scene_transforms, ExtractedEnvironmentMapLight, StandardMaterialAssets,
 };
+use producer::submit_raytracing_producers;
 use tracing::warn;
 
 /// Creates acceleration structures and binding arrays of resources for raytracing.
@@ -72,6 +75,7 @@ impl Plugin for RaytracingScenePlugin {
             .init_gpu_resource::<BlasManager>()
             .init_gpu_resource::<GeometryBlasManager>()
             .init_gpu_resource::<StandardMaterialAssets>()
+            .init_resource::<RaytracingProducerEncoder>()
             .init_gpu_resource::<RaytracingSceneBindings>()
             .init_gpu_resource::<TlasInstanceSetupPipeline>()
             .add_systems(
@@ -99,8 +103,11 @@ impl Plugin for RaytracingScenePlugin {
                         .in_set(RenderSystems::PrepareResources)
                         .before(prepare_raytracing_scene_resources),
                     prepare_raytracing_scene_resources.in_set(RenderSystems::PrepareResources),
-                    // Build after producer submissions and before the render graph builds the TLAS.
+                    // Record BLAS builds after the producer passes, then submit both before the TLAS build.
                     build_raytracing_geometry_blas.in_set(RenderSystems::PrepareBindGroups),
+                    submit_raytracing_producers
+                        .in_set(RenderSystems::PrepareBindGroups)
+                        .after(build_raytracing_geometry_blas),
                     prepare_raytracing_scene_bind_group.in_set(RenderSystems::PrepareBindGroups),
                 ),
             )
