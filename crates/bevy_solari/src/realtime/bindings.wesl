@@ -65,7 +65,14 @@ struct Reservoir {
     confidence_weight: f32,
     sample_point_world_normal: vec2<f32>,
     light_sample: LightSample,
+    /// Geometry anchor for GI samples (`light_sample.light_id == NULL_LIGHT_ID`).
+    /// Temporal reuse translates the instance ID and resolves the current position.
+    sample_point_instance_id: u32,
+    sample_point_triangle_id: u32,
+    sample_point_barycentrics: vec2<f32>,
 }
+
+const NO_SAMPLE_POINT_INSTANCE = 0xFFFFFFFFu;
 
 fn empty_reservoir() -> Reservoir {
     return Reservoir(
@@ -75,6 +82,9 @@ fn empty_reservoir() -> Reservoir {
         0.0,
         vec2(0.0),
         LightSample(NULL_LIGHT_ID, 0u),
+        NO_SAMPLE_POINT_INSTANCE,
+        0u,
+        vec2(0.0),
     );
 }
 
