@@ -424,6 +424,19 @@ pub fn build_raytracing_geometry_blas(
             if !entry.pending_build {
                 return None;
             }
+            // The entry was sized from the component as
+            // `prepare_raytracing_geometry_blas` saw it. A producer that swapped
+            // or resized the buffers since (its commands apply between the two
+            // sets) must not be built against that size: wgpu rejects a build
+            // whose buffers are too small, which invalidates the whole producer
+            // command buffer and drops every fill pass and build in it. Stay
+            // pending; the next prepare reallocates for the new buffers.
+            if entry.buffer_ids != (buffers.vertex_buffer.id(), buffers.index_buffer.id())
+                || entry.size.vertex_count != buffers.vertex_count
+                || entry.size.index_count != Some(buffers.index_count)
+            {
+                return None;
+            }
             built.push(entity);
             Some(BlasBuildEntry {
                 blas: &entry.blas,
