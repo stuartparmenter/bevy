@@ -7,6 +7,7 @@ enable wgpu_binding_array;
 struct InstanceGeometryIds {
     vertex_buffer_id: u32,
     vertex_buffer_offset: u32,
+    previous_vertex_buffer_id: u32,
     index_buffer_id: u32,
     index_buffer_offset: u32,
     triangle_count: u32,
@@ -136,8 +137,7 @@ struct ResolvedMaterial {
 
 struct ResolvedRayHitFull {
     world_position: vec3<f32>,
-    /// The previous transform applied to current vertices.
-    /// Vertex data is not double-buffered, so this excludes deformation motion.
+    /// Includes deformation motion when the producer supplies previous vertices.
     previous_frame_world_position: vec3<f32>,
     world_normal: vec3<f32>,
     geometric_world_normal: vec3<f32>,
@@ -233,8 +233,13 @@ fn resolve_triangle_data_full(instance_id: u32, triangle_id: u32, barycentrics: 
     let world_vertices = transform_positions(transform, vertices);
     let world_position = mat3x3(world_vertices[0], world_vertices[1], world_vertices[2]) * barycentrics;
 
-    // Use current vertices with the previous transform; deformation motion is unavailable.
-    let previous_frame_world_vertices = transform_positions(previous_frame_transform, vertices);
+    var previous_vertices = vertices;
+    if instance_geometry_ids.previous_vertex_buffer_id != instance_geometry_ids.vertex_buffer_id {
+        var previous_geometry_ids = instance_geometry_ids;
+        previous_geometry_ids.vertex_buffer_id = instance_geometry_ids.previous_vertex_buffer_id;
+        previous_vertices = load_vertices(previous_geometry_ids, triangle_id);
+    }
+    let previous_frame_world_vertices = transform_positions(previous_frame_transform, previous_vertices);
     let previous_frame_world_position = mat3x3(previous_frame_world_vertices[0], previous_frame_world_vertices[1], previous_frame_world_vertices[2]) * barycentrics;
 
     let uv = mat3x2(vertices[0].uv, vertices[1].uv, vertices[2].uv) * barycentrics;

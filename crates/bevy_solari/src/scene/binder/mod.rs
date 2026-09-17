@@ -19,7 +19,8 @@ pub use self::tlas::{build_raytracing_tlas, TlasInstanceSetupPipeline};
 use super::{
     blas::{BlasManager, GeometryBlasManager},
     extract::StandardMaterialAssets,
-    RaytracingGeometry, RaytracingGeometryBuffers, RaytracingMesh3d,
+    RaytracingGeometry, RaytracingGeometryBuffers, RaytracingGeometryPreviousVertices,
+    RaytracingMesh3d,
 };
 use bevy_ecs::{
     entity::Entity,
@@ -141,6 +142,7 @@ pub struct InstanceChanges<'w, 's> {
     removed_instances: RemovedComponents<'w, 's, RaytracingMesh3d>,
     removed_geometry: RemovedComponents<'w, 's, RaytracingGeometry>,
     removed_geometry_buffers: RemovedComponents<'w, 's, RaytracingGeometryBuffers>,
+    removed_previous_vertices: RemovedComponents<'w, 's, RaytracingGeometryPreviousVertices>,
 }
 
 /// Applies this frame's scene changes to the retained buffers, binding arrays and TLAS.
@@ -184,18 +186,26 @@ pub fn prepare_raytracing_scene_resources(
     );
 
     // Apply structural instance changes, now that asset slots are current
-    bindings.instances.remove_instances(
-        &mut bindings.lights,
+    for entity in instance_changes
+        .removed_instances
+        .read()
+        .chain(instance_changes.removed_geometry.read())
+    {
+        if instance_changes.instances.contains(entity) {
+            // Another geometry source remains. Keep the slot while switching sources.
+            bindings.instances.pending_refresh.insert(entity);
+        } else {
+            bindings
+                .instances
+                .remove_instances(&mut bindings.lights, [entity]);
+        }
+    }
+    bindings.instances.pending_refresh.extend(
         instance_changes
-            .removed_instances
+            .removed_geometry_buffers
             .read()
-            .chain(instance_changes.removed_geometry.read()),
+            .chain(instance_changes.removed_previous_vertices.read()),
     );
-    // Deactivate geometry with removed buffers until the producer supplies them again
-    bindings
-        .instances
-        .pending_refresh
-        .extend(instance_changes.removed_geometry_buffers.read());
     let inputs = InstanceInputs {
         assets: &bindings.assets,
         blas_manager: &blas_manager,

@@ -5,11 +5,11 @@ use super::{
     BlasManager, RaytracingGeometry, RaytracingGeometryBuffers, RaytracingMesh3d,
     RaytracingSceneBindings,
 };
-use crate::scene::blas::GeometryBlasManager;
+use crate::scene::{blas::GeometryBlasManager, RaytracingGeometryPreviousVertices};
 use bevy_asset::AssetId;
 use bevy_ecs::{
     entity::{Entity, EntityHashMap, EntityHashSet},
-    query::{Changed, Or, With},
+    query::{Changed, Has, Or, QueryItem, With},
     system::Query,
 };
 use bevy_math::{Affine3, Affine3Ext, Vec4};
@@ -37,6 +37,7 @@ const INSTANCE_NOT_PRESENT_THIS_FRAME: u32 = u32::MAX;
 pub struct GpuInstanceGeometryIds {
     vertex_buffer_id: u32,
     vertex_buffer_offset: u32,
+    previous_vertex_buffer_id: u32,
     index_buffer_id: u32,
     index_buffer_offset: u32,
     triangle_count: u32,
@@ -97,7 +98,7 @@ struct Instance {
     slot: u32,
     source: InstanceSource,
     material: AssetId<StandardMaterial>,
-    buffers: Option<(BufferId, BufferId)>,
+    buffers: Option<(BufferId, BufferId, BufferId)>,
 }
 
 /// Stable slots, reverse dependency indices and GPU data owned by raytracing instances.
@@ -234,7 +235,9 @@ impl InstanceState {
 
 pub type InstanceQueryData<'w> = (
     Option<&'w RaytracingMesh3d>,
+    Has<RaytracingGeometry>,
     Option<&'w RaytracingGeometryBuffers>,
+    Option<&'w RaytracingGeometryPreviousVertices>,
     &'w MeshMaterial3d<StandardMaterial>,
     &'w GlobalTransform,
     &'w PreviousGlobalTransform,
@@ -247,7 +250,9 @@ pub type ChangedInstanceFilter = (
     InstanceQueryFilter,
     Or<(
         Changed<RaytracingMesh3d>,
+        Changed<RaytracingGeometry>,
         Changed<RaytracingGeometryBuffers>,
+        Changed<RaytracingGeometryPreviousVertices>,
         Changed<MeshMaterial3d<StandardMaterial>>,
     )>,
 );
@@ -264,6 +269,7 @@ pub struct InstanceInputs<'a> {
 struct ResolvedGeometry<'a> {
     vertex_buffer: &'a Buffer,
     vertex_buffer_offset: u32,
+    previous_vertex_buffer: &'a Buffer,
     index_buffer: &'a Buffer,
     index_buffer_offset: u32,
     triangle_count: u32,
@@ -355,11 +361,19 @@ impl InstanceState {
         inputs: &InstanceInputs,
         lights: &mut LightState,
         entity: Entity,
-        (mesh, geometry, material, transform, previous_frame_transform): InstanceQueryData,
+        (
+            mesh,
+            has_geometry,
+            geometry,
+            previous_vertices,
+            material,
+            transform,
+            previous_frame_transform,
+        ): QueryItem<'_, '_, InstanceQueryData>,
     ) {
-        let source = match mesh {
-            Some(mesh) => InstanceSource::Mesh(mesh.id()),
-            None => InstanceSource::Geometry,
+        let source = match (has_geometry, mesh) {
+            (false, Some(mesh)) => InstanceSource::Mesh(mesh.id()),
+            _ => InstanceSource::Geometry,
         };
         let material_id = material.id();
         let previous = self.records.get(&entity).copied();
@@ -394,7 +408,14 @@ impl InstanceState {
             material: material_id,
             buffers: previous.and_then(|instance| instance.buffers),
         };
-        let resolved = self.resolve_instance(inputs, lights, entity, &mut instance, geometry);
+        let resolved = self.resolve_instance(
+            inputs,
+            lights,
+            entity,
+            &mut instance,
+            geometry,
+            previous_vertices,
+        );
 
         self.records.insert(entity, instance);
         if !resolved {
@@ -407,6 +428,7 @@ impl InstanceState {
         entity: Entity,
         source: InstanceSource,
         geometry: Option<&'a RaytracingGeometryBuffers>,
+        previous_vertices: Option<&'a RaytracingGeometryPreviousVertices>,
     ) -> Option<ResolvedGeometry<'a>> {
         match source {
             InstanceSource::Mesh(mesh) => {
@@ -415,6 +437,7 @@ impl InstanceState {
                 Some(ResolvedGeometry {
                     vertex_buffer: vertex_slice.buffer,
                     vertex_buffer_offset: vertex_slice.range.start,
+                    previous_vertex_buffer: vertex_slice.buffer,
                     index_buffer: index_slice.buffer,
                     index_buffer_offset: index_slice.range.start,
                     triangle_count: (index_slice.range.len() / 3) as u32,
@@ -427,6 +450,8 @@ impl InstanceState {
                 Some(ResolvedGeometry {
                     vertex_buffer: &buffers.vertex_buffer,
                     vertex_buffer_offset: 0,
+                    previous_vertex_buffer: previous_vertices
+                        .map_or(&buffers.vertex_buffer, |previous| &previous.0),
                     index_buffer: &buffers.index_buffer,
                     index_buffer_offset: 0,
                     triangle_count: buffers.index_count / 3,
@@ -443,10 +468,11 @@ impl InstanceState {
         entity: Entity,
         instance: &mut Instance,
         geometry: Option<&RaytracingGeometryBuffers>,
+        previous_vertices: Option<&RaytracingGeometryPreviousVertices>,
     ) -> bool {
         let slot = instance.slot;
         let (Some(resolved), Some(material_slot)) = (
-            Self::resolve_geometry(inputs, entity, instance.source, geometry),
+            Self::resolve_geometry(inputs, entity, instance.source, geometry, previous_vertices),
             inputs.assets.material_slots.get(&instance.material),
         ) else {
             self.deactivate_instance(lights, entity, instance);
@@ -454,18 +480,31 @@ impl InstanceState {
         };
 
         let vertex_buffer_key = resolved.vertex_buffer.id();
+        let previous_vertex_buffer_key = resolved.previous_vertex_buffer.id();
         let index_buffer_key = resolved.index_buffer.id();
         let capacity = MAX_MESH_SLAB_COUNT.get();
-        if !self.vertex_buffers.has_room(&vertex_buffer_key, capacity)
-            || !self.index_buffers.has_room(&index_buffer_key, capacity)
-        {
-            once!(warn!(
-                "Solari scene needs more than {} mesh slabs. Instances past that limit will \
-                 not be rendered.",
-                MAX_MESH_SLAB_COUNT.get()
-            ));
-            self.deactivate_instance(lights, entity, instance);
-            return false;
+        let has_room = |state: &Self| {
+            let required_vertex_slots =
+                u32::from(!state.vertex_buffers.contains(&vertex_buffer_key))
+                    + u32::from(
+                        previous_vertex_buffer_key != vertex_buffer_key
+                            && !state.vertex_buffers.contains(&previous_vertex_buffer_key),
+                    );
+            state.vertex_buffers.vacancies(capacity) >= required_vertex_slots
+                && state.index_buffers.has_room(&index_buffer_key, capacity)
+        };
+        if !has_room(self) {
+            // Replacing this instance's buffers may free the slots it needs.
+            self.release_buffers(instance.buffers.take());
+            if !has_room(self) {
+                once!(warn!(
+                    "Solari scene needs more than {} mesh slabs. Instances past that limit will \
+                     not be rendered.",
+                    MAX_MESH_SLAB_COUNT.get()
+                ));
+                self.deactivate_instance(lights, entity, instance);
+                return false;
+            }
         }
 
         let previous_buffers = instance.buffers.take();
@@ -475,11 +514,21 @@ impl InstanceState {
                 resolved.vertex_buffer.clone()
             })
             .expect("vertex slab binding array had room but handed out no slot");
+        let previous_vertex_buffer_id = self
+            .vertex_buffers
+            .acquire(previous_vertex_buffer_key, capacity, || {
+                resolved.previous_vertex_buffer.clone()
+            })
+            .expect("vertex slab binding array had room but handed out no slot");
         let index_buffer_id = self
             .index_buffers
             .acquire(index_buffer_key, capacity, || resolved.index_buffer.clone())
             .expect("index slab binding array had room but handed out no slot");
-        instance.buffers = Some((vertex_buffer_key, index_buffer_key));
+        instance.buffers = Some((
+            vertex_buffer_key,
+            previous_vertex_buffer_key,
+            index_buffer_key,
+        ));
         self.release_buffers(previous_buffers);
 
         let triangle_count = resolved.triangle_count;
@@ -488,6 +537,7 @@ impl InstanceState {
             GpuInstanceGeometryIds {
                 vertex_buffer_id,
                 vertex_buffer_offset: resolved.vertex_buffer_offset,
+                previous_vertex_buffer_id,
                 index_buffer_id,
                 index_buffer_offset: resolved.index_buffer_offset,
                 triangle_count,
@@ -556,9 +606,10 @@ impl InstanceState {
         self.release_buffers(instance.buffers.take());
     }
 
-    fn release_buffers(&mut self, buffers: Option<(BufferId, BufferId)>) {
-        if let Some((vertex_key, index_key)) = buffers {
+    fn release_buffers(&mut self, buffers: Option<(BufferId, BufferId, BufferId)>) {
+        if let Some((vertex_key, previous_vertex_key, index_key)) = buffers {
             self.vertex_buffers.release(&vertex_key);
+            self.vertex_buffers.release(&previous_vertex_key);
             self.index_buffers.release(&index_key);
         }
     }
