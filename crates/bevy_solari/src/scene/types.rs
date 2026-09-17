@@ -10,9 +10,16 @@ use derive_more::derive::From;
 
 /// A mesh component used for raytracing.
 ///
-/// The mesh used in this component must have [`Mesh::enable_raytracing`] set to true,
-/// use the following set of vertex attributes: `{POSITION, NORMAL, UV_0, TANGENT}`, use [`bevy_mesh::PrimitiveTopology::TriangleList`],
-/// and use [`bevy_mesh::Indices::U32`].
+/// The mesh must have [`Mesh::enable_raytracing`] set to true and use
+/// [`bevy_mesh::PrimitiveTopology::TriangleList`]. Static meshes must have exactly
+/// the vertex attributes `{POSITION, NORMAL, UV_0, TANGENT}` and use
+/// [`bevy_mesh::Indices::U32`].
+///
+/// Entities with [`bevy_mesh::skinning::SkinnedMesh`] or
+/// [`bevy_mesh::morph::MeshMorphWeights`] are deformed automatically for raytracing.
+/// These meshes support additional vertex attributes, `U16` or `U32` indices, and
+/// non-indexed triangles. The standard vertex attributes must use uncompressed
+/// floating-point formats; skinning also requires joint indices and weights.
 ///
 /// The material used for this entity must be [`MeshMaterial3d<StandardMaterial>`].
 #[derive(
