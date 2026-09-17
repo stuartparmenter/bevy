@@ -216,7 +216,11 @@ fn resolve_sample_point(instance_id: u32, triangle_id: u32, barycentrics: vec3<f
     let world_vertices = transform_positions(transform, vertices);
     let world_position = mat3x3(world_vertices[0], world_vertices[1], world_vertices[2]) * barycentrics;
     let local_normal = mat3x3(vertices[0].normal, vertices[1].normal, vertices[2].normal) * barycentrics;
-    let world_normal = normalize(mat3x3(transform[0].xyz, transform[1].xyz, transform[2].xyz) * local_normal);
+    let transform_3x3 = mat3x3(transform[0].xyz, transform[1].xyz, transform[2].xyz);
+    let cofactor = mat3x3(cross(transform_3x3[1], transform_3x3[2]), cross(transform_3x3[2], transform_3x3[0]), cross(transform_3x3[0], transform_3x3[1]));
+    let determinant = dot(transform_3x3[0], cofactor[0]);
+    let determinant_sign = select(sign(determinant), 1.0, determinant == 0.0);
+    let world_normal = normalize(determinant_sign * (cofactor * local_normal));
     return ResolvedSamplePoint(world_position, world_normal);
 }
 
