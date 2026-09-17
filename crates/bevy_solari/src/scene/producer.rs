@@ -10,12 +10,14 @@ use bevy_render::{
 /// A shared command encoder for GPU geometry updates and BLAS builds.
 ///
 /// Producers record compute passes that fill [`RaytracingGeometryBuffers`] during
-/// [`RenderSystems::PrepareResources`]. Solari records the BLAS builds afterward
-/// and submits the encoder once, before the render graph builds the TLAS.
+/// [`RenderSystems::PrepareResources`] or [`RenderSystems::PrepareResourcesFlush`].
+/// Solari records the BLAS builds afterward and submits the encoder once, before
+/// the render graph builds the TLAS.
 /// Queue buffer writes are flushed before the recorded commands execute.
 ///
 /// [`RaytracingGeometryBuffers`]: super::RaytracingGeometryBuffers
 /// [`RenderSystems::PrepareResources`]: bevy_render::RenderSystems::PrepareResources
+/// [`RenderSystems::PrepareResourcesFlush`]: bevy_render::RenderSystems::PrepareResourcesFlush
 #[derive(Resource, Default)]
 pub struct RaytracingProducerEncoder(Option<CommandEncoder>);
 
