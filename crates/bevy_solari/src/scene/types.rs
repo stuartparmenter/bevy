@@ -65,7 +65,8 @@ pub enum RaytracingGeometryUpdateMode {
 /// The producer creates and fills these buffers. Solari builds the BLAS and adds
 /// the TLAS instance. Both buffers must have `STORAGE | BLAS_INPUT` usage.
 /// With [`RaytracingGeometryUpdateMode::RebuildEveryFrame`], the producer can update
-/// the buffer contents in place each frame.
+/// vertex positions in place each frame. Replace the index buffer when triangle
+/// topology changes so Solari discards temporal triangle anchors.
 ///
 /// Add [`RaytracingGeometryPreviousVertices`] to provide deformation motion history.
 /// Otherwise, previous positions use the current vertices with the previous transform.
