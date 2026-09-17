@@ -1,5 +1,6 @@
 use super::{
-    RaytracingGeometry, RaytracingGeometryBuffers, RaytracingMesh3d, RaytracingSceneBindings,
+    RaytracingGeometry, RaytracingGeometryBuffers, RaytracingGeometryPreviousVertices,
+    RaytracingMesh3d, RaytracingSceneBindings,
 };
 use bevy_asset::{AssetEvent, AssetId, Assets, Handle};
 use bevy_camera::Camera;
@@ -95,9 +96,11 @@ pub fn extract_raytracing_scene_structural(
     for main_entity in removed_raytracing_geometry.read() {
         if let Ok(render_entity) = render_entities.get(main_entity) {
             // Remove the buffers too, so re-adding the marker cannot restore stale geometry.
-            commands
-                .entity(render_entity)
-                .remove::<(RaytracingGeometry, RaytracingGeometryBuffers)>();
+            commands.entity(render_entity).remove::<(
+                RaytracingGeometry,
+                RaytracingGeometryBuffers,
+                RaytracingGeometryPreviousVertices,
+            )>();
         }
     }
 

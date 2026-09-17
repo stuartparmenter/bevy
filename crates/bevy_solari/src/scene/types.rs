@@ -67,9 +67,8 @@ pub enum RaytracingGeometryUpdateMode {
 /// With [`RaytracingGeometryUpdateMode::RebuildEveryFrame`], the producer can update
 /// the buffer contents in place each frame.
 ///
-/// Solari does not double-buffer vertex data. Previous positions use the current
-/// vertices with the previous transform, so motion vectors capture rigid motion
-/// but not deformation.
+/// Add [`RaytracingGeometryPreviousVertices`] to provide deformation motion history.
+/// Otherwise, previous positions use the current vertices with the previous transform.
 #[derive(Component, Clone)]
 pub struct RaytracingGeometryBuffers {
     /// `array<PackedVertex>`, [`VERTEX_STRIDE`](Self::VERTEX_STRIDE) bytes each.
@@ -88,3 +87,16 @@ impl RaytracingGeometryBuffers {
     /// Size of a packed vertex: position `vec3`, normal `vec3`, UV `vec2`, tangent `vec4`.
     pub const VERTEX_STRIDE: u64 = 48;
 }
+
+/// Previous-frame vertices for a [`RaytracingGeometry`] render entity.
+///
+/// The buffer must use the same packed vertex layout and vertex order as
+/// [`RaytracingGeometryBuffers::vertex_buffer`], contain at least `vertex_count`
+/// vertices, and have `STORAGE` usage. Positions are in the entity's previous local
+/// space; Solari applies its previous global transform when reconstructing motion.
+///
+/// The producer must update this buffer before raytracing each frame. Initialize it
+/// with current vertices when history is unavailable, including after topology changes.
+/// Without this component, motion reconstruction only accounts for rigid transforms.
+#[derive(Component, Clone)]
+pub struct RaytracingGeometryPreviousVertices(pub Buffer);
