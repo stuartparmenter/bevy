@@ -1,3 +1,4 @@
+mod deformation;
 mod fog;
 mod gpu_preprocess;
 mod light;
@@ -7,6 +8,7 @@ mod mesh_view_bindings;
 mod morph;
 pub(crate) mod skin;
 
+pub use deformation::*;
 pub use fog::*;
 pub use gpu_preprocess::*;
 pub use light::*;
