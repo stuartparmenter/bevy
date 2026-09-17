@@ -88,6 +88,7 @@ use tracing::{error, warn};
 use self::irradiance_volume::IRRADIANCE_VOLUMES_ARE_USABLE;
 use crate::{
     render::{
+        deformation::clear_mesh_deformation_requests,
         morph::{
             extract_morphs, no_automatic_morph_batching, write_morph_buffers, MorphIndices,
             MorphUniforms,
@@ -195,6 +196,7 @@ impl Plugin for MeshRenderPlugin {
             render_app
                 .init_gpu_resource::<MeshCullingDataBuffer>()
                 .init_resource::<RenderMaterialInstances>()
+                .init_resource::<MeshDeformationRequests>()
                 .configure_sets(
                     ExtractSchedule,
                     MeshExtractionSystems.after_weak(view::extract_visibility_ranges),
@@ -202,8 +204,9 @@ impl Plugin for MeshRenderPlugin {
                 .add_systems(
                     ExtractSchedule,
                     (
-                        extract_skins,
-                        extract_morphs,
+                        clear_mesh_deformation_requests.before(MeshDeformationSystems::Collect),
+                        extract_skins.after(MeshDeformationSystems::Collect),
+                        extract_morphs.after(MeshDeformationSystems::Collect),
                         gpu_preprocessing::clear_batched_gpu_instance_buffers::<MeshPipeline>
                             .before(MeshExtractionSystems),
                     ),
