@@ -10,7 +10,8 @@ pub use binder::prepare_raytracing_scene_resources;
 pub use binder::{RaytracingSceneBindings, RaytracingSceneNeedsPreviousFrameData};
 pub use producer::RaytracingProducerEncoder;
 pub use types::{
-    RaytracingGeometry, RaytracingGeometryBuffers, RaytracingGeometryUpdateMode, RaytracingMesh3d,
+    RaytracingGeometry, RaytracingGeometryBuffers, RaytracingGeometryPreviousVertices,
+    RaytracingGeometryUpdateMode, RaytracingMesh3d,
 };
 
 use crate::SolariPlugins;
