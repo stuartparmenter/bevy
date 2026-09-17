@@ -92,6 +92,17 @@ impl InstanceSource {
     }
 }
 
+/// Buffer locations whose triangles can be reused by temporal geometry anchors.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct GeometryKey {
+    source: InstanceSource,
+    vertex_buffer: BufferId,
+    vertex_buffer_offset: u32,
+    index_buffer: BufferId,
+    index_buffer_offset: u32,
+    triangle_count: u32,
+}
+
 /// Everything tracked per raytracing instance.
 #[derive(Clone, Copy)]
 struct Instance {
@@ -99,6 +110,7 @@ struct Instance {
     source: InstanceSource,
     material: AssetId<StandardMaterial>,
     buffers: Option<(BufferId, BufferId, BufferId)>,
+    geometry: Option<GeometryKey>,
 }
 
 /// Stable slots, reverse dependency indices and GPU data owned by raytracing instances.
@@ -123,6 +135,8 @@ pub struct InstanceState {
     previous_slots: EntityHashMap<u32>,
     /// Instances whose liveness changed since the last consumed frame.
     liveness_changed: EntityHashSet,
+    /// Instances whose old triangle anchors must be discarded until the next consumed frame.
+    invalidated_geometry: EntityHashSet,
     nonidentity_translations: Vec<u32>,
 }
 
@@ -147,6 +161,7 @@ impl InstanceState {
             material_instances: HashMap::default(),
             previous_slots: EntityHashMap::default(),
             liveness_changed: EntityHashSet::default(),
+            invalidated_geometry: EntityHashSet::default(),
             nonidentity_translations: Vec::new(),
         }
     }
@@ -166,6 +181,7 @@ impl InstanceState {
         }
 
         if translations_consumed {
+            self.invalidated_geometry.clear();
             for entity in core::mem::take(&mut self.liveness_changed) {
                 match self.live_slot(entity) {
                     Some(slot) => self.previous_slots.insert(entity, slot),
@@ -183,9 +199,12 @@ impl InstanceState {
             let Some(&previous) = self.previous_slots.get(&entity) else {
                 continue;
             };
-            let current = self
-                .live_slot(entity)
-                .unwrap_or(INSTANCE_NOT_PRESENT_THIS_FRAME);
+            let current = if self.invalidated_geometry.contains(&entity) {
+                INSTANCE_NOT_PRESENT_THIS_FRAME
+            } else {
+                self.live_slot(entity)
+                    .unwrap_or(INSTANCE_NOT_PRESENT_THIS_FRAME)
+            };
 
             if current != previous {
                 self.previous_frame_id_translations
@@ -407,6 +426,7 @@ impl InstanceState {
             source,
             material: material_id,
             buffers: previous.and_then(|instance| instance.buffers),
+            geometry: previous.and_then(|instance| instance.geometry),
         };
         let resolved = self.resolve_instance(
             inputs,
@@ -532,6 +552,15 @@ impl InstanceState {
         self.release_buffers(previous_buffers);
 
         let triangle_count = resolved.triangle_count;
+        let geometry = GeometryKey {
+            source: instance.source,
+            vertex_buffer: vertex_buffer_key,
+            vertex_buffer_offset: resolved.vertex_buffer_offset,
+            index_buffer: index_buffer_key,
+            index_buffer_offset: resolved.index_buffer_offset,
+            triangle_count,
+        };
+        self.update_geometry(entity, instance, geometry);
         self.geometry_ids.grow_and_set(
             slot,
             GpuInstanceGeometryIds {
@@ -559,6 +588,17 @@ impl InstanceState {
             lights.remove_light(LightSourceId::EmissiveMesh(entity));
         }
         true
+    }
+
+    fn update_geometry(&mut self, entity: Entity, instance: &mut Instance, geometry: GeometryKey) {
+        if instance
+            .geometry
+            .replace(geometry)
+            .is_some_and(|previous| previous != geometry)
+        {
+            self.invalidated_geometry.insert(entity);
+            self.liveness_changed.insert(entity);
+        }
     }
 
     fn write_transforms(
@@ -590,6 +630,7 @@ impl InstanceState {
             self.live_count += 1;
             self.liveness_changed.insert(entity);
         } else if reference == GpuBlasRef::NONE {
+            self.invalidated_geometry.insert(entity);
             self.live_count -= 1;
             self.liveness_changed.insert(entity);
         }
@@ -641,5 +682,97 @@ impl RaytracingSceneBindings {
             self.instances
                 .write_transforms(instance.slot, transform, previous_frame_transform);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn live_instance(state: &mut InstanceState) -> (Entity, Instance) {
+        let entity = Entity::from_raw_u32(1).unwrap();
+        let slot = state.slots.allocate();
+        let instance = Instance {
+            slot,
+            source: InstanceSource::Geometry,
+            material: AssetId::default(),
+            buffers: None,
+            geometry: Some(GeometryKey {
+                source: InstanceSource::Geometry,
+                vertex_buffer: BufferId::new(),
+                vertex_buffer_offset: 0,
+                index_buffer: BufferId::new(),
+                index_buffer_offset: 0,
+                triangle_count: 4,
+            }),
+        };
+        state.records.insert(entity, instance);
+        state.set_blas_ref(entity, slot, GpuBlasRef(1));
+        state.write_instance_id_translations();
+        state.begin_frame(true);
+        (entity, instance)
+    }
+
+    #[test]
+    fn replaced_geometry_invalidates_anchors_until_consumed() {
+        let mut state = InstanceState::new();
+        let (entity, mut instance) = live_instance(&mut state);
+        let geometry = GeometryKey {
+            index_buffer: BufferId::new(),
+            ..instance.geometry.unwrap()
+        };
+        state.update_geometry(entity, &mut instance, geometry);
+        for _ in 0..2 {
+            state.write_instance_id_translations();
+            assert_eq!(
+                state.previous_frame_id_translations.get(instance.slot),
+                INSTANCE_NOT_PRESENT_THIS_FRAME,
+            );
+            state.begin_frame(false);
+        }
+        state.begin_frame(true);
+        state.write_instance_id_translations();
+        assert_eq!(
+            state.previous_frame_id_translations.get(instance.slot),
+            instance.slot,
+        );
+    }
+
+    #[test]
+    fn blas_rotation_preserves_anchors_but_reactivation_invalidates_them() {
+        let mut state = InstanceState::new();
+        let (entity, mut instance) = live_instance(&mut state);
+        let geometry = instance.geometry.unwrap();
+        state.update_geometry(entity, &mut instance, geometry);
+        state.set_blas_ref(entity, instance.slot, GpuBlasRef(2));
+        state.write_instance_id_translations();
+        assert_eq!(
+            state.previous_frame_id_translations.get(instance.slot),
+            instance.slot,
+        );
+
+        state.set_blas_ref(entity, instance.slot, GpuBlasRef::NONE);
+        state.set_blas_ref(entity, instance.slot, GpuBlasRef(3));
+        state.write_instance_id_translations();
+        assert_eq!(
+            state.previous_frame_id_translations.get(instance.slot),
+            INSTANCE_NOT_PRESENT_THIS_FRAME,
+        );
+    }
+
+    #[test]
+    fn source_switch_invalidates_anchors_with_shared_buffer_locations() {
+        let mut state = InstanceState::new();
+        let (entity, mut instance) = live_instance(&mut state);
+        let geometry = GeometryKey {
+            source: InstanceSource::Mesh(AssetId::default()),
+            ..instance.geometry.unwrap()
+        };
+        state.update_geometry(entity, &mut instance, geometry);
+        state.write_instance_id_translations();
+        assert_eq!(
+            state.previous_frame_id_translations.get(instance.slot),
+            INSTANCE_NOT_PRESENT_THIS_FRAME,
+        );
     }
 }
