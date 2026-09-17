@@ -18,7 +18,7 @@ use bevy_render::{
 };
 use bytemuck::{NoUninit, Pod, Zeroable};
 
-use crate::{skin, RenderMeshInstances};
+use crate::{skin, MeshDeformationRequests, RenderMeshInstances};
 
 #[derive(Component)]
 pub struct MorphIndex {
@@ -152,6 +152,21 @@ impl MorphUniforms {
 }
 
 impl MorphIndices {
+    /// Returns the current storage-buffer weight offset and count for a mesh instance.
+    ///
+    /// This does not require a raster mesh instance or a prepared morph descriptor.
+    /// Returns `None` on platforms that use uniform buffers.
+    pub fn current_weights_info(&self, main_entity: MainEntity) -> Option<(u32, u32)> {
+        match self {
+            Self::Uniform { .. } => None,
+            Self::Storage {
+                morph_weights_info, ..
+            } => morph_weights_info
+                .get(&main_entity)
+                .map(|info| (info.current_weight_offset, info.weight_count)),
+        }
+    }
+
     /// Returns the index of the morph descriptor in the morph descriptor table
     /// for the given entity.
     ///
@@ -249,15 +264,29 @@ fn add_to_alignment<T: NoUninit + Default>(buffer: &mut RawBufferVec<T>) {
 pub fn extract_morphs(
     morph_indices: ResMut<MorphIndices>,
     uniform: ResMut<MorphUniforms>,
-    query: Extract<Query<(Entity, &ViewVisibility, &MeshMorphWeights)>>,
+    deformation_requests: Res<MeshDeformationRequests>,
+    query: Extract<Query<(Entity, Option<&ViewVisibility>, &MeshMorphWeights)>>,
     weights_query: Extract<Query<&MorphWeights>>,
     render_device: Res<RenderDevice>,
 ) {
-    // Borrow check workaround.
-    let (morph_indices, uniform) = (morph_indices.into_inner(), uniform.into_inner());
+    extract_morph_weights(
+        morph_indices.into_inner(),
+        uniform.into_inner(),
+        &deformation_requests,
+        &query,
+        &weights_query,
+        skin::skins_use_uniform_buffers(&render_device.limits()),
+    );
+}
 
-    let morphs_use_uniform_buffers = skin::skins_use_uniform_buffers(&render_device.limits());
-
+fn extract_morph_weights(
+    morph_indices: &mut MorphIndices,
+    uniform: &mut MorphUniforms,
+    deformation_requests: &MeshDeformationRequests,
+    query: &Query<(Entity, Option<&ViewVisibility>, &MeshMorphWeights)>,
+    weights_query: &Query<&MorphWeights>,
+    morphs_use_uniform_buffers: bool,
+) {
     // Swap buffers. We need to keep the previous frame's buffer around for the
     // purposes of motion vector computation.
     let maybe_old_morph_target_info = match *morph_indices {
@@ -278,8 +307,10 @@ pub fn extract_morphs(
     uniform.prepare_for_new_frame();
 
     // Loop over each entity with morph targets.
-    for (entity, view_visibility, mesh_weights) in &query {
-        if !view_visibility.get() {
+    for (entity, view_visibility, mesh_weights) in query {
+        if !view_visibility.is_some_and(|visibility| visibility.get())
+            && !deformation_requests.contains(entity.into())
+        {
             continue;
         }
         let Ok(weights) = (match mesh_weights {
@@ -443,5 +474,85 @@ pub fn no_automatic_morph_batching(
 
     for entity in &query {
         commands.entity(entity).try_insert(NoAutomaticBatching);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_ecs::system::SystemState;
+
+    #[test]
+    fn requested_morph_inputs_follow_weights_and_request_lifetime() {
+        let mut world = World::new();
+        let owner = world
+            .spawn(MorphWeights::new(vec![0.25, 0.75], None).unwrap())
+            .id();
+        let offscreen = world
+            .spawn((MeshMorphWeights::Reference(owner), ViewVisibility::HIDDEN))
+            .id();
+        let raytracing_only = world
+            .spawn(MeshMorphWeights::Value { weights: vec![0.5] })
+            .id();
+        let visible = world
+            .spawn((
+                MeshMorphWeights::Value { weights: vec![1.0] },
+                ViewVisibility::VISIBLE,
+            ))
+            .id();
+
+        let mut indices = MorphIndices::Storage {
+            morph_weights_info: MainEntityHashMap::default(),
+            gpu_descriptor_indices: MainEntityHashMap::default(),
+            gpu_descriptor_free_list: vec![],
+        };
+        let mut uniforms = MorphUniforms {
+            current_buffer: RawBufferVec::new(BufferUsages::STORAGE),
+            prev_buffer: RawBufferVec::new(BufferUsages::STORAGE),
+            descriptors_buffer: None,
+        };
+        let mut queries = SystemState::<(
+            Query<(Entity, Option<&ViewVisibility>, &MeshMorphWeights)>,
+            Query<&MorphWeights>,
+        )>::new(&mut world);
+        let mut extract = |world: &mut World, requests: &MeshDeformationRequests| {
+            let (query, weights) = queries.get(world).unwrap();
+            extract_morph_weights(
+                &mut indices,
+                &mut uniforms,
+                requests,
+                &query,
+                &weights,
+                false,
+            );
+            [offscreen, raytracing_only, visible].map(|entity| {
+                indices
+                    .current_weights_info(entity.into())
+                    .map(|(offset, count)| {
+                        uniforms.current_buffer.values()[offset as usize..(offset + count) as usize]
+                            .to_vec()
+                    })
+            })
+        };
+
+        let mut requests = MeshDeformationRequests::default();
+        assert_eq!(
+            extract(&mut world, &requests),
+            [None, None, Some(vec![1.0])]
+        );
+        requests.insert(offscreen.into());
+        requests.insert(raytracing_only.into());
+        assert_eq!(
+            extract(&mut world, &requests),
+            [Some(vec![0.25, 0.75]), Some(vec![0.5]), Some(vec![1.0])]
+        );
+        world.get_mut::<MorphWeights>(owner).unwrap().weights_mut()[0] = 0.8;
+        assert_eq!(extract(&mut world, &requests)[0], Some(vec![0.8, 0.75]));
+        world.entity_mut(owner).remove::<MorphWeights>();
+        assert_eq!(extract(&mut world, &requests)[0], None);
+        assert_eq!(
+            extract(&mut world, &MeshDeformationRequests::default()),
+            [None, None, Some(vec![1.0])]
+        );
     }
 }

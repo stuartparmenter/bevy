@@ -18,6 +18,8 @@ use bevy_transform::prelude::GlobalTransform;
 use offset_allocator::{Allocation, Allocator};
 use tracing::error;
 
+use crate::MeshDeformationRequests;
+
 /// Maximum number of joints supported for skinned meshes.
 ///
 /// It is used to allocate buffers.
@@ -271,15 +273,12 @@ pub fn prepare_skins(
 // in the shader that you only read the values that are valid for that binding.
 pub fn extract_skins(
     skin_uniforms: ResMut<SkinUniforms>,
-    skinned_meshes: Extract<Query<(Entity, &SkinnedMesh)>>,
+    deformation_requests: Res<MeshDeformationRequests>,
+    skinned_meshes: Extract<Query<(Entity, Option<&ViewVisibility>, &SkinnedMesh)>>,
     changed_skinned_meshes: Extract<
         Query<
-            (Entity, &ViewVisibility, &SkinnedMesh),
-            Or<(
-                Changed<ViewVisibility>,
-                Changed<SkinnedMesh>,
-                AssetChanged<SkinnedMesh>,
-            )>,
+            (Entity, Option<&ViewVisibility>, &SkinnedMesh),
+            Or<(Changed<SkinnedMesh>, AssetChanged<SkinnedMesh>)>,
         >,
     >,
     skinned_mesh_inverse_bindposes: Extract<Res<Assets<SkinnedMeshInverseBindposes>>>,
@@ -289,76 +288,43 @@ pub fn extract_skins(
 ) {
     let skin_uniforms = skin_uniforms.into_inner();
 
-    // Find skins that have become visible or invisible on this frame. Allocate,
-    // reallocate, or free space for them as necessary.
-    add_or_delete_skins(
-        skin_uniforms,
-        &changed_skinned_meshes,
-        &skinned_mesh_inverse_bindposes,
-        &joints,
-    );
-
-    // Extract the transforms for all joints from the scene, and write them into
-    // the staging buffer at the appropriate spot.
-    for (skin_entity, skin) in &skinned_meshes {
-        extract_joints_for_skin(
-            skin_entity.into(),
-            skin,
-            skin_uniforms,
-            &changed_skinned_meshes,
-            &skinned_mesh_inverse_bindposes,
-            &changed_transforms,
-        );
-    }
-
-    // Delete skins that became invisible.
-    for skinned_mesh_entity in removed_skinned_meshes_query.read() {
-        // Only remove a skin if we didn't pick it up in `add_or_delete_skins`.
-        // It's possible that a necessary component was removed and re-added in
-        // the same frame.
-        if !changed_skinned_meshes.contains(skinned_mesh_entity) {
-            remove_skin(skin_uniforms, skinned_mesh_entity.into());
-        }
-    }
-}
-
-/// Searches for all skins that have become visible or invisible this frame and
-/// allocations for them as necessary.
-fn add_or_delete_skins(
-    skin_uniforms: &mut SkinUniforms,
-    changed_skinned_meshes: &Query<
-        (Entity, &ViewVisibility, &SkinnedMesh),
-        Or<(
-            Changed<ViewVisibility>,
-            Changed<SkinnedMesh>,
-            AssetChanged<SkinnedMesh>,
-        )>,
-    >,
-    skinned_mesh_inverse_bindposes: &Assets<SkinnedMeshInverseBindposes>,
-    joints: &Query<&GlobalTransform>,
-) {
-    // Find every skinned mesh that changed one of (1) visibility; (2) joint
-    // entities (part of `SkinnedMesh`); (3) the associated
-    // `SkinnedMeshInverseBindposes` asset.
-    for (skinned_mesh_entity, skinned_mesh_view_visibility, skinned_mesh) in changed_skinned_meshes
-    {
-        // Remove the skin if it existed last frame.
-        let skinned_mesh_entity = MainEntity::from(skinned_mesh_entity);
-        remove_skin(skin_uniforms, skinned_mesh_entity);
-
-        // If the skin is invisible, we're done.
-        if !(*skinned_mesh_view_visibility).get() {
+    // Reconcile visibility and deformation requests, then update joint transforms.
+    for (entity, visibility, skin) in &skinned_meshes {
+        let skin_entity = MainEntity::from(entity);
+        if !visibility.is_some_and(|visibility| visibility.get())
+            && !deformation_requests.contains(skin_entity)
+        {
+            remove_skin(skin_uniforms, skin_entity);
             continue;
         }
 
-        // Initialize the skin.
-        add_skin(
-            skinned_mesh_entity,
-            skinned_mesh,
-            skin_uniforms,
-            skinned_mesh_inverse_bindposes,
-            joints,
-        );
+        if changed_skinned_meshes.contains(entity)
+            || !skin_uniforms.skin_uniform_info.contains_key(&skin_entity)
+        {
+            remove_skin(skin_uniforms, skin_entity);
+            add_skin(
+                skin_entity,
+                skin,
+                skin_uniforms,
+                &skinned_mesh_inverse_bindposes,
+                &joints,
+            );
+        } else {
+            extract_joints_for_skin(
+                skin_entity,
+                skin,
+                skin_uniforms,
+                &skinned_mesh_inverse_bindposes,
+                &changed_transforms,
+            );
+        }
+    }
+
+    for skinned_mesh_entity in removed_skinned_meshes_query.read() {
+        // A skin removed and re-added in the same frame was already initialized above.
+        if !skinned_meshes.contains(skinned_mesh_entity) {
+            remove_skin(skin_uniforms, skinned_mesh_entity.into());
+        }
     }
 }
 
@@ -368,23 +334,9 @@ fn extract_joints_for_skin(
     skin_entity: MainEntity,
     skin: &SkinnedMesh,
     skin_uniforms: &mut SkinUniforms,
-    changed_skinned_meshes: &Query<
-        (Entity, &ViewVisibility, &SkinnedMesh),
-        Or<(
-            Changed<ViewVisibility>,
-            Changed<SkinnedMesh>,
-            AssetChanged<SkinnedMesh>,
-        )>,
-    >,
     skinned_mesh_inverse_bindposes: &Assets<SkinnedMeshInverseBindposes>,
     changed_transforms: &Query<(Entity, &GlobalTransform), Changed<GlobalTransform>>,
 ) {
-    // If we initialized the skin this frame, we already populated all
-    // the joints, so there's no need to populate them again.
-    if changed_skinned_meshes.contains(*skin_entity) {
-        return;
-    }
-
     // Fetch information about the skin.
     let Some(skin_uniform_info) = skin_uniforms.skin_uniform_info.get(&skin_entity) else {
         return;
@@ -510,5 +462,142 @@ pub fn no_automatic_skin_batching(
 
     for entity in &query {
         commands.entity(entity).try_insert(NoAutomaticBatching);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_ecs::system::RunSystemOnce;
+    use bevy_math::Vec3;
+    use bevy_platform::future::block_on;
+    use bevy_render::MainWorld;
+
+    fn dummy_device() -> RenderDevice {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::NOOP,
+            flags: wgpu::InstanceFlags::default(),
+            memory_budget_thresholds: Default::default(),
+            display: None,
+            backend_options: wgpu::BackendOptions {
+                noop: wgpu::NoopBackendOptions {
+                    enable: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        });
+        let adapter =
+            block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).unwrap();
+        let (device, _) =
+            block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).unwrap();
+        RenderDevice::from(device)
+    }
+
+    #[test]
+    fn requested_skins_follow_joint_updates_and_request_lifetime() {
+        let mut main_world = MainWorld::default();
+        let mut bindposes = Assets::<SkinnedMeshInverseBindposes>::default();
+        let bindposes_handle = bindposes.add(vec![Mat4::IDENTITY]);
+        main_world.insert_resource(bindposes);
+        let joint = main_world.spawn_empty().id();
+        let skin = SkinnedMesh {
+            inverse_bindposes: bindposes_handle,
+            joints: vec![joint],
+        };
+        let requested = main_world.spawn(skin.clone()).id();
+        let visible = main_world
+            .spawn((skin.clone(), ViewVisibility::VISIBLE))
+            .id();
+        let offscreen = main_world.spawn((skin, ViewVisibility::HIDDEN)).id();
+
+        let mut render_world = World::new();
+        render_world.insert_resource(main_world);
+        render_world.insert_resource(dummy_device());
+        render_world.init_resource::<MeshDeformationRequests>();
+        render_world
+            .resource_mut::<MeshDeformationRequests>()
+            .insert(requested.into());
+        render_world
+            .run_system_once(skin_uniforms_from_world)
+            .unwrap();
+        let mut extract = Schedule::default();
+        extract.add_systems(extract_skins);
+        extract.run(&mut render_world);
+
+        let uniforms = render_world.resource::<SkinUniforms>();
+        let offset = uniforms.skin_index(requested.into()).unwrap();
+        assert!(uniforms.skin_index(visible.into()).is_some());
+        assert!(uniforms.skin_index(offscreen.into()).is_none());
+        assert_eq!(
+            uniforms.current_staging_buffer[offset as usize],
+            Mat4::IDENTITY
+        );
+
+        // Joint transforms can arrive after the mesh instance is extracted.
+        let transform = GlobalTransform::from_translation(Vec3::new(1.0, 2.0, 3.0));
+        {
+            let mut main_world = render_world.resource_mut::<MainWorld>();
+            main_world.clear_trackers();
+            main_world.entity_mut(joint).insert(transform);
+            main_world
+                .entity_mut(requested)
+                .insert(ViewVisibility::VISIBLE);
+        }
+        extract.run(&mut render_world);
+        let uniforms = render_world.resource::<SkinUniforms>();
+        assert_eq!(uniforms.skin_index(requested.into()), Some(offset));
+        assert_eq!(
+            uniforms.current_staging_buffer[offset as usize],
+            transform.to_matrix()
+        );
+
+        // Raster visibility does not end a requested skin's allocation.
+        {
+            let mut main_world = render_world.resource_mut::<MainWorld>();
+            main_world.clear_trackers();
+            main_world
+                .entity_mut(requested)
+                .insert(ViewVisibility::HIDDEN);
+        }
+        extract.run(&mut render_world);
+        assert_eq!(
+            render_world
+                .resource::<SkinUniforms>()
+                .skin_index(requested.into()),
+            Some(offset)
+        );
+
+        render_world.insert_resource(MeshDeformationRequests::default());
+        render_world.resource_mut::<MainWorld>().clear_trackers();
+        extract.run(&mut render_world);
+        assert!(render_world
+            .resource::<SkinUniforms>()
+            .skin_index(requested.into())
+            .is_none());
+        assert!(render_world
+            .resource::<SkinUniforms>()
+            .skin_index(visible.into())
+            .is_some());
+
+        render_world
+            .resource_mut::<MeshDeformationRequests>()
+            .insert(requested.into());
+        render_world.resource_mut::<MainWorld>().clear_trackers();
+        extract.run(&mut render_world);
+        assert!(render_world
+            .resource::<SkinUniforms>()
+            .skin_index(requested.into())
+            .is_some());
+        {
+            let mut main_world = render_world.resource_mut::<MainWorld>();
+            main_world.clear_trackers();
+            main_world.entity_mut(requested).remove::<SkinnedMesh>();
+        }
+        extract.run(&mut render_world);
+        assert!(render_world
+            .resource::<SkinUniforms>()
+            .skin_index(requested.into())
+            .is_none());
     }
 }
