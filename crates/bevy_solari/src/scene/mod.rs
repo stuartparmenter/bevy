@@ -1,13 +1,20 @@
 mod binder;
 mod blas;
+mod deformation;
+mod deformation_source;
 mod extract;
 mod producer;
 mod types;
 
 use bevy_asset::embedded_asset;
+use bevy_pbr::{write_morph_buffers, MeshDeformationSystems};
 use bevy_shader::load_shader_library;
 pub use binder::prepare_raytracing_scene_resources;
 pub use binder::{RaytracingSceneBindings, RaytracingSceneNeedsPreviousFrameData};
+use deformation::{
+    extract_mesh_deformations, prepare_mesh_deformations, MeshDeformationPipeline, MeshDeformations,
+};
+use deformation_source::{prepare_deformation_sources, DeformationSources};
 pub use producer::RaytracingProducerEncoder;
 pub use types::{
     RaytracingGeometry, RaytracingGeometryBuffers, RaytracingGeometryPreviousVertices,
@@ -52,6 +59,7 @@ impl Plugin for RaytracingScenePlugin {
         load_shader_library!(app, "bindings.wesl");
         load_shader_library!(app, "sampling.wesl");
         embedded_asset!(app, "binder/setup_tlas_instances.wesl");
+        embedded_asset!(app, "deformation.wesl");
 
         // Meshlet raytracing entities can match both transform updaters.
         // Both write the same value, so their relative order does not matter.
@@ -82,6 +90,9 @@ impl Plugin for RaytracingScenePlugin {
 
         render_app
             .init_resource::<ExtractedEnvironmentMapLight>()
+            .init_gpu_resource::<DeformationSources>()
+            .init_gpu_resource::<MeshDeformationPipeline>()
+            .init_gpu_resource::<MeshDeformations>()
             .init_gpu_resource::<BlasManager>()
             .init_gpu_resource::<GeometryBlasManager>()
             .init_gpu_resource::<StandardMaterialAssets>()
@@ -92,6 +103,9 @@ impl Plugin for RaytracingScenePlugin {
                 ExtractSchedule,
                 (
                     extract_raytracing_scene_structural,
+                    extract_mesh_deformations
+                        .in_set(MeshDeformationSystems::Collect)
+                        .after(extract_raytracing_scene_structural),
                     extract_raytracing_scene_transforms,
                     extract_raytracing_scene_meshes_and_materials,
                     extract_raytracing_material_assets,
@@ -101,6 +115,13 @@ impl Plugin for RaytracingScenePlugin {
             .add_systems(
                 Render,
                 (
+                    prepare_deformation_sources
+                        .in_set(RenderSystems::PrepareAssets)
+                        .before(prepare_assets::<RenderMesh>)
+                        .after(allocate_and_free_meshes),
+                    prepare_mesh_deformations
+                        .in_set(RenderSystems::PrepareResourcesFlush)
+                        .after(write_morph_buffers),
                     prepare_raytracing_blas
                         .in_set(RenderSystems::PrepareAssets)
                         .before(prepare_assets::<RenderMesh>)
@@ -110,15 +131,19 @@ impl Plugin for RaytracingScenePlugin {
                         .after(prepare_raytracing_blas),
                     // Allocate before binding instances; build after producers fill their buffers.
                     prepare_raytracing_geometry_blas
-                        .in_set(RenderSystems::PrepareResources)
+                        .in_set(RenderSystems::PrepareBindGroups)
                         .before(prepare_raytracing_scene_resources),
-                    prepare_raytracing_scene_resources.in_set(RenderSystems::PrepareResources),
+                    prepare_raytracing_scene_resources.in_set(RenderSystems::PrepareBindGroups),
                     // Record BLAS builds after the producer passes, then submit both before the TLAS build.
-                    build_raytracing_geometry_blas.in_set(RenderSystems::PrepareBindGroups),
+                    build_raytracing_geometry_blas
+                        .in_set(RenderSystems::PrepareBindGroups)
+                        .after(prepare_raytracing_scene_resources),
                     submit_raytracing_producers
                         .in_set(RenderSystems::PrepareBindGroups)
                         .after(build_raytracing_geometry_blas),
-                    prepare_raytracing_scene_bind_group.in_set(RenderSystems::PrepareBindGroups),
+                    prepare_raytracing_scene_bind_group
+                        .in_set(RenderSystems::PrepareBindGroups)
+                        .after(prepare_raytracing_scene_resources),
                 ),
             )
             .add_systems(

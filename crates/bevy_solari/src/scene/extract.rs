@@ -129,7 +129,7 @@ pub fn extract_raytracing_scene_structural(
 /// Copies the transforms of moved raytracing instances from the main world
 /// straight into their GPU buffers.
 ///
-/// Also updates [`GlobalTransform`] on [`RaytracingGeometry`] render entities so
+/// Also updates [`GlobalTransform`] on raytracing render entities so
 /// producers converting vertices to local space use the same transform as the TLAS.
 pub fn extract_raytracing_scene_transforms(
     main_instances: Extract<
@@ -148,10 +148,10 @@ pub fn extract_raytracing_scene_transforms(
     moved_geometry: Extract<
         Query<
             (RenderEntity, &GlobalTransform),
-            (Changed<GlobalTransform>, With<RaytracingGeometry>),
+            (Changed<GlobalTransform>, RaytracingInstanceFilter),
         >,
     >,
-    mut render_geometry: Query<&mut GlobalTransform, With<RaytracingGeometry>>,
+    mut render_geometry: Query<&mut GlobalTransform, RaytracingInstanceFilter>,
     bindings: Res<RaytracingSceneBindings>,
 ) {
     main_instances
