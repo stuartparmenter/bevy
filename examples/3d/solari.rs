@@ -1,4 +1,8 @@
 //! Demonstrates realtime dynamic raytraced lighting using Bevy Solari.
+//! Pass `--animated-meshes` for a procedural skinning and morphing scene.
+
+#[path = "solari/animated_meshes.rs"]
+mod animated_meshes;
 
 use argh::FromArgs;
 use bevy::{
@@ -38,6 +42,9 @@ struct Args {
     /// stress test a scene with many lights.
     #[argh(switch)]
     many_lights: Option<bool>,
+    /// animate procedural meshes using skinning, morph targets, and both together.
+    #[argh(switch)]
+    animated_meshes: Option<bool>,
 }
 
 fn main() {
@@ -56,9 +63,13 @@ fn main() {
         FreeCameraPlugin,
         RenderDiagnosticsPlugin,
     ))
-    .insert_resource(args);
+    .insert_resource(args)
+    .add_systems(Startup, setup_ui);
 
-    if args.many_lights == Some(true) {
+    if args.animated_meshes == Some(true) {
+        app.add_systems(Startup, animated_meshes::setup)
+            .add_systems(Update, animated_meshes::animate);
+    } else if args.many_lights == Some(true) {
         app.add_systems(Startup, setup_many_lights);
     } else {
         app.add_systems(Startup, setup_pica_pica);
@@ -66,13 +77,17 @@ fn main() {
 
     if args.pathtracer == Some(true) {
         app.add_plugins(PathtracingPlugin);
+        if args.animated_meshes == Some(true) {
+            app.add_systems(Update, pause_scene)
+                .add_systems(PostUpdate, animated_meshes::update_pathtracer_text);
+        }
     } else {
         #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
         app.add_systems(Update, toggle_dlss_rr);
 
         app.add_systems(Update, toggle_restir);
 
-        if args.many_lights != Some(true) {
+        if args.many_lights != Some(true) || args.animated_meshes == Some(true) {
             app.add_systems(Update, (pause_scene, toggle_lights, patrol_path));
         }
         app.add_systems(PostUpdate, (update_control_text, update_performance_text));
@@ -168,36 +183,6 @@ fn setup_pica_pica(
     if dlss_rr_supported.is_some() {
         camera.insert(Dlss::<DlssRayReconstructionFeature>::default());
     }
-
-    commands.spawn((
-        ControlText,
-        Text::default(),
-        Node {
-            position_type: PositionType::Absolute,
-            bottom: px(12.0),
-            left: px(12.0),
-            ..default()
-        },
-    ));
-
-    commands.spawn((
-        Node {
-            position_type: PositionType::Absolute,
-            right: px(0.0),
-            padding: px(4.0).all(),
-            border_radius: BorderRadius::bottom_left(px(4.0)),
-            ..default()
-        },
-        BackgroundColor(Color::srgba(0.10, 0.10, 0.10, 0.8)),
-        children![(
-            PerformanceText,
-            Text::default(),
-            TextFont {
-                font_size: FontSize::Px(8.0),
-                ..default()
-            },
-        )],
-    ));
 }
 
 fn setup_many_lights(
@@ -349,7 +334,9 @@ fn setup_many_lights(
     if dlss_rr_supported.is_some() {
         camera.insert(Dlss::<DlssRayReconstructionFeature>::default());
     }
+}
 
+fn setup_ui(mut commands: Commands) {
     commands.spawn((
         ControlText,
         Text::default(),
@@ -583,7 +570,12 @@ fn update_control_text(
 ) {
     text.0.clear();
 
-    if args.many_lights != Some(true) {
+    if args.animated_meshes == Some(true) {
+        text.0
+            .push_str("Left: skinning | Middle: morph targets | Right: both\n");
+    }
+
+    if args.many_lights != Some(true) || args.animated_meshes == Some(true) {
         if time.is_paused() {
             text.0.push_str("(Space): Resume");
         } else {
@@ -600,9 +592,10 @@ fn update_control_text(
             Some(robot_light_material) if robot_light_material.emissive != LinearRgba::BLACK => {
                 text.0.push_str("\n(2): Disable robot emissive light");
             }
-            _ => {
+            Some(_) => {
                 text.0.push_str("\n(2): Enable robot emissive light");
             }
+            None => {}
         }
     }
 
