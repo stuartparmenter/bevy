@@ -13,7 +13,6 @@ use bevy_ecs::{
     entity::Entity,
     system::{Commands, Query, Res},
 };
-#[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
 use bevy_image::ToExtents;
 use bevy_math::UVec2;
 use bevy_render::{
@@ -21,7 +20,6 @@ use bevy_render::{
     render_resource::{Buffer, BufferDescriptor, BufferInitDescriptor, BufferUsages},
     renderer::{RenderDevice, RenderQueue},
 };
-#[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
 use bevy_render::{
     render_resource::{
         TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, TextureViewDescriptor,
@@ -29,6 +27,7 @@ use bevy_render::{
     texture::CachedTexture,
 };
 use bytemuck::{Pod, Zeroable};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 /// Size of the `LightSample` shader struct in bytes.
 const LIGHT_SAMPLE_STRUCT_SIZE: u64 = 8;
@@ -75,6 +74,14 @@ struct SolariLightingUniforms {
     world_cache_position_lod_scale: f32,
     frame_rng: u32,
     reset: u32,
+    grass_unshifted_ray_origin: u32,
+    raw_directional_visibility: u32,
+    grass_gi_exclusion: u32,
+    grass_geometric_ray_origin: u32,
+    grass_rt_receiver_origin: u32,
+    _receiver_padding0: u32,
+    _receiver_padding1: u32,
+    _receiver_padding2: u32,
 }
 
 impl SolariLightingUniforms {
@@ -92,6 +99,14 @@ impl SolariLightingUniforms {
             world_cache_position_lod_scale: settings.world_cache_position_lod_scale,
             frame_rng: frame_count.wrapping_mul(5782582),
             reset: (settings.reset || force_reset) as u32,
+            grass_unshifted_ray_origin: settings.grass_unshifted_ray_origin as u32,
+            raw_directional_visibility: settings.raw_directional_visibility,
+            grass_gi_exclusion: settings.grass_gi_exclusion as u32,
+            grass_geometric_ray_origin: settings.grass_geometric_ray_origin as u32,
+            grass_rt_receiver_origin: settings.grass_rt_receiver_origin as u32,
+            _receiver_padding0: 0,
+            _receiver_padding1: 0,
+            _receiver_padding2: 0,
         }
     }
 }
@@ -117,9 +132,51 @@ pub struct SolariLightingResources {
     pub light_tile_samples: Buffer,
     pub light_tile_resolved_samples: Buffer,
     pub reservoirs: Option<SolariReservoirBuffers>,
+    pub grass_receivers: GrassReceiverTextures,
     pub world_cache: Buffer,
     pub world_cache_active_cells_dispatch: Buffer,
     pub view_size: UVec2,
+}
+
+/// Per-view RT receiver IDs and barycentrics. The write slot advances only when
+/// the full lighting pass has been recorded; skipped frames force history reset.
+pub struct GrassReceiverTextures {
+    pub textures: [CachedTexture; 2],
+    pub history: GrassReceiverHistory,
+}
+
+pub struct GrassReceiverHistory {
+    current_frame: AtomicU32,
+    last_rendered_frame: AtomicU64,
+    write_index: AtomicUsize,
+}
+
+impl GrassReceiverHistory {
+    fn new(frame: u32) -> Self {
+        Self {
+            current_frame: AtomicU32::new(frame),
+            last_rendered_frame: AtomicU64::new(u64::MAX),
+            write_index: AtomicUsize::new(0),
+        }
+    }
+
+    /// True when the previous cache cannot describe last frame's G-buffer.
+    fn begin_frame(&self, frame: u32) -> bool {
+        self.current_frame.store(frame, Ordering::Relaxed);
+        self.last_rendered_frame.load(Ordering::Relaxed) != u64::from(frame.wrapping_sub(1))
+    }
+
+    pub fn write_index(&self) -> usize {
+        self.write_index.load(Ordering::Relaxed)
+    }
+
+    pub fn record_rendered(&self) {
+        self.write_index.fetch_xor(1, Ordering::Relaxed);
+        self.last_rendered_frame.store(
+            u64::from(self.current_frame.load(Ordering::Relaxed)),
+            Ordering::Relaxed,
+        );
+    }
 }
 
 pub struct SolariReservoirBuffers {
@@ -191,8 +248,10 @@ pub fn prepare_solari_lighting_resources(
         let reusable = solari_lighting_resources.filter(|r| {
             r.view_size == view_size && r.reservoirs.is_some() == solari_lighting.restir
         });
+        let receiver_history_invalid = reusable
+            .is_none_or(|resources| resources.grass_receivers.history.begin_frame(frame_count.0));
         let uniforms =
-            SolariLightingUniforms::new(solari_lighting, frame_count.0, reusable.is_none());
+            SolariLightingUniforms::new(solari_lighting, frame_count.0, receiver_history_invalid);
 
         if let Some(solari_lighting_resources) = reusable {
             // The constants uniform can change every frame, so always upload it.
@@ -255,11 +314,37 @@ pub fn prepare_solari_lighting_resources(
             mapped_at_creation: false,
         });
 
+        let receiver_texture = |label| {
+            let texture = render_device.create_texture(&TextureDescriptor {
+                label: Some(label),
+                size: view_size.to_extents(),
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format: TextureFormat::Rgba32Uint,
+                usage: TextureUsages::TEXTURE_BINDING | TextureUsages::STORAGE_BINDING,
+                view_formats: &[],
+            });
+            let default_view = texture.create_view(&TextureViewDescriptor::default());
+            CachedTexture {
+                texture,
+                default_view,
+            }
+        };
+        let grass_receivers = GrassReceiverTextures {
+            textures: [
+                receiver_texture("solari_grass_receivers_a"),
+                receiver_texture("solari_grass_receivers_b"),
+            ],
+            history: GrassReceiverHistory::new(frame_count.0),
+        };
+
         commands.entity(entity).insert(SolariLightingResources {
             constants,
             light_tile_samples,
             light_tile_resolved_samples,
             reservoirs,
+            grass_receivers,
             world_cache,
             world_cache_active_cells_dispatch,
             view_size,
@@ -303,5 +388,43 @@ fn create_dlss_rr_textures(
             "solari_lighting_specular_motion_vectors",
             TextureFormat::Rg16Float,
         ),
+    }
+}
+
+#[cfg(test)]
+mod receiver_history_tests {
+    use super::{GrassReceiverHistory, SolariLightingUniforms};
+
+    #[test]
+    fn receiver_history_advances_only_on_rendered_frames() {
+        let history = GrassReceiverHistory::new(10);
+        assert!(history.begin_frame(10));
+        assert_eq!(history.write_index(), 0);
+        history.record_rendered();
+        assert_eq!(history.write_index(), 1);
+        assert!(!history.begin_frame(11));
+        // Frame11 is prepared but a pipeline is unavailable, so no render call.
+        assert!(history.begin_frame(12));
+        assert_eq!(history.write_index(), 1);
+        history.record_rendered();
+        assert_eq!(history.write_index(), 0);
+        assert!(!history.begin_frame(13));
+    }
+
+    #[test]
+    fn recreated_resources_and_wrapping_frame_count_reset_correctly() {
+        let history = GrassReceiverHistory::new(u32::MAX);
+        assert!(history.begin_frame(u32::MAX));
+        history.record_rendered();
+        assert!(!history.begin_frame(0));
+        history.record_rendered();
+        assert!(!history.begin_frame(1));
+        // New camera/size/resources never trust newly allocated zero texture data.
+        assert!(GrassReceiverHistory::new(1).begin_frame(1));
+    }
+
+    #[test]
+    fn receiver_settings_keep_uniform_sixteen_byte_alignment() {
+        assert_eq!(size_of::<SolariLightingUniforms>(), 80);
     }
 }

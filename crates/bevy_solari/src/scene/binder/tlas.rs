@@ -509,7 +509,7 @@ fn build_tlas_through_wgpu_core(
         let capacity = tlas.get().len();
         tlas[0..capacity].iter_mut().for_each(|entry| *entry = None);
 
-        for (entity, slot, source, transform) in bindings.instances.drawable() {
+        for (entity, slot, source, transform, mask) in bindings.instances.drawable() {
             // A mesh can lose its acceleration structure after the instance resolved against it,
             // which leaves the slot with nothing to point at for a frame
             let blas = match source {
@@ -519,7 +519,7 @@ fn build_tlas_through_wgpu_core(
             let Some(blas) = blas else {
                 continue;
             };
-            tlas[slot as usize] = Some(TlasInstance::new(blas, transform, slot, 0xFF));
+            tlas[slot as usize] = Some(TlasInstance::new(blas, transform, slot, mask));
         }
     }
 

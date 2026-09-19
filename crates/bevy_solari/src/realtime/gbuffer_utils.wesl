@@ -2,9 +2,16 @@ import bevy_pbr::deferred::types::unpack_24bit_normal;
 import bevy_pbr::render::rgb9e5::rgb9e5_to_vec3_;
 import bevy_render::utils::octahedral_decode;
 import bevy_render::view::{View, depth_ndc_to_view_z};
-import package::scene::bindings::ResolvedMaterial;
+import package::scene::bindings::{ResolvedMaterial, RAY_T_MIN};
+import package::realtime::bindings::constants;
 
 struct ResolvedGPixel {
+    ray_origin: vec3<f32>,
+    geometric_normal: vec4<f32>,
+    receiver_geometric_normal: vec3<f32>,
+    is_grass: bool,
+    // False only when a previously matched RT anchor lost its geometry.
+    ray_origin_valid: bool,
     world_position: vec3<f32>,
     world_normal: vec3<f32>,
     material: ResolvedMaterial,
@@ -24,7 +31,20 @@ fn gpixel_resolve(gpixel: vec4<u32>, depth: f32, pixel_id: vec2<u32>, view_size:
     let emissive = rgb9e5_to_vec3_(gpixel.g);
     let material = ResolvedMaterial(base_color, emissive, reflectance, perceptual_roughness, roughness, metallic);
 
-    return ResolvedGPixel(world_position, world_normal, material);
+    // Meadow reserves flag bit 3 in the packed high byte (alpha bit 27).
+    // Its upright shading normal is not the ribbon's geometric normal.
+    let grass = (gpixel.a & (1u << 27u)) != 0u;
+    let has_geometry = grass && (gpixel.a & (1u << 28u)) != 0u;
+    let geometric = has_geometry && bool(constants.grass_geometric_ray_origin);
+    var receiver_geometric_normal = vec3(0.0);
+    if has_geometry {
+        let encoded = vec2(f32((gpixel.b >> 16u) & 255u), f32(gpixel.b >> 24u)) / 255.0;
+        receiver_geometric_normal = octahedral_decode(encoded);
+    }
+    let geometric_normal = select(vec4(0.0), vec4(receiver_geometric_normal, 0.02), geometric);
+    let skip_offset = geometric || (grass && bool(constants.grass_unshifted_ray_origin));
+    let ray_origin = select(world_position + world_normal * RAY_T_MIN, world_position, skip_offset);
+    return ResolvedGPixel(ray_origin, geometric_normal, receiver_geometric_normal, grass, true, world_position, world_normal, material);
 }
 
 fn reconstruct_world_position(pixel_id: vec2<u32>, depth: f32, view_size: vec2<f32>, world_from_clip: mat4x4<f32>) -> vec3<f32> {

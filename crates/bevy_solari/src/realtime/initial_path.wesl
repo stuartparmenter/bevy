@@ -5,8 +5,8 @@ import bevy_render::utils::octahedral_encode;
 import package::scene::brdf::{brdf_pdf, evaluate_and_sample_brdf, evaluate_brdf, EvaluateAndSampleBrdfResult, F_AB};
 import package::realtime::presample_light_tiles::unpack_resolved_light_sample;
 import package::realtime::bindings::{empty_reservoir, light_tile_resolved_samples, light_tile_samples, NO_SAMPLE_POINT_INSTANCE, Reservoir, constants, view};
-import package::scene::sampling::{calculate_resolved_light_contribution, isinf, LightSample, NULL_LIGHT_ID, power_heuristic, trace_visibility, sample_environment_map_light};
-import package::scene::bindings::{light_sources, RAY_T_MAX, RAY_T_MIN, resolve_ray_hit_full, ResolvedMaterial, ResolvedRayHitFull, trace_ray};
+import package::scene::sampling::{calculate_resolved_light_contribution, isinf, LightSample, NULL_LIGHT_ID, power_heuristic, trace_visibility_from_surface, sample_environment_map_light};
+import package::scene::bindings::{light_sources, RAY_T_MAX, RAY_T_MIN, resolve_ray_hit_full, ResolvedMaterial, ResolvedRayHitFull, trace_ray_masked, offset_surface_ray_origin};
 import package::realtime::world_cache_query::{get_cell_size, query_world_cache, WORLD_CACHE_CELL_LIFETIME};
 
 @if(DLSS_RR_GUIDE_BUFFERS)
@@ -34,6 +34,7 @@ struct InitialSamplingResult {
 /// surface), x2 = first BRDF-sampled hit (the reconnection vertex).
 struct PathState {
     ray_origin: vec3<f32>,
+    geometric_normal: vec4<f32>,
     normal: vec3<f32>,
     wo: vec3<f32>,
     material: ResolvedMaterial,
@@ -58,9 +59,10 @@ struct PathState {
     @if(RESTIR) selected_target_function: f32,
 }
 
-fn new_path_state(world_position: vec3<f32>, world_normal: vec3<f32>, wo: vec3<f32>, material: ResolvedMaterial) -> PathState {
+fn new_path_state(ray_origin: vec3<f32>, geometric_normal: vec4<f32>, world_normal: vec3<f32>, wo: vec3<f32>, material: ResolvedMaterial) -> PathState {
     var path: PathState;
-    path.ray_origin = world_position + (world_normal * RAY_T_MIN);
+    path.ray_origin = ray_origin;
+    path.geometric_normal = geometric_normal;
     path.normal = world_normal;
     path.wo = wo;
     path.material = material;
@@ -82,12 +84,12 @@ fn new_path_state(world_position: vec3<f32>, world_normal: vec3<f32>, wo: vec3<f
     return path;
 }
 
-fn generate_initial_path(world_position: vec3<f32>, world_normal: vec3<f32>, material: ResolvedMaterial, workgroup_id: vec2<u32>, pixel_id: vec2<u32>, rng: ptr<function, u32>) -> InitialSamplingResult {
+fn generate_initial_path(ray_origin: vec3<f32>, geometric_normal: vec4<f32>, world_position: vec3<f32>, world_normal: vec3<f32>, material: ResolvedMaterial, workgroup_id: vec2<u32>, pixel_id: vec2<u32>, rng: ptr<function, u32>) -> InitialSamplingResult {
     let wo = normalize(view.world_position - world_position);
     let primary_NdotV = max(dot(world_normal, wo), 0.0001);
     let primary_F_ab = F_AB(material.perceptual_roughness, primary_NdotV);
 
-    var path = new_path_state(world_position, world_normal, wo, material);
+    var path = new_path_state(ray_origin, geometric_normal, world_normal, wo, material);
 
     @if(DLSS_RR_GUIDE_BUFFERS)
     var psr = psr_init(world_normal, material);
@@ -106,7 +108,7 @@ fn generate_initial_path(world_position: vec3<f32>, world_normal: vec3<f32>, mat
         // Sample the BRDF and trace the next ray
         let next_bounce = evaluate_and_sample_brdf(path.wo, path.normal, path.material, F_ab, rng);
         if next_bounce.pdf == 0.0 { break; }
-        let ray = trace_ray(path.ray_origin, next_bounce.wi, RAY_T_MIN, RAY_T_MAX, RAY_FLAG_NONE);
+        let ray = trace_ray_masked(offset_surface_ray_origin(path.ray_origin, path.geometric_normal, next_bounce.wi), next_bounce.wi, RAY_T_MIN, RAY_T_MAX, RAY_FLAG_NONE, select(0xFFu, 0xFDu, bool(constants.grass_gi_exclusion)));
 
         if ray.kind == RAY_QUERY_INTERSECTION_NONE {
             @if(DLSS_RR_GUIDE_BUFFERS)
@@ -185,6 +187,7 @@ fn generate_initial_path(world_position: vec3<f32>, world_normal: vec3<f32>, mat
 
         // Advance to the next vertex
         path.ray_origin = ray_hit.world_position + (ray_hit.geometric_world_normal * RAY_T_MIN);
+        path.geometric_normal = vec4(0.0); // Secondary-hit policy remains unchanged.
         path.normal = ray_hit.world_normal;
         path.wo = -next_bounce.wi;
         path.material = ray_hit.material;
@@ -226,7 +229,7 @@ fn generate_nee_candidate(
 ) {
     if rand_f(rng) >= p_nee { return; }
 
-    let di = sample_light_ris((*path).ray_origin, (*path).normal, (*path).wo, (*path).material, F_ab, di_samples, workgroup_id, bounce, rng);
+    let di = sample_light_ris((*path).ray_origin, (*path).geometric_normal, (*path).normal, (*path).wo, (*path).material, F_ab, di_samples, workgroup_id, bounce, rng);
     let di_target_function = luminance(di.brdf_radiance);
     if di_target_function <= 0.0 { return; }
 
@@ -275,7 +278,7 @@ struct DiSample {
     brdf_rays_can_hit: bool,
 }
 
-fn sample_light_ris(ray_origin: vec3<f32>, normal: vec3<f32>, wo: vec3<f32>, material: ResolvedMaterial, F_ab: vec2<f32>, di_samples: u32, workgroup_id: vec2<u32>, bounce: u32, rng: ptr<function, u32>) -> DiSample {
+fn sample_light_ris(ray_origin: vec3<f32>, geometric_normal: vec4<f32>, normal: vec3<f32>, wo: vec3<f32>, material: ResolvedMaterial, F_ab: vec2<f32>, di_samples: u32, workgroup_id: vec2<u32>, bounce: u32, rng: ptr<function, u32>) -> DiSample {
     var workgroup_rng = (workgroup_id.x * 5782582u) + workgroup_id.y + bounce;
     let light_tile_start = rand_range_u(128u, &workgroup_rng) * 1024u;
 
@@ -314,7 +317,7 @@ fn sample_light_ris(ray_origin: vec3<f32>, normal: vec3<f32>, wo: vec3<f32>, mat
     var unbiased_contribution_weight = 0.0;
     if selected_target_function > 0.0 {
         unbiased_contribution_weight = weight_sum / selected_target_function;
-        unbiased_contribution_weight *= trace_visibility(ray_origin, selected_world_position);
+        unbiased_contribution_weight *= trace_visibility_from_surface(ray_origin, geometric_normal, selected_world_position);
     }
 
     return DiSample(unbiased_contribution_weight, light_tile_samples[selected_tile_sample], selected_wi, selected_brdf_radiance, selected_inverse_solid_angle_pdf, selected_brdf_rays_can_hit);

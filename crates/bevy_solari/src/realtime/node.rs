@@ -44,6 +44,7 @@ pub struct SolariLightingPipelines {
     sample_gi_for_world_cache_pipeline: CachedComputePipelineId,
     blend_new_world_cache_samples_pipeline: CachedComputePipelineId,
     presample_light_tiles_pipeline: CachedComputePipelineId,
+    resolve_grass_receivers_pipeline: CachedComputePipelineId,
     restir: RestirPipelines,
     no_restir: NoRestirPipelines,
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
@@ -155,6 +156,7 @@ pub fn solari_lighting(
         Some(sample_gi_for_world_cache_pipeline),
         Some(blend_new_world_cache_samples_pipeline),
         Some(presample_light_tiles_pipeline),
+        Some(resolve_grass_receivers_pipeline),
         Some(initial_pipeline),
         Some(scene_bind_group),
         Some(gbuffer),
@@ -172,6 +174,7 @@ pub fn solari_lighting(
         pipeline_cache.get_compute_pipeline(pipelines.sample_gi_for_world_cache_pipeline),
         pipeline_cache.get_compute_pipeline(pipelines.blend_new_world_cache_samples_pipeline),
         pipeline_cache.get_compute_pipeline(pipelines.presample_light_tiles_pipeline),
+        pipeline_cache.get_compute_pipeline(pipelines.resolve_grass_receivers_pipeline),
         pipeline_cache.get_compute_pipeline(initial_pipeline_id),
         &scene_bindings.bind_group,
         view_prepass_textures.deferred_view(),
@@ -207,20 +210,25 @@ pub fn solari_lighting(
     let view_target_attachment = view_target.get_unsampled_color_attachment();
 
     let s = solari_lighting_resources;
+    let receiver_write_index = s.grass_receivers.history.write_index();
+    let receiver_current = &s.grass_receivers.textures[receiver_write_index].default_view;
+    let receiver_previous = &s.grass_receivers.textures[receiver_write_index ^ 1].default_view;
     let bind_group = render_device.create_bind_group(
         "solari_lighting_bind_group",
         &pipeline_cache.get_bind_group_layout(&pipelines.bind_group_layout),
-        &BindGroupEntries::sequential((
-            view_target_attachment.view,
-            s.light_tile_samples.as_entire_binding(),
-            s.light_tile_resolved_samples.as_entire_binding(),
-            gbuffer,
-            depth_buffer,
-            motion_vectors,
-            view_uniforms_binding.clone(),
-            previous_view_uniforms_binding.clone(),
-            s.world_cache.as_entire_binding(),
-            s.constants.as_entire_binding(),
+        &BindGroupEntries::with_indices((
+            (0, view_target_attachment.view),
+            (1, s.light_tile_samples.as_entire_binding()),
+            (2, s.light_tile_resolved_samples.as_entire_binding()),
+            (3, gbuffer),
+            (4, depth_buffer),
+            (5, motion_vectors),
+            (6, view_uniforms_binding.clone()),
+            (7, previous_view_uniforms_binding.clone()),
+            (8, s.world_cache.as_entire_binding()),
+            (9, s.constants.as_entire_binding()),
+            (14, receiver_current),
+            (15, receiver_previous),
         )),
     );
 
@@ -244,6 +252,8 @@ pub fn solari_lighting(
                     previous_depth_buffer,
                     reservoirs.a.as_entire_binding(),
                     reservoirs.b.as_entire_binding(),
+                    receiver_current,
+                    receiver_previous,
                 )),
             )
         });
@@ -305,6 +315,11 @@ pub fn solari_lighting(
             previous_view_uniform_offset.offset,
         ],
     );
+
+    let receiver_span = diagnostics.time_span(&mut pass, "solari_lighting/grass_receivers");
+    pass.set_pipeline(resolve_grass_receivers_pipeline);
+    pass.dispatch_workgroups(dx, dy, 1);
+    receiver_span.end(&mut pass);
 
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
     if let Some(bind_group_resolve_dlss_rr_textures) = &bind_group_resolve_dlss_rr_textures {
@@ -384,6 +399,7 @@ pub fn solari_lighting(
     d.end(&mut pass);
 
     drop(pass);
+    s.grass_receivers.history.record_rendered();
 
     // Active cell count readback.
     diagnostics.record_u32(
@@ -405,19 +421,30 @@ pub fn init_solari_lighting_pipelines(
 ) {
     let bind_group_layout = BindGroupLayoutDescriptor::new(
         "solari_lighting_bind_group_layout",
-        &BindGroupLayoutEntries::sequential(
+        &BindGroupLayoutEntries::with_indices(
             ShaderStages::COMPUTE,
             (
-                texture_storage_2d(TextureFormat::Rgba16Float, StorageTextureAccess::ReadWrite),
-                storage_buffer_sized(false, None),
-                storage_buffer_sized(false, None),
-                texture_2d(TextureSampleType::Uint),
-                texture_depth_2d(),
-                texture_storage_2d(TextureFormat::Rg16Float, StorageTextureAccess::ReadWrite),
-                uniform_buffer::<ViewUniform>(true),
-                uniform_buffer::<PreviousViewData>(true),
-                storage_buffer_sized(false, None),
-                uniform_buffer_sized(false, None),
+                (
+                    0,
+                    texture_storage_2d(TextureFormat::Rgba16Float, StorageTextureAccess::ReadWrite),
+                ),
+                (1, storage_buffer_sized(false, None)),
+                (2, storage_buffer_sized(false, None)),
+                (3, texture_2d(TextureSampleType::Uint)),
+                (4, texture_depth_2d()),
+                (
+                    5,
+                    texture_storage_2d(TextureFormat::Rg16Float, StorageTextureAccess::ReadWrite),
+                ),
+                (6, uniform_buffer::<ViewUniform>(true)),
+                (7, uniform_buffer::<PreviousViewData>(true)),
+                (8, storage_buffer_sized(false, None)),
+                (9, uniform_buffer_sized(false, None)),
+                (
+                    14,
+                    texture_storage_2d(TextureFormat::Rgba32Uint, StorageTextureAccess::ReadWrite),
+                ),
+                (15, texture_2d(TextureSampleType::Uint)),
             ),
         ),
     );
@@ -441,6 +468,8 @@ pub fn init_solari_lighting_pipelines(
                 texture_depth_2d(),
                 storage_buffer_sized(false, None),
                 storage_buffer_sized(false, None),
+                texture_storage_2d(TextureFormat::Rgba32Uint, StorageTextureAccess::ReadWrite),
+                texture_2d(TextureSampleType::Uint),
             ),
         ),
     );
@@ -525,6 +554,14 @@ pub fn init_solari_lighting_pipelines(
         #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
         bind_group_layout_resolve_dlss_rr_textures: bind_group_layout_resolve_dlss_rr_textures
             .clone(),
+        resolve_grass_receivers_pipeline: create_pipeline(
+            "solari_lighting_resolve_grass_receivers_pipeline",
+            "resolve_grass_receivers",
+            load_embedded_asset!(asset_server.as_ref(), "grass_receiver.wesl"),
+            false,
+            ExtraBindGroup::None,
+            vec![],
+        ),
         decay_world_cache_pipeline: create_pipeline(
             "solari_lighting_decay_world_cache_pipeline",
             "decay_world_cache",

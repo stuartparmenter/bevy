@@ -73,7 +73,9 @@ pub enum RaytracingGeometryUpdateMode {
 /// the TLAS instance. Both buffers must have `STORAGE | BLAS_INPUT` usage.
 /// With [`RaytracingGeometryUpdateMode::RebuildEveryFrame`], the producer can update
 /// vertex positions in place each frame. Replace the index buffer when triangle
-/// topology changes so Solari discards temporal triangle anchors.
+/// topology changes so Solari discards temporal triangle anchors. If triangle
+/// identities change within existing buffers, update
+/// [`RaytracingGeometryTopologyGeneration`] instead.
 ///
 /// Add [`RaytracingGeometryPreviousVertices`] to provide deformation motion history.
 /// Otherwise, previous positions use the current vertices with the previous transform.
@@ -89,6 +91,11 @@ pub struct RaytracingGeometryBuffers {
     pub index_count: u32,
     /// Whether the BLAS is built once or rebuilt every frame.
     pub update_mode: RaytracingGeometryUpdateMode,
+    /// TLAS inclusion bits. Use 0xFF for ordinary geometry; bit 1 alone marks grass proxies.
+    pub ray_mask: u8,
+    /// Diagnostic primitive grouping: 0 ordinary geometry, 9 exact grass blade, 1 proxy.
+    /// Primitive order must keep each group contiguous. No effect on normal lighting.
+    pub diagnostic_primitives_per_group: u32,
 }
 
 impl RaytracingGeometryBuffers {
@@ -108,3 +115,16 @@ impl RaytracingGeometryBuffers {
 /// Without this component, motion reconstruction only accounts for rigid transforms.
 #[derive(Component, Clone)]
 pub struct RaytracingGeometryPreviousVertices(pub Buffer);
+
+/// Producer-maintained identity generation for triangles in external geometry.
+///
+/// Insert this component in the render world and change its value whenever a
+/// triangle index starts referring to a different surface (for example, after
+/// compacting a procedural mesh). This discards temporal geometry anchors while
+/// keeping buffer allocations and BLAS allocations intact. Ordinary deformation
+/// with stable triangle identities must leave the generation unchanged.
+///
+/// Absence is equivalent to generation zero. This does not request a BLAS rebuild;
+/// use [`RaytracingGeometryUpdateMode::RebuildEveryFrame`] for changing geometry.
+#[derive(Component, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RaytracingGeometryTopologyGeneration(pub u64);

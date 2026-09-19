@@ -48,6 +48,9 @@ pub struct SolariLightingPlugin;
 impl Plugin for SolariLightingPlugin {
     fn build(&self, app: &mut App) {
         load_shader_library!(app, "gbuffer_utils.wesl");
+        load_shader_library!(app, "shadow_diagnostics.wesl");
+        load_shader_library!(app, "grass_receiver.wesl");
+        load_shader_library!(app, "grass_receiver_geometry.wesl");
         load_shader_library!(app, "bindings.wesl");
         load_shader_library!(app, "presample_light_tiles.wesl");
         load_shader_library!(app, "initial_path.wesl");
@@ -132,6 +135,30 @@ pub struct SolariLighting {
     /// Higher values are more stable but slower to react to lighting changes
     /// and will lead to increased artifacts.
     pub confidence_weight_cap: f32,
+
+    /// Diagnostic for procedural grass marked with G-buffer alpha bit 27.
+    /// Skip its primary shading-normal ray offset, retaining the ray minimum
+    /// distance and BRDF normal. Set `reset` when changing this at runtime.
+    pub grass_unshifted_ray_origin: bool,
+
+    /// Use separately packed grass triangle normals for outgoing-side primary ray offsets.
+    /// Reset lighting history when toggling. Leaves artistic shading normals unchanged.
+    pub grass_geometric_ray_origin: bool,
+
+    /// Resolve matched exact grass receivers once per frame against RT geometry.
+    /// Costs one additional camera ray per grass pixel and two 16-byte/pixel caches.
+    /// Reset history when toggling.
+    pub grass_rt_receiver_origin: bool,
+
+    /// Diagnostic: 0 lighting, 1 fixed sun, 2 sampled sun, 3 blocker class,
+    /// 4 RT receiver anchor, 5 center-pixel blocker highlight. Modes 3..5 require
+    /// exact nearby grass casters and infer receiver identity by position/normal.
+    /// Disable temporal reconstruction and camera jitter to inspect raw output.
+    pub raw_directional_visibility: u32,
+
+    /// Exclude grass-only TLAS mask bit 1 from BRDF/GI rays, preserving shadow rays.
+    /// Reset lighting history when toggling.
+    pub grass_gi_exclusion: bool,
 
     /// Number of direct light samples taken for the camera's primary hit during
     /// initial sampling.
@@ -222,6 +249,11 @@ impl Default for SolariLighting {
         Self {
             restir: false,
             confidence_weight_cap: 8.0,
+            grass_unshifted_ray_origin: true,
+            grass_geometric_ray_origin: true,
+            grass_rt_receiver_origin: true,
+            raw_directional_visibility: 0,
+            grass_gi_exclusion: false,
             primary_di_samples: 8,
             secondary_di_samples: 4,
             max_bounces: 3,
@@ -265,3 +297,15 @@ fn manage_prepass_double_buffers(
         }
     }
 }
+
+#[cfg(test)]
+mod grass_ray_origin_tests;
+
+#[cfg(test)]
+mod shadow_diagnostic_tests;
+
+#[cfg(test)]
+mod grass_receiver_tests;
+
+#[cfg(test)]
+mod grass_receiver_precision_tests;

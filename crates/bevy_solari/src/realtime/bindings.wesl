@@ -15,6 +15,10 @@ enable wgpu_ray_query;
 @group(1) @binding(8) var<storage, read_write> world_cache: WorldCache;
 @group(1) @binding(9) var<uniform> constants: SolariLightingSettings;
 
+// Cached exact receiver anchors: instance, triangle, and two f32 barycentric bits.
+@group(1) @binding(14) var grass_receiver_anchors: texture_storage_2d<rgba32uint, read_write>;
+@group(1) @binding(15) var previous_grass_receiver_anchors: texture_2d<u32>;
+
 @if(RESTIR) {
 @group(1) @binding(10) var previous_gbuffer: texture_2d<u32>;
 @group(1) @binding(11) var previous_depth_buffer: texture_depth_2d;
@@ -45,6 +49,14 @@ struct SolariLightingSettings {
     world_cache_position_lod_scale: f32,
     frame_rng: u32,
     reset: u32,
+    grass_unshifted_ray_origin: u32,
+    raw_directional_visibility: u32,
+    grass_gi_exclusion: u32,
+    grass_geometric_ray_origin: u32,
+    grass_rt_receiver_origin: u32,
+    _receiver_padding0: u32,
+    _receiver_padding1: u32,
+    _receiver_padding2: u32,
 }
 
 /// Don't adjust the size of this struct without also adjusting `prepare::RESOLVED_LIGHT_SAMPLE_STRUCT_SIZE`.

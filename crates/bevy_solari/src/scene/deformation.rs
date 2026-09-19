@@ -394,6 +394,8 @@ pub(super) fn prepare_mesh_deformations(
         if existing.is_none_or(|buffers| buffers.vertex_buffer.id() != output.vertices.id()) {
             commands.entity(entity).insert((
                 RaytracingGeometryBuffers {
+                    ray_mask: 0xFF,
+                    diagnostic_primitives_per_group: 0,
                     vertex_buffer: output.vertices.clone(),
                     index_buffer: source.index_buffer.clone(),
                     vertex_count: source.vertex_count,

@@ -18,7 +18,7 @@ use deformation_source::{prepare_deformation_sources, DeformationSources};
 pub use producer::RaytracingProducerEncoder;
 pub use types::{
     RaytracingGeometry, RaytracingGeometryBuffers, RaytracingGeometryPreviousVertices,
-    RaytracingGeometryUpdateMode, RaytracingMesh3d,
+    RaytracingGeometryTopologyGeneration, RaytracingGeometryUpdateMode, RaytracingMesh3d,
 };
 
 use crate::SolariPlugins;

@@ -11,6 +11,8 @@ struct InstanceGeometryIds {
     index_buffer_id: u32,
     index_buffer_offset: u32,
     triangle_count: u32,
+    ray_mask: u32,
+    diagnostic_primitives_per_group: u32,
 }
 
 struct VertexBuffer { vertices: array<PackedVertex> }
@@ -106,8 +108,38 @@ const RAY_T_MAX = 100000.0f;
 
 const RAY_NO_CULL = 0xFFu;
 
+/// Grass primary surfaces carry (triangle normal, angular uncertainty).
+/// Packed oct8x2 normals require a 0.02 guard; exact RT triangles use 1e-6.
+/// Zero context preserves ordinary/secondary surfaces' existing origin policy.
+/// `direction` must be normalized.
+fn offset_surface_ray_origin(position: vec3<f32>, geometric_normal: vec4<f32>, direction: vec3<f32>) -> vec3<f32> {
+    let n_dot_d = dot(geometric_normal.xyz, direction);
+    if !(abs(n_dot_d) > geometric_normal.w) { return position; }
+    return offset_triangle_ray_origin(position, geometric_normal.xyz, direction);
+}
+
+/// An unquantized triangle normal from the RT vertices does not need the oct8x2
+/// uncertainty band. Retain only a small arithmetic guard near exact tangency:
+/// cross/normalize/dot are still f32, not exact geometry predicates.
+/// Used for verified RT receiver anchors as well as the surface reference.
+fn offset_triangle_ray_origin(position: vec3<f32>, geometric_normal: vec3<f32>, direction: vec3<f32>) -> vec3<f32> {
+    let n_dot_d = dot(geometric_normal, direction);
+    if !(abs(n_dot_d) > 0.000001) { return position; }
+    let normal = select(-geometric_normal, geometric_normal, n_dot_d > 0.0);
+    // A small, position-scaled allowance for f32 reconstruction/rounding error.
+    // This is a heuristic, not an error bound for arbitrary depth transforms.
+    // Four epsilons avoids the centimetre-scale offsets of 256-ULP schemes at
+    // common world coordinates; the 10um floor handles positions near zero.
+    let distance = max(0.00001, 4.0 * 1.1920928955078125e-7 * dot(abs(normal), abs(position)));
+    return position + normal * distance;
+}
+
 fn trace_ray(ray_origin: vec3<f32>, ray_direction: vec3<f32>, ray_t_min: f32, ray_t_max: f32, ray_flag: u32) -> RayIntersection {
-    let ray = RayDesc(ray_flag, RAY_NO_CULL, ray_t_min, ray_t_max, ray_origin, ray_direction);
+    return trace_ray_masked(ray_origin, ray_direction, ray_t_min, ray_t_max, ray_flag, RAY_NO_CULL);
+}
+
+fn trace_ray_masked(ray_origin: vec3<f32>, ray_direction: vec3<f32>, ray_t_min: f32, ray_t_max: f32, ray_flag: u32, mask: u32) -> RayIntersection {
+    let ray = RayDesc(ray_flag, mask, ray_t_min, ray_t_max, ray_origin, ray_direction);
     var rq: ray_query;
     rayQueryInitialize(&rq, tlas, ray);
     rayQueryProceed(&rq);

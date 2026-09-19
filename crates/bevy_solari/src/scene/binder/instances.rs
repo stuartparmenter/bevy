@@ -5,7 +5,10 @@ use super::{
     BlasManager, RaytracingGeometry, RaytracingGeometryBuffers, RaytracingMesh3d,
     RaytracingSceneBindings,
 };
-use crate::scene::{blas::GeometryBlasManager, RaytracingGeometryPreviousVertices};
+use crate::scene::{
+    blas::GeometryBlasManager, RaytracingGeometryPreviousVertices,
+    RaytracingGeometryTopologyGeneration,
+};
 use bevy_asset::AssetId;
 use bevy_ecs::{
     entity::{Entity, EntityHashMap, EntityHashSet},
@@ -41,6 +44,8 @@ pub struct GpuInstanceGeometryIds {
     index_buffer_id: u32,
     index_buffer_offset: u32,
     triangle_count: u32,
+    ray_mask: u32,
+    diagnostic_primitives_per_group: u32,
 }
 
 /// A world-from-local affine transform, stored transposed as three rows.
@@ -59,11 +64,19 @@ impl GpuTransform {
 
 /// The device address of a slot's acceleration structure. Zero marks an inactive slot.
 #[derive(Clone, Copy, Default, PartialEq, Pod, Zeroable)]
-#[repr(transparent)]
-pub struct GpuBlasRef(u64);
+#[repr(C)]
+pub struct GpuBlasRef {
+    address: u64,
+    mask: u32,
+    _padding: u32,
+}
 
 impl GpuBlasRef {
-    const NONE: Self = Self(0);
+    const NONE: Self = Self { address: 0, mask: 0, _padding: 0 };
+
+    fn new(address: u64, mask: u8) -> Self {
+        Self { address, mask: u32::from(mask), _padding: 0 }
+    }
 }
 
 impl_atomic_pod!(GpuInstanceGeometryIds, GpuInstanceGeometryIdsBlob);
@@ -95,6 +108,7 @@ impl InstanceSource {
 /// Buffer locations whose triangles can be reused by temporal geometry anchors.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct GeometryKey {
+    topology_generation: u64,
     source: InstanceSource,
     vertex_buffer: BufferId,
     vertex_buffer_offset: u32,
@@ -230,7 +244,7 @@ impl InstanceState {
     /// Only the `wgpu-core` TLAS build path needs this, to fill in the instance descriptors that
     /// the raw path sets up on the GPU. Slots with a null acceleration structure reference are not
     /// currently drawable, and are left out.
-    pub fn drawable(&self) -> impl Iterator<Item = (Entity, u32, InstanceSource, [f32; 12])> + '_ {
+    pub fn drawable(&self) -> impl Iterator<Item = (Entity, u32, InstanceSource, [f32; 12], u8)> + '_ {
         self.records.iter().filter_map(|(entity, instance)| {
             let slot = instance.slot;
             (self.blas_refs.get(slot) != GpuBlasRef::NONE).then(|| {
@@ -239,6 +253,7 @@ impl InstanceState {
                     slot,
                     instance.source,
                     self.transforms.get(slot).rows(),
+                    self.blas_refs.get(slot).mask as u8,
                 )
             })
         })
@@ -257,6 +272,7 @@ pub type InstanceQueryData<'w> = (
     Has<RaytracingGeometry>,
     Option<&'w RaytracingGeometryBuffers>,
     Option<&'w RaytracingGeometryPreviousVertices>,
+    Option<&'w RaytracingGeometryTopologyGeneration>,
     &'w MeshMaterial3d<StandardMaterial>,
     &'w GlobalTransform,
     &'w PreviousGlobalTransform,
@@ -272,6 +288,7 @@ pub type ChangedInstanceFilter = (
         Changed<RaytracingGeometry>,
         Changed<RaytracingGeometryBuffers>,
         Changed<RaytracingGeometryPreviousVertices>,
+        Changed<RaytracingGeometryTopologyGeneration>,
         Changed<MeshMaterial3d<StandardMaterial>>,
     )>,
 );
@@ -293,6 +310,8 @@ struct ResolvedGeometry<'a> {
     index_buffer_offset: u32,
     triangle_count: u32,
     blas_address: u64,
+    ray_mask: u8,
+    diagnostic_primitives_per_group: u32,
 }
 
 fn unlink<K: Eq + Hash>(map: &mut HashMap<K, EntityHashSet>, key: &K, entity: Entity) {
@@ -385,6 +404,7 @@ impl InstanceState {
             has_geometry,
             geometry,
             previous_vertices,
+            topology_generation,
             material,
             transform,
             previous_frame_transform,
@@ -435,6 +455,7 @@ impl InstanceState {
             &mut instance,
             geometry,
             previous_vertices,
+            topology_generation.map_or(0, |generation| generation.0),
         );
 
         self.records.insert(entity, instance);
@@ -462,6 +483,8 @@ impl InstanceState {
                     index_buffer_offset: index_slice.range.start,
                     triangle_count: (index_slice.range.len() / 3) as u32,
                     blas_address: inputs.blas_manager.device_address(&mesh)?,
+                    ray_mask: 0xFF,
+                    diagnostic_primitives_per_group: 0,
                 })
             }
             // Wait for producer buffers, then bind them with the entity's BLAS.
@@ -476,6 +499,8 @@ impl InstanceState {
                     index_buffer_offset: 0,
                     triangle_count: buffers.index_count / 3,
                     blas_address: inputs.geometry_blas_manager.device_address(&entity)?,
+                    ray_mask: buffers.ray_mask,
+                    diagnostic_primitives_per_group: buffers.diagnostic_primitives_per_group,
                 })
             }
         }
@@ -489,6 +514,7 @@ impl InstanceState {
         instance: &mut Instance,
         geometry: Option<&RaytracingGeometryBuffers>,
         previous_vertices: Option<&RaytracingGeometryPreviousVertices>,
+        topology_generation: u64,
     ) -> bool {
         let slot = instance.slot;
         let (Some(resolved), Some(material_slot)) = (
@@ -553,6 +579,7 @@ impl InstanceState {
 
         let triangle_count = resolved.triangle_count;
         let geometry = GeometryKey {
+            topology_generation,
             source: instance.source,
             vertex_buffer: vertex_buffer_key,
             vertex_buffer_offset: resolved.vertex_buffer_offset,
@@ -570,10 +597,12 @@ impl InstanceState {
                 index_buffer_id,
                 index_buffer_offset: resolved.index_buffer_offset,
                 triangle_count,
+                ray_mask: u32::from(resolved.ray_mask),
+                diagnostic_primitives_per_group: resolved.diagnostic_primitives_per_group,
             },
         );
         self.material_ids.grow_and_set(slot, material_slot);
-        self.set_blas_ref(entity, slot, GpuBlasRef(resolved.blas_address));
+        self.set_blas_ref(entity, slot, GpuBlasRef::new(resolved.blas_address, resolved.ray_mask));
 
         let is_emissive = inputs
             .assets
@@ -698,6 +727,7 @@ mod tests {
             material: AssetId::default(),
             buffers: None,
             geometry: Some(GeometryKey {
+                topology_generation: 0,
                 source: InstanceSource::Geometry,
                 vertex_buffer: BufferId::new(),
                 vertex_buffer_offset: 0,
@@ -707,10 +737,43 @@ mod tests {
             }),
         };
         state.records.insert(entity, instance);
-        state.set_blas_ref(entity, slot, GpuBlasRef(1));
+        state.set_blas_ref(entity, slot, GpuBlasRef::new(1, 0xFF));
         state.write_instance_id_translations();
         state.begin_frame(true);
         (entity, instance)
+    }
+
+    #[test]
+    fn diagnostic_geometry_metadata_matches_shader_layout() {
+        let ids = GpuInstanceGeometryIds {
+            vertex_buffer_id: 1,
+            vertex_buffer_offset: 2,
+            previous_vertex_buffer_id: 3,
+            index_buffer_id: 4,
+            index_buffer_offset: 5,
+            triangle_count: 27,
+            ray_mask: 2,
+            diagnostic_primitives_per_group: 9,
+        };
+        assert_eq!(core::mem::size_of_val(&ids), 32);
+        let words: [u32; 8] = bytemuck::cast(ids);
+        assert_eq!(words, [1, 2, 3, 4, 5, 27, 2, 9]);
+    }
+
+    #[test]
+    fn tlas_mask_layout_and_cpu_descriptor_agree() {
+        let reference = GpuBlasRef::new(0x0123456789ABCDEF, 0x02);
+        let words: [u32; 4] = bytemuck::cast(reference);
+        assert_eq!(words, [0x89ABCDEF, 0x01234567, 0x02, 0]);
+        let mut state = InstanceState::new();
+        let (entity, instance) = live_instance(&mut state);
+        state.reserve_slot(instance.slot);
+        state.set_blas_ref(entity, instance.slot, reference);
+        let (_, _, _, _, mask) = state.drawable().next().unwrap();
+        assert_eq!(mask, 0x02);
+        assert_eq!(mask & 0xFD, 0, "GI rays exclude grass-only geometry");
+        assert_ne!(mask & 0xFF, 0, "shadow rays retain grass geometry");
+        assert_ne!(0xFFu8 & 0xFD, 0, "GI rays retain ordinary geometry");
     }
 
     #[test]
@@ -744,7 +807,7 @@ mod tests {
         let (entity, mut instance) = live_instance(&mut state);
         let geometry = instance.geometry.unwrap();
         state.update_geometry(entity, &mut instance, geometry);
-        state.set_blas_ref(entity, instance.slot, GpuBlasRef(2));
+        state.set_blas_ref(entity, instance.slot, GpuBlasRef::new(2, 0xFF));
         state.write_instance_id_translations();
         assert_eq!(
             state.previous_frame_id_translations.get(instance.slot),
@@ -752,11 +815,53 @@ mod tests {
         );
 
         state.set_blas_ref(entity, instance.slot, GpuBlasRef::NONE);
-        state.set_blas_ref(entity, instance.slot, GpuBlasRef(3));
+        state.set_blas_ref(entity, instance.slot, GpuBlasRef::new(3, 0xFF));
         state.write_instance_id_translations();
         assert_eq!(
             state.previous_frame_id_translations.get(instance.slot),
             INSTANCE_NOT_PRESENT_THIS_FRAME,
+        );
+    }
+
+    #[test]
+    fn topology_generation_invalidates_anchors_with_unchanged_buffers() {
+        let mut state = InstanceState::new();
+        let (entity, mut instance) = live_instance(&mut state);
+        let original = instance.geometry.unwrap();
+        state.update_geometry(entity, &mut instance, original);
+        state.write_instance_id_translations();
+        assert_eq!(
+            state.previous_frame_id_translations.get(instance.slot),
+            instance.slot
+        );
+
+        let changed = GeometryKey {
+            topology_generation: 1,
+            ..original
+        };
+        state.update_geometry(entity, &mut instance, changed);
+        state.write_instance_id_translations();
+        assert_eq!(
+            state.previous_frame_id_translations.get(instance.slot),
+            INSTANCE_NOT_PRESENT_THIS_FRAME
+        );
+        // Generation invalidation leaves geometry and TLAS instance allocation intact.
+        assert_eq!(
+            instance.geometry.unwrap().vertex_buffer,
+            original.vertex_buffer
+        );
+        assert_eq!(
+            instance.geometry.unwrap().index_buffer,
+            original.index_buffer
+        );
+        assert_eq!(state.live_slot(entity), Some(instance.slot));
+
+        state.begin_frame(true);
+        state.update_geometry(entity, &mut instance, changed);
+        state.write_instance_id_translations();
+        assert_eq!(
+            state.previous_frame_id_translations.get(instance.slot),
+            instance.slot
         );
     }
 
