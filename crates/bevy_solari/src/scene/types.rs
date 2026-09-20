@@ -73,7 +73,9 @@ pub enum RaytracingGeometryUpdateMode {
 /// the TLAS instance. Both buffers must have `STORAGE | BLAS_INPUT` usage.
 /// With [`RaytracingGeometryUpdateMode::RebuildEveryFrame`], the producer can update
 /// vertex positions in place each frame. Replace the index buffer when triangle
-/// topology changes so Solari discards temporal triangle anchors.
+/// topology changes so Solari discards temporal triangle anchors. If triangle
+/// identities change within existing buffers, update
+/// [`RaytracingGeometryTopologyGeneration`] instead.
 ///
 /// Add [`RaytracingGeometryPreviousVertices`] to provide deformation motion history.
 /// Otherwise, previous positions use the current vertices with the previous transform.
@@ -108,3 +110,24 @@ impl RaytracingGeometryBuffers {
 /// Without this component, motion reconstruction only accounts for rigid transforms.
 #[derive(Component, Clone)]
 pub struct RaytracingGeometryPreviousVertices(pub Buffer);
+
+/// Producer-maintained identity generation for triangles in external geometry.
+///
+/// Insert this component in the render world and change its value whenever a
+/// triangle index starts referring to a different surface (for example, after
+/// compacting a procedural mesh). This discards temporal geometry anchors while
+/// keeping buffer allocations and BLAS allocations intact. Ordinary deformation
+/// with stable triangle identities must leave the generation unchanged.
+///
+/// Absence is equivalent to generation zero. This does not request a BLAS rebuild;
+/// use [`RaytracingGeometryUpdateMode::RebuildEveryFrame`] for changing geometry.
+#[derive(Component, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RaytracingGeometryTopologyGeneration(pub u64);
+
+/// A producer-defined value for a raytracing instance. Solari never interprets it.
+///
+/// Insert this component on the instance's render entity. Shaders read it as
+/// `InstanceGeometryIds.user_tag` from `geometry_ids`, indexed by instance slot.
+/// Absence is equivalent to 0.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RaytracingInstanceTag(pub u32);

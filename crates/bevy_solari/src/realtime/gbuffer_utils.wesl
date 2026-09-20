@@ -2,9 +2,15 @@ import bevy_pbr::deferred::types::unpack_24bit_normal;
 import bevy_pbr::render::rgb9e5::rgb9e5_to_vec3_;
 import bevy_render::utils::octahedral_decode;
 import bevy_render::view::{View, depth_ndc_to_view_z};
-import package::scene::bindings::ResolvedMaterial;
+import package::scene::bindings::{ResolvedMaterial, RAY_T_MIN};
 
 struct ResolvedGPixel {
+    /// Origin of rays leaving this surface.
+    ray_origin: vec3<f32>,
+    /// Face normal and tangent guard for `offset_surface_ray_origin`. Zero selects no offset.
+    geometric_normal: vec4<f32>,
+    /// False when `ray_origin` could not be reconstructed, which makes the surface's history unusable.
+    ray_origin_valid: bool,
     world_position: vec3<f32>,
     world_normal: vec3<f32>,
     material: ResolvedMaterial,
@@ -24,7 +30,7 @@ fn gpixel_resolve(gpixel: vec4<u32>, depth: f32, pixel_id: vec2<u32>, view_size:
     let emissive = rgb9e5_to_vec3_(gpixel.g);
     let material = ResolvedMaterial(base_color, emissive, reflectance, perceptual_roughness, roughness, metallic);
 
-    return ResolvedGPixel(world_position, world_normal, material);
+    return ResolvedGPixel(world_position + world_normal * RAY_T_MIN, vec4(0.0), true, world_position, world_normal, material);
 }
 
 fn reconstruct_world_position(pixel_id: vec2<u32>, depth: f32, view_size: vec2<f32>, world_from_clip: mat4x4<f32>) -> vec3<f32> {

@@ -11,6 +11,8 @@ struct InstanceGeometryIds {
     index_buffer_id: u32,
     index_buffer_offset: u32,
     triangle_count: u32,
+    /// `RaytracingInstanceTag` of the instance, or 0.
+    user_tag: u32,
 }
 
 struct VertexBuffer { vertices: array<PackedVertex> }
@@ -105,6 +107,32 @@ const RAY_T_MIN = 0.001f;
 const RAY_T_MAX = 100000.0f;
 
 const RAY_NO_CULL = 0xFFu;
+
+/// Tangent guard for a face normal computed from the raytracing vertices themselves.
+/// Cross, normalize and dot are still f32, so exact tangency is not decidable.
+const EXACT_NORMAL_TANGENT_GUARD = 0.000001;
+
+/// Moves the origin of a ray leaving a thin two-sided primary surface to the ray's side of it.
+///
+/// `geometric_normal.xyz` is the surface's face normal, of either sign. `geometric_normal.w` is
+/// the sine of that normal's angular uncertainty: a ray closer to the surface plane than that
+/// leaves from an unknown side and is not offset. `EXACT_NORMAL_TANGENT_GUARD` is the smallest
+/// effective value. `vec4(0.0)` selects the ordinary origin policy and returns `position`
+/// unchanged. Not valid for closed meshes, whose inside is not a legal ray origin. `direction`
+/// must be normalized.
+fn offset_surface_ray_origin(position: vec3<f32>, geometric_normal: vec4<f32>, direction: vec3<f32>) -> vec3<f32> {
+    let n_dot_d = dot(geometric_normal.xyz, direction);
+    // Separate negated comparisons, so a NaN cosine or guard leaves `position` unchanged.
+    if !(abs(n_dot_d) > geometric_normal.w) { return position; }
+    if !(abs(n_dot_d) > EXACT_NORMAL_TANGENT_GUARD) { return position; }
+    let normal = select(-geometric_normal.xyz, geometric_normal.xyz, n_dot_d > 0.0);
+    // A small, position-scaled allowance for f32 reconstruction/rounding error.
+    // This is a heuristic, not an error bound for arbitrary depth transforms.
+    // Four epsilons avoids the centimetre-scale offsets of 256-ULP schemes at
+    // common world coordinates; the 10um floor handles positions near zero.
+    let distance = max(0.00001, 4.0 * 1.1920928955078125e-7 * dot(abs(normal), abs(position)));
+    return position + normal * distance;
+}
 
 fn trace_ray(ray_origin: vec3<f32>, ray_direction: vec3<f32>, ray_t_min: f32, ray_t_max: f32, ray_flag: u32) -> RayIntersection {
     let ray = RayDesc(ray_flag, RAY_NO_CULL, ray_t_min, ray_t_max, ray_origin, ray_direction);
@@ -210,6 +238,7 @@ struct ResolvedSamplePoint {
 
 /// Resolves a geometry anchor using current transforms and vertices.
 /// Returns the interpolated vertex normal without material or normal-map sampling.
+/// The position uses the weighted-sum form; callers absorb its rounding with `reanchor_epsilon`.
 fn resolve_sample_point(instance_id: u32, triangle_id: u32, barycentrics: vec3<f32>) -> ResolvedSamplePoint {
     let transform = affine3_to_square(transforms[instance_id]);
     let vertices = load_vertices(geometry_ids[instance_id], triangle_id);

@@ -5,7 +5,10 @@ use super::{
     BlasManager, RaytracingGeometry, RaytracingGeometryBuffers, RaytracingMesh3d,
     RaytracingSceneBindings,
 };
-use crate::scene::{blas::GeometryBlasManager, RaytracingGeometryPreviousVertices};
+use crate::scene::{
+    blas::GeometryBlasManager, RaytracingGeometryPreviousVertices,
+    RaytracingGeometryTopologyGeneration, RaytracingInstanceTag,
+};
 use bevy_asset::AssetId;
 use bevy_ecs::{
     entity::{Entity, EntityHashMap, EntityHashSet},
@@ -41,6 +44,7 @@ pub struct GpuInstanceGeometryIds {
     index_buffer_id: u32,
     index_buffer_offset: u32,
     triangle_count: u32,
+    user_tag: u32,
 }
 
 /// A world-from-local affine transform, stored transposed as three rows.
@@ -92,9 +96,11 @@ impl InstanceSource {
     }
 }
 
-/// Buffer locations whose triangles can be reused by temporal geometry anchors.
+/// Buffer locations and identity generation of the triangles that temporal geometry anchors
+/// refer to. Anchors survive only while the key is unchanged.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct GeometryKey {
+    topology_generation: u64,
     source: InstanceSource,
     vertex_buffer: BufferId,
     vertex_buffer_offset: u32,
@@ -257,6 +263,8 @@ pub type InstanceQueryData<'w> = (
     Has<RaytracingGeometry>,
     Option<&'w RaytracingGeometryBuffers>,
     Option<&'w RaytracingGeometryPreviousVertices>,
+    Option<&'w RaytracingGeometryTopologyGeneration>,
+    Option<&'w RaytracingInstanceTag>,
     &'w MeshMaterial3d<StandardMaterial>,
     &'w GlobalTransform,
     &'w PreviousGlobalTransform,
@@ -272,6 +280,8 @@ pub type ChangedInstanceFilter = (
         Changed<RaytracingGeometry>,
         Changed<RaytracingGeometryBuffers>,
         Changed<RaytracingGeometryPreviousVertices>,
+        Changed<RaytracingGeometryTopologyGeneration>,
+        Changed<RaytracingInstanceTag>,
         Changed<MeshMaterial3d<StandardMaterial>>,
     )>,
 );
@@ -385,6 +395,8 @@ impl InstanceState {
             has_geometry,
             geometry,
             previous_vertices,
+            topology_generation,
+            user_tag,
             material,
             transform,
             previous_frame_transform,
@@ -435,6 +447,8 @@ impl InstanceState {
             &mut instance,
             geometry,
             previous_vertices,
+            topology_generation.map_or(0, |generation| generation.0),
+            user_tag.map_or(0, |tag| tag.0),
         );
 
         self.records.insert(entity, instance);
@@ -489,6 +503,8 @@ impl InstanceState {
         instance: &mut Instance,
         geometry: Option<&RaytracingGeometryBuffers>,
         previous_vertices: Option<&RaytracingGeometryPreviousVertices>,
+        topology_generation: u64,
+        user_tag: u32,
     ) -> bool {
         let slot = instance.slot;
         let (Some(resolved), Some(material_slot)) = (
@@ -553,6 +569,7 @@ impl InstanceState {
 
         let triangle_count = resolved.triangle_count;
         let geometry = GeometryKey {
+            topology_generation,
             source: instance.source,
             vertex_buffer: vertex_buffer_key,
             vertex_buffer_offset: resolved.vertex_buffer_offset,
@@ -570,6 +587,7 @@ impl InstanceState {
                 index_buffer_id,
                 index_buffer_offset: resolved.index_buffer_offset,
                 triangle_count,
+                user_tag,
             },
         );
         self.material_ids.grow_and_set(slot, material_slot);
@@ -698,6 +716,7 @@ mod tests {
             material: AssetId::default(),
             buffers: None,
             geometry: Some(GeometryKey {
+                topology_generation: 0,
                 source: InstanceSource::Geometry,
                 vertex_buffer: BufferId::new(),
                 vertex_buffer_offset: 0,
@@ -711,6 +730,22 @@ mod tests {
         state.write_instance_id_translations();
         state.begin_frame(true);
         (entity, instance)
+    }
+
+    /// `InstanceGeometryIds` in `bindings.wesl`.
+    #[test]
+    fn instance_geometry_ids_match_shader_layout() {
+        let ids = GpuInstanceGeometryIds {
+            vertex_buffer_id: 1,
+            vertex_buffer_offset: 2,
+            previous_vertex_buffer_id: 3,
+            index_buffer_id: 4,
+            index_buffer_offset: 5,
+            triangle_count: 27,
+            user_tag: 0xABCD_0001,
+        };
+        let words: [u32; 7] = bytemuck::cast(ids);
+        assert_eq!(words, [1, 2, 3, 4, 5, 27, 0xABCD_0001]);
     }
 
     #[test]
@@ -757,6 +792,48 @@ mod tests {
         assert_eq!(
             state.previous_frame_id_translations.get(instance.slot),
             INSTANCE_NOT_PRESENT_THIS_FRAME,
+        );
+    }
+
+    #[test]
+    fn topology_generation_invalidates_anchors_with_unchanged_buffers() {
+        let mut state = InstanceState::new();
+        let (entity, mut instance) = live_instance(&mut state);
+        let original = instance.geometry.unwrap();
+        state.update_geometry(entity, &mut instance, original);
+        state.write_instance_id_translations();
+        assert_eq!(
+            state.previous_frame_id_translations.get(instance.slot),
+            instance.slot
+        );
+
+        let changed = GeometryKey {
+            topology_generation: 1,
+            ..original
+        };
+        state.update_geometry(entity, &mut instance, changed);
+        state.write_instance_id_translations();
+        assert_eq!(
+            state.previous_frame_id_translations.get(instance.slot),
+            INSTANCE_NOT_PRESENT_THIS_FRAME
+        );
+        // Generation invalidation leaves geometry and TLAS instance allocation intact.
+        assert_eq!(
+            instance.geometry.unwrap().vertex_buffer,
+            original.vertex_buffer
+        );
+        assert_eq!(
+            instance.geometry.unwrap().index_buffer,
+            original.index_buffer
+        );
+        assert_eq!(state.live_slot(entity), Some(instance.slot));
+
+        state.begin_frame(true);
+        state.update_geometry(entity, &mut instance, changed);
+        state.write_instance_id_translations();
+        assert_eq!(
+            state.previous_frame_id_translations.get(instance.slot),
+            instance.slot
         );
     }
 

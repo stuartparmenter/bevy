@@ -22,7 +22,7 @@ use bevy_ecs::{
     entity::Entity,
     query::Has,
     reflect::ReflectComponent,
-    schedule::IntoScheduleConfigs,
+    schedule::{IntoScheduleConfigs, SystemSet},
     system::{Commands, Query},
 };
 use bevy_pbr::DefaultOpaqueRendererMethod;
@@ -33,7 +33,8 @@ use bevy_render::{
 };
 use bevy_shader::load_shader_library;
 use extract::extract_solari_lighting;
-use node::{init_solari_lighting_pipelines, solari_lighting};
+use node::{clear_receiver_overrides, init_solari_lighting_pipelines, solari_lighting};
+pub use prepare::SolariReceiverOverrides;
 use prepare::{
     prepare_solari_lighting_resources, setup_raytracing_scene_needs_previous_frame_data,
 };
@@ -48,6 +49,7 @@ pub struct SolariLightingPlugin;
 impl Plugin for SolariLightingPlugin {
     fn build(&self, app: &mut App) {
         load_shader_library!(app, "gbuffer_utils.wesl");
+        load_shader_library!(app, "receiver_override.wesl");
         load_shader_library!(app, "bindings.wesl");
         load_shader_library!(app, "presample_light_tiles.wesl");
         load_shader_library!(app, "initial_path.wesl");
@@ -93,13 +95,32 @@ impl Plugin for SolariLightingPlugin {
                 )
                     .in_set(RenderSystems::PrepareResources),
             )
+            .configure_sets(
+                Core3d,
+                SolariLightingSystems::WriteReceiverOverrides
+                    .in_set(Core3dSystems::MainPass)
+                    .before(main_opaque_pass_3d),
+            )
             .add_systems(
                 Core3d,
-                solari_lighting
-                    .before(main_opaque_pass_3d)
-                    .in_set(Core3dSystems::MainPass),
+                (
+                    clear_receiver_overrides.before(SolariLightingSystems::WriteReceiverOverrides),
+                    solari_lighting.after(SolariLightingSystems::WriteReceiverOverrides),
+                )
+                    .in_set(Core3dSystems::MainPass)
+                    .before(main_opaque_pass_3d),
             );
     }
+}
+
+/// System sets of the Solari lighting pass in [`Core3d`].
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SolariLightingSystems {
+    /// Producers write this frame's receiver overrides to
+    /// [`SolariReceiverOverrides::write_view`]. Runs after Solari zeroes that texture and
+    /// before lighting reads it. The prepass textures and the raytracing scene bind group
+    /// are final here.
+    WriteReceiverOverrides,
 }
 
 /// A component for a 3d camera entity to enable the Solari raytraced lighting system.
@@ -132,6 +153,18 @@ pub struct SolariLighting {
     /// Higher values are more stable but slower to react to lighting changes
     /// and will lead to increased artifacts.
     pub confidence_weight_cap: f32,
+
+    /// Allocates the view's [`SolariReceiverOverrides`] textures and makes lighting read them.
+    ///
+    /// Each texel can replace the ray origin policy of its pixel's primary surface, for
+    /// surfaces whose rasterized shading normal is not a usable offset direction. Producers
+    /// write the texels during [`SolariLightingSystems::WriteReceiverOverrides`].
+    ///
+    /// Costs 16 bytes per pixel, or 32 with [`SolariLighting::restir`]. Changing this
+    /// recreates the view's lighting resources, which discards its history.
+    ///
+    /// Defaults to `false`.
+    pub receiver_overrides: bool,
 
     /// Number of direct light samples taken for the camera's primary hit during
     /// initial sampling.
@@ -222,6 +255,7 @@ impl Default for SolariLighting {
         Self {
             restir: false,
             confidence_weight_cap: 8.0,
+            receiver_overrides: false,
             primary_di_samples: 8,
             secondary_di_samples: 4,
             max_bounces: 3,

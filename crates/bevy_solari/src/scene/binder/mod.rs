@@ -20,7 +20,7 @@ use super::{
     blas::{BlasManager, GeometryBlasManager},
     extract::StandardMaterialAssets,
     RaytracingGeometry, RaytracingGeometryBuffers, RaytracingGeometryPreviousVertices,
-    RaytracingMesh3d,
+    RaytracingGeometryTopologyGeneration, RaytracingInstanceTag, RaytracingMesh3d,
 };
 use bevy_ecs::{
     entity::Entity,
@@ -142,7 +142,9 @@ pub struct InstanceChanges<'w, 's> {
     removed_instances: RemovedComponents<'w, 's, RaytracingMesh3d>,
     removed_geometry: RemovedComponents<'w, 's, RaytracingGeometry>,
     removed_geometry_buffers: RemovedComponents<'w, 's, RaytracingGeometryBuffers>,
+    removed_topology_generation: RemovedComponents<'w, 's, RaytracingGeometryTopologyGeneration>,
     removed_previous_vertices: RemovedComponents<'w, 's, RaytracingGeometryPreviousVertices>,
+    removed_instance_tags: RemovedComponents<'w, 's, RaytracingInstanceTag>,
 }
 
 /// Applies this frame's scene changes to the retained buffers, binding arrays and TLAS.
@@ -204,7 +206,9 @@ pub fn prepare_raytracing_scene_resources(
         instance_changes
             .removed_geometry_buffers
             .read()
-            .chain(instance_changes.removed_previous_vertices.read()),
+            .chain(instance_changes.removed_previous_vertices.read())
+            .chain(instance_changes.removed_topology_generation.read())
+            .chain(instance_changes.removed_instance_tags.read()),
     );
     let inputs = InstanceInputs {
         assets: &bindings.assets,
