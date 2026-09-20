@@ -4,6 +4,10 @@ mod deformation;
 mod deformation_source;
 mod extract;
 mod producer;
+#[cfg(test)]
+mod ray_origin_offset_tests;
+#[cfg(test)]
+mod triangle_anchor_tests;
 mod types;
 
 use bevy_asset::embedded_asset;
@@ -18,7 +22,8 @@ use deformation_source::{prepare_deformation_sources, DeformationSources};
 pub use producer::RaytracingProducerEncoder;
 pub use types::{
     RaytracingGeometry, RaytracingGeometryBuffers, RaytracingGeometryPreviousVertices,
-    RaytracingGeometryUpdateMode, RaytracingMesh3d,
+    RaytracingGeometryTopologyGeneration, RaytracingGeometryUpdateMode, RaytracingInstanceTag,
+    RaytracingMesh3d,
 };
 
 use crate::SolariPlugins;
@@ -58,6 +63,7 @@ impl Plugin for RaytracingScenePlugin {
         load_shader_library!(app, "brdf.wesl");
         load_shader_library!(app, "bindings.wesl");
         load_shader_library!(app, "sampling.wesl");
+        load_shader_library!(app, "triangle_anchor.wesl");
         embedded_asset!(app, "binder/setup_tlas_instances.wesl");
         embedded_asset!(app, "deformation.wesl");
 

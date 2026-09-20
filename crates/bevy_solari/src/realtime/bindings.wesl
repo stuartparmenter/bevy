@@ -17,12 +17,16 @@ enable wgpu_ray_query;
 @group(1) @binding(7) var<uniform> previous_view: PreviousViewUniforms;
 @group(1) @binding(8) var<storage, read_write> world_cache: WorldCache;
 @group(1) @binding(9) var<uniform> constants: SolariLightingSettings;
+// Read through `load_receiver_override`: a 1x1 fallback is bound while overrides are disabled.
+@group(1) @binding(14) var receiver_overrides: texture_2d<u32>;
 
 @if(RESTIR) {
 @group(1) @binding(10) var previous_gbuffer: texture_2d<u32>;
 @group(1) @binding(11) var previous_depth_buffer: texture_depth_2d;
 @group(1) @binding(12) var<storage, read_write> reservoirs_a: array<Reservoir>;
 @group(1) @binding(13) var<storage, read_write> reservoirs_b: array<Reservoir>;
+// Read through `load_previous_receiver_override`.
+@group(1) @binding(15) var previous_receiver_overrides: texture_2d<u32>;
 }
 
 @if(DLSS_RR_GUIDE_BUFFERS) {
@@ -54,7 +58,24 @@ struct SolariLightingSettings {
     world_cache_position_base_cell_size: f32,
     world_cache_position_lod_scale: f32,
     frame_rng: u32,
+    /// The world cache and all per-pixel history are invalid.
     reset: u32,
+    /// Per-pixel history is invalid: `reset`, or the previous frame's lighting did not run.
+    history_reset: u32,
+    receiver_overrides: u32,
+}
+
+/// This frame's receiver override texel for `pixel`; see `receiver_override.wesl`.
+fn load_receiver_override(pixel: vec2<u32>) -> vec4<u32> {
+    if constants.receiver_overrides == 0u { return vec4(0u); }
+    return textureLoad(receiver_overrides, pixel, 0);
+}
+
+/// The previous frame's receiver override texel for `pixel`.
+@if(RESTIR)
+fn load_previous_receiver_override(pixel: vec2<u32>) -> vec4<u32> {
+    if constants.receiver_overrides == 0u || constants.history_reset != 0u { return vec4(0u); }
+    return textureLoad(previous_receiver_overrides, pixel, 0);
 }
 
 /// Don't adjust the size of this struct without also adjusting `prepare::RESOLVED_LIGHT_SAMPLE_STRUCT_SIZE`.
