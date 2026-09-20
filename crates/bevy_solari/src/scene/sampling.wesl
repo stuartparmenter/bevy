@@ -1,7 +1,7 @@
 import bevy_pbr::render::pbr_lighting::D_GGX;
 import bevy_pbr::render::utils::{rand_vec2f, rand_u, rand_range_u, sample_uniform_sphere};
 import bevy_render::maths::{PI_2, orthonormalize};
-import package::scene::bindings::{trace_ray, trace_ray_previous_frame, RAY_T_MIN, RAY_T_MAX, light_sources, directional_lights, point_lights, rect_lights, environment_map, environment_map_sampler, environment_map_light, LightSource, light_source_kind, emissive_mesh_triangle_count, LIGHT_SOURCE_KIND_EMISSIVE_MESH, LIGHT_SOURCE_KIND_DIRECTIONAL, LIGHT_SOURCE_KIND_POINT, LIGHT_SOURCE_KIND_RECT, resolve_triangle_data_full, ResolvedRayHitFull, MIRROR_ROUGHNESS_THRESHOLD};
+import package::scene::bindings::{offset_surface_ray_origin, trace_ray, trace_ray_previous_frame, RAY_T_MIN, RAY_T_MAX, light_sources, directional_lights, point_lights, rect_lights, environment_map, environment_map_sampler, environment_map_light, LightSource, light_source_kind, emissive_mesh_triangle_count, LIGHT_SOURCE_KIND_EMISSIVE_MESH, LIGHT_SOURCE_KIND_DIRECTIONAL, LIGHT_SOURCE_KIND_POINT, LIGHT_SOURCE_KIND_RECT, resolve_triangle_data_full, ResolvedRayHitFull, MIRROR_ROUGHNESS_THRESHOLD};
 
 enable wgpu_ray_query;
 
@@ -318,6 +318,26 @@ fn emission_cone_attenuation(cos_theta: f32, cos_inner: f32, cos_outer: f32) -> 
     let scale = 1.0 / max(cos_inner - cos_outer, 1e-4);
     let attenuation = saturate((cos_theta - cos_outer) * scale);
     return attenuation * attenuation;
+}
+
+/// Offset the receiving surface toward the outgoing light ray. Finite targets
+/// are resolved again from the shifted origin by `trace_visibility`.
+fn trace_visibility_from_surface(ray_origin: vec3<f32>, geometric_normal: vec4<f32>, point: vec4<f32>) -> f32 {
+    var direction = point.xyz;
+    if point.w == 1.0 {
+        direction -= ray_origin;
+        if dot(direction, direction) < RAY_T_MIN * RAY_T_MIN { return 0.0; }
+    }
+    return trace_visibility(offset_surface_ray_origin(ray_origin, geometric_normal, normalize(direction)), point);
+}
+
+fn trace_visibility_previous_frame_from_surface(ray_origin: vec3<f32>, geometric_normal: vec4<f32>, point: vec4<f32>) -> f32 {
+    var direction = point.xyz;
+    if point.w == 1.0 {
+        direction -= ray_origin;
+        if dot(direction, direction) < RAY_T_MIN * RAY_T_MIN { return 0.0; }
+    }
+    return trace_visibility_previous_frame(offset_surface_ray_origin(ray_origin, geometric_normal, normalize(direction)), point);
 }
 
 fn trace_visibility(ray_origin: vec3<f32>, point: vec4<f32>) -> f32 {

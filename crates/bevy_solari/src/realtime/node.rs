@@ -1,6 +1,6 @@
 use super::prepare::{
-    SolariLightingResources, LIGHT_TILE_BLOCKS, WORLD_CACHE_ACTIVE_CELLS_COUNT_OFFSET,
-    WORLD_CACHE_SIZE,
+    SolariLightingResources, SolariReceiverOverrides, LIGHT_TILE_BLOCKS,
+    WORLD_CACHE_ACTIVE_CELLS_COUNT_OFFSET, WORLD_CACHE_SIZE,
 };
 use crate::scene::RaytracingSceneBindings;
 #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
@@ -19,9 +19,11 @@ use bevy_render::{
             uniform_buffer_sized,
         },
         BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries,
-        CachedComputePipelineId, ComputePassDescriptor, ComputePipelineDescriptor, LoadOp,
-        PipelineCache, RenderPassDescriptor, ShaderStages, StorageTextureAccess, TextureFormat,
-        TextureFormatFeatureFlags, TextureSampleType,
+        CachedComputePipelineId, ComputePassDescriptor, ComputePipelineDescriptor, Extent3d,
+        LoadOp, Operations, PipelineCache, RenderPassColorAttachment, RenderPassDescriptor,
+        ShaderStages, StorageTextureAccess, StoreOp, TextureDescriptor, TextureDimension,
+        TextureFormat, TextureFormatFeatureFlags, TextureSampleType, TextureUsages, TextureView,
+        TextureViewDescriptor,
     },
     renderer::{RenderAdapter, RenderContext, RenderDevice, ViewQuery},
     view::{ViewTarget, ViewUniform, ViewUniformOffset, ViewUniforms},
@@ -49,6 +51,8 @@ pub struct SolariLightingPipelines {
     no_restir: NoRestirPipelines,
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
     resolve_dlss_rr_textures_pipeline: CachedComputePipelineId,
+    /// Bound in place of a view's receiver override textures while it has none.
+    receiver_overrides_fallback: TextureView,
 }
 
 struct RestirPipelines {
@@ -67,6 +71,7 @@ struct NoRestirPipelines {
 #[cfg(any(not(feature = "dlss"), feature = "force_disable_dlss"))]
 type SolariLightingViewQuery = (
     &'static SolariLightingResources,
+    Option<&'static SolariReceiverOverrides>,
     &'static ViewTarget,
     &'static ViewPrepassTextures,
     &'static ViewUniformOffset,
@@ -76,12 +81,35 @@ type SolariLightingViewQuery = (
 #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
 type SolariLightingViewQuery = (
     &'static SolariLightingResources,
+    Option<&'static SolariReceiverOverrides>,
     &'static ViewTarget,
     &'static ViewPrepassTextures,
     &'static ViewUniformOffset,
     &'static PreviousViewUniformOffset,
     Option<&'static ViewDlssRayReconstructionTextures>,
 );
+
+/// Zeroes the view's receiver override texture, so pixels no producer writes have no override.
+pub fn clear_receiver_overrides(view: ViewQuery<&SolariReceiverOverrides>, mut ctx: RenderContext) {
+    let receiver_overrides = view.into_inner();
+    ctx.command_encoder()
+        .begin_render_pass(&RenderPassDescriptor {
+            label: Some("solari_lighting_clear_receiver_overrides"),
+            color_attachments: &[Some(RenderPassColorAttachment {
+                view: receiver_overrides.write_view(),
+                depth_slice: None,
+                resolve_target: None,
+                ops: Operations {
+                    load: LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+}
 
 pub fn solari_lighting(
     view: ViewQuery<SolariLightingViewQuery>,
@@ -96,6 +124,7 @@ pub fn solari_lighting(
     #[cfg(any(not(feature = "dlss"), feature = "force_disable_dlss"))]
     let (
         solari_lighting_resources,
+        receiver_overrides,
         view_target,
         view_prepass_textures,
         view_uniform_offset,
@@ -105,6 +134,7 @@ pub fn solari_lighting(
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
     let (
         solari_lighting_resources,
+        receiver_overrides,
         view_target,
         view_prepass_textures,
         view_uniform_offset,
@@ -208,20 +238,28 @@ pub fn solari_lighting(
     let view_target_attachment = view_target.get_unsampled_color_attachment();
 
     let s = solari_lighting_resources;
+    let (receiver_overrides, previous_receiver_overrides) = receiver_overrides.map_or(
+        (
+            &pipelines.receiver_overrides_fallback,
+            &pipelines.receiver_overrides_fallback,
+        ),
+        |overrides| (overrides.write_view(), overrides.previous_view()),
+    );
     let bind_group = render_device.create_bind_group(
         "solari_lighting_bind_group",
         &pipeline_cache.get_bind_group_layout(&pipelines.bind_group_layout),
-        &BindGroupEntries::sequential((
-            view_target_attachment.view,
-            s.light_tile_samples.as_entire_binding(),
-            s.light_tile_resolved_samples.as_entire_binding(),
-            gbuffer,
-            depth_buffer,
-            motion_vectors,
-            view_uniforms_binding.clone(),
-            previous_view_uniforms_binding.clone(),
-            s.world_cache.as_entire_binding(),
-            s.constants.as_entire_binding(),
+        &BindGroupEntries::with_indices((
+            (0, view_target_attachment.view),
+            (1, s.light_tile_samples.as_entire_binding()),
+            (2, s.light_tile_resolved_samples.as_entire_binding()),
+            (3, gbuffer),
+            (4, depth_buffer),
+            (5, motion_vectors),
+            (6, view_uniforms_binding.clone()),
+            (7, previous_view_uniforms_binding.clone()),
+            (8, s.world_cache.as_entire_binding()),
+            (9, s.constants.as_entire_binding()),
+            (14, receiver_overrides),
         )),
     );
 
@@ -245,6 +283,8 @@ pub fn solari_lighting(
                     previous_depth_buffer,
                     reservoirs.a.as_entire_binding(),
                     reservoirs.b.as_entire_binding(),
+                    receiver_overrides,
+                    previous_receiver_overrides,
                 )),
             )
         });
@@ -385,6 +425,7 @@ pub fn solari_lighting(
     d.end(&mut pass);
 
     drop(pass);
+    s.history.record_rendered();
 
     // Active cell count readback.
     diagnostics.record_u32(
@@ -404,6 +445,7 @@ pub fn init_solari_lighting_pipelines(
     scene_bindings: Res<RaytracingSceneBindings>,
     asset_server: Res<AssetServer>,
     render_adapter: Res<RenderAdapter>,
+    render_device: Res<RenderDevice>,
 ) {
     let motion_vectors_storage_read_write = render_adapter
         .get_texture_format_features(MOTION_VECTOR_PREPASS_FORMAT)
@@ -417,19 +459,23 @@ pub fn init_solari_lighting_pipelines(
 
     let bind_group_layout = BindGroupLayoutDescriptor::new(
         "solari_lighting_bind_group_layout",
-        &BindGroupLayoutEntries::sequential(
+        &BindGroupLayoutEntries::with_indices(
             ShaderStages::COMPUTE,
             (
-                texture_storage_2d(TextureFormat::Rgba16Float, StorageTextureAccess::ReadWrite),
-                storage_buffer_sized(false, None),
-                storage_buffer_sized(false, None),
-                texture_2d(TextureSampleType::Uint),
-                texture_depth_2d(),
-                motion_vectors_binding,
-                uniform_buffer::<ViewUniform>(true),
-                uniform_buffer::<PreviousViewData>(true),
-                storage_buffer_sized(false, None),
-                uniform_buffer_sized(false, None),
+                (
+                    0,
+                    texture_storage_2d(TextureFormat::Rgba16Float, StorageTextureAccess::ReadWrite),
+                ),
+                (1, storage_buffer_sized(false, None)),
+                (2, storage_buffer_sized(false, None)),
+                (3, texture_2d(TextureSampleType::Uint)),
+                (4, texture_depth_2d()),
+                (5, motion_vectors_binding),
+                (6, uniform_buffer::<ViewUniform>(true)),
+                (7, uniform_buffer::<PreviousViewData>(true)),
+                (8, storage_buffer_sized(false, None)),
+                (9, uniform_buffer_sized(false, None)),
+                (14, texture_2d(TextureSampleType::Uint)),
             ),
         ),
     );
@@ -453,6 +499,8 @@ pub fn init_solari_lighting_pipelines(
                 texture_depth_2d(),
                 storage_buffer_sized(false, None),
                 storage_buffer_sized(false, None),
+                texture_2d(TextureSampleType::Uint),
+                texture_2d(TextureSampleType::Uint),
             ),
         ),
     );
@@ -531,6 +579,20 @@ pub fn init_solari_lighting_pipelines(
             ..default()
         })
     };
+
+    // Never sampled: the shaders read override textures only while the view's uniform enables them.
+    let receiver_overrides_fallback = render_device
+        .create_texture(&TextureDescriptor {
+            label: Some("solari_lighting_receiver_overrides_fallback"),
+            size: Extent3d::default(),
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: SolariReceiverOverrides::FORMAT,
+            usage: TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        })
+        .create_view(&TextureViewDescriptor::default());
 
     commands.insert_resource(SolariLightingPipelines {
         bind_group_layout: bind_group_layout.clone(),
@@ -659,6 +721,7 @@ pub fn init_solari_lighting_pipelines(
             ExtraBindGroup::DlssRrGuideBuffers,
             vec![],
         ),
+        receiver_overrides_fallback,
     });
 }
 
