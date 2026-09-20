@@ -1,4 +1,4 @@
-use super::{prepare::SolariLightingResources, SolariLighting};
+use super::{prepare::SolariLightingResources, SolariLighting, SolariReceiverOverrides};
 use bevy_camera::Camera;
 use bevy_ecs::system::{Commands, ResMut};
 use bevy_pbr::deferred::SkipDeferredLighting;
@@ -20,6 +20,7 @@ pub fn extract_solari_lighting(mut main_world: ResMut<MainWorld>, mut commands: 
             entity_commands.remove::<(
                 SolariLighting,
                 SolariLightingResources,
+                SolariReceiverOverrides,
                 SkipDeferredLighting,
             )>();
         }
