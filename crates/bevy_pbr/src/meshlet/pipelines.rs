@@ -325,11 +325,9 @@ pub fn init_meshlet_pipelines(
             },
         ),
 
-        // `primitive` is left at the default `cull_mode: None` here even though the software
-        // rasterizer culls backfaces. The two paths only need to agree on which face is nearest,
-        // which the depth test already decides, and a `Face::Back` cull would drop the backfaces
-        // that double-sided and open single-sided meshlet geometry relies on. Per-material cull
-        // modes are not plumbed into these shared raster pipelines.
+        // `primitive` is left at the default `cull_mode: None`: one pipeline rasterizes every
+        // material, so the shader culls per instance from its `MeshFlags` cull bits instead, the
+        // same way the software rasterizer does.
         visibility_buffer_hardware_raster: pipeline_cache.queue_render_pipeline(
             RenderPipelineDescriptor {
                 label: Some("meshlet_visibility_buffer_hardware_raster_pipeline".into()),
