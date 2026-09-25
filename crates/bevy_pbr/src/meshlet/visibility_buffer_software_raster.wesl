@@ -17,7 +17,11 @@ import package::{
     },
     render::{
         mesh_functions::mesh_position_local_to_world,
-        mesh_types::MESH_FLAGS_SIGN_DETERMINANT_MODEL_3X3_BIT,
+        mesh_types::{
+            MESH_FLAGS_CULL_BACK_FACES_BIT,
+            MESH_FLAGS_CULL_FRONT_FACES_BIT,
+            MESH_FLAGS_SIGN_DETERMINANT_MODEL_3X3_BIT,
+        },
         view_transformations::ndc_to_uv,
     },
 };
@@ -89,13 +93,16 @@ fn rasterize_cluster(
     var vertex_2 = viewport_vertices[select(vertex_ids[0], vertex_ids[1], mirrored)];
     let packed_ids = (cluster_id << 7u) | triangle_id;
 
-    // The hardware rasterizer draws both faces (cull_mode None), so this path must too;
-    // otherwise a back face appears and disappears as its cluster crosses the size threshold
-    // between the two rasterizers. Backfacing triangles have negative area: swap two vertices
-    // to restore positive winding and rasterize as normal. Zero area is degenerate; skip it.
+    // A cluster moves between this and the hardware rasterizer as its screen size changes, so both
+    // cull the faces the instance's material culls, from the same instance flags. Zero area is
+    // degenerate; skip it. A kept back face has negative area: swap two vertices to restore
+    // positive winding and rasterize as normal.
     var triangle_double_area = edge_function(vertex_0.xy, vertex_1.xy, vertex_2.xy);
     if triangle_double_area == 0.0 { return; }
-    if triangle_double_area < 0.0 {
+    let front_facing = triangle_double_area > 0.0;
+    let culled_face = select(MESH_FLAGS_CULL_BACK_FACES_BIT, MESH_FLAGS_CULL_FRONT_FACES_BIT, front_facing);
+    if (instance_uniform.flags & culled_face) != 0u { return; }
+    if !front_facing {
         let backface_vertex = vertex_1;
         vertex_1 = vertex_2;
         vertex_2 = backface_vertex;

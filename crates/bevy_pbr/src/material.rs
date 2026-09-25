@@ -163,6 +163,18 @@ pub trait Material: Asset + AsBindGroup + Clone + Sized {
         AlphaMode::Opaque
     }
 
+    /// Returns which face of this material's triangles to cull, if any. Defaults to
+    /// `Some(Face::Back)`, the cull mode of the default mesh pipeline.
+    ///
+    /// Meshlet meshes rasterize every material in shared passes, so they read this instead of the
+    /// cull mode `specialize` sets on a pipeline; a material that sets its cull mode in
+    /// `specialize` should return the same value here. The meshlet path applies it to the main,
+    /// prepass and shadow passes alike.
+    #[inline]
+    fn cull_mode(&self) -> Option<Face> {
+        Some(Face::Back)
+    }
+
     /// Returns if this material should be rendered by the deferred or forward renderer.
     /// for `AlphaMode::Opaque` or `AlphaMode::Mask` materials.
     /// If `OpaqueRendererMethod::Auto`, it will default to what is selected in the `DefaultOpaqueRendererMethod` resource.
@@ -1806,6 +1818,7 @@ where
             binding,
             properties: Arc::new(MaterialProperties {
                 alpha_mode,
+                cull_mode: material.cull_mode(),
                 depth_bias: material.depth_bias(),
                 reads_view_transmission_texture,
                 render_phase_type,

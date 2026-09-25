@@ -3,7 +3,8 @@ use super::{
     MeshletMesh, MeshletMesh3d,
 };
 use crate::{
-    MeshFlags, MeshGeometryError, MeshTransforms, MeshUniform, PreviousGlobalTransform,
+    MeshFlags, MeshGeometryError, MeshTransforms, MeshUniform, PreparedMaterial,
+    PreviousGlobalTransform,
     RenderMaterialInstances,
 };
 use bevy_asset::{AssetEvent, AssetServer, Assets, UntypedAssetId};
@@ -22,8 +23,9 @@ use bevy_light::{NotShadowCaster, NotShadowReceiver};
 use bevy_math::Vec4;
 use bevy_platform::collections::{HashMap, HashSet};
 use bevy_render::{
+    erased_render_asset::ErasedRenderAssets,
     material_bind_groups::{MaterialBindingId, RenderMaterialBindings},
-    render_resource::StorageBuffer,
+    render_resource::{Face, StorageBuffer},
     renderer::RenderDevice,
     sync_world::MainEntity,
     MainWorld,
@@ -146,10 +148,13 @@ impl InstanceManager {
         render_layers: Option<&RenderLayers>,
         mesh_material_ids: &RenderMaterialInstances,
         render_material_bindings: &RenderMaterialBindings,
+        render_materials: &ErasedRenderAssets<PreparedMaterial>,
         not_shadow_receiver: bool,
         not_shadow_caster: bool,
         geometry_error: Option<&MeshGeometryError>,
     ) {
+        let mesh_material = mesh_material_ids.mesh_material(instance);
+
         // Build a MeshUniform for the instance
         let transform = transform.affine();
         let previous_transform = previous_transform.map(|t| t.0).unwrap_or(transform);
@@ -162,13 +167,18 @@ impl InstanceManager {
             flags |= MeshFlags::SIGN_DETERMINANT_MODEL_3X3;
         }
         flags |= MeshFlags::from_geometry_error(geometry_error, &transform);
+        // The raster passes are shared by every material, so they cull per instance. A material
+        // that is not prepared yet takes the default mesh pipeline's back-face culling until it is.
+        let cull_mode = mesh_material
+            .and_then(|material| render_materials.get(material))
+            .map_or(Some(Face::Back), |material| material.properties.cull_mode);
+        flags |= MeshFlags::from_cull_mode(cull_mode);
         let transforms = MeshTransforms {
             world_from_local: transform.into(),
             previous_world_from_local: previous_transform.into(),
             flags: flags.bits(),
         };
 
-        let mesh_material = mesh_material_ids.mesh_material(instance);
         let mesh_material_binding_id = if let Some(mesh_material) = mesh_material {
             self.scene_material_assets.insert(mesh_material);
             render_material_bindings
@@ -343,6 +353,7 @@ pub fn extract_meshlet_mesh_entities(
     mut main_world: ResMut<MainWorld>,
     mesh_material_ids: Res<RenderMaterialInstances>,
     render_material_bindings: Res<RenderMaterialBindings>,
+    render_materials: Res<ErasedRenderAssets<PreparedMaterial>>,
     render_device: Res<RenderDevice>,
     mut system_state: Local<
         Option<
@@ -441,10 +452,11 @@ pub fn extract_meshlet_mesh_entities(
     // rest are a handful of integer and tick comparisons.
     let rebuild = instance_manager
         .asset_residency_changed(meshlet_mesh_manager.residency_revision())
-        // An entity changing material, or a material moving bind group slot - the slot is baked
-        // into every MeshUniform.
+        // An entity changing material, a material moving bind group slot, or a material being
+        // (re)prepared - the slot and the material's cull mode are baked into every MeshUniform.
         || mesh_material_ids.is_changed()
         || render_material_bindings.is_changed()
+        || render_materials.is_changed()
         || removed_instance
         || !changed_instances.is_empty();
     #[cfg(debug_assertions)]
@@ -507,6 +519,7 @@ pub fn extract_meshlet_mesh_entities(
             render_layers,
             &mesh_material_ids,
             &render_material_bindings,
+            &render_materials,
             not_shadow_receiver,
             not_shadow_caster,
             geometry_error,

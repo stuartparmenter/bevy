@@ -1290,6 +1290,7 @@ where
             properties: Arc::new(MaterialProperties {
                 depth_bias: material.depth_bias(),
                 alpha_mode: material.alpha_mode().into(),
+                cull_mode: None,
                 material_layout: Some(material_layout),
                 bindless,
                 base_specialize: Some(base_specialize),

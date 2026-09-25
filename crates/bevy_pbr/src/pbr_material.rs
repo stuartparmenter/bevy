@@ -1422,6 +1422,11 @@ impl Material for StandardMaterial {
     }
 
     #[inline]
+    fn cull_mode(&self) -> Option<Face> {
+        self.cull_mode
+    }
+
+    #[inline]
     fn opaque_render_method(&self) -> OpaqueRendererMethod {
         match self.opaque_render_method {
             // For now, diffuse transmission doesn't work under deferred rendering as we don't pack

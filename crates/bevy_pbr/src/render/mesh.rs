@@ -846,6 +846,12 @@ bitflags::bitflags! {
         const LOD_INDEX_MASK              = (1 << 16) - 1;
         /// Bitmask for the 5-bit quantized world geometry error code.
         const GEOMETRY_ERROR_CODE_MASK    = 0x1F << 16;
+        /// The material culls front faces. Set on meshlet instances only, whose shared raster
+        /// passes cull per instance; regular meshes cull through their pipeline state.
+        const CULL_FRONT_FACES            = 1 << 25;
+        /// The material culls back faces. Set on meshlet instances only, like
+        /// [`Self::CULL_FRONT_FACES`].
+        const CULL_BACK_FACES             = 1 << 26;
         /// Whether visibility ranges use the center of the AABB to compute
         /// distance from the camera.
         ///
@@ -912,6 +918,16 @@ impl MeshFlags {
 
     /// The first bit of the quantized world geometry error code.
     pub const GEOMETRY_ERROR_CODE_SHIFT: u32 = 16;
+
+    /// The [`MeshFlags::CULL_FRONT_FACES`] or [`MeshFlags::CULL_BACK_FACES`] bit for a material's
+    /// cull mode.
+    pub fn from_cull_mode(cull_mode: Option<Face>) -> MeshFlags {
+        match cull_mode {
+            Some(Face::Front) => MeshFlags::CULL_FRONT_FACES,
+            Some(Face::Back) => MeshFlags::CULL_BACK_FACES,
+            None => MeshFlags::empty(),
+        }
+    }
 
     /// Quantizes an instance's geometry error, in world space, into
     /// [`MeshFlags::GEOMETRY_ERROR_CODE_MASK`].
@@ -5013,11 +5029,54 @@ mod tests {
         GEOMETRY_ERROR_CODE_UNKNOWN, GEOMETRY_ERROR_CODE_ZERO, GEOMETRY_ERROR_UNKNOWN,
     };
     use bevy_math::{ops, Affine3A, Vec3};
+    use bevy_render::render_resource::Face;
     use core::f32::consts::FRAC_PI_4;
 
     /// The measured per-instance world geometry errors in Zorah's Throne Room, plus the endpoints
     /// that decide whether the quantizer can ever round a bias down.
     const MEASURED_WORLD_ERRORS: [f32; 6] = [0.0, 0.02, 0.0283, 0.0543, 0.1395, 0.185];
+
+    #[test]
+    fn cull_mode_flags_match_the_shader_constants() {
+        let cull_faces = MeshFlags::CULL_FRONT_FACES | MeshFlags::CULL_BACK_FACES;
+        assert_eq!(
+            MeshFlags::from_cull_mode(Some(Face::Front)).bits(),
+            MeshFlags::CULL_FRONT_FACES.bits()
+        );
+        assert_eq!(
+            MeshFlags::from_cull_mode(Some(Face::Back)).bits(),
+            MeshFlags::CULL_BACK_FACES.bits()
+        );
+        assert_eq!(MeshFlags::from_cull_mode(None).bits(), 0);
+
+        // Clear of every other field the flags word packs.
+        let other_fields = MeshFlags::LOD_INDEX_MASK
+            | MeshFlags::GEOMETRY_ERROR_CODE_MASK
+            | MeshFlags::AABB_BASED_VISIBILITY_RANGE
+            | MeshFlags::NO_FRUSTUM_CULLING
+            | MeshFlags::SHADOW_RECEIVER
+            | MeshFlags::TRANSMITTED_SHADOW_RECEIVER
+            | MeshFlags::SIGN_DETERMINANT_MODEL_3X3;
+        assert!(!other_fields.intersects(cull_faces));
+
+        // The meshlet rasterizers read these bits through the WESL mirrors.
+        let mesh_types = include_str!("mesh_types.wesl")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for (name, flag) in [
+            ("CULL_FRONT_FACES", MeshFlags::CULL_FRONT_FACES),
+            ("CULL_BACK_FACES", MeshFlags::CULL_BACK_FACES),
+        ] {
+            let shift = flag.bits().trailing_zeros();
+            assert!(
+                mesh_types.contains(&format!(
+                    "const MESH_FLAGS_{name}_BIT: u32 = 1u << {shift}u;"
+                )),
+                "{name}"
+            );
+        }
+    }
 
     #[test]
     fn quantized_geometry_error_is_never_an_underestimate() {
@@ -5141,7 +5200,10 @@ mod tests {
         // two halves to each other by text.
         let deferred_types = include_str!("../deferred/types.wesl");
         assert!(deferred_types.contains("exp2((f32(code) - 2.0) / 3.0 - 10.0)"));
-        let mesh_types = include_str!("mesh_types.wesl");
+        let mesh_types = include_str!("mesh_types.wesl")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         assert!(mesh_types.contains("0x1Fu << 16u"));
     }
 

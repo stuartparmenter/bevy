@@ -7,7 +7,7 @@ use bevy_render::{
     combined_bind_group as cbg,
     render_resource::{
         AsBindGroup, AsBindGroupError, BindGroupBuilder, BindGroupLayout, BindGroupLayoutEntry,
-        BindlessDescriptor, BindlessSlabResourceLimit, RenderPipelineDescriptor,
+        BindlessDescriptor, BindlessSlabResourceLimit, Face, RenderPipelineDescriptor,
         SpecializedMeshPipelineError,
     },
     renderer::RenderDevice,
@@ -252,6 +252,10 @@ impl<B: Material, E: MaterialExtension> Material for ExtendedMaterial<B, E> {
 
     fn depth_bias(&self) -> f32 {
         B::depth_bias(&self.base)
+    }
+
+    fn cull_mode(&self) -> Option<Face> {
+        B::cull_mode(&self.base)
     }
 
     fn reads_view_transmission_texture(&self) -> bool {

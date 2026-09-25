@@ -56,6 +56,8 @@ pub struct MaterialProperties {
     pub render_method: OpaqueRendererMethod,
     /// The [`AlphaMode`] of this material.
     pub alpha_mode: AlphaMode,
+    /// Which face of this material's triangles is culled, if any.
+    pub cull_mode: Option<wgpu_types::Face>,
     /// The bits in the [`ErasedMeshPipelineKey`] for this material.
     ///
     /// These are precalculated so that we can just "or" them together in
