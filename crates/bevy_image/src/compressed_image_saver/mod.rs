@@ -1,4 +1,6 @@
 #[cfg(feature = "compressed_image_saver")]
+mod alpha_coverage;
+#[cfg(feature = "compressed_image_saver")]
 mod ctt;
 #[cfg(feature = "compressed_image_saver")]
 mod ctt_helpers;
@@ -99,6 +101,8 @@ use wgpu_types::TextureFormat;
 /// Both backends generate a full mip chain automatically when processing the image. This prevents
 /// aliasing when textures are viewed at a distance, and increases GPU cache hits, improving
 /// rendering performance. This can be disabled per-texture via [`CompressedImageSaverSettings::generate_mipmaps`].
+/// Alpha-tested textures keep their coverage across the chain with
+/// [`CompressedImageSaverSettings::alpha_test_cutoff`].
 ///
 /// # Settings
 ///
@@ -177,6 +181,18 @@ pub struct CompressedImageSaverSettings {
     /// Defaults to `true`. Mipmaps prevent aliasing when textures are minified and improve GPU
     /// cache locality, so they are almost always wanted for material textures.
     pub generate_mipmaps: bool,
+    /// The alpha test cutoff of the material sampling this texture (e.g. the `0.5` of
+    /// `AlphaMode::Mask(0.5)`), to keep its coverage in the generated mips.
+    ///
+    /// Filtered mips average thin opaque features into partial alpha that falls under the
+    /// cutoff, so alpha-tested foliage thins out and vanishes with distance. When set, the mips
+    /// are box filtered and each level's alpha is scaled so the share of texels at or above the
+    /// cutoff is as near the base level's as its alpha values allow (Castaño, "Computing Alpha
+    /// Mipmaps"). Requires `generate_mipmaps`, an `Rgba8Unorm` or `Rgba8UnormSrgb` input and
+    /// the `compressed_image_saver` backend.
+    ///
+    /// Defaults to `None`.
+    pub alpha_test_cutoff: Option<f32>,
 }
 
 impl Default for CompressedImageSaverSettings {
@@ -186,6 +202,7 @@ impl Default for CompressedImageSaverSettings {
             input_alpha_mode: ImageCompressorAlphaMode::Straight,
             output_alpha_mode: ImageCompressorAlphaMode::Premultiplied,
             generate_mipmaps: true,
+            alpha_test_cutoff: None,
         }
     }
 }
@@ -225,4 +242,7 @@ pub enum CompressedImageSaverError {
          the input Image's texture_descriptor.format must be a non-sRGB (linear) variant"
     )]
     NormalMapMustBeLinear(TextureFormat),
+    /// The [`CompressedImageSaverSettings`] cannot be applied to this image or backend.
+    #[error("Invalid compressed image saver settings: {0}")]
+    InvalidSettings(&'static str),
 }
