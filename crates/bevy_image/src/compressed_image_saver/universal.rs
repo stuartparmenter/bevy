@@ -18,6 +18,11 @@ impl CompressedImageSaverUniversal {
         settings: &CompressedImageSaverSettings,
         _asset_path: AssetPath<'_>,
     ) -> Result<ImageLoaderSettings, CompressedImageSaverError> {
+        if settings.alpha_test_cutoff.is_some() {
+            return Err(CompressedImageSaverError::InvalidSettings(
+                "alpha_test_cutoff needs the compressed_image_saver backend",
+            ));
+        }
         let is_srgb = image.texture_descriptor.format.is_srgb();
 
         let compressed_basis_data = {
