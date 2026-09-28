@@ -5,12 +5,14 @@ use ctt::{
 };
 
 use super::{
+    alpha_coverage::alpha_tested_mips,
     ctt_helpers::{
         bevy_to_ctt_alpha_mode, choose_ctt_compressed_format, wgpu_to_ctt_texture_format,
     },
     CompressedImageSaverError, CompressedImageSaverSettings,
 };
 use crate::{Image, ImageFormat, ImageFormatSetting, ImageLoaderSettings};
+use wgpu_types::TextureFormat;
 
 #[derive(Default)]
 pub struct CompressedImageSaverCtt;
@@ -60,19 +62,56 @@ impl CompressedImageSaverCtt {
                 |_| CompressedImageSaverError::UnsupportedFormat(image.texture_descriptor.format),
             )? as u32;
 
-        let surfaces = data
-            .chunks_exact((image.width() * image.height() * bytes_per_pixel) as usize)
-            .map(|layer_data| {
-                vec![SurfaceRef {
-                    data: layer_data,
-                    width: image.width(),
-                    height: image.height(),
-                    depth: 1,
-                    stride: image.width() * bytes_per_pixel,
-                    slice_stride: 0,
-                }]
-            })
-            .collect();
+        if settings.alpha_test_cutoff.is_some() {
+            if !settings.generate_mipmaps {
+                return Err(CompressedImageSaverError::InvalidSettings(
+                    "alpha_test_cutoff needs generate_mipmaps",
+                ));
+            }
+            if !matches!(
+                image.texture_descriptor.format,
+                TextureFormat::Rgba8Unorm | TextureFormat::Rgba8UnormSrgb
+            ) {
+                return Err(CompressedImageSaverError::InvalidSettings(
+                    "alpha_test_cutoff needs an Rgba8Unorm or Rgba8UnormSrgb input",
+                ));
+            }
+        }
+        let layers =
+            data.chunks_exact((image.width() * image.height() * bytes_per_pixel) as usize);
+        // ctt borrows its surfaces, so alpha-tested chains are built up front.
+        let alpha_tested_chains = settings.alpha_test_cutoff.map(|cutoff| {
+            layers
+                .clone()
+                .map(|layer_data| {
+                    alpha_tested_mips(layer_data, image.width(), image.height(), is_srgb, cutoff)
+                })
+                .collect::<Vec<_>>()
+        });
+        let surface = |data, width: u32, height: u32| SurfaceRef {
+            data,
+            width,
+            height,
+            depth: 1,
+            stride: width * bytes_per_pixel,
+            slice_stride: 0,
+        };
+        // Each layer's mip chain: the base alone for ctt to complete, or all of
+        // an alpha-tested chain built here.
+        let surfaces = match &alpha_tested_chains {
+            Some(chains) => chains
+                .iter()
+                .map(|chain| {
+                    chain
+                        .iter()
+                        .map(|level| surface(&level.texels, level.width, level.height))
+                        .collect()
+                })
+                .collect(),
+            None => layers
+                .map(|layer_data| vec![surface(layer_data, image.width(), image.height())])
+                .collect(),
+        };
         let ctt_image = ImageRef {
             surfaces,
             kind: if is_cubemap {
@@ -95,7 +134,8 @@ impl CompressedImageSaverCtt {
             output_alpha: Some(bevy_to_ctt_alpha_mode(settings.output_alpha_mode)),
             allow_discarding_alpha: settings.is_normal_map,
             swizzle: None,
-            mipmap: settings.generate_mipmaps,
+            // An alpha-tested chain arrives complete.
+            mipmap: settings.generate_mipmaps && settings.alpha_test_cutoff.is_none(),
             mipmap_count: None,
             mipmap_filter: if settings.is_normal_map {
                 MipmapFilter::Triangle
