@@ -186,9 +186,9 @@ pub struct CompressedImageSaverSettings {
     ///
     /// Filtered mips average thin opaque features into partial alpha that falls under the
     /// cutoff, so alpha-tested foliage thins out and vanishes with distance. When set, the mips
-    /// are box filtered and each level's alpha is scaled so the share of texels at or above the
-    /// cutoff is as near the base level's as its alpha values allow (Castaño, "Computing Alpha
-    /// Mipmaps"). Requires `generate_mipmaps`, an `Rgba8Unorm` or `Rgba8UnormSrgb` input and
+    /// are box filtered and each level's alpha is scaled so the share of it passing the cutoff,
+    /// sampled bilinearly, is as near the base level's as its alpha values allow (Castaño,
+    /// "Computing Alpha Mipmaps"). Requires `generate_mipmaps`, an `Rgba8Unorm` or `Rgba8UnormSrgb` input and
     /// the `compressed_image_saver` backend.
     ///
     /// Defaults to `None`.

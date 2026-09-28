@@ -11,8 +11,12 @@ pub struct MipLevel {
 
 /// The full mip chain of straight-alpha RGBA8 `texels` (`width` x `height`,
 /// color sRGB-encoded when `srgb`), with each level's alpha scaled so the
-/// share of texels at or above `cutoff` is as near the base level's as its
-/// alpha values allow (Castaño, "Computing Alpha Mipmaps", 2010).
+/// share of it passing `cutoff` is as near the base level's as its alpha
+/// values allow (Castaño, "Computing Alpha Mipmaps", 2010).
+///
+/// Coverage is measured as the GPU samples the texture, bilinearly between
+/// texels: a level's isolated texels just above the cutoff pass only near
+/// their centers, so counting texels would overstate it.
 ///
 /// Levels are 2x2 box filtered from the unscaled level above, color in
 /// linear light weighted by alpha, so transparent texels do not bleed into
@@ -50,7 +54,8 @@ pub fn alpha_tested_mips(
             ]
         })
         .collect();
-    let target = passing_share(&level, cutoff, 1.0);
+    let alpha = |level: &[[f32; 4]]| level.iter().map(|t| t[3]).collect::<Vec<_>>();
+    let target = passing_share(&alpha(&level), width, height, cutoff, 1.0);
     let mut chain = vec![MipLevel {
         texels: texels.to_vec(),
         width,
@@ -58,7 +63,7 @@ pub fn alpha_tested_mips(
     }];
     while width > 1 || height > 1 {
         (level, width, height) = downsample(&level, width, height);
-        let scale = coverage_scale(&level, cutoff, target);
+        let scale = coverage_scale(&alpha(&level), width, height, cutoff, target);
         let texels = level
             .iter()
             .flat_map(|&[r, g, b, a]| [encoded(r), encoded(g), encoded(b), to_u8(a * scale)])
@@ -72,25 +77,58 @@ pub fn alpha_tested_mips(
     chain
 }
 
-/// The share of `level`'s texels whose alpha, times `scale`, reaches `cutoff`.
-fn passing_share(level: &[[f32; 4]], cutoff: f32, scale: f32) -> f32 {
-    level.iter().filter(|t| t[3] * scale >= cutoff).count() as f32 / level.len() as f32
+/// Subsamples per texel along each axis when measuring coverage.
+const SUBSAMPLES: u32 = 4;
+
+/// The share of `alpha` (`width` x `height`), times `scale` and clamped to
+/// 1, that reaches `cutoff` when sampled bilinearly with clamped edges, from
+/// `SUBSAMPLES` x `SUBSAMPLES` samples spread over each texel.
+fn passing_share(alpha: &[f32], width: u32, height: u32, cutoff: f32, scale: f32) -> f32 {
+    let scaled: Vec<f32> = alpha.iter().map(|a| (a * scale).min(1.0)).collect();
+    // Each subsample's two neighboring texel indices and the weight of the
+    // second, along one axis.
+    let taps = |size: u32| {
+        (0..size * SUBSAMPLES)
+            .map(|s| {
+                let at = (s as f32 + 0.5) / SUBSAMPLES as f32 - 0.5;
+                let first = at.floor();
+                let clamp = |i: f32| (i.max(0.0) as u32).min(size - 1) as usize;
+                (clamp(first), clamp(first + 1.0), at - first)
+            })
+            .collect::<Vec<_>>()
+    };
+    let (columns, rows) = (taps(width), taps(height));
+    let row = |y: usize| &scaled[y * width as usize..][..width as usize];
+    let mut passing = 0usize;
+    for &(y0, y1, ty) in &rows {
+        let (top, bottom) = (row(y0), row(y1));
+        for &(x0, x1, tx) in &columns {
+            let upper = top[x0] + (top[x1] - top[x0]) * tx;
+            let lower = bottom[x0] + (bottom[x1] - bottom[x0]) * tx;
+            if upper + (lower - upper) * ty >= cutoff {
+                passing += 1;
+            }
+        }
+    }
+    passing as f32 / (columns.len() * rows.len()) as f32
 }
 
-/// The alpha scale that brings the share of `level` passing `cutoff` nearest
-/// `target`. Coverage only changes in steps, so the bisection's bounds end
-/// either side of the step that crosses `target` and the nearer one wins.
-fn coverage_scale(level: &[[f32; 4]], cutoff: f32, target: f32) -> f32 {
+/// The alpha scale that brings the share of `alpha` (`width` x `height`)
+/// passing `cutoff` nearest `target`. Coverage only changes in steps, so the
+/// bisection's bounds end either side of the step that crosses `target` and
+/// the nearer one wins; 12 steps resolve the scale finer than 8-bit alpha.
+fn coverage_scale(alpha: &[f32], width: u32, height: u32, cutoff: f32, target: f32) -> f32 {
+    let share = |scale| passing_share(alpha, width, height, cutoff, scale);
     let (mut low, mut high) = (0.0, 4.0 / cutoff);
-    for _ in 0..24 {
+    for _ in 0..12 {
         let mid = (low + high) * 0.5;
-        if passing_share(level, cutoff, mid) < target {
+        if share(mid) < target {
             low = mid;
         } else {
             high = mid;
         }
     }
-    let error = |scale| (passing_share(level, cutoff, scale) - target).abs();
+    let error = |scale| (share(scale) - target).abs();
     if error(low) < error(high) {
         low
     } else {
@@ -155,8 +193,12 @@ mod tests {
     }
 
     fn coverage(level: &MipLevel) -> f32 {
-        let passing = level.texels.chunks_exact(4).filter(|t| t[3] >= 128).count();
-        passing as f32 / (level.width * level.height) as f32
+        let alpha: Vec<f32> = level
+            .texels
+            .chunks_exact(4)
+            .map(|t| f32::from(t[3]) / 255.0)
+            .collect();
+        passing_share(&alpha, level.width, level.height, 0.5, 1.0)
     }
 
     #[test]
