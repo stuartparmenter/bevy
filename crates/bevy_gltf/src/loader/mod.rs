@@ -59,9 +59,11 @@ use tracing::{error, info_span, warn};
 use wgpu_types::Face;
 
 use crate::{
-    convert_coordinates::ConvertCoordinates as _, vertex_attributes::convert_attribute, Gltf,
-    GltfAssetLabel, GltfExtras, GltfMaterial, GltfMaterialExtras, GltfMaterialName, GltfMeshExtras,
-    GltfMeshName, GltfNode, GltfSceneExtras, GltfSceneName, GltfSkin, GltfSkinnedMeshBoundsPolicy,
+    convert_coordinates::ConvertCoordinates as _,
+    vertex_attributes::{convert_attribute, morph_targets, position_bounds},
+    Gltf, GltfAssetLabel, GltfExtras, GltfMaterial, GltfMaterialExtras, GltfMaterialName,
+    GltfMeshExtras, GltfMeshName, GltfNode, GltfSceneExtras, GltfSceneName, GltfSkin,
+    GltfSkinnedMeshBoundsPolicy,
 };
 
 #[cfg(feature = "bevy_animation")]
@@ -161,9 +163,12 @@ const KHR_MESHOPT_COMPRESSION: &str = "KHR_meshopt_compression";
 const EXT_MESHOPT_COMPRESSION: &str = "EXT_meshopt_compression";
 const MESHOPT_COMPRESSION_EXTENSIONS: [&str; 2] =
     [KHR_MESHOPT_COMPRESSION, EXT_MESHOPT_COMPRESSION];
+const KHR_MESH_QUANTIZATION: &str = "KHR_mesh_quantization";
 
-/// Runs the `gltf` crate's validation, minus its rejection of a required
-/// meshopt compression extension when the `meshopt` feature decodes it.
+/// Runs the `gltf` crate's validation, minus its rejection of required
+/// extensions the loader handles itself: `KHR_mesh_quantization`, which it
+/// dequantizes, and the meshopt compression extensions when the `meshopt`
+/// feature decodes them.
 ///
 /// Mirrors the crate-private `gltf::Document::validate` (gltf 1.4.1).
 fn validate_document(document: &gltf::Document) -> Result<(), GltfError> {
@@ -174,16 +179,18 @@ fn validate_document(document: &gltf::Document) -> Result<(), GltfError> {
     root.validate(root, gltf::json::Path::new, &mut |path, error| {
         errors.push((path(), error));
     });
-    if cfg!(feature = "meshopt") {
-        errors.retain(|(path, error)| {
-            let path = path.as_str();
-            !(*error == ValidationError::Unsupported
-                && path.starts_with("extensionsRequired[")
-                && path.rsplit_once(" = ").is_some_and(|(_, value)| {
-                    MESHOPT_COMPRESSION_EXTENSIONS.contains(&value.trim_matches('"'))
-                }))
-        });
-    }
+    let handled = |name: &str| {
+        name == KHR_MESH_QUANTIZATION
+            || (cfg!(feature = "meshopt") && MESHOPT_COMPRESSION_EXTENSIONS.contains(&name))
+    };
+    errors.retain(|(path, error)| {
+        let path = path.as_str();
+        !(*error == ValidationError::Unsupported
+            && path.starts_with("extensionsRequired[")
+            && path
+                .rsplit_once(" = ")
+                .is_some_and(|(_, value)| handled(value.trim_matches('"'))))
+    });
     if errors.is_empty() {
         Ok(())
     } else {
@@ -854,25 +861,24 @@ impl GltfLoader {
                         });
                     };
 
-                    {
-                        let morph_target_reader = reader.read_morph_targets();
-                        if morph_target_reader.len() != 0 {
-                            mesh.set_morph_targets(
-                                morph_target_reader
-                                    .flat_map(|i| PrimitiveMorphAttributesIter {
-                                        convert_coordinates: convert_coordinates.rotate_meshes,
-                                        positions: i.0,
-                                        normals: i.1,
-                                        tangents: i.2,
-                                    })
-                                    .collect(),
-                            );
+                    if primitive.morph_targets().len() != 0 {
+                        match morph_targets(
+                            &primitive,
+                            &buffer_data,
+                            convert_coordinates.rotate_meshes,
+                        ) {
+                            Ok(targets) => {
+                                mesh.set_morph_targets(targets);
 
-                            let extras = gltf_mesh.extras().as_ref();
-                            if let Some(names) = extras.and_then(|extras| {
-                                serde_json::from_str::<MorphTargetNames>(extras.get()).ok()
-                            }) {
-                                mesh.set_morph_target_names(names.target_names);
+                                let extras = gltf_mesh.extras().as_ref();
+                                if let Some(names) = extras.and_then(|extras| {
+                                    serde_json::from_str::<MorphTargetNames>(extras.get()).ok()
+                                }) {
+                                    mesh.set_morph_target_names(names.target_names);
+                                }
+                            }
+                            Err(err) => {
+                                warn!("Ignoring morph targets of {primitive_label}: {err}");
                             }
                         }
                     }
@@ -1735,7 +1741,6 @@ fn load_node(
                     mesh: mesh.index(),
                     primitive: primitive.index(),
                 };
-                let bounds = primitive.bounding_box();
                 let parent_entity = parent.target_entity();
 
                 // Apply the inverse of the conversion transform that's been
@@ -1768,8 +1773,7 @@ fn load_node(
                     mesh_entity.insert(MeshMorphWeights::Reference(parent_entity));
                 }
 
-                let mut bounds_min = Vec3::from_slice(&bounds.min);
-                let mut bounds_max = Vec3::from_slice(&bounds.max);
+                let (mut bounds_min, mut bounds_max) = position_bounds(&primitive);
 
                 if convert_coordinates.rotate_meshes {
                     let converted_min = bounds_min.convert_coordinates();
@@ -2988,5 +2992,134 @@ mod test {
                 state => panic!("Unexpected load state: {state:?}"),
             });
         }
+    }
+
+    #[test]
+    fn dequantizes_khr_mesh_quantization() {
+        use bevy_mesh::{Mesh, VertexAttributeValues};
+
+        let mut bin = Vec::new();
+        // POSITION: i16 VEC3, padded to a 4-byte stride.
+        for p in [[0i16, 0, 0], [2, 0, 0], [0, 3, 0]] {
+            p.iter().for_each(|c| bin.extend(c.to_le_bytes()));
+            bin.extend([0; 2]);
+        }
+        // NORMAL: normalized i8 VEC3, padded.
+        for _ in 0..3 {
+            bin.extend([0, 0, 127, 0]);
+        }
+        // TANGENT: normalized i16 VEC4; -32768 clamps to -1.
+        for _ in 0..3 {
+            [i16::MAX, 0, 0, i16::MIN]
+                .iter()
+                .for_each(|c| bin.extend(c.to_le_bytes()));
+        }
+        // TEXCOORD_0: normalized i8 VEC2, padded.
+        for uv in [[0i8, 0], [127, 0], [0, 127]] {
+            bin.extend([uv[0] as u8, uv[1] as u8, 0, 0]);
+        }
+        [0u16, 1, 2]
+            .iter()
+            .for_each(|i| bin.extend(i.to_le_bytes()));
+        bin.extend([0; 2]);
+        // Morph POSITION: i16 VEC3, padded.
+        for p in [[1i16, 0, 0], [0, -2, 0], [0, 0, 3]] {
+            p.iter().for_each(|c| bin.extend(c.to_le_bytes()));
+            bin.extend([0; 2]);
+        }
+        // Morph NORMAL: normalized i8 VEC3, padded.
+        for _ in 0..3 {
+            bin.extend([0, (-127i8) as u8, 0, 0]);
+        }
+
+        let uri = format!(
+            "data:application/octet-stream;base64,{}",
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bin)
+        );
+        let gltf = r#"
+{
+    "asset": { "version": "2.0" },
+    "extensionsUsed": ["KHR_mesh_quantization"],
+    "extensionsRequired": ["KHR_mesh_quantization"],
+    "buffers": [{ "uri": "BIN_URI", "byteLength": 116 }],
+    "bufferViews": [
+        { "buffer": 0, "byteOffset": 0, "byteLength": 24, "byteStride": 8, "target": 34962 },
+        { "buffer": 0, "byteOffset": 24, "byteLength": 12, "byteStride": 4, "target": 34962 },
+        { "buffer": 0, "byteOffset": 36, "byteLength": 24, "target": 34962 },
+        { "buffer": 0, "byteOffset": 60, "byteLength": 12, "byteStride": 4, "target": 34962 },
+        { "buffer": 0, "byteOffset": 72, "byteLength": 6, "target": 34963 },
+        { "buffer": 0, "byteOffset": 80, "byteLength": 24, "byteStride": 8, "target": 34962 },
+        { "buffer": 0, "byteOffset": 104, "byteLength": 12, "byteStride": 4, "target": 34962 }
+    ],
+    "accessors": [
+        { "bufferView": 0, "componentType": 5122, "count": 3, "type": "VEC3", "min": [0, 0, 0], "max": [2, 3, 0] },
+        { "bufferView": 1, "componentType": 5120, "normalized": true, "count": 3, "type": "VEC3" },
+        { "bufferView": 2, "componentType": 5122, "normalized": true, "count": 3, "type": "VEC4" },
+        { "bufferView": 3, "componentType": 5120, "normalized": true, "count": 3, "type": "VEC2" },
+        { "bufferView": 4, "componentType": 5123, "count": 3, "type": "SCALAR" },
+        { "bufferView": 5, "componentType": 5122, "count": 3, "type": "VEC3", "min": [0, -2, 0], "max": [1, 0, 3] },
+        { "bufferView": 6, "componentType": 5120, "normalized": true, "count": 3, "type": "VEC3" }
+    ],
+    "meshes": [{ "primitives": [{
+        "attributes": { "POSITION": 0, "NORMAL": 1, "TANGENT": 2, "TEXCOORD_0": 3 },
+        "indices": 4,
+        "targets": [{ "POSITION": 5, "NORMAL": 6 }]
+    }] }],
+    "nodes": [{ "mesh": 0 }],
+    "scenes": [{ "nodes": [0] }]
+}
+"#
+        .replace("BIN_URI", &uri);
+
+        let app = load_gltf_into_app("quantized.gltf", &gltf);
+        let (_, mesh) = app
+            .world()
+            .resource::<Assets<Mesh>>()
+            .iter()
+            .next()
+            .unwrap();
+        let attribute = |id| mesh.attribute(id).cloned();
+        assert_eq!(
+            attribute(Mesh::ATTRIBUTE_POSITION),
+            Some(VertexAttributeValues::Float32x3(vec![
+                [0.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+                [0.0, 3.0, 0.0]
+            ]))
+        );
+        assert_eq!(
+            attribute(Mesh::ATTRIBUTE_NORMAL),
+            Some(VertexAttributeValues::Float32x3(vec![[0.0, 0.0, 1.0]; 3]))
+        );
+        assert_eq!(
+            attribute(Mesh::ATTRIBUTE_TANGENT),
+            Some(VertexAttributeValues::Float32x4(vec![
+                [1.0, 0.0, 0.0, -1.0];
+                3
+            ]))
+        );
+        assert_eq!(
+            attribute(Mesh::ATTRIBUTE_UV_0),
+            Some(VertexAttributeValues::Float32x2(vec![
+                [0.0, 0.0],
+                [1.0, 0.0],
+                [0.0, 1.0]
+            ]))
+        );
+        let morph = |position: [f32; 3]| {
+            bevy_mesh::morph::MorphAttributes::from([
+                position.into(),
+                bevy_math::Vec3::NEG_Y,
+                bevy_math::Vec3::ZERO,
+            ])
+        };
+        assert_eq!(
+            mesh.morph_targets(),
+            Some(&vec![
+                morph([1.0, 0.0, 0.0]),
+                morph([0.0, -2.0, 0.0]),
+                morph([0.0, 0.0, 3.0])
+            ])
+        );
     }
 }
