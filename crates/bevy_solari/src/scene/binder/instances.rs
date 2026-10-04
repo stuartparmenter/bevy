@@ -812,6 +812,7 @@ mod tests {
             slot,
             source: InstanceSource::Geometry,
             material: AssetId::default(),
+            opacity: BlasOpacity::Opaque,
             buffers: None,
             geometry: Some(GeometryKey {
                 topology_generation: 0,
