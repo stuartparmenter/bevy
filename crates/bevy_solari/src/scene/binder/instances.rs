@@ -45,7 +45,14 @@ pub struct GpuInstanceGeometryIds {
     index_buffer_offset: u32,
     triangle_count: u32,
     user_tag: u32,
+    /// [`NO_MESH_METADATA`] for meshes without allocator metadata.
+    metadata_buffer_id: u32,
+    metadata_offset: u32,
 }
+
+/// The `metadata_buffer_id` of meshes without allocator metadata, whose attributes are all
+/// uncompressed.
+const NO_MESH_METADATA: u32 = u32::MAX;
 
 /// A world-from-local affine transform, stored transposed as three rows.
 #[derive(Clone, Copy, Default, PartialEq, Pod, Zeroable)]
@@ -116,8 +123,17 @@ struct Instance {
     source: InstanceSource,
     material: AssetId<StandardMaterial>,
     opacity: BlasOpacity,
-    buffers: Option<(BufferId, BufferId, BufferId)>,
+    buffers: Option<InstanceBuffers>,
     geometry: Option<GeometryKey>,
+}
+
+/// The buffers an instance holds slots for in the binding arrays.
+#[derive(Clone, Copy)]
+struct InstanceBuffers {
+    vertex: BufferId,
+    previous_vertex: BufferId,
+    index: BufferId,
+    metadata: Option<BufferId>,
 }
 
 impl Instance {
@@ -134,6 +150,7 @@ impl Instance {
 pub struct InstanceState {
     pub vertex_buffers: RetainedBindingArray<BufferId, Buffer>,
     pub index_buffers: RetainedBindingArray<BufferId, Buffer>,
+    pub metadata_buffers: RetainedBindingArray<BufferId, Buffer>,
     pub transforms: AtomicSparseBufferVec<GpuTransform>,
     pub previous_frame_transforms: AtomicSparseBufferVec<GpuTransform>,
     pub geometry_ids: AtomicSparseBufferVec<GpuInstanceGeometryIds>,
@@ -145,7 +162,7 @@ pub struct InstanceState {
     pub slots: IndexAllocator,
     /// Slab buffer references dropped this frame, released next frame since the previous frame's
     /// TLAS can still reach them through `geometry_ids`.
-    retired_buffers: Vec<(BufferId, BufferId, BufferId)>,
+    retired_buffers: Vec<InstanceBuffers>,
     records: EntityHashMap<Instance>,
     pub live_count: u32,
     pub pending_refresh: EntityHashSet,
@@ -165,6 +182,7 @@ impl InstanceState {
         Self {
             vertex_buffers: RetainedBindingArray::new(),
             index_buffers: RetainedBindingArray::new(),
+            metadata_buffers: RetainedBindingArray::new(),
             transforms: storage_buffer("solari_transforms"),
             previous_frame_transforms: storage_buffer("solari_previous_frame_transforms"),
             geometry_ids: storage_buffer("solari_geometry_ids"),
@@ -198,12 +216,13 @@ impl InstanceState {
     /// advances only after the previous table was consumed, matching [`LightState::begin_frame`].
     pub fn begin_frame(&mut self, translations_consumed: bool) {
         self.slots.recycle_retired();
-        for (vertex_key, previous_vertex_key, index_key) in
-            core::mem::take(&mut self.retired_buffers)
-        {
-            self.vertex_buffers.release(&vertex_key);
-            self.vertex_buffers.release(&previous_vertex_key);
-            self.index_buffers.release(&index_key);
+        for buffers in core::mem::take(&mut self.retired_buffers) {
+            self.vertex_buffers.release(&buffers.vertex);
+            self.vertex_buffers.release(&buffers.previous_vertex);
+            self.index_buffers.release(&buffers.index);
+            if let Some(metadata) = buffers.metadata {
+                self.metadata_buffers.release(&metadata);
+            }
         }
 
         for index in core::mem::take(&mut self.nonidentity_translations) {
@@ -330,6 +349,9 @@ struct ResolvedGeometry<'a> {
     index_buffer: &'a Buffer,
     index_buffer_offset: u32,
     triangle_count: u32,
+    /// The buffer and element offset of the mesh's allocator metadata, which describes how its
+    /// vertices are compressed. `None` for uncompressed vertices.
+    metadata: Option<(&'a Buffer, u32)>,
     blas_address: u64,
 }
 
@@ -505,6 +527,10 @@ impl InstanceState {
                     index_buffer: index_slice.buffer,
                     index_buffer_offset: index_slice.range.start,
                     triangle_count: (index_slice.range.len() / 3) as u32,
+                    metadata: inputs
+                        .mesh_allocator
+                        .mesh_metadata_slice(&mesh)
+                        .map(|slice| (slice.buffer, slice.range.start)),
                     blas_address: inputs
                         .blas_manager
                         .device_address(&BlasKey { mesh, opacity })?,
@@ -521,6 +547,7 @@ impl InstanceState {
                     index_buffer: &buffers.index_buffer,
                     index_buffer_offset: 0,
                     triangle_count: buffers.index_count / 3,
+                    metadata: None,
                     blas_address: inputs.geometry_blas_manager.device_address(&entity)?,
                 })
             }
@@ -580,19 +607,24 @@ impl InstanceState {
             return false;
         };
 
-        let vertex_buffer_key = resolved.vertex_buffer.id();
-        let previous_vertex_buffer_key = resolved.previous_vertex_buffer.id();
-        let index_buffer_key = resolved.index_buffer.id();
+        let buffers = InstanceBuffers {
+            vertex: resolved.vertex_buffer.id(),
+            previous_vertex: resolved.previous_vertex_buffer.id(),
+            index: resolved.index_buffer.id(),
+            metadata: resolved.metadata.map(|(buffer, _)| buffer.id()),
+        };
         let capacity = MAX_MESH_SLAB_COUNT.get();
         let has_room = |state: &Self| {
-            let required_vertex_slots =
-                u32::from(!state.vertex_buffers.contains(&vertex_buffer_key))
-                    + u32::from(
-                        previous_vertex_buffer_key != vertex_buffer_key
-                            && !state.vertex_buffers.contains(&previous_vertex_buffer_key),
-                    );
+            let required_vertex_slots = u32::from(!state.vertex_buffers.contains(&buffers.vertex))
+                + u32::from(
+                    buffers.previous_vertex != buffers.vertex
+                        && !state.vertex_buffers.contains(&buffers.previous_vertex),
+                );
             state.vertex_buffers.vacancies(capacity) >= required_vertex_slots
-                && state.index_buffers.has_room(&index_buffer_key, capacity)
+                && state.index_buffers.has_room(&buffers.index, capacity)
+                && buffers
+                    .metadata
+                    .is_none_or(|key| state.metadata_buffers.has_room(&key, capacity))
         };
         if !has_room(self) {
             // Replacing this instance's buffers may free the slots it needs.
@@ -611,34 +643,37 @@ impl InstanceState {
         let previous_buffers = instance.buffers.take();
         let vertex_buffer_id = self
             .vertex_buffers
-            .acquire(vertex_buffer_key, capacity, || {
-                resolved.vertex_buffer.clone()
-            })
+            .acquire(buffers.vertex, capacity, || resolved.vertex_buffer.clone())
             .expect("vertex slab binding array had room but handed out no slot");
         let previous_vertex_buffer_id = self
             .vertex_buffers
-            .acquire(previous_vertex_buffer_key, capacity, || {
+            .acquire(buffers.previous_vertex, capacity, || {
                 resolved.previous_vertex_buffer.clone()
             })
             .expect("vertex slab binding array had room but handed out no slot");
         let index_buffer_id = self
             .index_buffers
-            .acquire(index_buffer_key, capacity, || resolved.index_buffer.clone())
+            .acquire(buffers.index, capacity, || resolved.index_buffer.clone())
             .expect("index slab binding array had room but handed out no slot");
-        instance.buffers = Some((
-            vertex_buffer_key,
-            previous_vertex_buffer_key,
-            index_buffer_key,
-        ));
+        let (metadata_buffer_id, metadata_offset) = match resolved.metadata {
+            Some((buffer, offset)) => (
+                self.metadata_buffers
+                    .acquire(buffer.id(), capacity, || buffer.clone())
+                    .expect("metadata slab binding array had room but handed out no slot"),
+                offset,
+            ),
+            None => (NO_MESH_METADATA, 0),
+        };
+        instance.buffers = Some(buffers);
         self.release_buffers(previous_buffers);
 
         let triangle_count = resolved.triangle_count;
         let geometry = GeometryKey {
             topology_generation,
             source: instance.source,
-            vertex_buffer: vertex_buffer_key,
+            vertex_buffer: buffers.vertex,
             vertex_buffer_offset: resolved.vertex_buffer_offset,
-            index_buffer: index_buffer_key,
+            index_buffer: buffers.index,
             index_buffer_offset: resolved.index_buffer_offset,
             triangle_count,
         };
@@ -653,6 +688,8 @@ impl InstanceState {
                 index_buffer_offset: resolved.index_buffer_offset,
                 triangle_count,
                 user_tag,
+                metadata_buffer_id,
+                metadata_offset,
             },
         );
         self.material_ids.grow_and_set(slot, material_slot);
@@ -730,7 +767,7 @@ impl InstanceState {
         self.release_buffers(instance.buffers.take());
     }
 
-    fn release_buffers(&mut self, buffers: Option<(BufferId, BufferId, BufferId)>) {
+    fn release_buffers(&mut self, buffers: Option<InstanceBuffers>) {
         self.retired_buffers.extend(buffers);
     }
 
@@ -804,9 +841,11 @@ mod tests {
             index_buffer_offset: 5,
             triangle_count: 27,
             user_tag: 0xABCD_0001,
+            metadata_buffer_id: 6,
+            metadata_offset: 7,
         };
-        let words: [u32; 7] = bytemuck::cast(ids);
-        assert_eq!(words, [1, 2, 3, 4, 5, 27, 0xABCD_0001]);
+        let words: [u32; 9] = bytemuck::cast(ids);
+        assert_eq!(words, [1, 2, 3, 4, 5, 27, 0xABCD_0001, 6, 7]);
     }
 
     #[test]
