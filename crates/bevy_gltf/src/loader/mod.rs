@@ -1436,6 +1436,7 @@ fn load_material(
     // Parse the `KHR_materials_specular` extension data if necessary.
     let specular =
         SpecularExtension::parse(material, textures, asset_path.clone()).unwrap_or_default();
+    let [tint_r, tint_g, tint_b] = specular.specular_tint();
 
     // We need to operate in the Linear color space and be willing to exceed 1.0 in our channels
     let base_emissive = LinearRgba::rgb(emissive[0], emissive[1], emissive[2]);
@@ -1505,18 +1506,12 @@ fn load_material(
         anisotropy_channel: anisotropy.anisotropy_channel,
         #[cfg(feature = "pbr_anisotropy_texture")]
         anisotropy_texture: anisotropy.anisotropy_texture,
-        // From the `KHR_materials_specular` spec:
-        // <https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_materials_specular#materials-with-reflectance-parameter>
-        reflectance: specular.specular_factor * 0.5,
+        reflectance: specular.reflectance(ior),
         #[cfg(feature = "pbr_specular_textures")]
         specular_channel: specular.specular_channel,
         #[cfg(feature = "pbr_specular_textures")]
         specular_texture: specular.specular_texture,
-        specular_tint: Color::linear_rgb(
-            specular.specular_color_factor[0],
-            specular.specular_color_factor[1],
-            specular.specular_color_factor[2],
-        ),
+        specular_tint: Color::linear_rgb(tint_r, tint_g, tint_b),
         #[cfg(feature = "pbr_specular_textures")]
         specular_tint_channel: specular.specular_color_channel,
         #[cfg(feature = "pbr_specular_textures")]
@@ -2134,6 +2129,7 @@ mod test {
         },
         AssetApp, AssetLoader, AssetPlugin, AssetServer, Assets, Handle, LoadContext, LoadState,
     };
+    use bevy_color::LinearRgba;
     use bevy_ecs::{resource::Resource, world::World};
     use bevy_image::{Image, ImageLoaderSettings};
     use bevy_log::LogPlugin;
@@ -2242,6 +2238,56 @@ mod test {
         assert_eq!(gltf_node.index, 0, "Correct index");
         assert_eq!(gltf_node.children.len(), 0, "No children");
         assert_eq!(gltf_node.asset_label(), GltfAssetLabel::Node(0));
+    }
+
+    #[test]
+    fn specular_and_ior_set_f0() {
+        let gltf_path = "test.gltf";
+        let app = load_gltf_into_app(
+            gltf_path,
+            r#"
+{
+    "asset": { "version": "2.0" },
+    "extensionsUsed": ["KHR_materials_ior", "KHR_materials_specular"],
+    "materials": [
+        { "extensions": { "KHR_materials_ior": { "ior": 1.45 } } },
+        {
+            "extensions": {
+                "KHR_materials_specular": {
+                    "specularFactor": 0.2,
+                    "specularColorFactor": [0.25, 1.0, 1.0]
+                }
+            }
+        },
+        {
+            "extensions": {
+                "KHR_materials_ior": { "ior": 2.0 },
+                "KHR_materials_specular": { "specularFactor": 0.5 }
+            }
+        }
+    ]
+}
+"#,
+        );
+        let asset_server = app.world().resource::<AssetServer>();
+        let handle: Handle<Gltf> = asset_server.load(gltf_path);
+        let gltf = app.world().resource::<Assets<Gltf>>().get(&handle).unwrap();
+        let materials = app.world().resource::<Assets<GltfMaterial>>();
+
+        // (ior, specularFactor, specularColorFactor red channel)
+        let cases = [(1.45, 1.0, 1.0), (1.5, 0.2, 0.25), (2.0, 0.5, 1.0)];
+        for (handle, (ior, factor, color)) in gltf.materials.iter().zip(cases) {
+            let material = materials.get(handle).unwrap();
+            let r = (ior - 1.0) / (ior + 1.0);
+            let expected = r * r * factor * color;
+            // Bevy's dielectric F0, from `calculate_F0_dielectric`.
+            let x = material.reflectance * LinearRgba::from(material.specular_tint).red;
+            let f0 = 0.16 * x * x;
+            assert!(
+                (f0 - expected).abs() < 1e-6,
+                "ior {ior}, specularFactor {factor}: F0 {f0}, expected {expected}"
+            );
+        }
     }
 
     #[test]

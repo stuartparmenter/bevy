@@ -43,7 +43,12 @@ pub struct GltfMaterial {
     /// Metallic and roughness maps, stored as a single texture.
     pub metallic_roughness_texture: Option<Handle<Image>>,
 
-    /// Specular intensity for non-metals on a linear scale of `[0.0, 1.0]`.
+    /// Specular intensity for non-metals, on the scale of
+    /// `StandardMaterial::reflectance`.
+    ///
+    /// Derived from the IOR and `KHR_materials_specular` `specularFactor`, so it
+    /// already includes the F0 of the IOR. It exceeds 1.0 for an IOR above about
+    /// 2.33 or an IOR of 0.
     pub reflectance: f32,
 
     /// The UV channel to use for the [`GltfMaterial::specular_texture`].
@@ -56,6 +61,9 @@ pub struct GltfMaterial {
 
     /// A color with which to modulate the [`GltfMaterial::reflectance`] for
     /// non-metals.
+    ///
+    /// F0 scales by the square of this tint, so it holds the square root of the
+    /// `KHR_materials_specular` `specularColorFactor`.
     pub specular_tint: Color,
 
     /// The UV channel to use for the

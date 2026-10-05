@@ -4,7 +4,7 @@ use super::{
     StandardMaterialAssets,
 };
 use bevy_asset::AssetId;
-use bevy_color::{ColorToComponents, LinearRgba};
+use bevy_color::{ColorToComponents, LinearRgba, Luminance};
 use bevy_image::Image;
 use bevy_material::AlphaMode;
 use bevy_math::{Mat2, Vec2, Vec3};
@@ -243,7 +243,10 @@ impl AssetState {
                 perceptual_roughness: material.perceptual_roughness.clamp(0.0, 1.0),
                 emissive,
                 metallic: material.metallic.clamp(0.0, 1.0),
-                reflectance: material.reflectance,
+                // Solari has no specular tint, so fold its luminance into
+                // reflectance, as the deferred G-buffer does.
+                reflectance: material.reflectance
+                    * LinearRgba::from(material.specular_tint).luminance(),
                 flags,
                 uv_translation: material.uv_transform.translation,
                 uv_transform: material.uv_transform.matrix2,

@@ -273,9 +273,9 @@ pbr_input.material.uv_transform = uv_transform;
             let specular = textureSampleGrad(texture, sampler_, coords, bias.ddx_uv, bias.ddy_uv).a;
             @else
             let specular = textureSampleBias(texture, sampler_, coords, bias.mip_bias).a;
-            // This 0.5 factor is from the `KHR_materials_specular` specification:
-            // <https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_materials_specular#materials-with-reflectance-parameter>
-            pbr_input.material.reflectance *= specular * 0.5;
+            // F0 is quadratic in reflectance, so the square root scales F0
+            // linearly, as `KHR_materials_specular` specifies.
+            pbr_input.material.reflectance *= sqrt(specular);
         }
 
         // Specular tint texture
@@ -296,7 +296,7 @@ pbr_input.material.uv_transform = uv_transform;
             let specular_tint = textureSampleGrad(texture, sampler_, coords, bias.ddx_uv, bias.ddy_uv).rgb;
             @else
             let specular_tint = textureSampleBias(texture, sampler_, coords, bias.mip_bias).rgb;
-            pbr_input.material.reflectance *= specular_tint;
+            pbr_input.material.reflectance *= sqrt(specular_tint);
         }
 
 }

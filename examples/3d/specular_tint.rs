@@ -223,9 +223,6 @@ fn toggle_specular_map(
                 material.specular_tint_texture = None;
             }
             TintType::Map => {
-                // Set reflectance to 2.0 to spread out the map's reflectance
-                // range from the default [0.0, 0.5] to [0.0, 1.0].
-                material.reflectance = 2.0;
                 // As the tint map is multiplied by the tint color, we set the
                 // latter to white so that only the map has an effect.
                 material.specular_tint = WHITE.into();

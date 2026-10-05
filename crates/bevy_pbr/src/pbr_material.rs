@@ -453,15 +453,11 @@ pub struct StandardMaterial {
 
     /// A map that specifies reflectance for non-metallic materials.
     ///
-    /// Alpha values from [0.0, 1.0] in this texture are linearly mapped to
-    /// reflectance values of [0.0, 0.5] and multiplied by the constant
-    /// [`StandardMaterial::reflectance`] value. This follows the
-    /// `KHR_materials_specular` specification. The map will have no effect if
-    /// the material is fully metallic.
-    ///
-    /// When using this map, you may wish to set the
-    /// [`StandardMaterial::reflectance`] value to 2.0 so that this map can
-    /// express the full [0.0, 1.0] range of values.
+    /// The alpha channel scales the F0 derived from
+    /// [`StandardMaterial::reflectance`] linearly, as the
+    /// `KHR_materials_specular` specification defines it: 1.0 leaves F0
+    /// unchanged and 0.0 removes the specular reflection. The map will have no
+    /// effect if the material is fully metallic.
     ///
     /// Note that, because the reflectance is stored in the alpha channel, and
     /// the [`StandardMaterial::specular_tint_texture`] has no alpha value, it
@@ -483,9 +479,9 @@ pub struct StandardMaterial {
     /// A map that specifies color adjustment to be applied to the specular
     /// reflection for non-metallic materials.
     ///
-    /// The RGB values of this texture modulate the
-    /// [`StandardMaterial::specular_tint`] value. See the documentation for
-    /// that field for more information.
+    /// The RGB channels scale F0 linearly, as the `KHR_materials_specular`
+    /// specification defines it. [`StandardMaterial::specular_tint`] instead
+    /// scales reflectance, so F0 scales by its square.
     ///
     /// Like the fixed specular tint value, this texture map isn't supported in
     /// the deferred renderer.
