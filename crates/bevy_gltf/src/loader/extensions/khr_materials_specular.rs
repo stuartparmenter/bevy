@@ -8,8 +8,11 @@ use {crate::loader::gltf_ext::material::uv_channel, bevy_mesh::UvChannel};
 
 /// Parsed data from the `KHR_materials_specular` extension.
 ///
-/// We currently don't parse `specularFactor` and `specularTexture`, since
-/// they're incompatible with Filament.
+/// The extension defines a dielectric F0 that is linear in both factors,
+/// `F0 = 0.04 * specularColorFactor * specularFactor` at the default IOR of
+/// 1.5, while Bevy (like Filament) derives it quadratically from reflectance,
+/// `F0 = 0.16 * (reflectance * specular_tint)^2`. [`Self::reflectance`] and
+/// [`Self::specular_tint`] convert the factors so the two agree.
 ///
 /// Note that the map is a *specular map*, not a *reflectance map*. In Bevy and
 /// Filament terms, the reflectance values in the specular map range from [0.0,
@@ -53,6 +56,22 @@ impl Default for SpecularExtension {
 }
 
 impl SpecularExtension {
+    /// The [`StandardMaterial::reflectance`] whose F0 equals the extension's
+    /// `0.04 * specularFactor`: `sqrt(0.04 * specularFactor / 0.16)`.
+    ///
+    /// [`StandardMaterial::reflectance`]: https://docs.rs/bevy/latest/bevy/pbr/struct.StandardMaterial.html#structfield.reflectance
+    pub(crate) fn reflectance(&self) -> f32 {
+        0.5 * self.specular_factor.max(0.0).sqrt()
+    }
+
+    /// The linear [`StandardMaterial::specular_tint`] whose square scales F0
+    /// by `specularColorFactor`, per channel.
+    ///
+    /// [`StandardMaterial::specular_tint`]: https://docs.rs/bevy/latest/bevy/pbr/struct.StandardMaterial.html#structfield.specular_tint
+    pub(crate) fn specular_tint(&self) -> [f32; 3] {
+        self.specular_color_factor.map(|c| c.max(0.0).sqrt())
+    }
+
     #[expect(
         clippy::allow_attributes,
         reason = "`unused_variables` is not always linted"
@@ -106,5 +125,40 @@ impl SpecularExtension {
             #[cfg(feature = "pbr_specular_textures")]
             specular_color_texture: _specular_color_texture,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SpecularExtension;
+
+    /// Bevy's dielectric F0 for a reflectance and a specular tint channel.
+    fn bevy_f0(reflectance: f32, tint: f32) -> f32 {
+        let r = reflectance * tint;
+        0.16 * r * r
+    }
+
+    #[test]
+    fn f0_matches_the_extension() {
+        let mut ext = SpecularExtension::default();
+        for factor in [0.0, 0.1, 0.15, 0.2, 0.5, 1.0] {
+            for color in [0.0, 0.25, 1.0, 2.0] {
+                ext.specular_factor = factor;
+                ext.specular_color_factor = [color, 1.0, 0.5];
+                let f0 = bevy_f0(ext.reflectance(), ext.specular_tint()[0]);
+                let expected = 0.04 * color * factor;
+                assert!(
+                    (f0 - expected).abs() < 1e-6,
+                    "specularFactor {factor}, specularColorFactor {color}: F0 {f0}, expected {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn defaults_keep_bevy_default_reflectance() {
+        let ext = SpecularExtension::default();
+        assert_eq!(ext.reflectance(), 0.5);
+        assert_eq!(ext.specular_tint(), [1.0; 3]);
     }
 }

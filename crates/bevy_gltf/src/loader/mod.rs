@@ -1531,6 +1531,8 @@ fn load_material(
     // Parse the `KHR_materials_specular` extension data if necessary.
     let specular =
         SpecularExtension::parse(material, textures, asset_path.clone()).unwrap_or_default();
+    let reflectance = specular.reflectance();
+    let [tint_r, tint_g, tint_b] = specular.specular_tint();
 
     // We need to operate in the Linear color space and be willing to exceed 1.0 in our channels
     let base_emissive = LinearRgba::rgb(emissive[0], emissive[1], emissive[2]);
@@ -1600,18 +1602,12 @@ fn load_material(
         anisotropy_channel: anisotropy.anisotropy_channel,
         #[cfg(feature = "pbr_anisotropy_texture")]
         anisotropy_texture: anisotropy.anisotropy_texture,
-        // From the `KHR_materials_specular` spec:
-        // <https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_materials_specular#materials-with-reflectance-parameter>
-        reflectance: specular.specular_factor * 0.5,
+        reflectance,
         #[cfg(feature = "pbr_specular_textures")]
         specular_channel: specular.specular_channel,
         #[cfg(feature = "pbr_specular_textures")]
         specular_texture: specular.specular_texture,
-        specular_tint: Color::linear_rgb(
-            specular.specular_color_factor[0],
-            specular.specular_color_factor[1],
-            specular.specular_color_factor[2],
-        ),
+        specular_tint: Color::linear_rgb(tint_r, tint_g, tint_b),
         #[cfg(feature = "pbr_specular_textures")]
         specular_tint_channel: specular.specular_color_channel,
         #[cfg(feature = "pbr_specular_textures")]
