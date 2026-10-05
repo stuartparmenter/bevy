@@ -40,7 +40,7 @@
 mod log;
 mod process;
 
-use async_lock::RwLockReadGuardArc;
+use async_lock::{RwLockReadGuardArc, Semaphore};
 pub use log::*;
 pub use process::*;
 
@@ -78,6 +78,12 @@ use {
     alloc::string::ToString,
     tracing::{info_span, instrument::Instrument},
 };
+
+/// Bounds how many processing tasks perform their own source and destination I/O at once.
+///
+/// Every source asset gets its own processing task, so without a bound each of them can hold open
+/// files and read buffers at the same time.
+static PROCESS_IO_LIMITER: Semaphore = Semaphore::new(64);
 
 /// A "background" asset processor that reads asset values from a source [`AssetSource`] (which corresponds to an [`AssetReader`](crate::io::AssetReader) / [`AssetWriter`](crate::io::AssetWriter) pair),
 /// processes them in some way, and writes them to a destination [`AssetSource`].
@@ -1050,6 +1056,12 @@ impl AssetProcessor {
             err,
         };
 
+        // Held for this task's own I/O and released before `Process::process`, which can wait on
+        // other processing tasks: nested loads read processed assets through
+        // `ProcessorGatedReader`, which waits until those assets finish processing. Holding a
+        // permit across that wait can deadlock once every permit belongs to a waiting task.
+        let io_permit = PROCESS_IO_LIMITER.acquire().await;
+
         let (mut source_meta, meta_bytes, processor) = match reader.read_meta_bytes(path).await {
             Ok(meta_bytes) => {
                 let minimal: AssetMetaMinimal = ron::de::from_bytes(&meta_bytes).map_err(|e| {
@@ -1179,6 +1191,7 @@ impl AssetProcessor {
             let reader_for_process = reader.read(path).await.map_err(reader_err)?;
 
             let mut writer = processed_writer.write(path).await.map_err(writer_err)?;
+            drop(io_permit);
             let mut processed_meta = {
                 let mut context = ProcessContext::new(
                     self,
