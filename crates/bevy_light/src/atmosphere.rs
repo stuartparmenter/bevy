@@ -69,11 +69,21 @@ fn set_default_transform(mut world: DeferredWorld<'_>, HookContext { entity, .. 
     }
 }
 
+/// Height of [`Atmosphere::earth`], i.e. the distance between its inner and outer radius.
+///
+/// units: m
+pub const EARTH_ATMOSPHERE_HEIGHT: f32 = 100_000.0;
+
+/// Height of [`Atmosphere::mars`], i.e. the distance between its inner and outer radius.
+///
+/// units: m
+pub const MARS_ATMOSPHERE_HEIGHT: f32 = 120_000.0;
+
 impl Atmosphere {
     /// An atmosphere like that of earth. Use this with a [`ScatteringMedium::earth`] handle.
     pub fn earth(medium: Handle<ScatteringMedium>) -> Self {
         const EARTH_INNER_RADIUS: f32 = 6_360_000.0;
-        const EARTH_OUTER_RADIUS: f32 = 6_460_000.0;
+        const EARTH_OUTER_RADIUS: f32 = EARTH_INNER_RADIUS + EARTH_ATMOSPHERE_HEIGHT;
         const EARTH_ALBEDO: Vec3 = Vec3::splat(0.3);
         Self {
             inner_radius: EARTH_INNER_RADIUS,
@@ -90,7 +100,7 @@ impl Atmosphere {
     /// [Seidelmann et al. 2007, Table 4]: https://doi.org/10.1007/s10569-007-9072-y
     pub fn mars(medium: Handle<ScatteringMedium>) -> Self {
         const MARS_INNER_RADIUS: f32 = 3_389_500.0;
-        const MARS_OUTER_RADIUS: f32 = 3_509_500.0;
+        const MARS_OUTER_RADIUS: f32 = MARS_INNER_RADIUS + MARS_ATMOSPHERE_HEIGHT;
         const MARS_ALBEDO: Vec3 = Vec3::splat(0.1);
         Self {
             inner_radius: MARS_INNER_RADIUS,
@@ -188,13 +198,50 @@ impl ScatteringMedium {
         self
     }
 
-    /// Returns a scattering medium representing an earth atmosphere.
+    /// Returns a scattering medium representing an earth atmosphere, for use with
+    /// [`Atmosphere::earth`].
     ///
-    /// Uses physically-based scale heights from Earth's atmosphere, assuming
-    /// a 60 km atmosphere height:
+    /// Uses the reference parameters of [Bruneton 2017] and [Hillaire 2020]:
     /// - Rayleigh (molecular) scattering: 8 km scale height
-    /// - Mie (aerosol) scattering: 1.2 km scale height
+    /// - Mie (aerosol) scattering: [`EarthAerosol::default`], 1.2 km scale height
+    /// - Ozone absorption: a 30 km wide layer peaking at 25 km altitude
+    ///
+    /// Use [`ScatteringMedium::earth_with_aerosol`] for hazier air.
+    ///
+    /// [Bruneton 2017]: https://ebruneton.github.io/precomputed_atmospheric_scattering/
+    /// [Hillaire 2020]: https://doi.org/10.1111/cgf.14050
     pub fn earth(falloff_resolution: u32, phase_resolution: u32) -> Self {
+        Self::earth_with_aerosol(
+            falloff_resolution,
+            phase_resolution,
+            EarthAerosol::default(),
+        )
+    }
+
+    /// Returns a scattering medium representing an earth atmosphere with the
+    /// given aerosol layer, for use with [`Atmosphere::earth`].
+    ///
+    /// The Rayleigh and ozone terms match [`ScatteringMedium::earth`].
+    ///
+    /// ```
+    /// # use bevy_light::atmosphere::{EarthAerosol, ScatteringMedium};
+    /// let continental = ScatteringMedium::earth_with_aerosol(
+    ///     256,
+    ///     256,
+    ///     EarthAerosol {
+    ///         optical_depth: 0.15,
+    ///         angstrom_exponent: 1.3,
+    ///         ..Default::default()
+    ///     },
+    /// );
+    /// ```
+    pub fn earth_with_aerosol(
+        falloff_resolution: u32,
+        phase_resolution: u32,
+        aerosol: EarthAerosol,
+    ) -> Self {
+        const RAYLEIGH_SCALE_HEIGHT: f32 = 8_000.0;
+
         Self::new(
             falloff_resolution,
             phase_resolution,
@@ -203,16 +250,13 @@ impl ScatteringMedium {
                 ScatteringTerm {
                     absorption: Vec3::ZERO,
                     scattering: Vec3::new(5.802e-6, 13.558e-6, 33.100e-6),
-                    falloff: Falloff::Exponential { scale: 8.0 / 60.0 },
+                    falloff: Falloff::Exponential {
+                        scale: RAYLEIGH_SCALE_HEIGHT / EARTH_ATMOSPHERE_HEIGHT,
+                    },
                     phase: PhaseFunction::Rayleigh,
                 },
                 // Mie scattering Term
-                ScatteringTerm {
-                    absorption: Vec3::splat(3.996e-6),
-                    scattering: Vec3::splat(0.444e-6),
-                    falloff: Falloff::Exponential { scale: 1.2 / 60.0 },
-                    phase: PhaseFunction::Mie { asymmetry: 0.8 },
-                },
+                aerosol.scattering_term(),
                 // Ozone scattering Term
                 ScatteringTerm {
                     absorption: Vec3::new(0.650e-6, 1.881e-6, 0.085e-6),
@@ -238,7 +282,6 @@ impl ScatteringMedium {
     ///
     /// [Schneegans et al. 2024]: https://doi.org/10.1111/cgf.15010
     pub fn mars(falloff_resolution: u32, phase_resolution: u32, dust_phase: Handle<Image>) -> Self {
-        const MARS_ATMOSPHERE_HEIGHT: f32 = 120_000.0;
         const RAYLEIGH_SCALE_HEIGHT: f32 = 8_000.0;
 
         // Dust density, from Fig. 8.
@@ -271,6 +314,89 @@ impl ScatteringMedium {
             ],
         )
         .with_label("mars_atmosphere")
+    }
+}
+
+/// The aerosol (Mie) layer of an earth [`ScatteringMedium`], described by the
+/// column optical properties that sun photometer networks such as [AERONET] report.
+///
+/// At wavelength `λ`, the layer's extinction coefficient at the ground is
+/// `optical_depth * (λ / 550 nm)^-angstrom_exponent / scale_height`, split into
+/// scattering and absorption by `single_scattering_albedo`. Its density falls off
+/// exponentially with altitude, so its vertical optical depth at 550 nm is
+/// `optical_depth`. The medium's RGB channels sample 680, 550 and 440 nm.
+///
+/// The [`Default`] reproduces the Mie coefficients of [Hillaire 2020] (scattering
+/// 3.996e-6 m^-1, absorption 0.444e-6 m^-1): an optical depth of 0.005328 with no
+/// wavelength dependence, far cleaner than real air.
+///
+/// [AERONET]: https://aeronet.gsfc.nasa.gov/
+/// [Hillaire 2020]: https://doi.org/10.1111/cgf.14050
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EarthAerosol {
+    /// Vertical aerosol optical depth (AOD) at 550 nm.
+    ///
+    /// Around 0.05 for clean air, 0.1 to 0.25 for typical continental air, and
+    /// above 0.5 for heavy haze, smoke or dust.
+    ///
+    /// domain: [0, ∞)
+    pub optical_depth: f32,
+    /// Ångström exponent, which sets how much more strongly the aerosol
+    /// extinguishes short wavelengths than long ones.
+    ///
+    /// Around 1.3 for continental aerosol, below 0.5 for coarse particles such
+    /// as sea salt and desert dust, and up to 2 for fine smoke. Zero gives
+    /// wavelength-independent, grey haze.
+    pub angstrom_exponent: f32,
+    /// Single-scattering albedo, the fraction of extinction that is scattering
+    /// rather than absorption.
+    ///
+    /// Around 0.9 for continental aerosol, lower for soot-rich smoke.
+    ///
+    /// domain: [0, 1]
+    pub single_scattering_albedo: f32,
+    /// Asymmetry of the layer's [`PhaseFunction::Mie`].
+    ///
+    /// domain: [-1, 1]
+    pub asymmetry: f32,
+    /// Scale height of the layer's exponential density falloff.
+    ///
+    /// units: m
+    pub scale_height: f32,
+}
+
+impl Default for EarthAerosol {
+    fn default() -> Self {
+        Self {
+            optical_depth: 0.005328,
+            angstrom_exponent: 0.0,
+            single_scattering_albedo: 0.9,
+            asymmetry: 0.8,
+            scale_height: 1_200.0,
+        }
+    }
+}
+
+impl EarthAerosol {
+    /// Wavelengths sampled by the RGB channels of a [`ScatteringMedium`].
+    ///
+    /// units: nm
+    const RGB_WAVELENGTHS: Vec3 = Vec3::new(680.0, 550.0, 440.0);
+
+    fn scattering_term(&self) -> ScatteringTerm {
+        let spectral =
+            (Self::RGB_WAVELENGTHS / 550.0).map(|x| ops::powf(x, -self.angstrom_exponent));
+        let extinction = spectral * (self.optical_depth / self.scale_height);
+        ScatteringTerm {
+            absorption: extinction * (1.0 - self.single_scattering_albedo),
+            scattering: extinction * self.single_scattering_albedo,
+            falloff: Falloff::Exponential {
+                scale: self.scale_height / EARTH_ATMOSPHERE_HEIGHT,
+            },
+            phase: PhaseFunction::Mie {
+                asymmetry: self.asymmetry,
+            },
+        }
     }
 }
 
@@ -332,11 +458,13 @@ pub enum Falloff {
     /// When paired with an absolute "falloff distance" like the distance from
     /// Earth's surface to the edge of space, this is analogous to the "height
     /// scale" value common in atmospheric scattering literature, though it will
-    /// diverge from this for large or negative `scale` values.
+    /// diverge from this for large or negative `scale` values. For an
+    /// [`Atmosphere`], `scale` is the scale height divided by
+    /// `outer_radius - inner_radius`.
     ///
     /// f(1) = 1
     /// f(0) = 0
-    /// f(p) = (e^((1-p)/s) - e^(1/s))/(e - e^(1/s))
+    /// f(p) = (e^(-(1-p)/s) - e^(-1/s))/(1 - e^(-1/s))
     Exponential {
         /// The "scale" of the exponential falloff. Values closer to zero will
         /// produce steeper falloff, and values farther from zero will produce
@@ -608,5 +736,53 @@ pub fn extract_chromatic_phase_textures(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_rel_eq(actual: Vec3, expected: Vec3, tolerance: f32) {
+        let error = ((actual - expected) / expected).abs().max_element();
+        assert!(
+            error <= tolerance,
+            "{actual} != {expected} (relative error {error})"
+        );
+    }
+
+    #[test]
+    fn earth_mie_term_matches_reference_coefficients() {
+        let medium = ScatteringMedium::earth(16, 16);
+        let term = &medium.terms[1];
+        assert_rel_eq(term.scattering, Vec3::splat(3.996e-6), 1e-6);
+        assert_rel_eq(term.absorption, Vec3::splat(0.444e-6), 1e-6);
+    }
+
+    #[test]
+    fn earth_aerosol_column_optical_depth() {
+        const SAMPLES: u32 = 100_000;
+
+        let aerosol = EarthAerosol {
+            optical_depth: 0.15,
+            angstrom_exponent: 1.3,
+            ..Default::default()
+        };
+        let term = aerosol.scattering_term();
+        let extinctions = term.scattering + term.absorption;
+        let extinction = extinctions.y;
+
+        let blue_to_red = ops::powf(440.0 / 680.0, -aerosol.angstrom_exponent);
+        assert!((extinctions.z / extinctions.x / blue_to_red - 1.0).abs() < 1e-5);
+        assert!((term.scattering.y / extinction - aerosol.single_scattering_albedo).abs() < 1e-6);
+
+        let column = (0..SAMPLES)
+            .map(|i| term.falloff.sample((i as f32 + 0.5) / SAMPLES as f32))
+            .sum::<f32>()
+            * EARTH_ATMOSPHERE_HEIGHT
+            / SAMPLES as f32;
+
+        assert!((column / aerosol.scale_height - 1.0).abs() < 1e-3);
+        assert!((extinction * column / aerosol.optical_depth - 1.0).abs() < 1e-3);
     }
 }
