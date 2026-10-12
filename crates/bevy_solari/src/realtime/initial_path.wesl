@@ -7,8 +7,8 @@ import package::realtime::presample_light_tiles::unpack_resolved_light_sample;
 import package::realtime::bindings::{empty_reservoir, light_tile_resolved_samples, light_tile_samples, NO_SAMPLE_POINT_INSTANCE, Reservoir, constants, view};
 import package::realtime::atmosphere::calculate_light_contribution;
 import package::scene::sampling::{isinf, LightSample, NULL_LIGHT_ID, power_heuristic, trace_visibility_from_surface, sample_environment_map_light};
-import package::scene::bindings::{light_sources, MIRROR_ROUGHNESS_THRESHOLD, RAY_T_MAX, RAY_T_MIN, resolve_ray_hit_full, ResolvedMaterial, ResolvedRayHitFull, trace_ray, offset_surface_ray_origin};
-import package::realtime::world_cache_query::{get_cell_size, query_world_cache, WORLD_CACHE_CELL_LIFETIME};
+import package::scene::bindings::{light_sources, MIRROR_ROUGHNESS_THRESHOLD, NORMAL_OFFSET_ORIGIN, RAY_T_MAX, RAY_T_MIN, resolve_ray_hit_full, ResolvedMaterial, ResolvedRayHitFull, trace_ray, offset_surface_ray_origin};
+import package::realtime::world_cache_query::{get_cell_size, query_world_cache_diffuse, WORLD_CACHE_CELL_LIFETIME};
 
 @if(DLSS_RR_GUIDE_BUFFERS)
 import package::realtime::resolve_dlss_rr_textures::{is_delta_mirror, primary_surface_glossy, psr_bounce_reflectance, psr_chain_mirror, psr_environment_miss, psr_init, replace_primary_surface};
@@ -184,8 +184,8 @@ fn generate_initial_path(ray_origin: vec3<f32>, geometric_normal: vec4<f32>, wor
         }
 
         // Advance to the next vertex
-        path.ray_origin = ray_hit.world_position + (ray_hit.geometric_world_normal * RAY_T_MIN);
-        path.geometric_normal = vec4(0.0); // Hit vertices use the ordinary origin policy
+        path.ray_origin = ray_hit.world_position;
+        path.geometric_normal = vec4(ray_hit.geometric_world_normal, NORMAL_OFFSET_ORIGIN);
         path.normal = ray_hit.world_normal;
         path.wo = -next_bounce.wi;
         path.material = ray_hit.material;
@@ -311,7 +311,7 @@ fn sample_light_ris(ray_origin: vec3<f32>, normal: vec3<f32>, wo: vec3<f32>, mat
     for (var i = 0u; i < di_samples; i++) {
         let tile_sample = light_tile_start + rand_range_u(1024u, rng);
         let resolved_light_sample = unpack_resolved_light_sample(light_tile_resolved_samples[tile_sample], view.exposure);
-        let light_contribution = calculate_light_contribution(resolved_light_sample, ray_origin, normal);
+        let light_contribution = calculate_light_contribution(resolved_light_sample, ray_origin, normal, material.diffuse_transmission > 0.0);
         let brdf_current = evaluate_brdf(wo, light_contribution.wi, normal, material, F_ab);
         let brdf_radiance = brdf_current * light_contribution.radiance;
 
@@ -454,7 +454,7 @@ fn terminate_into_cache(
     let world_cache_cell_size = get_cell_size(ray_hit.world_position, view.world_position, ray_t, &rng_copy);
     if ray_t <= sqrt(3.0) * world_cache_cell_size { return false; }
 
-    let cached_radiance = query_world_cache(ray_hit.world_position, ray_hit.geometric_world_normal, view.world_position, ray_t, WORLD_CACHE_CELL_LIFETIME, rng);
+    let cached_radiance = query_world_cache_diffuse(ray_hit.world_position, ray_hit.geometric_world_normal, ray_hit.material.diffuse_transmission, view.world_position, ray_t, WORLD_CACHE_CELL_LIFETIME, rng);
 
     let cache_outgoing = (ray_hit.material.base_color / PI) * cached_radiance;
     let cache_L_at_reconnection = (*path).throughput_past_first_hit * cache_outgoing;

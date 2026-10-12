@@ -3,7 +3,7 @@ import bevy_pbr::render::utils::{rand_f, rand_vec2f};
 import bevy_render::view::View;
 import package::scene::brdf::{evaluate_brdf, evaluate_and_sample_brdf, brdf_pdf, F_AB};
 import package::scene::sampling::{sample_random_light, random_emissive_light_pdf, power_heuristic, sample_environment_map_light};
-import package::scene::bindings::{trace_ray, resolve_ray_hit_full, RAY_T_MIN, RAY_T_MAX, MIRROR_ROUGHNESS_THRESHOLD};
+import package::scene::bindings::{trace_ray, resolve_ray_hit_full, offset_ray_origin_along_normal, RAY_T_MIN, RAY_T_MAX, MIRROR_ROUGHNESS_THRESHOLD};
 
 enable wgpu_ray_query;
 
@@ -75,7 +75,7 @@ fn pathtrace(@builtin(global_invocation_id) global_id: vec3<u32>) {
             let next_bounce = evaluate_and_sample_brdf(wo, ray_hit.world_normal, ray_hit.material, F_ab, &rng);
             if next_bounce.pdf == 0.0 { break; }
             ray_direction = next_bounce.wi;
-            ray_origin = ray_hit.world_position + (ray_hit.geometric_world_normal * RAY_T_MIN);
+            ray_origin = offset_ray_origin_along_normal(ray_hit.world_position, ray_hit.geometric_world_normal, ray_direction);
             ray_t_min = RAY_T_MIN;
             p_bounce = next_bounce.pdf;
             throughput *= next_bounce.throughput;

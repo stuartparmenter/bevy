@@ -5,7 +5,7 @@ import package::realtime::presample_light_tiles::unpack_resolved_light_sample;
 import package::realtime::atmosphere::calculate_light_contribution;
 import package::scene::sampling::{trace_visibility, sample_environment_map_light};
 import package::scene::bindings::{trace_ray, resolve_ray_hit_full, RAY_T_MIN};
-import package::realtime::world_cache_query::query_world_cache;
+import package::realtime::world_cache_query::query_world_cache_diffuse;
 import package::realtime::bindings::{
     light_tile_resolved_samples,
     view,
@@ -45,7 +45,7 @@ fn sample_gi(@builtin(workgroup_id) workgroup_id: vec3<u32>, @builtin(global_inv
     if ray.kind != RAY_QUERY_INTERSECTION_NONE {
         let ray_hit = resolve_ray_hit_full(ray);
         let cell_life = atomicLoad(&world_cache.life[cell_index]);
-        let radiance = query_world_cache(ray_hit.world_position, ray_hit.geometric_world_normal, view.world_position, ray.t, cell_life, &rng);
+        let radiance = query_world_cache_diffuse(ray_hit.world_position, ray_hit.geometric_world_normal, ray_hit.material.diffuse_transmission, view.world_position, ray.t, cell_life, &rng);
         world_cache.active_cells_new_radiance[active_cell_id.x] += ray_hit.material.base_color * radiance;
     } else {
         // The ray is cut short at world_cache_max_gi_ray_distance to save on traversal costs. 
@@ -96,7 +96,7 @@ fn sample_random_light_ris(world_position: vec3<f32>, world_normal: vec3<f32>, w
     for (var i = 0u; i < constants.world_cache_direct_light_sample_count; i++) {
         let tile_sample = light_tile_start + rand_range_u(1024u, rng);
         let resolved_light_sample = unpack_resolved_light_sample(light_tile_resolved_samples[tile_sample], view.exposure);
-        let light_contribution = calculate_light_contribution(resolved_light_sample, world_position, world_normal);
+        let light_contribution = calculate_light_contribution(resolved_light_sample, world_position, world_normal, false);
 
         let contribution = light_contribution.radiance * saturate(dot(light_contribution.wi, world_normal));
         let target_function = luminance(contribution);

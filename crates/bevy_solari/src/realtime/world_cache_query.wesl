@@ -16,6 +16,15 @@ const WORLD_CACHE_MAX_SEARCH_STEPS: u32 = 3u;
 /// Marker value for an empty cell
 const WORLD_CACHE_EMPTY_CELL: u32 = 0u;
 
+/// The irradiance a diffuse surface at `world_position` receives for the side `world_normal`
+/// faces, in expectation: the cached irradiance of that side or, with probability
+/// `diffuse_transmission`, of the back side, from the cell facing `-world_normal`.
+@if(!WORLD_CACHE_NON_ATOMIC_LIFE_BUFFER)
+fn query_world_cache_diffuse(world_position: vec3<f32>, world_normal: vec3<f32>, diffuse_transmission: f32, view_position: vec3<f32>, ray_t: f32, cell_lifetime: u32, rng: ptr<function, u32>) -> vec3<f32> {
+    let transmitted = diffuse_transmission > 0.0 && rand_f(rng) < diffuse_transmission;
+    return query_world_cache(world_position, select(world_normal, -world_normal, transmitted), view_position, ray_t, cell_lifetime, rng);
+}
+
 @if(!WORLD_CACHE_NON_ATOMIC_LIFE_BUFFER)
 fn query_world_cache(world_position_in: vec3<f32>, world_normal: vec3<f32>, view_position: vec3<f32>, ray_t: f32, cell_lifetime: u32, rng: ptr<function, u32>) -> vec3<f32> {
     var world_position = world_position_in;

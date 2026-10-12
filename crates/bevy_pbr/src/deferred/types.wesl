@@ -1,17 +1,19 @@
 import package::render::{
-    mesh_types::MESH_FLAGS_SHADOW_RECEIVER_BIT,
+    mesh_types::{MESH_FLAGS_SHADOW_RECEIVER_BIT, MESH_FLAGS_TRANSMITTED_SHADOW_RECEIVER_BIT},
     pbr_types::{STANDARD_MATERIAL_FLAGS_FOG_ENABLED_BIT, STANDARD_MATERIAL_FLAGS_UNLIT_BIT},
-    rgb9e5::{vec3_to_rgb9e5_, rgb9e5_to_vec3_},
+    rgb9e5::{shared_exponent_to_vec3_, vec3_to_shared_exponent_},
 };
 
 // Maximum of 8 bits available
 const DEFERRED_FLAGS_UNLIT_BIT: u32                 = 1u << 0u;
 const DEFERRED_FLAGS_FOG_ENABLED_BIT: u32           = 1u << 1u;
 const DEFERRED_MESH_FLAGS_SHADOW_RECEIVER_BIT: u32  = 1u << 2u;
+const DEFERRED_MESH_FLAGS_TRANSMITTED_SHADOW_RECEIVER_BIT: u32 = 1u << 3u;
 
 fn deferred_flags_from_mesh_material_flags(mesh_flags: u32, mat_flags: u32) -> u32 {
     var flags = 0u;
     flags |= u32((mesh_flags & MESH_FLAGS_SHADOW_RECEIVER_BIT) != 0u) * DEFERRED_MESH_FLAGS_SHADOW_RECEIVER_BIT;
+    flags |= u32((mesh_flags & MESH_FLAGS_TRANSMITTED_SHADOW_RECEIVER_BIT) != 0u) * DEFERRED_MESH_FLAGS_TRANSMITTED_SHADOW_RECEIVER_BIT;
     flags |= u32((mat_flags & STANDARD_MATERIAL_FLAGS_FOG_ENABLED_BIT) != 0u) * DEFERRED_FLAGS_FOG_ENABLED_BIT;
     flags |= u32((mat_flags & STANDARD_MATERIAL_FLAGS_UNLIT_BIT) != 0u) * DEFERRED_FLAGS_UNLIT_BIT;
     return flags;
@@ -21,6 +23,7 @@ fn mesh_material_flags_from_deferred_flags(deferred_flags: u32) -> vec2<u32> {
     var mat_flags = 0u;
     var mesh_flags = 0u;
     mesh_flags |= u32((deferred_flags & DEFERRED_MESH_FLAGS_SHADOW_RECEIVER_BIT) != 0u) * MESH_FLAGS_SHADOW_RECEIVER_BIT;
+    mesh_flags |= u32((deferred_flags & DEFERRED_MESH_FLAGS_TRANSMITTED_SHADOW_RECEIVER_BIT) != 0u) * MESH_FLAGS_TRANSMITTED_SHADOW_RECEIVER_BIT;
     mat_flags |= u32((deferred_flags & DEFERRED_FLAGS_FOG_ENABLED_BIT) != 0u) * STANDARD_MATERIAL_FLAGS_FOG_ENABLED_BIT;
     mat_flags |= u32((deferred_flags & DEFERRED_FLAGS_UNLIT_BIT) != 0u) * STANDARD_MATERIAL_FLAGS_UNLIT_BIT;
     return vec2(mesh_flags, mat_flags);
@@ -105,18 +108,29 @@ fn unpack_unorm3x4_plus_unorm_20_(v: u32) -> vec4<f32> {
     );
 }
 
-/// `vec3_to_rgb9e5_(vec3(1.0))`.
-const RGB9E5_WHITE: u32 = 0x84020100u;
+// The deferred specular tint texture's word: the specular tint in `vec3_to_shared_exponent_`'s
+// encoding with 7-bit mantissas (bits 0-25) XORed with the encoding of white, and the diffuse
+// transmission as a 6-bit unorm in bits 26-31. White with no transmission packs to 0, so the
+// cleared texture and unwritten `FragmentOutput` fields decode to it.
+const SPECULAR_TINT_MANTISSA_BITS: u32 = 7u;
+/// `vec3_to_shared_exponent_(vec3(1.0), SPECULAR_TINT_MANTISSA_BITS)`.
+const SPECULAR_TINT_WHITE: u32 = 0x02102040u;
+const DIFFUSE_TRANSMISSION_SHIFT: u32 = 26u;
+const DIFFUSE_TRANSMISSION_MAX: f32 = 63.0;
 
-/// Packs a specular tint for the deferred specular tint texture.
-///
-/// The tint is stored as rgb9e5 XORed with the rgb9e5 encoding of white, so white packs to 0. The
-/// cleared texture and unwritten `FragmentOutput` fields are 0, so both decode to white.
-fn pack_specular_tint(specular_tint: vec3<f32>) -> u32 {
-    return vec3_to_rgb9e5_(specular_tint) ^ RGB9E5_WHITE;
+/// Packs a specular tint and a diffuse transmission for the deferred specular tint texture.
+fn pack_specular_tint_transmission(specular_tint: vec3<f32>, diffuse_transmission: f32) -> u32 {
+    let tint = vec3_to_shared_exponent_(specular_tint, SPECULAR_TINT_MANTISSA_BITS) ^ SPECULAR_TINT_WHITE;
+    let transmission = u32(round(saturate(diffuse_transmission) * DIFFUSE_TRANSMISSION_MAX));
+    return tint | (transmission << DIFFUSE_TRANSMISSION_SHIFT);
 }
 
-/// Unpacks a specular tint packed by `pack_specular_tint`.
+/// Unpacks the specular tint packed by `pack_specular_tint_transmission`.
 fn unpack_specular_tint(packed: u32) -> vec3<f32> {
-    return rgb9e5_to_vec3_(packed ^ RGB9E5_WHITE);
+    return shared_exponent_to_vec3_(packed ^ SPECULAR_TINT_WHITE, SPECULAR_TINT_MANTISSA_BITS);
+}
+
+/// Unpacks the diffuse transmission packed by `pack_specular_tint_transmission`.
+fn unpack_diffuse_transmission(packed: u32) -> f32 {
+    return f32(packed >> DIFFUSE_TRANSMISSION_SHIFT) / DIFFUSE_TRANSMISSION_MAX;
 }
