@@ -1,4 +1,5 @@
 import bevy_render::view::View;
+import bevy_pbr::atmosphere::types::Atmosphere;
 import bevy_pbr::prepass::bindings::PreviousViewUniforms;
 import package::scene::sampling::{LightSample, NULL_LIGHT_ID};
 
@@ -20,6 +21,10 @@ enable wgpu_ray_query;
 @group(1) @binding(10) var gbuffer_specular_tint: texture_2d<u32>;
 // Read through `load_receiver_override`: a 1x1 fallback is bound while overrides are disabled.
 @group(1) @binding(16) var receiver_overrides: texture_2d<u32>;
+// The view's atmosphere. Views without one bind fallbacks with a zero `outer_radius`.
+@group(1) @binding(18) var atmosphere_transmittance_lut: texture_2d<f32>;
+@group(1) @binding(19) var atmosphere_transmittance_sampler: sampler;
+@group(1) @binding(20) var<uniform> atmosphere: Atmosphere;
 
 @if(RESTIR) {
 @group(1) @binding(11) var previous_gbuffer: texture_2d<u32>;
