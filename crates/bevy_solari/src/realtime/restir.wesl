@@ -10,7 +10,7 @@ import package::realtime::receiver_override::apply_receiver_override_texel;
 import package::realtime::bindings::{depth_buffer, empty_reservoir, load_motion_vector, load_previous_receiver_override, load_receiver_override, NO_SAMPLE_POINT_INSTANCE, previous_depth_buffer, previous_view, reservoirs_a, reservoirs_b, Reservoir, constants, view, view_output};
 import package::realtime::atmosphere::calculate_light_contribution;
 import package::scene::sampling::{balance_heuristic, isinf, isnan, LightSample, NULL_LIGHT_ID, power_heuristic, resolve_light_sample, ResolvedLightSample, trace_visibility_from_surface, trace_visibility_previous_frame_from_surface};
-import package::scene::bindings::{geometry_ids, INSTANCE_NOT_PRESENT_THIS_FRAME, light_sources, LIGHT_NOT_PRESENT_THIS_FRAME, previous_frame_instance_id_translations, previous_frame_light_id_translations, RAY_T_MAX, RAY_T_MIN, resolve_sample_point, ResolvedMaterial};
+import package::scene::bindings::{geometry_ids, INSTANCE_NOT_PRESENT_THIS_FRAME, light_sources, LIGHT_NOT_PRESENT_THIS_FRAME, previous_frame_instance_id_translations, previous_frame_light_id_translations, NORMAL_OFFSET_ORIGIN, RAY_T_MAX, resolve_sample_point, ResolvedMaterial};
 import package::realtime::world_cache_query::{query_world_cache, WORLD_CACHE_CELL_LIFETIME};
 
 enable wgpu_ray_query;
@@ -174,7 +174,7 @@ fn load_spatial_reservoir(pixel_id: vec2<u32>, depth: f32, world_position: vec3<
         return NeighborInfo(reservoirs_b[spatial_pixel_index], spatial_surface.ray_origin, spatial_surface.geometric_normal, spatial_surface.world_position, spatial_surface.world_normal, spatial_surface.material);
     }
 
-    return NeighborInfo(empty_reservoir(), world_position + world_normal * RAY_T_MIN, vec4(0.0), world_position, world_normal, empty_material());
+    return NeighborInfo(empty_reservoir(), world_position, vec4(world_normal, NORMAL_OFFSET_ORIGIN), world_position, world_normal, empty_material());
 }
 
 fn get_neighbor_pixel_id(center_pixel_id: vec2<u32>, search_radius: f32, rng: ptr<function, u32>) -> vec2<u32> {
@@ -197,7 +197,7 @@ fn empty_neighbor_info() -> NeighborInfo {
 }
 
 fn empty_material() -> ResolvedMaterial {
-    return ResolvedMaterial(vec3(0.0), vec3(0.0), 0.0, 0.0, vec3(0.0), 0.0, 0.0, 0.0, false);
+    return ResolvedMaterial(vec3(0.0), vec3(0.0), 0.0, 0.0, vec3(0.0), 0.0, 0.0, 0.0, 0.0, false);
 }
 
 fn jacobian(
@@ -371,7 +371,7 @@ struct ReservoirContribution {
 
 fn reservoir_contribution(reservoir: Reservoir, resolved: ResolvedLightSample, ray_origin: vec3<f32>, world_position: vec3<f32>, world_normal: vec3<f32>, wo: vec3<f32>, material: ResolvedMaterial, F_ab: vec2<f32>) -> ReservoirContribution {
     if reservoir.light_sample.light_id != NULL_LIGHT_ID {
-        let light_contribution = calculate_light_contribution(resolved, world_position, world_normal);
+        let light_contribution = calculate_light_contribution(resolved, world_position, world_normal, material.diffuse_transmission > 0.0);
 
         // MIS weight against the bounce-0 BRDF-emissive strategy, recomputed from this surface's
         // brdf and material rather than baked into the unbiased contribution weight at generation. Mirrors the bounce-0

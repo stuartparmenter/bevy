@@ -51,7 +51,8 @@ struct FragmentOutput {
 }
 ```
 
-Write it with `pack_specular_tint`, or leave it at `0`, which is a white tint.
+Write it with `pack_specular_tint_transmission`, which also packs the diffuse transmission, or
+leave it at `0`, which is a white tint and no transmission.
 
 If you build deferred prepass pipelines or textures yourself:
 

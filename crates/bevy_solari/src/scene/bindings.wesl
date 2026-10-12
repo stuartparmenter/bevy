@@ -66,6 +66,8 @@ struct Material {
     alpha_cutoff: f32,
     specular_texture_id: u32,
     specular_tint_texture_id: u32,
+    diffuse_transmission: f32,
+    diffuse_transmission_texture_id: u32,
 }
 
 const TEXTURE_MAP_NONE = 0xFFFFFFFFu;
@@ -165,15 +167,25 @@ const RAY_NO_CULL = 0xFFu;
 /// Cross, normalize and dot are still f32, so exact tangency is not decidable.
 const EXACT_NORMAL_TANGENT_GUARD = 0.000001;
 
-/// Moves the origin of a ray leaving a thin two-sided primary surface to the ray's side of it.
+/// `geometric_normal.w` of a surface whose rays leave `RAY_T_MIN` along its normal, on the ray's
+/// side: in front for reflected rays, behind for transmitted ones.
+const NORMAL_OFFSET_ORIGIN = -1.0f;
+
+/// Moves the origin of a ray leaving a surface to the ray's side of it.
 ///
-/// `geometric_normal.xyz` is the surface's face normal, of either sign. `geometric_normal.w` is
-/// the sine of that normal's angular uncertainty: a ray closer to the surface plane than that
-/// leaves from an unknown side and is not offset. `EXACT_NORMAL_TANGENT_GUARD` is the smallest
-/// effective value. `vec4(0.0)` selects the ordinary origin policy and returns `position`
-/// unchanged. Not valid for closed meshes, whose inside is not a legal ray origin. `direction`
-/// must be normalized.
+/// With `geometric_normal.w` of `NORMAL_OFFSET_ORIGIN`, `geometric_normal.xyz` is the surface's
+/// normal and the origin moves `RAY_T_MIN` along it, on the ray's side: a ray transmitted through
+/// a closed mesh starts inside it, as through a thin one. Otherwise the surface is a thin
+/// two-sided primary surface: `geometric_normal.xyz` is its face normal, of either sign, and
+/// `geometric_normal.w` the sine of that normal's angular uncertainty: a ray closer to the surface
+/// plane than that leaves from an unknown side and is not offset. `EXACT_NORMAL_TANGENT_GUARD` is
+/// the smallest effective value. `vec4(0.0)` returns `position` unchanged. This policy is not
+/// valid for closed meshes, whose inside is not a legal ray origin. `direction` must be
+/// normalized.
 fn offset_surface_ray_origin(position: vec3<f32>, geometric_normal: vec4<f32>, direction: vec3<f32>) -> vec3<f32> {
+    if geometric_normal.w == NORMAL_OFFSET_ORIGIN {
+        return offset_ray_origin_along_normal(position, geometric_normal.xyz, direction);
+    }
     let n_dot_d = dot(geometric_normal.xyz, direction);
     // Separate negated comparisons, so a NaN cosine or guard leaves `position` unchanged.
     if !(abs(n_dot_d) > geometric_normal.w) { return position; }
@@ -185,6 +197,11 @@ fn offset_surface_ray_origin(position: vec3<f32>, geometric_normal: vec4<f32>, d
     // common world coordinates; the 10um floor handles positions near zero.
     let distance = max(0.00001, 4.0 * 1.1920928955078125e-7 * dot(abs(normal), abs(position)));
     return position + normal * distance;
+}
+
+/// `position` moved `RAY_T_MIN` along `normal` to the side `direction` leaves by.
+fn offset_ray_origin_along_normal(position: vec3<f32>, normal: vec3<f32>, direction: vec3<f32>) -> vec3<f32> {
+    return position + normal * select(-RAY_T_MIN, RAY_T_MIN, dot(normal, direction) >= 0.0);
 }
 
 fn trace_ray(ray_origin: vec3<f32>, ray_direction: vec3<f32>, ray_t_min: f32, ray_t_max: f32, ray_flag: u32) -> RayIntersection {
@@ -234,6 +251,8 @@ struct ResolvedMaterial {
     perceptual_roughness: f32,
     roughness: f32,
     metallic: f32,
+    /// Share of the diffuse lobe transmitted to the back hemisphere.
+    diffuse_transmission: f32,
     alpha_masked_out: bool,
 }
 
@@ -294,6 +313,11 @@ fn resolve_material(material: Material, uv: vec2<f32>) -> ResolvedMaterial {
     }
 
     m.roughness = m.perceptual_roughness * m.perceptual_roughness;
+
+    m.diffuse_transmission = material.diffuse_transmission;
+    if material.diffuse_transmission_texture_id != TEXTURE_MAP_NONE {
+        m.diffuse_transmission *= sample_texture(material.diffuse_transmission_texture_id, uv).a;
+    }
 
     return m;
 }
