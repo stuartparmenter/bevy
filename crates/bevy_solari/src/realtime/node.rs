@@ -11,19 +11,23 @@ use bevy_core_pipeline::prepass::{
     MOTION_VECTOR_PREPASS_FORMAT,
 };
 use bevy_ecs::{prelude::*, resource::Resource, system::Commands};
+use bevy_pbr::resources::{AtmosphereSampler, AtmosphereTextures, GpuAtmosphere};
 use bevy_render::{
     diagnostic::RecordDiagnostics as _,
     render_resource::{
         binding_types::{
-            storage_buffer_sized, texture_2d, texture_depth_2d, texture_storage_2d, uniform_buffer,
-            uniform_buffer_sized,
+            sampler, storage_buffer_sized, texture_2d, texture_depth_2d, texture_storage_2d,
+            uniform_buffer, uniform_buffer_sized,
         },
-        BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries,
-        CachedComputePipelineId, ComputePassDescriptor, ComputePipelineDescriptor, LoadOp,
-        PipelineCache, RenderPassDescriptor, ShaderStages, StorageTextureAccess, TextureFormat,
-        TextureFormatFeatureFlags, TextureSampleType,
+        BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries, Buffer,
+        BufferInitDescriptor, BufferUsages, CachedComputePipelineId, ComputePassDescriptor,
+        ComputePipelineDescriptor, LoadOp, PipelineCache, RenderPassDescriptor, SamplerBindingType,
+        ShaderStages, ShaderType, StorageTextureAccess, TextureFormat, TextureFormatFeatureFlags,
+        TextureSampleType,
     },
     renderer::{RenderAdapter, RenderContext, RenderDevice, ViewQuery},
+    texture::FallbackImage,
+    uniform::{ComponentUniforms, DynamicUniformIndex},
     view::{ViewTarget, ViewUniform, ViewUniformOffset, ViewUniforms},
 };
 use bevy_shader::{Shader, ShaderDefVal};
@@ -49,6 +53,9 @@ pub struct SolariLightingPipelines {
     no_restir: NoRestirPipelines,
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
     resolve_dlss_rr_textures_pipeline: CachedComputePipelineId,
+    /// Bound in place of a view's atmosphere uniform while it has none. Zeroed, so `outer_radius`
+    /// is 0.
+    atmosphere_fallback: Buffer,
 }
 
 struct RestirPipelines {
@@ -71,6 +78,8 @@ type SolariLightingViewQuery = (
     &'static ViewPrepassTextures,
     &'static ViewUniformOffset,
     &'static PreviousViewUniformOffset,
+    Option<&'static AtmosphereTextures>,
+    Option<&'static DynamicUniformIndex<GpuAtmosphere>>,
 );
 
 #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
@@ -80,6 +89,8 @@ type SolariLightingViewQuery = (
     &'static ViewPrepassTextures,
     &'static ViewUniformOffset,
     &'static PreviousViewUniformOffset,
+    Option<&'static AtmosphereTextures>,
+    Option<&'static DynamicUniformIndex<GpuAtmosphere>>,
     Option<&'static ViewDlssRayReconstructionTextures>,
 );
 
@@ -90,6 +101,9 @@ pub fn solari_lighting(
     scene_bindings: Res<RaytracingSceneBindings>,
     view_uniforms: Res<ViewUniforms>,
     previous_view_uniforms: Res<PreviousViewUniforms>,
+    atmosphere_uniforms: Option<Res<ComponentUniforms<GpuAtmosphere>>>,
+    atmosphere_sampler: Option<Res<AtmosphereSampler>>,
+    fallback_image: Res<FallbackImage>,
     render_device: Res<RenderDevice>,
     mut ctx: RenderContext,
 ) {
@@ -100,6 +114,8 @@ pub fn solari_lighting(
         view_prepass_textures,
         view_uniform_offset,
         previous_view_uniform_offset,
+        atmosphere_textures,
+        atmosphere_uniform_index,
     ) = view.into_inner();
 
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
@@ -109,6 +125,8 @@ pub fn solari_lighting(
         view_prepass_textures,
         view_uniform_offset,
         previous_view_uniform_offset,
+        atmosphere_textures,
+        atmosphere_uniform_index,
         view_dlss_rr_textures,
     ) = view.into_inner();
 
@@ -185,6 +203,26 @@ pub fn solari_lighting(
         return;
     };
 
+    let (atmosphere_transmittance_lut, atmosphere_sampler, atmosphere, atmosphere_offset) = match (
+        atmosphere_textures,
+        atmosphere_uniform_index,
+        atmosphere_sampler.as_deref(),
+        atmosphere_uniforms.as_ref().and_then(|u| u.binding()),
+    ) {
+        (Some(textures), Some(uniform_index), Some(sampler), Some(atmosphere)) => (
+            &textures.transmittance_lut.default_view,
+            &**sampler,
+            atmosphere,
+            uniform_index.index(),
+        ),
+        _ => (
+            &fallback_image.d2.texture_view,
+            &fallback_image.d2.sampler,
+            pipelines.atmosphere_fallback.as_entire_binding(),
+            0,
+        ),
+    };
+
     let spatial_and_shade_pipeline = match spatial_pipeline_id {
         Some(id) => match pipeline_cache.get_compute_pipeline(id) {
             None => return,
@@ -211,17 +249,20 @@ pub fn solari_lighting(
     let bind_group = render_device.create_bind_group(
         "solari_lighting_bind_group",
         &pipeline_cache.get_bind_group_layout(&pipelines.bind_group_layout),
-        &BindGroupEntries::sequential((
-            view_target_attachment.view,
-            s.light_tile_samples.as_entire_binding(),
-            s.light_tile_resolved_samples.as_entire_binding(),
-            gbuffer,
-            depth_buffer,
-            motion_vectors,
-            view_uniforms_binding.clone(),
-            previous_view_uniforms_binding.clone(),
-            s.world_cache.as_entire_binding(),
-            s.constants.as_entire_binding(),
+        &BindGroupEntries::with_indices((
+            (0, view_target_attachment.view),
+            (1, s.light_tile_samples.as_entire_binding()),
+            (2, s.light_tile_resolved_samples.as_entire_binding()),
+            (3, gbuffer),
+            (4, depth_buffer),
+            (5, motion_vectors),
+            (6, view_uniforms_binding.clone()),
+            (7, previous_view_uniforms_binding.clone()),
+            (8, s.world_cache.as_entire_binding()),
+            (9, s.constants.as_entire_binding()),
+            (14, atmosphere_transmittance_lut),
+            (15, atmosphere_sampler),
+            (16, atmosphere.clone()),
         )),
     );
 
@@ -245,6 +286,9 @@ pub fn solari_lighting(
                     previous_depth_buffer,
                     reservoirs.a.as_entire_binding(),
                     reservoirs.b.as_entire_binding(),
+                    atmosphere_transmittance_lut,
+                    atmosphere_sampler,
+                    atmosphere,
                 )),
             )
         });
@@ -304,6 +348,7 @@ pub fn solari_lighting(
         &[
             view_uniform_offset.offset,
             previous_view_uniform_offset.offset,
+            atmosphere_offset,
         ],
     );
 
@@ -366,6 +411,7 @@ pub fn solari_lighting(
             &[
                 view_uniform_offset.offset,
                 previous_view_uniform_offset.offset,
+                atmosphere_offset,
             ],
         );
     }
@@ -404,6 +450,7 @@ pub fn init_solari_lighting_pipelines(
     scene_bindings: Res<RaytracingSceneBindings>,
     asset_server: Res<AssetServer>,
     render_adapter: Res<RenderAdapter>,
+    render_device: Res<RenderDevice>,
 ) {
     let motion_vectors_storage_read_write = render_adapter
         .get_texture_format_features(MOTION_VECTOR_PREPASS_FORMAT)
@@ -417,19 +464,28 @@ pub fn init_solari_lighting_pipelines(
 
     let bind_group_layout = BindGroupLayoutDescriptor::new(
         "solari_lighting_bind_group_layout",
-        &BindGroupLayoutEntries::sequential(
+        &BindGroupLayoutEntries::with_indices(
             ShaderStages::COMPUTE,
             (
-                texture_storage_2d(TextureFormat::Rgba16Float, StorageTextureAccess::ReadWrite),
-                storage_buffer_sized(false, None),
-                storage_buffer_sized(false, None),
-                texture_2d(TextureSampleType::Uint),
-                texture_depth_2d(),
-                motion_vectors_binding,
-                uniform_buffer::<ViewUniform>(true),
-                uniform_buffer::<PreviousViewData>(true),
-                storage_buffer_sized(false, None),
-                uniform_buffer_sized(false, None),
+                (
+                    0,
+                    texture_storage_2d(TextureFormat::Rgba16Float, StorageTextureAccess::ReadWrite),
+                ),
+                (1, storage_buffer_sized(false, None)),
+                (2, storage_buffer_sized(false, None)),
+                (3, texture_2d(TextureSampleType::Uint)),
+                (4, texture_depth_2d()),
+                (5, motion_vectors_binding),
+                (6, uniform_buffer::<ViewUniform>(true)),
+                (7, uniform_buffer::<PreviousViewData>(true)),
+                (8, storage_buffer_sized(false, None)),
+                (9, uniform_buffer_sized(false, None)),
+                (
+                    14,
+                    texture_2d(TextureSampleType::Float { filterable: true }),
+                ),
+                (15, sampler(SamplerBindingType::Filtering)),
+                (16, uniform_buffer::<GpuAtmosphere>(true)),
             ),
         ),
     );
@@ -453,6 +509,9 @@ pub fn init_solari_lighting_pipelines(
                 texture_depth_2d(),
                 storage_buffer_sized(false, None),
                 storage_buffer_sized(false, None),
+                texture_2d(TextureSampleType::Float { filterable: true }),
+                sampler(SamplerBindingType::Filtering),
+                uniform_buffer::<GpuAtmosphere>(true),
             ),
         ),
     );
@@ -531,6 +590,12 @@ pub fn init_solari_lighting_pipelines(
             ..default()
         })
     };
+
+    let atmosphere_fallback = render_device.create_buffer_with_data(&BufferInitDescriptor {
+        label: Some("solari_lighting_atmosphere_fallback"),
+        contents: &vec![0; GpuAtmosphere::min_size().get() as usize],
+        usage: BufferUsages::UNIFORM,
+    });
 
     commands.insert_resource(SolariLightingPipelines {
         bind_group_layout: bind_group_layout.clone(),
@@ -659,6 +724,7 @@ pub fn init_solari_lighting_pipelines(
             ExtraBindGroup::DlssRrGuideBuffers,
             vec![],
         ),
+        atmosphere_fallback,
     });
 }
 
