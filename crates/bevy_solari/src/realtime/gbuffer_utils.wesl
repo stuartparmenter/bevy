@@ -1,15 +1,15 @@
-import bevy_pbr::deferred::types::{unpack_24bit_normal, unpack_8bit_ior_specular, unpack_specular_tint};
+import bevy_pbr::deferred::types::{unpack_24bit_normal, unpack_8bit_ior_specular, unpack_diffuse_transmission, unpack_specular_tint};
 import bevy_pbr::render::pbr_functions::calculate_F0_dielectric;
 import bevy_pbr::render::rgb9e5::rgb9e5_to_vec3_;
 import bevy_render::utils::octahedral_decode;
 import bevy_render::view::{View, depth_ndc_to_view_z};
 import package::realtime::bindings::{gbuffer, gbuffer_specular_tint, previous_gbuffer, previous_gbuffer_specular_tint, previous_view, view};
-import package::scene::bindings::{ResolvedMaterial, RAY_T_MIN};
+import package::scene::bindings::{NORMAL_OFFSET_ORIGIN, ResolvedMaterial};
 
 struct ResolvedGPixel {
-    /// Origin of rays leaving this surface.
+    /// The point rays leave this surface from, before `offset_surface_ray_origin`.
     ray_origin: vec3<f32>,
-    /// Face normal and tangent guard for `offset_surface_ray_origin`. Zero selects no offset.
+    /// The surface's `geometric_normal` for `offset_surface_ray_origin`.
     geometric_normal: vec4<f32>,
     /// False when `ray_origin` could not be reconstructed, which makes the surface's history unusable.
     ray_origin_valid: bool,
@@ -28,7 +28,7 @@ fn load_previous_gpixel(pixel_id: vec2<u32>, depth: f32) -> ResolvedGPixel {
     return gpixel_resolve(textureLoad(previous_gbuffer, pixel_id, 0), textureLoad(previous_gbuffer_specular_tint, pixel_id, 0).r, depth, pixel_id, view.main_pass_viewport.zw, previous_view.world_from_clip);
 }
 
-fn gpixel_resolve(gpixel: vec4<u32>, gpixel_specular_tint: u32, depth: f32, pixel_id: vec2<u32>, view_size: vec2<f32>, world_from_clip: mat4x4<f32>) -> ResolvedGPixel {
+fn gpixel_resolve(gpixel: vec4<u32>, gpixel_tint_transmission: u32, depth: f32, pixel_id: vec2<u32>, view_size: vec2<f32>, world_from_clip: mat4x4<f32>) -> ResolvedGPixel {
     let world_position = reconstruct_world_position(pixel_id, depth, view_size, world_from_clip);
     let world_normal = octahedral_decode(unpack_24bit_normal(gpixel.a));
 
@@ -40,10 +40,11 @@ fn gpixel_resolve(gpixel: vec4<u32>, gpixel_specular_tint: u32, depth: f32, pixe
     let ior_specular = unpack_8bit_ior_specular(gpixel.b);
     let metallic = props.g;
     let emissive = rgb9e5_to_vec3_(gpixel.g);
-    let F0_dielectric = calculate_F0_dielectric(ior_specular.x, unpack_specular_tint(gpixel_specular_tint));
-    let material = ResolvedMaterial(base_color, emissive, F0_dielectric, ior_specular.y, perceptual_roughness, roughness, metallic, false);
+    let F0_dielectric = calculate_F0_dielectric(ior_specular.x, unpack_specular_tint(gpixel_tint_transmission));
+    let diffuse_transmission = unpack_diffuse_transmission(gpixel_tint_transmission);
+    let material = ResolvedMaterial(base_color, emissive, F0_dielectric, ior_specular.y, perceptual_roughness, roughness, metallic, diffuse_transmission, false);
 
-    return ResolvedGPixel(world_position + world_normal * RAY_T_MIN, vec4(0.0), true, world_position, world_normal, material);
+    return ResolvedGPixel(world_position, vec4(world_normal, NORMAL_OFFSET_ORIGIN), true, world_position, world_normal, material);
 }
 
 fn reconstruct_world_position(pixel_id: vec2<u32>, depth: f32, view_size: vec2<f32>, world_from_clip: mat4x4<f32>) -> vec3<f32> {

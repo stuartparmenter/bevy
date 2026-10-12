@@ -66,9 +66,12 @@ fn evaluate_and_sample_brdf(
 
     var wi: vec3<f32>;
     var wi_tangent: vec3<f32>;
-    let diffuse_selected = rand_f(rng) < diffuse_weight;
+    let lobe_sample = rand_f(rng);
+    let diffuse_selected = lobe_sample < diffuse_weight;
     if diffuse_selected {
-        wi = sample_cosine_hemisphere(world_normal, rng);
+        // Given the diffuse lobe, `lobe_sample` is uniform over [0, diffuse_weight).
+        let transmitted = lobe_sample < diffuse_weight * material.diffuse_transmission;
+        wi = sample_cosine_hemisphere(select(world_normal, -world_normal, transmitted), rng);
         wi_tangent = vec3(dot(wi, T), dot(wi, B), dot(wi, N));
     } else {
         wi_tangent = sample_ggx_vndf(wo_tangent, material.roughness, rng);
@@ -88,9 +91,7 @@ fn evaluate_and_sample_brdf(
         }
     }
 
-    let diffuse_pdf = wi_tangent.z / PI;
-    let specular_pdf = ggx_vndf_pdf(wo_tangent, wi_tangent, material.roughness);
-    let pdf = (diffuse_weight * diffuse_pdf) + (specular_weight * specular_pdf);
+    let pdf = lobe_mixture_pdf(wo_tangent, wi_tangent, material, specular_weight);
     let throughput = evaluate_brdf(wo, wi, world_normal, material, F_ab) / pdf;
     return EvaluateAndSampleBrdfResult(wi, throughput, pdf, diffuse_selected);
 }
@@ -105,12 +106,22 @@ fn evaluate_brdf(
     return evaluate_diffuse_brdf(wo, wi, world_normal, material, F_ab) + evaluate_specular_brdf(wo, wi, world_normal, material, F_ab);
 }
 
+/// Lambertian reflection into the front hemisphere and, for `diffuse_transmission`, its mirror
+/// image into the back one, splitting the diffuse lobe's energy between them.
 fn evaluate_diffuse_brdf(wo: vec3<f32>, wi: vec3<f32>, world_normal: vec3<f32>, material: ResolvedMaterial, F_ab: vec2<f32>) -> vec3<f32> {
     let NdotL = dot(world_normal, wi);
     let NdotV = dot(world_normal, wo);
-    if NdotL < 0.0001 || NdotV < 0.0001 { return vec3(0.0); }
+    if abs(NdotL) < 0.0001 || NdotV < 0.0001 { return vec3(0.0); }
+    let share = diffuse_hemisphere_share(material, NdotL);
+    if share == 0.0 { return vec3(0.0); }
     let rho = lobe_reflectances(material, F_ab);
-    return rho.diffuse / PI * NdotL;
+    return rho.diffuse * share / PI * abs(NdotL);
+}
+
+/// The share of the diffuse lobe's energy leaving into the hemisphere of a direction whose
+/// cosine with the normal is `cos_theta`: reflected in front, transmitted behind.
+fn diffuse_hemisphere_share(material: ResolvedMaterial, cos_theta: f32) -> f32 {
+    return select(1.0 - material.diffuse_transmission, material.diffuse_transmission, cos_theta < 0.0);
 }
 
 fn evaluate_specular_brdf(wo: vec3<f32>, wi: vec3<f32>, world_normal: vec3<f32>, material: ResolvedMaterial, F_ab: vec2<f32>) -> vec3<f32> {
@@ -148,7 +159,6 @@ fn brdf_pdf(wo: vec3<f32>, wi: vec3<f32>, world_normal: vec3<f32>, material: Res
     let NdotV = max(dot(world_normal, wo), 0.0001);
     let rho = lobe_reflectances(material, F_ab);
     let specular_weight = specular_lobe_sampling_probability(rho, material.perceptual_roughness);
-    let diffuse_weight = 1.0 - specular_weight;
 
     let TBN = orthonormalize(world_normal);
     let T = TBN[0];
@@ -158,9 +168,19 @@ fn brdf_pdf(wo: vec3<f32>, wi: vec3<f32>, world_normal: vec3<f32>, material: Res
     let wo_tangent = vec3(dot(wo, T), dot(wo, B), dot(wo, N));
     let wi_tangent = vec3(dot(wi, T), dot(wi, B), dot(wi, N));
 
-    let diffuse_pdf = wi_tangent.z / PI;
-    let specular_pdf = ggx_vndf_pdf(wo_tangent, wi_tangent, material.roughness);
-    return (diffuse_weight * diffuse_pdf) + (specular_weight * specular_pdf);
+    return lobe_mixture_pdf(wo_tangent, wi_tangent, material, specular_weight);
+}
+
+/// The pdf of `evaluate_and_sample_brdf` choosing tangent-space `wi_tangent`: the specular lobe,
+/// picked with `specular_weight`, only reflects; the diffuse lobe samples each hemisphere
+/// cosine-weighted, by its `diffuse_hemisphere_share`.
+fn lobe_mixture_pdf(wo_tangent: vec3<f32>, wi_tangent: vec3<f32>, material: ResolvedMaterial, specular_weight: f32) -> f32 {
+    let diffuse_pdf = diffuse_hemisphere_share(material, wi_tangent.z) * abs(wi_tangent.z) / PI;
+    var specular_pdf = 0.0;
+    if wi_tangent.z > 0.0 {
+        specular_pdf = ggx_vndf_pdf(wo_tangent, wi_tangent, material.roughness);
+    }
+    return ((1.0 - specular_weight) * diffuse_pdf) + (specular_weight * specular_pdf);
 }
 
 fn fresnel(f0: vec3<f32>, LdotH: f32) -> vec3<f32> {

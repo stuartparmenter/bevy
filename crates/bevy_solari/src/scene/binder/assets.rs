@@ -30,8 +30,8 @@ const MATERIAL_FLAG_FLIP_NORMAL_MAP_Y: u32 = 1 << 1;
 /// The textures a [`StandardMaterial`] can reference, in [`GpuMaterial`] field order.
 ///
 /// The specular and specular tint textures are always `None` without the `pbr_specular_textures`
-/// feature.
-type MaterialTextures = [Option<AssetId<Image>>; 6];
+/// feature, and the diffuse transmission texture without `pbr_transmission_textures`.
+type MaterialTextures = [Option<AssetId<Image>>; 7];
 
 #[derive(Clone, Copy, Default, PartialEq, Pod, Zeroable)]
 #[repr(C)]
@@ -54,6 +54,9 @@ pub struct GpuMaterial {
     alpha_cutoff: f32,
     specular_texture_id: u32,
     specular_tint_texture_id: u32,
+    diffuse_transmission: f32,
+    diffuse_transmission_texture_id: u32,
+    _padding: [u32; 2],
 }
 
 impl_atomic_pod!(GpuMaterial, GpuMaterialBlob);
@@ -154,6 +157,10 @@ impl AssetState {
         let specular_handles = [&material.specular_texture, &material.specular_tint_texture];
         #[cfg(not(feature = "pbr_specular_textures"))]
         let specular_handles = [&None, &None];
+        #[cfg(feature = "pbr_transmission_textures")]
+        let diffuse_transmission_handle = &material.diffuse_transmission_texture;
+        #[cfg(not(feature = "pbr_transmission_textures"))]
+        let diffuse_transmission_handle = &None;
         let handles = [
             &material.normal_map_texture,
             &material.base_color_texture,
@@ -161,10 +168,11 @@ impl AssetState {
             &material.metallic_roughness_texture,
             specular_handles[0],
             specular_handles[1],
+            diffuse_transmission_handle,
         ];
 
         // Resolve first so a missing texture leaves no partially acquired slots
-        let mut textures: MaterialTextures = [None; 6];
+        let mut textures = MaterialTextures::default();
         for (slot, handle) in textures.iter_mut().zip(handles) {
             let Some(handle) = handle else { continue };
             let image_id = handle.id();
@@ -192,7 +200,7 @@ impl AssetState {
             }
         }
 
-        let mut texture_ids = [TEXTURE_MAP_NONE; 6];
+        let mut texture_ids = [TEXTURE_MAP_NONE; 7];
         for (texture_id, image_id) in texture_ids.iter_mut().zip(textures) {
             let Some(image_id) = image_id else { continue };
             let image = texture_assets.get(image_id).unwrap();
@@ -265,6 +273,9 @@ impl AssetState {
                 alpha_cutoff,
                 specular_texture_id: texture_ids[4],
                 specular_tint_texture_id: texture_ids[5],
+                diffuse_transmission: material.diffuse_transmission.clamp(0.0, 1.0),
+                diffuse_transmission_texture_id: texture_ids[6],
+                _padding: [0; 2],
             },
         );
 

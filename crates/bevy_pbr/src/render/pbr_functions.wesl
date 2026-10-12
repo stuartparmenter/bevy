@@ -129,9 +129,10 @@ fn prepare_world_normal(
     is_front: bool,
 ) -> vec3<f32> {
     var output: vec3<f32> = world_normal;
-    @if(!VERTEX_TANGENTS && !STANDARD_MATERIAL_NORMAL_MAP)
     // NOTE: When NOT using normal-mapping, if looking at the back face of a double-sided
     // material, the normal needs to be inverted. This is a branchless version of that.
+    // `apply_normal_mapping` inverts it instead, and runs only with UVs, tangents and a normal map.
+    @if(!VERTEX_UVS || !VERTEX_TANGENTS || !STANDARD_MATERIAL_NORMAL_MAP)
     output = (f32(!double_sided || is_front) * 2.0 - 1.0) * output;
     return output;
 }
@@ -541,15 +542,17 @@ fn apply_pbr_lighting(
         // F_ab = vec2<f32>(0.1)
         // F0 = vec3<f32>(0.0)
         // specular_weight = 0.0
-        var transmitted_shadow: f32 = 1.0;
-        if ((in.flags & (MESH_FLAGS_SHADOW_RECEIVER_BIT | MESH_FLAGS_TRANSMITTED_SHADOW_RECEIVER_BIT)) == (MESH_FLAGS_SHADOW_RECEIVER_BIT | MESH_FLAGS_TRANSMITTED_SHADOW_RECEIVER_BIT)
-                && (view_bindings::clustered_lights.data[light_id].flags & mesh_view_types::POINT_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) != 0u) {
-            transmitted_shadow = shadows::fetch_point_shadow(light_id, diffuse_transmissive_lobe_world_position, -in.world_normal, in.frag_coord.xy);
-        }
+        if diffuse_transmission > 0.0 {
+            var transmitted_shadow: f32 = 1.0;
+            if ((in.flags & (MESH_FLAGS_SHADOW_RECEIVER_BIT | MESH_FLAGS_TRANSMITTED_SHADOW_RECEIVER_BIT)) == (MESH_FLAGS_SHADOW_RECEIVER_BIT | MESH_FLAGS_TRANSMITTED_SHADOW_RECEIVER_BIT)
+                    && (view_bindings::clustered_lights.data[light_id].flags & mesh_view_types::POINT_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) != 0u) {
+                transmitted_shadow = shadows::fetch_point_shadow(light_id, diffuse_transmissive_lobe_world_position, -in.world_normal, in.frag_coord.xy);
+            }
 
-        let transmitted_light_contrib =
-            lighting::point_light(light_id, &transmissive_lighting_input, enable_diffuse, true);
-        transmitted_light += transmitted_light_contrib * transmitted_shadow;
+            let transmitted_light_contrib =
+                lighting::point_light(light_id, &transmissive_lighting_input, enable_diffuse, true);
+            transmitted_light += transmitted_light_contrib * transmitted_shadow;
+        }
 }
     }
 
@@ -603,21 +606,23 @@ fn apply_pbr_lighting(
         // F_ab = vec2<f32>(0.1)
         // F0 = vec3<f32>(0.0)
         // specular_weight = 0.0
-        var transmitted_shadow: f32 = 1.0;
-        if ((in.flags & (MESH_FLAGS_SHADOW_RECEIVER_BIT | MESH_FLAGS_TRANSMITTED_SHADOW_RECEIVER_BIT)) == (MESH_FLAGS_SHADOW_RECEIVER_BIT | MESH_FLAGS_TRANSMITTED_SHADOW_RECEIVER_BIT)
-                && (view_bindings::clustered_lights.data[light_id].flags & mesh_view_types::POINT_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) != 0u) {
-            transmitted_shadow = shadows::fetch_spot_shadow(
-                light_id,
-                diffuse_transmissive_lobe_world_position,
-                -in.world_normal,
-                view_bindings::clustered_lights.data[light_id].shadow_map_near_z,
-                in.frag_coord.xy,
-            );
-        }
+        if diffuse_transmission > 0.0 {
+            var transmitted_shadow: f32 = 1.0;
+            if ((in.flags & (MESH_FLAGS_SHADOW_RECEIVER_BIT | MESH_FLAGS_TRANSMITTED_SHADOW_RECEIVER_BIT)) == (MESH_FLAGS_SHADOW_RECEIVER_BIT | MESH_FLAGS_TRANSMITTED_SHADOW_RECEIVER_BIT)
+                    && (view_bindings::clustered_lights.data[light_id].flags & mesh_view_types::POINT_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) != 0u) {
+                transmitted_shadow = shadows::fetch_spot_shadow(
+                    light_id,
+                    diffuse_transmissive_lobe_world_position,
+                    -in.world_normal,
+                    view_bindings::clustered_lights.data[light_id].shadow_map_near_z,
+                    in.frag_coord.xy,
+                );
+            }
 
-        let transmitted_light_contrib =
-            lighting::spot_light(light_id, &transmissive_lighting_input, enable_diffuse);
-        transmitted_light += transmitted_light_contrib * transmitted_shadow;
+            let transmitted_light_contrib =
+                lighting::spot_light(light_id, &transmissive_lighting_input, enable_diffuse);
+            transmitted_light += transmitted_light_contrib * transmitted_shadow;
+        }
 }
     }
 
@@ -679,15 +684,17 @@ fn apply_pbr_lighting(
         // F_ab = vec2<f32>(0.1)
         // F0 = vec3<f32>(0.0)
         // specular_weight = 0.0
-        var transmitted_shadow: f32 = 1.0;
-        if ((in.flags & (MESH_FLAGS_SHADOW_RECEIVER_BIT | MESH_FLAGS_TRANSMITTED_SHADOW_RECEIVER_BIT)) == (MESH_FLAGS_SHADOW_RECEIVER_BIT | MESH_FLAGS_TRANSMITTED_SHADOW_RECEIVER_BIT)
-                && (view_bindings::lights.directional_lights[i].flags & mesh_view_types::DIRECTIONAL_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) != 0u) {
-            transmitted_shadow = shadows::fetch_directional_shadow(i, diffuse_transmissive_lobe_world_position, -in.world_normal, view_z, in.frag_coord.xy);
-        }
+        if diffuse_transmission > 0.0 {
+            var transmitted_shadow: f32 = 1.0;
+            if ((in.flags & (MESH_FLAGS_SHADOW_RECEIVER_BIT | MESH_FLAGS_TRANSMITTED_SHADOW_RECEIVER_BIT)) == (MESH_FLAGS_SHADOW_RECEIVER_BIT | MESH_FLAGS_TRANSMITTED_SHADOW_RECEIVER_BIT)
+                    && (view_bindings::lights.directional_lights[i].flags & mesh_view_types::DIRECTIONAL_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) != 0u) {
+                transmitted_shadow = shadows::fetch_directional_shadow(i, diffuse_transmissive_lobe_world_position, -in.world_normal, view_z, in.frag_coord.xy);
+            }
 
-        let transmitted_light_contrib =
-            lighting::directional_light(i, &transmissive_lighting_input, enable_diffuse);
-        transmitted_light += transmitted_light_contrib * transmitted_shadow;
+            let transmitted_light_contrib =
+                lighting::directional_light(i, &transmissive_lighting_input, enable_diffuse);
+            transmitted_light += transmitted_light_contrib * transmitted_shadow;
+        }
 }
     }
 
@@ -713,14 +720,16 @@ fn apply_pbr_lighting(
         direct_light += light_contrib;
 
     @if(STANDARD_MATERIAL_DIFFUSE_TRANSMISSION) {
-        let transmitted_light_contrib =
-            lighting::rect_light(&light, &transmissive_lighting_input, enable_diffuse);
-        transmitted_light += transmitted_light_contrib;
+        if diffuse_transmission > 0.0 {
+            let transmitted_light_contrib =
+                lighting::rect_light(&light, &transmissive_lighting_input, enable_diffuse);
+            transmitted_light += transmitted_light_contrib;
+        }
     }
     }
 }
 
-    @if(STANDARD_MATERIAL_DIFFUSE_TRANSMISSION)
+    @if(STANDARD_MATERIAL_DIFFUSE_TRANSMISSION) {
     // NOTE: We use the diffuse transmissive color, the second Lambertian lobe's calculated
     // world position, inverted normal and view vectors, and the following simplified
     // values for a fully diffuse transmitted light contribution approximation:
@@ -730,7 +739,10 @@ fn apply_pbr_lighting(
     // F0 = vec3<f32>(0.0)
     // F90 = 0.0
     // diffuse_occlusion = vec3<f32>(1.0)
-    transmitted_light += ambient::ambient_light(diffuse_transmissive_lobe_world_position, -in.N, -in.V, 1.0, diffuse_transmissive_color, vec3<f32>(0.0), 0.0, 1.0, vec3<f32>(1.0));
+    if diffuse_transmission > 0.0 {
+        transmitted_light += ambient::ambient_light(diffuse_transmissive_lobe_world_position, -in.N, -in.V, 1.0, diffuse_transmissive_color, vec3<f32>(0.0), 0.0, 1.0, vec3<f32>(1.0));
+    }
+    }
 
     // Diffuse indirect lighting can come from a variety of sources. The
     // priority goes like this:
@@ -824,65 +836,67 @@ fn apply_pbr_lighting(
 @if(ENVIRONMENT_MAP) {
 
 @if(STANDARD_MATERIAL_DIFFUSE_OR_SPECULAR_TRANSMISSION) {
-    // NOTE: We use the diffuse transmissive color, inverted normal and view vectors,
-    // and the following simplified values for the transmitted environment light contribution
-    // approximation:
-    //
-    // diffuse_color = vec3<f32>(1.0) // later we use `diffuse_transmissive_color` and `specular_transmissive_color`
-    // NdotV = 1.0;
-    // R = T // see definition below
-    // F0 = vec3<f32>(1.0) (using F0_dielectric = 1, F0_metallic = 0 and metallic = 0)
-    // specular_weight = 1.0 (`specular_transmissive_light()` applies the material's F0 and F90)
-    // diffuse_occlusion = 1.0
-    //
-    // (This one is slightly different from the other light types above, because the environment
-    // map light returns both diffuse and specular components separately, and we want to use both)
+    if diffuse_transmission > 0.0 || specular_transmission > 0.0 {
+        // NOTE: We use the diffuse transmissive color, inverted normal and view vectors,
+        // and the following simplified values for the transmitted environment light contribution
+        // approximation:
+        //
+        // diffuse_color = vec3<f32>(1.0) // later we use `diffuse_transmissive_color` and `specular_transmissive_color`
+        // NdotV = 1.0;
+        // R = T // see definition below
+        // F0 = vec3<f32>(1.0) (using F0_dielectric = 1, F0_metallic = 0 and metallic = 0)
+        // specular_weight = 1.0 (`specular_transmissive_light()` applies the material's F0 and F90)
+        // diffuse_occlusion = 1.0
+        //
+        // (This one is slightly different from the other light types above, because the environment
+        // map light returns both diffuse and specular components separately, and we want to use both)
 
-    let T = -normalize(
-        in.V + // start with view vector at entry point
-        refract(in.V, -in.N, 1.0 / ior) * thickness // add refracted vector scaled by thickness, towards exit point
-    ); // normalize to find exit point view vector
+        let T = -normalize(
+            in.V + // start with view vector at entry point
+            refract(in.V, -in.N, 1.0 / ior) * thickness // add refracted vector scaled by thickness, towards exit point
+        ); // normalize to find exit point view vector
 
-    var transmissive_environment_light_input: lighting::LightingInput;
-    transmissive_environment_light_input.diffuse_color = vec3(1.0);
-    transmissive_environment_light_input.layers[LAYER_BASE].NdotV = 1.0;
-    transmissive_environment_light_input.P = in.world_position.xyz;
-    transmissive_environment_light_input.layers[LAYER_BASE].N = -in.N;
-    transmissive_environment_light_input.V = in.V;
-    transmissive_environment_light_input.layers[LAYER_BASE].R = T;
-    transmissive_environment_light_input.layers[LAYER_BASE].perceptual_roughness = perceptual_roughness;
-    transmissive_environment_light_input.layers[LAYER_BASE].roughness = roughness;
-    transmissive_environment_light_input.metallic = 0.0;
-    transmissive_environment_light_input.specular_weight = 1.0;
-    transmissive_environment_light_input.F0_dielectric = vec3<f32>(1.0);
-    transmissive_environment_light_input.F0_metallic = vec3<f32>(0.0);
-    transmissive_environment_light_input.F_ab = vec2(0.1);
-@if(STANDARD_MATERIAL_CLEARCOAT) {
-    // No clearcoat.
-    transmissive_environment_light_input.clearcoat_strength = 0.0;
-    transmissive_environment_light_input.layers[LAYER_CLEARCOAT].NdotV = 0.0;
-    transmissive_environment_light_input.layers[LAYER_CLEARCOAT].N = in.N;
-    transmissive_environment_light_input.layers[LAYER_CLEARCOAT].R = vec3(0.0);
-    transmissive_environment_light_input.layers[LAYER_CLEARCOAT].perceptual_roughness = 0.0;
-    transmissive_environment_light_input.layers[LAYER_CLEARCOAT].roughness = 0.0;
-}
+        var transmissive_environment_light_input: lighting::LightingInput;
+        transmissive_environment_light_input.diffuse_color = vec3(1.0);
+        transmissive_environment_light_input.layers[LAYER_BASE].NdotV = 1.0;
+        transmissive_environment_light_input.P = in.world_position.xyz;
+        transmissive_environment_light_input.layers[LAYER_BASE].N = -in.N;
+        transmissive_environment_light_input.V = in.V;
+        transmissive_environment_light_input.layers[LAYER_BASE].R = T;
+        transmissive_environment_light_input.layers[LAYER_BASE].perceptual_roughness = perceptual_roughness;
+        transmissive_environment_light_input.layers[LAYER_BASE].roughness = roughness;
+        transmissive_environment_light_input.metallic = 0.0;
+        transmissive_environment_light_input.specular_weight = 1.0;
+        transmissive_environment_light_input.F0_dielectric = vec3<f32>(1.0);
+        transmissive_environment_light_input.F0_metallic = vec3<f32>(0.0);
+        transmissive_environment_light_input.F_ab = vec2(0.1);
+    @if(STANDARD_MATERIAL_CLEARCOAT) {
+        // No clearcoat.
+        transmissive_environment_light_input.clearcoat_strength = 0.0;
+        transmissive_environment_light_input.layers[LAYER_CLEARCOAT].NdotV = 0.0;
+        transmissive_environment_light_input.layers[LAYER_CLEARCOAT].N = in.N;
+        transmissive_environment_light_input.layers[LAYER_CLEARCOAT].R = vec3(0.0);
+        transmissive_environment_light_input.layers[LAYER_CLEARCOAT].perceptual_roughness = 0.0;
+        transmissive_environment_light_input.layers[LAYER_CLEARCOAT].roughness = 0.0;
+    }
 
-    let transmitted_environment_light = environment_map::environment_map_light(
-        &transmissive_environment_light_input,
-        lighting::compute_lobe_multiscatter(
-            transmissive_environment_light_input.F0_dielectric,
-            transmissive_environment_light_input.F0_metallic,
-            transmissive_environment_light_input.F_ab,
-            transmissive_environment_light_input.specular_weight,
-        ),
-        &clusterable_object_index_ranges,
-        false,
-    );
+        let transmitted_environment_light = environment_map::environment_map_light(
+            &transmissive_environment_light_input,
+            lighting::compute_lobe_multiscatter(
+                transmissive_environment_light_input.F0_dielectric,
+                transmissive_environment_light_input.F0_metallic,
+                transmissive_environment_light_input.F_ab,
+                transmissive_environment_light_input.specular_weight,
+            ),
+            &clusterable_object_index_ranges,
+            false,
+        );
 
-    @if(STANDARD_MATERIAL_DIFFUSE_TRANSMISSION)
-    transmitted_light += transmitted_environment_light.diffuse * diffuse_transmissive_color;
-    @if(STANDARD_MATERIAL_SPECULAR_TRANSMISSION)
-    specular_transmitted_environment_light = transmitted_environment_light.specular * specular_transmissive_color;
+        @if(STANDARD_MATERIAL_DIFFUSE_TRANSMISSION)
+        transmitted_light += transmitted_environment_light.diffuse * diffuse_transmissive_color;
+        @if(STANDARD_MATERIAL_SPECULAR_TRANSMISSION)
+        specular_transmitted_environment_light = transmitted_environment_light.specular * specular_transmissive_color;
+    }
 
 }
 

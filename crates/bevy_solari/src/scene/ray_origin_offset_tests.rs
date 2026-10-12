@@ -15,7 +15,8 @@ const NORMAL_ERROR: f32 = 0.01;
 /// A world position far enough from the origin for one f32 ULP to be about 0.1 mm.
 const FAR_POSITION: Vec3 = Vec3::new(300.0, 45.0, 1442.0);
 
-/// `offset_surface_ray_origin`. A NaN cosine fails the comparisons and leaves `p` unchanged.
+/// `offset_surface_ray_origin` for a thin two-sided surface (any `geometric_normal.w` but
+/// `NORMAL_OFFSET_ORIGIN`). A NaN cosine fails the comparisons and leaves `p` unchanged.
 fn offset_surface(p: Vec3, n: Vec3, guard: f32, d: Vec3) -> Vec3 {
     let cosine = n.dot(d);
     if cosine.abs() > guard && cosine.abs() > EXACT_NORMAL_TANGENT_GUARD {
@@ -191,6 +192,40 @@ fn grazing_ray_does_not_hit_its_own_finite_triangle() {
         for winding in [n, -n] {
             let shifted = offset_surface(origin, winding, EXACT_NORMAL_TANGENT_GUARD, direction);
             assert!(!hit(shifted, direction));
+        }
+    }
+}
+
+/// `RAY_T_MIN` in `bindings.wesl`.
+const RAY_T_MIN: f32 = 0.001;
+
+/// `offset_ray_origin_along_normal`, the `NORMAL_OFFSET_ORIGIN` policy.
+fn offset_along_normal(p: Vec3, n: Vec3, d: Vec3) -> Vec3 {
+    p + n * if n.dot(d) >= 0.0 {
+        RAY_T_MIN
+    } else {
+        -RAY_T_MIN
+    }
+}
+
+#[test]
+fn normal_offset_moves_rays_to_their_side_even_when_grazing() {
+    let n = Vec3::Z;
+    for (d, side) in [
+        (Vec3::Z, 1.0),
+        (Vec3::NEG_Z, -1.0),
+        (Vec3::new(1.0, 0.0, 1.0e-6).normalize(), 1.0),
+        (Vec3::new(1.0, 0.0, -1.0e-6).normalize(), -1.0),
+    ] {
+        let p = Vec3::new(3.0, 2.0, 1.0);
+        let offset = offset_along_normal(p, n, d) - p;
+        assert!(
+            offset.abs_diff_eq(n * (side * RAY_T_MIN), 1.0e-6),
+            "{d}: {offset}"
+        );
+        // The thin-surface policy leaves the grazing rays unoffset.
+        if d.z.abs() < 1.0e-3 {
+            assert_eq!(offset_surface(FAR_POSITION, n, WIDE_GUARD, d), FAR_POSITION);
         }
     }
 }
