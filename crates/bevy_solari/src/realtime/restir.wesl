@@ -8,7 +8,8 @@ import package::realtime::gbuffer_utils::{load_gpixel, load_previous_gpixel, per
 import package::realtime::initial_path::{generate_initial_path, InitialSamplingResult, nee_probability};
 import package::realtime::receiver_override::apply_receiver_override_texel;
 import package::realtime::bindings::{depth_buffer, empty_reservoir, load_motion_vector, load_previous_receiver_override, load_receiver_override, NO_SAMPLE_POINT_INSTANCE, previous_depth_buffer, previous_view, reservoirs_a, reservoirs_b, Reservoir, constants, view, view_output};
-import package::scene::sampling::{balance_heuristic, calculate_resolved_light_contribution, isinf, isnan, LightSample, NULL_LIGHT_ID, power_heuristic, resolve_light_sample, ResolvedLightSample, trace_visibility_from_surface, trace_visibility_previous_frame_from_surface};
+import package::realtime::atmosphere::calculate_light_contribution;
+import package::scene::sampling::{balance_heuristic, isinf, isnan, LightSample, NULL_LIGHT_ID, power_heuristic, resolve_light_sample, ResolvedLightSample, trace_visibility_from_surface, trace_visibility_previous_frame_from_surface};
 import package::scene::bindings::{geometry_ids, INSTANCE_NOT_PRESENT_THIS_FRAME, light_sources, LIGHT_NOT_PRESENT_THIS_FRAME, previous_frame_instance_id_translations, previous_frame_light_id_translations, RAY_T_MAX, RAY_T_MIN, resolve_sample_point, ResolvedMaterial};
 import package::realtime::world_cache_query::{query_world_cache, WORLD_CACHE_CELL_LIFETIME};
 
@@ -265,7 +266,7 @@ fn merge_reservoirs(
     let other_sample_at_other = reservoir_contribution(other_reservoir, other_resolved, other_ray_origin, other_world_position, other_world_normal, other_wo, other_material, other_F_ab);
 
     // Jacobians for resampling and MIS. Light samples don't need a reprojection jacobian,
-    // since calculate_resolved_light_contribution already accounts for the shading point's geometry.
+    // since calculate_light_contribution already accounts for the shading point's geometry.
     var other_sample_at_canonical_jacobian = 1.0;
     if other_reservoir.light_sample.light_id == NULL_LIGHT_ID {
         other_sample_at_canonical_jacobian = jacobian(
@@ -370,7 +371,7 @@ struct ReservoirContribution {
 
 fn reservoir_contribution(reservoir: Reservoir, resolved: ResolvedLightSample, ray_origin: vec3<f32>, world_position: vec3<f32>, world_normal: vec3<f32>, wo: vec3<f32>, material: ResolvedMaterial, F_ab: vec2<f32>) -> ReservoirContribution {
     if reservoir.light_sample.light_id != NULL_LIGHT_ID {
-        let light_contribution = calculate_resolved_light_contribution(resolved, world_position, world_normal);
+        let light_contribution = calculate_light_contribution(resolved, world_position, world_normal);
 
         // MIS weight against the bounce-0 BRDF-emissive strategy, recomputed from this surface's
         // brdf and material rather than baked into the unbiased contribution weight at generation. Mirrors the bounce-0
