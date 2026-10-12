@@ -1,7 +1,7 @@
-import package::realtime::gbuffer_utils::gpixel_resolve;
+import package::realtime::gbuffer_utils::load_gpixel;
 import package::realtime::initial_path::generate_initial_path;
 import package::realtime::receiver_override::apply_receiver_override_texel;
-import package::realtime::bindings::{constants, depth_buffer, gbuffer, load_receiver_override, view, view_output};
+import package::realtime::bindings::{constants, depth_buffer, load_receiver_override, view, view_output};
 import package::scene::bindings::RAY_T_MAX;
 import package::realtime::world_cache_query::{query_world_cache, WORLD_CACHE_CELL_LIFETIME};
 
@@ -17,7 +17,7 @@ fn initial_and_shade(@builtin(workgroup_id) workgroup_id: vec3<u32>, @builtin(gl
     let depth = textureLoad(depth_buffer, global_id.xy, 0);
     if depth == 0.0 { return; }
 
-    let raster_surface = gpixel_resolve(textureLoad(gbuffer, global_id.xy, 0), depth, global_id.xy, view.main_pass_viewport.zw, view.world_from_clip);
+    let raster_surface = load_gpixel(global_id.xy, depth);
     let surface = apply_receiver_override_texel(raster_surface, load_receiver_override(global_id.xy), false);
 
     let path = generate_initial_path(surface.ray_origin, surface.geometric_normal, surface.world_position, surface.world_normal, surface.material, workgroup_id.xy, global_id.xy, &rng);
