@@ -354,7 +354,11 @@ impl SpecializedRenderPipeline for DeferredLightingLayout {
             .view_layouts
             .has_deferred_specular_tint(key.into())
         {
+            // The target carries each pixel's diffuse transmission too, so the pass lights the
+            // transmitted lobe wherever it is nonzero.
             shader_defs.push("DEFERRED_SPECULAR_TINT".into());
+            shader_defs.push("STANDARD_MATERIAL_DIFFUSE_TRANSMISSION".into());
+            shader_defs.push("STANDARD_MATERIAL_DIFFUSE_OR_SPECULAR_TRANSMISSION".into());
         }
 
         let layout = self.mesh_pipeline.get_view_layout(key.into());

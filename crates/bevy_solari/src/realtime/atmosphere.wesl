@@ -11,11 +11,12 @@ enable wgpu_ray_query;
 /// Directional light samples are points on the light's disk, so testing each one against the
 /// horizon (an angular size of 0) averages to the visible fraction of the disk. Without soft
 /// shadows every sample is the disk's centre, and the light cuts off at the horizon.
-fn calculate_light_contribution(resolved_light_sample: ResolvedLightSample, ray_origin: vec3<f32>, origin_world_normal: vec3<f32>) -> LightContribution {
+fn calculate_light_contribution(resolved_light_sample: ResolvedLightSample, ray_origin: vec3<f32>, origin_world_normal: vec3<f32>, two_sided: bool) -> LightContribution {
     var light_contribution = calculate_resolved_light_contribution(resolved_light_sample, ray_origin, origin_world_normal);
-    // Views without an atmosphere bind a zeroed fallback (`outer_radius` 0). Lights behind the
-    // surface contribute nothing, so they skip the lookup.
-    if atmosphere.outer_radius > 0.0 && resolved_light_sample.world_position.w == 0.0 && dot(light_contribution.wi, origin_world_normal) > 0.0 {
+    // Views without an atmosphere bind a zeroed fallback (`outer_radius` 0). Light behind a
+    // surface reaches only a `two_sided` (transmissive) one, so others skip the lookup for it.
+    let receives = two_sided || dot(light_contribution.wi, origin_world_normal) > 0.0;
+    if atmosphere.outer_radius > 0.0 && resolved_light_sample.world_position.w == 0.0 && receives {
         light_contribution.radiance *= directional_light_attenuation(
             atmosphere,
             atmosphere_transmittance_lut,

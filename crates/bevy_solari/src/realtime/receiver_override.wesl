@@ -24,7 +24,8 @@ fn encode_receiver_override_surface() -> vec4<u32> {
 }
 
 /// A thin two-sided surface with a face normal of either sign. `tangent_guard` is the sine of
-/// the normal's angular uncertainty; see `offset_surface_ray_origin`.
+/// the normal's angular uncertainty, never negative (`NORMAL_OFFSET_ORIGIN` selects another
+/// policy); see `offset_surface_ray_origin`.
 fn encode_receiver_override_surface_normal(octahedral_normal: vec2<f32>, tangent_guard: f32) -> vec4<u32> {
     return vec4<u32>((RECEIVER_OVERRIDE_SURFACE << 24u) | 1u, bitcast<u32>(tangent_guard), bitcast<vec2<u32>>(octahedral_normal));
 }

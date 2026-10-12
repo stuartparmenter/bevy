@@ -141,7 +141,8 @@ pub struct ViewPrepassTextures {
     /// A texture that specifies the deferred lighting pass id for a material.
     /// Exists only if [`DeferredPrepass`] is added to the `ViewTarget`
     pub deferred_lighting_pass_id: Option<ColorAttachment>,
-    /// The specular tint written by the deferred pass, in [`DEFERRED_SPECULAR_TINT_FORMAT`].
+    /// The specular tint and diffuse transmission written by the deferred pass, in
+    /// [`DEFERRED_SPECULAR_TINT_FORMAT`].
     /// Exists only if [`DeferredPrepass`] is added to the `ViewTarget` and
     /// [`DeferredSpecularTintSupport::is_supported`](crate::deferred::DeferredSpecularTintSupport::is_supported)
     /// returns `true`.

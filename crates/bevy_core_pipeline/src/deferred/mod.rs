@@ -23,8 +23,8 @@ pub const DEFERRED_PREPASS_FORMAT: TextureFormat = TextureFormat::Rgba32Uint;
 pub const DEFERRED_LIGHTING_PASS_ID_FORMAT: TextureFormat = TextureFormat::R8Uint;
 pub const DEFERRED_SPECULAR_TINT_FORMAT: TextureFormat = TextureFormat::R32Uint;
 
-/// Whether the deferred pass has the specular tint target, for each combination of normal and
-/// motion vector prepasses.
+/// Whether the deferred pass has the specular tint target, which also carries the diffuse
+/// transmission, for each combination of normal and motion vector prepasses.
 ///
 /// The tint target is supported when all deferred pass color targets fit in the device's
 /// `max_color_attachments` and `max_color_attachment_bytes_per_sample` limits, and
