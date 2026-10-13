@@ -2,8 +2,8 @@ use core::f32::consts::PI;
 
 use super::{
     RaytracingGeometry, RaytracingGeometryBuffers, RaytracingGeometryPreviousVertices,
-    RaytracingGeometryTopologyGeneration, RaytracingInstanceTag, RaytracingMesh3d,
-    RaytracingSceneBindings,
+    RaytracingGeometryTopologyGeneration, RaytracingInstanceMask, RaytracingInstanceTag,
+    RaytracingMesh3d, RaytracingSceneBindings,
 };
 use bevy_asset::{AssetEvent, AssetId, Assets, Handle};
 use bevy_camera::{visibility::InheritedVisibility, Camera};
@@ -88,8 +88,15 @@ pub fn extract_raytracing_scene_structural(
             Added<RaytracingGeometry>,
         >,
     >,
+    changed_masks: Extract<
+        Query<
+            (RenderEntity, &RaytracingInstanceMask),
+            (Changed<RaytracingInstanceMask>, RaytracingInstanceFilter),
+        >,
+    >,
     mut removed_raytracing_meshes: Extract<RemovedComponents<RaytracingMesh3d>>,
     mut removed_raytracing_geometry: Extract<RemovedComponents<RaytracingGeometry>>,
+    mut removed_masks: Extract<RemovedComponents<RaytracingInstanceMask>>,
     render_entities: Extract<Query<RenderEntity>>,
     mut commands: Commands,
 ) {
@@ -97,6 +104,14 @@ pub fn extract_raytracing_scene_structural(
     for main_entity in removed_raytracing_meshes.read() {
         if let Ok(render_entity) = render_entities.get(main_entity) {
             commands.entity(render_entity).remove::<RaytracingMesh3d>();
+        }
+    }
+
+    for main_entity in removed_masks.read() {
+        if let Ok(render_entity) = render_entities.get(main_entity) {
+            commands
+                .entity(render_entity)
+                .remove::<RaytracingInstanceMask>();
         }
     }
 
@@ -132,6 +147,11 @@ pub fn extract_raytracing_scene_structural(
             *transform,
             PreviousGlobalTransform(transform.affine()),
         ));
+    }
+
+    // Masks of new instances are changed too, so this covers both.
+    for (render_entity, mask) in &changed_masks {
+        commands.entity(render_entity).insert(*mask);
     }
 }
 
