@@ -66,8 +66,20 @@ impl BlasManager {
             .is_some_and(|mesh| !mesh.requires.contains(key.opacity.flag()))
     }
 
-    fn require(&mut self, mesh: AssetId<Mesh>, flags: MeshRaytracingFlags) {
-        self.blas.entry(mesh).or_default().requires = flags;
+    fn require(
+        &mut self,
+        mesh: AssetId<Mesh>,
+        flags: MeshRaytracingFlags,
+        index_format: IndexFormat,
+    ) {
+        let blas = self.blas.entry(mesh).or_default();
+        blas.requires = flags;
+        blas.index_format = index_format;
+    }
+
+    /// The index format of a raytracing compatible mesh's BLAS geometry.
+    pub fn index_format(&self, mesh: &AssetId<Mesh>) -> Option<IndexFormat> {
+        self.blas.get(mesh).map(|blas| blas.index_format)
     }
 
     pub fn changed_meshes(&self) -> &[AssetId<Mesh>] {
@@ -110,6 +122,7 @@ impl BlasManager {
 
 struct MeshBlas {
     requires: MeshRaytracingFlags,
+    index_format: IndexFormat,
     opaque: Option<Blas>,
     non_opaque: Option<Blas>,
 }
@@ -118,6 +131,7 @@ impl Default for MeshBlas {
     fn default() -> Self {
         Self {
             requires: MeshRaytracingFlags::empty(),
+            index_format: IndexFormat::Uint32,
             opaque: None,
             non_opaque: None,
         }
@@ -216,8 +230,8 @@ pub fn prepare_raytracing_blas(
     // Record which BLAS added or changed meshes declare, even if none
     let features = render_device.features();
     for (asset_id, mesh) in &extracted_meshes.extracted {
-        if is_mesh_raytracing_compatible(mesh, features) {
-            blas_manager.require(*asset_id, mesh.raytracing);
+        if let Some(index_format) = raytracing_index_format(mesh, features) {
+            blas_manager.require(*asset_id, mesh.raytracing, index_format);
         }
     }
 
@@ -228,7 +242,7 @@ pub fn prepare_raytracing_blas(
     let blas_inputs = extracted_meshes
         .extracted
         .iter()
-        .filter(|(_, mesh)| is_mesh_raytracing_compatible(mesh, features))
+        .filter(|(_, mesh)| raytracing_index_format(mesh, features).is_some())
         .flat_map(|(asset_id, mesh)| {
             BlasOpacity::declared(mesh.raytracing).map(move |opacity| {
                 (
@@ -276,6 +290,9 @@ pub fn prepare_raytracing_blas(
                 &vertex_slice,
                 &index_slice,
                 position_format,
+                blas_manager
+                    .index_format(&key.mesh)
+                    .unwrap_or(IndexFormat::Uint32),
                 key,
                 &render_device,
             );
@@ -399,13 +416,14 @@ fn allocate_blas(
     vertex_slice: &MeshBufferSlice,
     index_slice: &MeshBufferSlice,
     position_format: VertexFormat,
+    index_format: IndexFormat,
     key: BlasKey,
     render_device: &RenderDevice,
 ) -> (Blas, BlasTriangleGeometrySizeDescriptor) {
     let blas_size = BlasTriangleGeometrySizeDescriptor {
         vertex_format: position_format,
         vertex_count: vertex_slice.range.len() as u32,
-        index_format: Some(IndexFormat::Uint32),
+        index_format: Some(index_format),
         index_count: Some(index_slice.range.len() as u32),
         flags: key.opacity.geometry_flags(),
     };
@@ -669,7 +687,9 @@ fn allocate_geometry_blas(
     (blas, blas_size)
 }
 
-fn is_mesh_raytracing_compatible(mesh: &Mesh, features: WgpuFeatures) -> bool {
+/// The index format of a raytracing compatible `mesh`'s BLAS geometry, its own as the mesh
+/// allocator stores it; `None` for a mesh that is not raytracing compatible.
+fn raytracing_index_format(mesh: &Mesh, features: WgpuFeatures) -> Option<IndexFormat> {
     const ATTRIBUTES: [MeshVertexAttribute; 4] = [
         Mesh::ATTRIBUTE_POSITION,
         Mesh::ATTRIBUTE_NORMAL,
@@ -689,7 +709,6 @@ fn is_mesh_raytracing_compatible(mesh: &Mesh, features: WgpuFeatures) -> bool {
             };
             (attribute.id, format)
         }));
-    let indexed_32 = matches!(mesh.indices(), Some(Indices::U32(..)));
     // Acceleration structures built from compressed positions need an extended vertex format.
     let position_format_supported = !compression
         .contains(MeshAttributeCompressionFlags::COMPRESS_POSITION)
@@ -700,5 +719,11 @@ fn is_mesh_raytracing_compatible(mesh: &Mesh, features: WgpuFeatures) -> bool {
             WgpuFeatures::EXTENDED_ACCELERATION_STRUCTURE_VERTEX_FORMATS
         ));
     }
-    triangle_list && vertex_attributes && indexed_32 && position_format_supported
+    if !(triangle_list && vertex_attributes && position_format_supported) {
+        return None;
+    }
+    match mesh.indices()? {
+        Indices::U16(_) => Some(IndexFormat::Uint16),
+        Indices::U32(_) => Some(IndexFormat::Uint32),
+    }
 }

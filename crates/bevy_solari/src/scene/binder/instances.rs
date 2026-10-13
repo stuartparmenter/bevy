@@ -22,7 +22,9 @@ use bevy_platform::collections::HashMap;
 use bevy_render::{
     impl_atomic_pod,
     mesh::allocator::MeshAllocator,
-    render_resource::{AtomicPod, AtomicSparseBufferVec, Buffer, BufferId, BufferUsages},
+    render_resource::{
+        AtomicPod, AtomicSparseBufferVec, Buffer, BufferId, BufferUsages, IndexFormat,
+    },
 };
 use bevy_transform::components::GlobalTransform;
 use bevy_utils::once;
@@ -53,6 +55,10 @@ pub struct GpuInstanceGeometryIds {
 /// The `metadata_buffer_id` of meshes without allocator metadata, whose attributes are all
 /// uncompressed.
 const NO_MESH_METADATA: u32 = u32::MAX;
+
+/// `index_buffer_offset` bit of 16-bit indices, two to a word of the index buffer; the other
+/// bits count indices. `INDEX_BUFFER_OFFSET_U16` in `bindings.wesl`.
+const INDEX_BUFFER_OFFSET_U16: u32 = 1 << 31;
 
 /// A world-from-local affine transform, stored transposed as three rows.
 #[derive(Clone, Copy, Default, PartialEq, Pod, Zeroable)]
@@ -532,12 +538,16 @@ impl InstanceState {
             InstanceSource::Mesh(mesh) => {
                 let vertex_slice = inputs.mesh_allocator.mesh_vertex_slice(&mesh)?;
                 let index_slice = inputs.mesh_allocator.mesh_index_slice(&mesh)?;
+                let index_format_flag = match inputs.blas_manager.index_format(&mesh)? {
+                    IndexFormat::Uint16 => INDEX_BUFFER_OFFSET_U16,
+                    IndexFormat::Uint32 => 0,
+                };
                 Some(ResolvedGeometry {
                     vertex_buffer: vertex_slice.buffer,
                     vertex_buffer_offset: vertex_slice.range.start,
                     previous_vertex_buffer: vertex_slice.buffer,
                     index_buffer: index_slice.buffer,
-                    index_buffer_offset: index_slice.range.start,
+                    index_buffer_offset: index_slice.range.start | index_format_flag,
                     triangle_count: (index_slice.range.len() / 3) as u32,
                     metadata: inputs
                         .mesh_allocator
