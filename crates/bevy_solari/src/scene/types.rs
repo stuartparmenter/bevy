@@ -19,7 +19,7 @@ use derive_more::derive::From;
 /// The mesh must declare the BLAS its material needs in [`Mesh::raytracing`] and use
 /// [`bevy_mesh::PrimitiveTopology::TriangleList`]. Static meshes must have exactly
 /// the vertex attributes `{POSITION, NORMAL, UV_0, TANGENT}` and use
-/// [`bevy_mesh::Indices::U32`].
+/// [`bevy_mesh::Indices::U16`] or [`bevy_mesh::Indices::U32`].
 ///
 /// Entities with [`bevy_mesh::skinning::SkinnedMesh`] or
 /// [`bevy_mesh::morph::MeshMorphWeights`] are deformed automatically for raytracing.
