@@ -7,7 +7,7 @@ use super::{
 };
 use crate::scene::{
     blas::GeometryBlasManager, RaytracingGeometryPreviousVertices,
-    RaytracingGeometryTopologyGeneration, RaytracingInstanceTag,
+    RaytracingGeometryTopologyGeneration, RaytracingInstanceMask, RaytracingInstanceTag,
 };
 use bevy_asset::AssetId;
 use bevy_ecs::{
@@ -156,6 +156,8 @@ pub struct InstanceState {
     pub geometry_ids: AtomicSparseBufferVec<GpuInstanceGeometryIds>,
     pub material_ids: AtomicSparseBufferVec<u32>,
     pub blas_refs: AtomicSparseBufferVec<GpuBlasRef>,
+    /// Each slot's [`RaytracingInstanceMask`].
+    pub instance_masks: AtomicSparseBufferVec<u32>,
     /// Maps instance slots from the last consumed frame to the current frame.
     /// Removed instances map to [`INSTANCE_NOT_PRESENT_THIS_FRAME`].
     pub previous_frame_id_translations: AtomicSparseBufferVec<u32>,
@@ -188,6 +190,7 @@ impl InstanceState {
             geometry_ids: storage_buffer("solari_geometry_ids"),
             material_ids: storage_buffer("solari_material_ids"),
             blas_refs: storage_buffer("solari_blas_refs"),
+            instance_masks: storage_buffer("solari_instance_masks"),
             previous_frame_id_translations: storage_buffer(
                 "solari_previous_frame_instance_id_translations",
             ),
@@ -275,15 +278,15 @@ impl InstanceState {
         }
     }
 
-    /// Every drawable instance's entity, slot, mesh BLAS key and world-from-local transform. The
-    /// key is `None` for instances that trace an entity-keyed geometry BLAS.
+    /// Every drawable instance's entity, slot, mesh BLAS key, world-from-local transform and
+    /// instance mask. The key is `None` for instances that trace an entity-keyed geometry BLAS.
     ///
     /// Only the `wgpu-core` TLAS build path needs this, to fill in the instance descriptors that
     /// the raw path sets up on the GPU. Slots with a null acceleration structure reference are not
     /// currently drawable, and are left out.
     pub fn drawable(
         &self,
-    ) -> impl Iterator<Item = (Entity, u32, Option<BlasKey>, [f32; 12])> + '_ {
+    ) -> impl Iterator<Item = (Entity, u32, Option<BlasKey>, [f32; 12], u8)> + '_ {
         self.records.iter().filter_map(|(entity, instance)| {
             let slot = instance.slot;
             (self.blas_refs.get(slot) != GpuBlasRef::NONE).then(|| {
@@ -292,6 +295,7 @@ impl InstanceState {
                     slot,
                     instance.blas_key(),
                     self.transforms.get(slot).rows(),
+                    self.instance_masks.get(slot) as u8,
                 )
             })
         })
@@ -312,6 +316,7 @@ pub type InstanceQueryData<'w> = (
     Option<&'w RaytracingGeometryPreviousVertices>,
     Option<&'w RaytracingGeometryTopologyGeneration>,
     Option<&'w RaytracingInstanceTag>,
+    Option<&'w RaytracingInstanceMask>,
     &'w MeshMaterial3d<StandardMaterial>,
     &'w GlobalTransform,
     &'w PreviousGlobalTransform,
@@ -329,6 +334,7 @@ pub type ChangedInstanceFilter = (
         Changed<RaytracingGeometryPreviousVertices>,
         Changed<RaytracingGeometryTopologyGeneration>,
         Changed<RaytracingInstanceTag>,
+        Changed<RaytracingInstanceMask>,
         Changed<MeshMaterial3d<StandardMaterial>>,
     )>,
 );
@@ -433,6 +439,7 @@ impl InstanceState {
         self.transforms.grow(len);
         self.previous_frame_transforms.grow(len);
         self.blas_refs.grow(len);
+        self.instance_masks.grow(len);
     }
 
     fn refresh_instance(
@@ -447,6 +454,7 @@ impl InstanceState {
             previous_vertices,
             topology_generation,
             user_tag,
+            mask,
             material,
             transform,
             previous_frame_transform,
@@ -477,6 +485,10 @@ impl InstanceState {
             None => self.slots.allocate(),
         };
         self.reserve_slot(slot);
+        self.instance_masks.set_if_changed(
+            slot,
+            u32::from(mask.map_or(RaytracingInstanceMask::ALL, |mask| *mask).0),
+        );
 
         // Seed only once. Later refreshes must not overwrite transforms written by extraction.
         if previous.is_none() {

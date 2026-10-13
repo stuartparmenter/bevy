@@ -20,8 +20,9 @@ pub mod prelude {
     pub use crate::realtime::SolariLighting;
     pub use crate::scene::{
         RaytracingGeometry, RaytracingGeometryBuffers, RaytracingGeometryPreviousVertices,
-        RaytracingGeometryTopologyGeneration, RaytracingGeometryUpdateMode, RaytracingInstanceTag,
-        RaytracingMesh3d, RaytracingProducerEncoder,
+        RaytracingGeometryTopologyGeneration, RaytracingGeometryUpdateMode, RaytracingInstanceMask,
+        RaytracingInstanceTag, RaytracingMesh3d, RaytracingProducerEncoder, ShadowHeightfield,
+        ShadowTiers,
     };
 }
 

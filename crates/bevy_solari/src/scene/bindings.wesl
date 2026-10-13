@@ -134,6 +134,36 @@ struct EnvironmentMapLight {
 const LIGHT_NOT_PRESENT_THIS_FRAME = 0xFFFFFFFFu;
 const INSTANCE_NOT_PRESENT_THIS_FRAME = 0xFFFFFFFFu;
 
+/// A near and mid sphere of `ShadowTiers`.
+struct TierSphere {
+    center: vec3<f32>,
+    near_radius: f32,
+    mid_radius: f32,
+}
+
+/// `ShadowTiers` of the scene. See `shadow_tiers.wesl`.
+struct ShadowTiers {
+    /// This frame's spheres, then the previous frame's.
+    spheres: array<TierSphere, 2>,
+    flags: u32,
+    /// The greatest height the heightfield's ground or canopy reaches.
+    height_max: f32,
+    /// World XZ of the heightfield textures' first texel corner, and the metres they span.
+    origin: vec2<f32>,
+    extent: f32,
+    canopy_height_max: f32,
+    canopy_base: f32,
+    canopy_extinction: f32,
+    canopy_self_radius: f32,
+    ground_slack: f32,
+    canopy_surface_height: f32,
+}
+
+/// `ShadowTiers.flags`: directional shadow rays are split into tiers.
+const SHADOW_TIERS_TIERED = 1u;
+/// `ShadowTiers.flags`: `shadow_ground` and `shadow_canopy` are bound and marched.
+const SHADOW_TIERS_HEIGHTFIELD = 2u;
+
 @group(0) @binding(0) var<storage> vertex_buffers: binding_array<VertexBuffer>;
 @group(0) @binding(1) var<storage> index_buffers: binding_array<IndexBuffer>;
 @group(0) @binding(2) var textures: binding_array<texture_2d<f32>>;
@@ -157,11 +187,18 @@ const INSTANCE_NOT_PRESENT_THIS_FRAME = 0xFFFFFFFFu;
 @group(0) @binding(20) var<storage> previous_frame_light_id_translations: array<u32>;
 @group(0) @binding(21) var<storage> previous_frame_instance_id_translations: array<u32>;
 @group(0) @binding(22) var<storage> mesh_metadata_buffers: binding_array<MeshMetadataBuffer>;
+@group(0) @binding(23) var<storage> shadow_tiers: ShadowTiers;
+/// `R32Float` ground height in metres, mips holding per-texel maxima.
+@group(0) @binding(24) var shadow_ground: texture_2d<f32>;
+/// r = canopy coverage, g = canopy height / `canopy_height_max`, b = its per-texel maximum.
+@group(0) @binding(25) var shadow_canopy: texture_2d<f32>;
 
 const RAY_T_MIN = 0.001f;
 const RAY_T_MAX = 100000.0f;
 
-const RAY_NO_CULL = 0xFFu;
+/// Instance mask bit of the instances every ray traces; the other bits belong to the shadow
+/// tiers (`RaytracingInstanceMask`).
+const RAY_MASK_ALL_RAYS = 0x01u;
 
 /// Tangent guard for a face normal computed from the raytracing vertices themselves.
 /// Cross, normalize and dot are still f32, so exact tangency is not decidable.
@@ -205,22 +242,30 @@ fn offset_ray_origin_along_normal(position: vec3<f32>, normal: vec3<f32>, direct
 }
 
 fn trace_ray(ray_origin: vec3<f32>, ray_direction: vec3<f32>, ray_t_min: f32, ray_t_max: f32, ray_flag: u32) -> RayIntersection {
-    let ray = RayDesc(ray_flag, RAY_NO_CULL, ray_t_min, ray_t_max, ray_origin, ray_direction);
-    var rq: ray_query;
-    rayQueryInitialize(&rq, tlas, ray);
-    while rayQueryProceed(&rq) {
-        let candidate = rayQueryGetCandidateIntersection(&rq);
-        if passes_alpha_test(candidate) {
-            rayQueryConfirmIntersection(&rq);
-        }
-    }
-    return rayQueryGetCommittedIntersection(&rq);
+    return trace(false, ray_origin, ray_direction, ray_t_min, ray_t_max, ray_flag, RAY_MASK_ALL_RAYS);
 }
 
 fn trace_ray_previous_frame(ray_origin: vec3<f32>, ray_direction: vec3<f32>, ray_t_min: f32, ray_t_max: f32, ray_flag: u32) -> RayIntersection {
-    let ray = RayDesc(ray_flag, RAY_NO_CULL, ray_t_min, ray_t_max, ray_origin, ray_direction);
+    return trace(true, ray_origin, ray_direction, ray_t_min, ray_t_max, ray_flag, RAY_MASK_ALL_RAYS);
+}
+
+/// Whether anything in `cull_mask` blocks the ray between `ray_t_min` and `ray_t_max`, in this
+/// frame's scene or, with `previous`, the previous frame's.
+fn occluded(previous: bool, ray_origin: vec3<f32>, ray_direction: vec3<f32>, ray_t_min: f32, ray_t_max: f32, ray_flag: u32, cull_mask: u32) -> bool {
+    let hit = trace(previous, ray_origin, ray_direction, ray_t_min, ray_t_max, ray_flag | RAY_FLAG_TERMINATE_ON_FIRST_HIT, cull_mask);
+    return hit.kind != RAY_QUERY_INTERSECTION_NONE;
+}
+
+/// The closest alpha-tested hit of the ray in this frame's scene or, with `previous`, the previous
+/// frame's, among the instances in `cull_mask`.
+fn trace(previous: bool, ray_origin: vec3<f32>, ray_direction: vec3<f32>, ray_t_min: f32, ray_t_max: f32, ray_flag: u32, cull_mask: u32) -> RayIntersection {
+    let ray = RayDesc(ray_flag, cull_mask, ray_t_min, ray_t_max, ray_origin, ray_direction);
     var rq: ray_query;
-    rayQueryInitialize(&rq, previous_frame_tlas, ray);
+    if previous {
+        rayQueryInitialize(&rq, previous_frame_tlas, ray);
+    } else {
+        rayQueryInitialize(&rq, tlas, ray);
+    }
     while rayQueryProceed(&rq) {
         let candidate = rayQueryGetCandidateIntersection(&rq);
         if passes_alpha_test(candidate) {
