@@ -3,8 +3,7 @@ use bevy_derive::{Deref, DerefMut};
 use bevy_ecs::{
     component::Component, prelude::ReflectComponent, resource::Resource, template::FromTemplate,
 };
-use bevy_image::Image;
-use bevy_math::{Vec2, Vec3};
+use bevy_math::Vec3;
 use bevy_mesh::Mesh;
 use bevy_pbr::{MeshMaterial3d, StandardMaterial};
 use bevy_reflect::{prelude::ReflectDefault, Reflect};
@@ -236,9 +235,10 @@ impl Default for RaytracingInstanceMask {
 /// A shadow ray from a surface inside the `near_radius` sphere first traces the scene to where it
 /// leaves that sphere, against instances with bit 0 of their [`RaytracingInstanceMask`]. From
 /// there to where it leaves the `mid_radius` sphere it traces one random bit of 1 to 7, culling
-/// back faces so a receiver inside a closed proxy of its own is not shadowed by it. Past that, and
-/// from the surface itself for one outside the mid sphere, it marches the [`ShadowHeightfield`].
-/// Every ray that is not a directional shadow ray traces bit 0 at any distance.
+/// back faces so a receiver inside a closed proxy of its own is not shadowed by it. Past that,
+/// and from the surface itself for one outside the mid sphere, the application's
+/// [`FarFieldVisibility`](super::FarFieldVisibility) answers, or nothing occludes. Every ray that
+/// is not a directional shadow ray traces bit 0 at any distance.
 ///
 /// Insert and update this resource in the main world. Temporal reuse traces the previous frame's
 /// scene with the previous frame's tiers.
@@ -247,41 +247,7 @@ impl Default for RaytracingInstanceMask {
 pub struct ShadowTiers {
     pub center: Vec3,
     pub near_radius: f32,
-    /// At least `near_radius`.
+    /// At least `near_radius`. Without a [`FarFieldVisibility`](super::FarFieldVisibility) the
+    /// partial occluders are traced to any distance instead.
     pub mid_radius: f32,
-    pub heightfield: Option<ShadowHeightfield>,
-}
-
-/// Ground and canopy heightfields that directional shadow rays march past the scene's geometry.
-///
-/// Both textures cover the same world square, `origin` to `origin + extent` in XZ, texel (0, 0)
-/// at `origin`. A ray below the ground by more than `ground_slack` is blocked. A ray crossing a
-/// canopy texel's band, from `canopy_base` of its canopy height above the ground to the full
-/// height, is attenuated by `coverage * (1 - exp(-canopy_extinction * length))`.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ShadowHeightfield {
-    /// `R32Float` ground height in metres, with a full mip chain of per-texel maxima.
-    pub ground: Handle<Image>,
-    /// `Rgba8Unorm`: r = share of the texel under canopy, g = canopy height over
-    /// `canopy_height_max`, b = the greatest canopy height in the texel over `canopy_height_max`.
-    /// Mips average r, average g weighted by r, and take the maximum of b.
-    pub canopy: Handle<Image>,
-    pub origin: Vec2,
-    pub extent: f32,
-    /// The greatest height any texel's canopy top reaches, in metres.
-    pub height_max: f32,
-    /// Metres a canopy height of 1 encodes.
-    pub canopy_height_max: f32,
-    /// Share of the canopy height below which a texel is clear.
-    pub canopy_base: f32,
-    /// Extinction per metre of ray inside the canopy band.
-    pub canopy_extinction: f32,
-    /// Horizontal distance from a surface inside the canopy over which canopy is ignored, so a
-    /// surface is not shadowed by the canopy texels it is part of.
-    pub canopy_self_radius: f32,
-    /// Metres the ground may stand above a ray before it is blocked: the difference between the
-    /// ground texture and the surfaces rays leave from.
-    pub ground_slack: f32,
-    /// Metres above the ground at which a surface counts as inside the canopy.
-    pub canopy_surface_height: f32,
 }

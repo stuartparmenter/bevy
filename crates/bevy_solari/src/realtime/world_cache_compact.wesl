@@ -5,7 +5,7 @@ import package::realtime::bindings::{
 
 enable wgpu_ray_query;
 
-@group(2) @binding(0) var<storage, read_write> world_cache_active_cells_dispatch: vec3<u32>;
+@group(constants::EXTRA_BIND_GROUP) @binding(0) var<storage, read_write> world_cache_active_cells_dispatch: vec3<u32>;
 
 var<workgroup> w1: array<u32, 1024u>;
 var<workgroup> w2: array<u32, 1024u>;

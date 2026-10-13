@@ -2,7 +2,7 @@ use super::prepare::{
     SolariLightingResources, SolariReceiverOverrides, LIGHT_TILE_BLOCKS,
     WORLD_CACHE_ACTIVE_CELLS_COUNT_OFFSET, WORLD_CACHE_SIZE,
 };
-use crate::scene::RaytracingSceneBindings;
+use crate::scene::{FarFieldVisibility, FarFieldVisibilityBindGroup, RaytracingSceneBindings};
 #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
 use bevy_anti_alias::dlss::ViewDlssRayReconstructionTextures;
 use bevy_asset::{load_embedded_asset, AssetServer, Handle};
@@ -34,7 +34,8 @@ use bevy_render::{
     view::{ViewTarget, ViewUniform, ViewUniformOffset, ViewUniforms},
 };
 use bevy_shader::{Shader, ShaderDefVal};
-use bevy_utils::default;
+use bevy_utils::{default, once};
+use tracing::warn;
 
 /// Resource holding the Solari lighting pipeline configuration.
 #[derive(Resource)]
@@ -101,6 +102,12 @@ type SolariLightingViewQuery = (
     Option<&'static ViewDlssRayReconstructionTextures>,
 );
 
+/// The bind group index of a pipeline's own extra bindings: after the far field's when one is
+/// installed. The shaders read it as `constants::EXTRA_BIND_GROUP`.
+fn extra_bind_group_index(far_field: bool) -> u32 {
+    FarFieldVisibility::BIND_GROUP + u32::from(far_field)
+}
+
 /// Zeroes the view's receiver override texture, so pixels no producer writes have no override.
 pub fn clear_receiver_overrides(view: ViewQuery<&SolariReceiverOverrides>, mut ctx: RenderContext) {
     let receiver_overrides = view.into_inner();
@@ -126,6 +133,8 @@ pub fn clear_receiver_overrides(view: ViewQuery<&SolariReceiverOverrides>, mut c
 pub fn solari_lighting(
     view: ViewQuery<SolariLightingViewQuery>,
     solari_pipelines: Option<Res<SolariLightingPipelines>>,
+    far_field: Option<Res<FarFieldVisibility>>,
+    far_field_bind_group: Option<Res<FarFieldVisibilityBindGroup>>,
     pipeline_cache: Res<PipelineCache>,
     scene_bindings: Res<RaytracingSceneBindings>,
     view_uniforms: Res<ViewUniforms>,
@@ -165,6 +174,17 @@ pub fn solari_lighting(
     let Some(pipelines) = solari_pipelines else {
         return;
     };
+    let far_field_bind_group = match (far_field.is_some(), far_field_bind_group) {
+        (true, Some(bind_group)) => Some(bind_group),
+        (true, None) => {
+            once!(warn!(
+                "FarFieldVisibility is installed but no FarFieldVisibilityBindGroup was inserted; skipping solari lighting"
+            ));
+            return;
+        }
+        (false, _) => None,
+    };
+    let extra_group = extra_bind_group_index(far_field.is_some());
 
     let gbuffer_specular_tint = view_prepass_textures
         .deferred_specular_tint_view()
@@ -403,10 +423,13 @@ pub fn solari_lighting(
             atmosphere_offset,
         ],
     );
+    if let Some(far_field_bind_group) = &far_field_bind_group {
+        pass.set_bind_group(FarFieldVisibility::BIND_GROUP, &far_field_bind_group.0, &[]);
+    }
 
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
     if let Some(bind_group_resolve_dlss_rr_textures) = &bind_group_resolve_dlss_rr_textures {
-        pass.set_bind_group(2, bind_group_resolve_dlss_rr_textures, &[]);
+        pass.set_bind_group(extra_group, bind_group_resolve_dlss_rr_textures, &[]);
         pass.set_pipeline(resolve_dlss_rr_textures_pipeline);
         pass.dispatch_workgroups(dx, dy, 1);
     }
@@ -418,7 +441,11 @@ pub fn solari_lighting(
 
     let d = diagnostics.time_span(&mut pass, "solari_lighting/world_cache");
 
-    pass.set_bind_group(2, &bind_group_world_cache_active_cells_dispatch, &[]);
+    pass.set_bind_group(
+        extra_group,
+        &bind_group_world_cache_active_cells_dispatch,
+        &[],
+    );
 
     pass.set_pipeline(decay_world_cache_pipeline);
     pass.dispatch_workgroups((WORLD_CACHE_SIZE / 1024) as u32, 1, 1);
@@ -432,7 +459,7 @@ pub fn solari_lighting(
     pass.set_pipeline(compact_world_cache_write_active_cells_pipeline);
     pass.dispatch_workgroups((WORLD_CACHE_SIZE / 1024) as u32, 1, 1);
 
-    pass.set_bind_group(2, None, &[]);
+    pass.set_bind_group(extra_group, None, &[]);
 
     pass.set_pipeline(sample_di_for_world_cache_pipeline);
     pass.dispatch_workgroups_indirect(
@@ -470,7 +497,7 @@ pub fn solari_lighting(
 
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
     if let Some(bind_group_resolve_dlss_rr_textures) = &bind_group_resolve_dlss_rr_textures {
-        pass.set_bind_group(2, bind_group_resolve_dlss_rr_textures, &[]);
+        pass.set_bind_group(extra_group, bind_group_resolve_dlss_rr_textures, &[]);
     }
     pass.set_pipeline(initial_pipeline);
     pass.dispatch_workgroups(dx, dy, 1);
@@ -531,6 +558,7 @@ pub(crate) fn init_specular_tint_fallback(
 
 /// Initializes the Solari lighting pipelines at render startup.
 pub fn init_solari_lighting_pipelines(
+    far_field: Option<Res<FarFieldVisibility>>,
     mut commands: Commands,
     pipeline_cache: Res<PipelineCache>,
     scene_bindings: Res<RaytracingSceneBindings>,
@@ -628,6 +656,8 @@ pub fn init_solari_lighting_pipelines(
         ),
     );
 
+    let extra_group = extra_bind_group_index(far_field.is_some());
+
     let create_pipeline = |label: &'static str,
                            entry_point: &'static str,
                            shader: Handle<Shader>,
@@ -640,6 +670,9 @@ pub fn init_solari_lighting_pipelines(
             &bind_group_layout
         };
         let mut layout = vec![scene_bindings.bind_group_layout.clone(), group_1.clone()];
+        if let Some(far_field) = &far_field {
+            layout.push(far_field.bind_group_layout.clone());
+        }
         match extra_bind_group {
             ExtraBindGroup::None => {}
             ExtraBindGroup::WorldCacheDispatch => {
@@ -651,10 +684,13 @@ pub fn init_solari_lighting_pipelines(
             }
         }
 
-        let mut shader_defs = vec![ShaderDefVal::UInt(
-            "WORLD_CACHE_SIZE".into(),
-            WORLD_CACHE_SIZE as u32,
-        )];
+        let mut shader_defs = vec![
+            ShaderDefVal::UInt("WORLD_CACHE_SIZE".into(), WORLD_CACHE_SIZE as u32),
+            ShaderDefVal::UInt("EXTRA_BIND_GROUP".into(), extra_group),
+        ];
+        if far_field.is_some() {
+            shader_defs.push("FAR_FIELD_VISIBILITY".into());
+        }
         if motion_vectors_storage_read_write {
             shader_defs.push("MOTION_VECTORS_READ_WRITE".into());
         }

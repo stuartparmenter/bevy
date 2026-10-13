@@ -3,6 +3,7 @@ mod blas;
 mod deformation;
 mod deformation_source;
 mod extract;
+mod far_field;
 mod producer;
 #[cfg(test)]
 mod ray_origin_offset_tests;
@@ -19,11 +20,12 @@ use deformation::{
     extract_mesh_deformations, prepare_mesh_deformations, MeshDeformationPipeline, MeshDeformations,
 };
 use deformation_source::{prepare_deformation_sources, DeformationSources};
+pub use far_field::{FarFieldVisibility, FarFieldVisibilityBindGroup};
 pub use producer::RaytracingProducerEncoder;
 pub use types::{
     RaytracingGeometry, RaytracingGeometryBuffers, RaytracingGeometryPreviousVertices,
     RaytracingGeometryTopologyGeneration, RaytracingGeometryUpdateMode, RaytracingInstanceMask,
-    RaytracingInstanceTag, RaytracingMesh3d, ShadowHeightfield, ShadowTiers,
+    RaytracingInstanceTag, RaytracingMesh3d, ShadowTiers,
 };
 
 use crate::SolariPlugins;
