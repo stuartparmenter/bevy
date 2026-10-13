@@ -1,5 +1,5 @@
 use super::{prepare::PathtracerAccumulationTexture, Pathtracer};
-use crate::scene::RaytracingSceneBindings;
+use crate::scene::{FarFieldVisibility, FarFieldVisibilityBindGroup, RaytracingSceneBindings};
 use bevy_asset::{load_embedded_asset, AssetServer};
 use bevy_ecs::{prelude::*, resource::Resource, system::Commands};
 use bevy_render::{
@@ -28,6 +28,7 @@ pub fn init_pathtracer_pipelines(
     pipeline_cache: Res<PipelineCache>,
     scene_bindings: Res<RaytracingSceneBindings>,
     asset_server: Res<AssetServer>,
+    far_field: Option<Res<FarFieldVisibility>>,
 ) {
     let bind_group_layout = BindGroupLayoutDescriptor::new(
         "pathtracer_bind_group_layout",
@@ -41,13 +42,20 @@ pub fn init_pathtracer_pipelines(
         ),
     );
 
+    let mut layout = vec![
+        scene_bindings.bind_group_layout.clone(),
+        bind_group_layout.clone(),
+    ];
+    let mut shader_defs = Vec::new();
+    if let Some(far_field) = &far_field {
+        layout.push(far_field.bind_group_layout.clone());
+        shader_defs.push("FAR_FIELD_VISIBILITY".into());
+    }
     let pipeline = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
         label: Some("pathtracer_pipeline".into()),
-        layout: vec![
-            scene_bindings.bind_group_layout.clone(),
-            bind_group_layout.clone(),
-        ],
+        layout,
         shader: load_embedded_asset!(asset_server.as_ref(), "pathtracer.wesl"),
+        shader_defs,
         ..default()
     });
 
@@ -66,6 +74,8 @@ pub fn pathtracer(
         &ViewUniformOffset,
     )>,
     pathtracer_pipelines: Option<Res<PathtracerPipelines>>,
+    far_field: Option<Res<FarFieldVisibility>>,
+    far_field_bind_group: Option<Res<FarFieldVisibilityBindGroup>>,
     pipeline_cache: Res<PipelineCache>,
     scene_bindings: Res<RaytracingSceneBindings>,
     view_uniforms: Res<ViewUniforms>,
@@ -114,5 +124,11 @@ pub fn pathtracer(
     pass.set_pipeline(pipeline);
     pass.set_bind_group(0, scene_bind_group, &[]);
     pass.set_bind_group(1, &bind_group, &[view_uniform_offset.offset]);
+    if far_field.is_some() {
+        let Some(far_field_bind_group) = far_field_bind_group else {
+            return;
+        };
+        pass.set_bind_group(FarFieldVisibility::BIND_GROUP, &far_field_bind_group.0, &[]);
+    }
     pass.dispatch_workgroups(viewport.x.div_ceil(8), viewport.y.div_ceil(8), 1);
 }

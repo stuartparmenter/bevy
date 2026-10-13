@@ -28,7 +28,6 @@ pub struct BindGroupCacheState {
     last_dfg_ids: Option<(TextureViewId, SamplerId)>,
     last_light_count: u32,
     last_environment_map_light_id: Option<TextureViewId>,
-    last_shadow_tiers_ids: Option<[Option<TextureViewId>; 2]>,
     pub dummy_buffer: Buffer,
 }
 
@@ -50,7 +49,6 @@ impl BindGroupCacheState {
             last_dfg_ids: None,
             last_light_count: 0,
             last_environment_map_light_id: None,
-            last_shadow_tiers_ids: None,
             dummy_buffer,
         }
     }
@@ -138,12 +136,6 @@ impl RaytracingSceneBindings {
             invalid = true;
         }
 
-        let shadow_tiers_ids = Some(self.shadow_tiers.texture_ids());
-        if self.bind_groups.last_shadow_tiers_ids != shadow_tiers_ids {
-            self.bind_groups.last_shadow_tiers_ids = shadow_tiers_ids;
-            invalid = true;
-        }
-
         invalid
     }
 
@@ -188,7 +180,6 @@ impl RaytracingSceneBindings {
             ),
         };
 
-        let shadow_views = self.shadow_tiers.views(fallback_texture);
         let current = self.tlas.structures[current_index].as_ref().unwrap();
         let previous = self.tlas.structures[current_index ^ 1]
             .as_ref()
@@ -229,8 +220,6 @@ impl RaytracingSceneBindings {
                     .unwrap(),
                 metadata_buffers.as_slice(),
                 self.shadow_tiers.binding(),
-                shadow_views[0],
-                shadow_views[1],
             )),
         )
     }
