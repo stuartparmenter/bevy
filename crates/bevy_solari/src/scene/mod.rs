@@ -22,14 +22,15 @@ use deformation_source::{prepare_deformation_sources, DeformationSources};
 pub use producer::RaytracingProducerEncoder;
 pub use types::{
     RaytracingGeometry, RaytracingGeometryBuffers, RaytracingGeometryPreviousVertices,
-    RaytracingGeometryTopologyGeneration, RaytracingGeometryUpdateMode, RaytracingInstanceTag,
-    RaytracingMesh3d,
+    RaytracingGeometryTopologyGeneration, RaytracingGeometryUpdateMode, RaytracingInstanceMask,
+    RaytracingInstanceTag, RaytracingMesh3d, ShadowHeightfield, ShadowTiers,
 };
 
 use crate::SolariPlugins;
 use bevy_app::{App, Plugin, PreUpdate};
 use bevy_ecs::schedule::IntoScheduleConfigs;
 use bevy_render::{
+    extract_resource::ExtractResourcePlugin,
     mesh::{
         allocator::{allocate_and_free_meshes, MeshAllocatorSettings},
         RenderMesh,
@@ -66,6 +67,7 @@ impl Plugin for RaytracingScenePlugin {
         load_shader_library!(app, "bindings.wesl");
         load_shader_library!(app, "sampling.wesl");
         load_shader_library!(app, "triangle_anchor.wesl");
+        load_shader_library!(app, "shadow_tiers.wesl");
         embedded_asset!(app, "binder/setup_tlas_instances.wesl");
         embedded_asset!(app, "deformation.wesl");
 
@@ -76,6 +78,8 @@ impl Plugin for RaytracingScenePlugin {
             update_raytracing_previous_global_transforms
                 .ambiguous_with(bevy_pbr::update_mesh_previous_global_transforms),
         );
+
+        app.add_plugins(ExtractResourcePlugin::<ShadowTiers>::default());
     }
 
     fn finish(&self, app: &mut App) {

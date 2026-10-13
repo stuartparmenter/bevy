@@ -3,6 +3,7 @@ mod assets;
 mod bind_group;
 mod instances;
 mod lights;
+mod shadow_tiers;
 mod tlas;
 mod tlas_build;
 
@@ -14,6 +15,7 @@ use self::instances::{
     MAX_MESH_SLAB_COUNT,
 };
 use self::lights::LightState;
+use self::shadow_tiers::ShadowTiersState;
 use self::tlas::TlasState;
 pub use self::tlas::{build_raytracing_tlas, TlasInstanceSetupPipeline};
 use super::{
@@ -23,7 +25,8 @@ use super::{
         ExtractedRaytracingRectLight, ExtractedRaytracingSpotLight, StandardMaterialAssets,
     },
     RaytracingGeometry, RaytracingGeometryBuffers, RaytracingGeometryPreviousVertices,
-    RaytracingGeometryTopologyGeneration, RaytracingInstanceTag, RaytracingMesh3d,
+    RaytracingGeometryTopologyGeneration, RaytracingInstanceMask, RaytracingInstanceTag,
+    RaytracingMesh3d, ShadowTiers,
 };
 use bevy_ecs::{
     entity::Entity,
@@ -60,6 +63,7 @@ pub struct RaytracingSceneBindings {
     lights: LightState,
     environment_map_light_sampler: Sampler,
     environment_map_light_buffer: StorageBuffer<GpuEnvironmentMapLight>,
+    shadow_tiers: ShadowTiersState,
     tlas: TlasState,
     bind_groups: BindGroupCacheState,
     /// Set by the lighting node once it has recorded work reading the translation tables.
@@ -107,6 +111,9 @@ impl FromWorld for RaytracingSceneBindings {
                     storage_buffer_read_only_sized(false, None),
                     storage_buffer_read_only_sized(false, None),
                     storage_buffer_read_only_sized(false, None).count(MAX_MESH_SLAB_COUNT),
+                    storage_buffer_read_only_sized(false, None),
+                    texture_2d(TextureSampleType::Float { filterable: false }),
+                    texture_2d(TextureSampleType::Float { filterable: false }),
                 ),
             ),
         );
@@ -133,6 +140,7 @@ impl FromWorld for RaytracingSceneBindings {
             lights: LightState::new(),
             environment_map_light_sampler,
             environment_map_light_buffer,
+            shadow_tiers: ShadowTiersState::new(),
             tlas: TlasState::new(render_device),
             bind_groups: BindGroupCacheState::new(render_device),
             translations_consumed: AtomicBool::new(false),
@@ -151,6 +159,7 @@ pub struct InstanceChanges<'w, 's> {
     removed_topology_generation: RemovedComponents<'w, 's, RaytracingGeometryTopologyGeneration>,
     removed_previous_vertices: RemovedComponents<'w, 's, RaytracingGeometryPreviousVertices>,
     removed_instance_tags: RemovedComponents<'w, 's, RaytracingInstanceTag>,
+    removed_instance_masks: RemovedComponents<'w, 's, RaytracingInstanceMask>,
 }
 
 /// Applies this frame's scene changes to the retained buffers, binding arrays and TLAS.
@@ -179,6 +188,7 @@ pub fn prepare_raytracing_scene_resources(
         RemovedComponents<ExtractedRaytracingRectLight>,
     ),
     needs_previous_frame_data: Option<Res<RaytracingSceneNeedsPreviousFrameData>>,
+    shadow_tiers: Option<Res<ShadowTiers>>,
     mesh_allocator: Res<MeshAllocator>,
     blas_manager: Res<BlasManager>,
     geometry_blas_manager: Res<GeometryBlasManager>,
@@ -235,7 +245,8 @@ pub fn prepare_raytracing_scene_resources(
             .read()
             .chain(instance_changes.removed_previous_vertices.read())
             .chain(instance_changes.removed_topology_generation.read())
-            .chain(instance_changes.removed_instance_tags.read()),
+            .chain(instance_changes.removed_instance_tags.read())
+            .chain(instance_changes.removed_instance_masks.read()),
     );
     let inputs = InstanceInputs {
         assets: &bindings.assets,
@@ -269,6 +280,12 @@ pub fn prepare_raytracing_scene_resources(
 
     // Upload the above writes
     write_sparse_buffers(bindings, &render_device, &render_queue);
+    bindings.shadow_tiers.update(
+        shadow_tiers.as_deref(),
+        &texture_assets,
+        &render_device,
+        &render_queue,
+    );
 
     // Prepare the next TLAS
     let build_ready = !bindings.tlas.uses_raw_build()
@@ -313,6 +330,9 @@ fn write_sparse_buffers(
         .write_buffers_non_empty(device, queue);
     if bindings.tlas.uses_raw_build() {
         instances.blas_refs.write_buffers_non_empty(device, queue);
+        instances
+            .instance_masks
+            .write_buffers_non_empty(device, queue);
     }
 
     let lights = &mut bindings.lights;

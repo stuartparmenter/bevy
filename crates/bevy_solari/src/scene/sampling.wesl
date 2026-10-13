@@ -1,7 +1,8 @@
 import bevy_pbr::render::pbr_lighting::D_GGX;
 import bevy_pbr::render::utils::{rand_vec2f, rand_u, rand_range_u, sample_uniform_sphere};
 import bevy_render::maths::{PI_2, orthonormalize};
-import package::scene::bindings::{offset_surface_ray_origin, trace_ray, trace_ray_previous_frame, RAY_T_MIN, RAY_T_MAX, light_sources, directional_lights, point_lights, rect_lights, environment_map, environment_map_sampler, environment_map_light, LightSource, light_source_kind, emissive_mesh_triangle_count, LIGHT_SOURCE_KIND_EMISSIVE_MESH, LIGHT_SOURCE_KIND_DIRECTIONAL, LIGHT_SOURCE_KIND_POINT, LIGHT_SOURCE_KIND_RECT, resolve_triangle_data_full, ResolvedRayHitFull, MIRROR_ROUGHNESS_THRESHOLD};
+import package::scene::shadow_tiers::directional_visibility;
+import package::scene::bindings::{offset_surface_ray_origin, occluded, RAY_MASK_ALL_RAYS, RAY_T_MIN, RAY_T_MAX, light_sources, directional_lights, point_lights, rect_lights, environment_map, environment_map_sampler, environment_map_light, LightSource, light_source_kind, emissive_mesh_triangle_count, LIGHT_SOURCE_KIND_EMISSIVE_MESH, LIGHT_SOURCE_KIND_DIRECTIONAL, LIGHT_SOURCE_KIND_POINT, LIGHT_SOURCE_KIND_RECT, resolve_triangle_data_full, ResolvedRayHitFull, MIRROR_ROUGHNESS_THRESHOLD};
 
 enable wgpu_ray_query;
 
@@ -340,38 +341,26 @@ fn trace_visibility_previous_frame_from_surface(ray_origin: vec3<f32>, geometric
     return trace_visibility_previous_frame(offset_surface_ray_origin(ray_origin, geometric_normal, normalize(direction)), point);
 }
 
+/// Visibility of `point` (a position with `w == 1`, else a direction) from `ray_origin` in this
+/// frame's scene. Directions take the scene's shadow tiers.
 fn trace_visibility(ray_origin: vec3<f32>, point: vec4<f32>) -> f32 {
-    var ray_direction = point.xyz;
-    var ray_t_max = RAY_T_MAX;
-
-    if point.w == 1.0 {
-        let ray = ray_direction - ray_origin;
-        let dist = length(ray);
-        ray_direction = ray / dist;
-        ray_t_max = dist - RAY_T_MIN;
-    }
-
-    if ray_t_max < RAY_T_MIN { return 0.0; }
-
-    let ray_hit = trace_ray(ray_origin, ray_direction, RAY_T_MIN, ray_t_max, RAY_FLAG_TERMINATE_ON_FIRST_HIT);
-    return f32(ray_hit.kind == RAY_QUERY_INTERSECTION_NONE);
+    return visibility(ray_origin, point, false);
 }
 
+/// `trace_visibility` in the previous frame's scene.
 fn trace_visibility_previous_frame(ray_origin: vec3<f32>, point: vec4<f32>) -> f32 {
-    var ray_direction = point.xyz;
-    var ray_t_max = RAY_T_MAX;
+    return visibility(ray_origin, point, true);
+}
 
-    if point.w == 1.0 {
-        let ray = ray_direction - ray_origin;
-        let dist = length(ray);
-        ray_direction = ray / dist;
-        ray_t_max = dist - RAY_T_MIN;
+fn visibility(ray_origin: vec3<f32>, point: vec4<f32>, previous: bool) -> f32 {
+    if point.w == 0.0 {
+        return directional_visibility(ray_origin, point.xyz, previous);
     }
-
+    let ray = point.xyz - ray_origin;
+    let dist = length(ray);
+    let ray_t_max = dist - RAY_T_MIN;
     if ray_t_max < RAY_T_MIN { return 0.0; }
-
-    let ray_hit = trace_ray_previous_frame(ray_origin, ray_direction, RAY_T_MIN, ray_t_max, RAY_FLAG_TERMINATE_ON_FIRST_HIT);
-    return f32(ray_hit.kind == RAY_QUERY_INTERSECTION_NONE);
+    return f32(!occluded(previous, ray_origin, ray / dist, RAY_T_MIN, ray_t_max, RAY_FLAG_NONE, RAY_MASK_ALL_RAYS));
 }
 
 /// https://www.realtimerendering.com/raytracinggems/unofficial_RayTracingGems_v1.9.pdf#0004286901.INDD%3ASec22%3A297

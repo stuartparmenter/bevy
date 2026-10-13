@@ -24,10 +24,11 @@ use tracing::info_span;
 pub struct BindGroupCacheState {
     cached: [Option<BindGroup>; 2],
     pub invalid: bool,
-    last_buffer_ids: Option<[BufferId; 12]>,
+    last_buffer_ids: Option<[BufferId; 13]>,
     last_dfg_ids: Option<(TextureViewId, SamplerId)>,
     last_light_count: u32,
     last_environment_map_light_id: Option<TextureViewId>,
+    last_shadow_tiers_ids: Option<[Option<TextureViewId>; 2]>,
     pub dummy_buffer: Buffer,
 }
 
@@ -49,6 +50,7 @@ impl BindGroupCacheState {
             last_dfg_ids: None,
             last_light_count: 0,
             last_environment_map_light_id: None,
+            last_shadow_tiers_ids: None,
             dummy_buffer,
         }
     }
@@ -71,7 +73,7 @@ fn buffer_bindings<'a>(
 
 impl RaytracingSceneBindings {
     /// The id of each buffer in the bind group.
-    fn buffer_ids(&self) -> [BufferId; 12] {
+    fn buffer_ids(&self) -> [BufferId; 13] {
         [
             self.assets.materials.buffer(),
             self.instances.transforms.buffer(),
@@ -85,6 +87,7 @@ impl RaytracingSceneBindings {
             self.environment_map_light_buffer.buffer(),
             self.lights.previous_frame_id_translations.buffer(),
             self.instances.previous_frame_id_translations.buffer(),
+            self.shadow_tiers.buffer(),
         ]
         .map(|buffer| {
             buffer
@@ -135,6 +138,12 @@ impl RaytracingSceneBindings {
             invalid = true;
         }
 
+        let shadow_tiers_ids = Some(self.shadow_tiers.texture_ids());
+        if self.bind_groups.last_shadow_tiers_ids != shadow_tiers_ids {
+            self.bind_groups.last_shadow_tiers_ids = shadow_tiers_ids;
+            invalid = true;
+        }
+
         invalid
     }
 
@@ -179,6 +188,7 @@ impl RaytracingSceneBindings {
             ),
         };
 
+        let shadow_views = self.shadow_tiers.views(fallback_texture);
         let current = self.tlas.structures[current_index].as_ref().unwrap();
         let previous = self.tlas.structures[current_index ^ 1]
             .as_ref()
@@ -218,6 +228,9 @@ impl RaytracingSceneBindings {
                     .binding()
                     .unwrap(),
                 metadata_buffers.as_slice(),
+                self.shadow_tiers.binding(),
+                shadow_views[0],
+                shadow_views[1],
             )),
         )
     }
@@ -403,6 +416,9 @@ fn prepare_sparse_uploads(
     if bindings.tlas.uses_raw_build() {
         instances
             .blas_refs
+            .prepare_to_populate_buffers(device, cache, jobs, groups, pipelines);
+        instances
+            .instance_masks
             .prepare_to_populate_buffers(device, cache, jobs, groups, pipelines);
     }
 
