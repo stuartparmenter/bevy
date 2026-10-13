@@ -1,3 +1,4 @@
+import bevy_pbr::deferred::types::NO_DIRECTIONAL_OCCLUSION;
 import bevy_pbr::render::pbr_functions::{
     calculate_tbn_mikktspace, dielectric_fresnel_ratio, dielectric_reflectance
 };
@@ -284,6 +285,9 @@ struct ResolvedMaterial {
     /// Share of the diffuse lobe transmitted to the back hemisphere.
     diffuse_transmission: f32,
     alpha_masked_out: bool,
+    /// The surface's baked directional occlusion (b, v), which scales the BRDF in every direction
+    /// (`bevy_pbr::deferred::types::directional_visibility`): (0, 0, 0, 1) sees everything.
+    directional_occlusion: vec4<f32>,
 }
 
 struct ResolvedRayHitFull {
@@ -348,6 +352,8 @@ fn resolve_material(material: Material, uv: vec2<f32>) -> ResolvedMaterial {
     if material.diffuse_transmission_texture_id != TEXTURE_MAP_NONE {
         m.diffuse_transmission *= sample_texture(material.diffuse_transmission_texture_id, uv).a;
     }
+
+    m.directional_occlusion = NO_DIRECTIONAL_OCCLUSION;
 
     return m;
 }
