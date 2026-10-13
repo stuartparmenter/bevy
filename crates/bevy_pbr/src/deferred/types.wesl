@@ -1,7 +1,7 @@
 import package::render::{
     mesh_types::{MESH_FLAGS_SHADOW_RECEIVER_BIT, MESH_FLAGS_TRANSMITTED_SHADOW_RECEIVER_BIT},
     pbr_types::{STANDARD_MATERIAL_FLAGS_FOG_ENABLED_BIT, STANDARD_MATERIAL_FLAGS_UNLIT_BIT},
-    rgb9e5::{shared_exponent_to_vec3_, vec3_to_shared_exponent_},
+    rgb9e5::{rgb9e5_to_vec3_, shared_exponent_to_vec3_, vec3_to_shared_exponent_},
 };
 
 // Maximum of 8 bits available
@@ -9,6 +9,9 @@ const DEFERRED_FLAGS_UNLIT_BIT: u32                 = 1u << 0u;
 const DEFERRED_FLAGS_FOG_ENABLED_BIT: u32           = 1u << 1u;
 const DEFERRED_MESH_FLAGS_SHADOW_RECEIVER_BIT: u32  = 1u << 2u;
 const DEFERRED_MESH_FLAGS_TRANSMITTED_SHADOW_RECEIVER_BIT: u32 = 1u << 3u;
+// The pixel carries baked directional occlusion in place of emissive and clearcoat
+// (`pack_directional_occlusion`).
+const DEFERRED_FLAGS_DIRECTIONAL_OCCLUSION_BIT: u32      = 1u << 4u;
 
 fn deferred_flags_from_mesh_material_flags(mesh_flags: u32, mat_flags: u32) -> u32 {
     var flags = 0u;
@@ -133,4 +136,48 @@ fn unpack_specular_tint(packed: u32) -> vec3<f32> {
 /// Unpacks the diffuse transmission packed by `pack_specular_tint_transmission`.
 fn unpack_diffuse_transmission(packed: u32) -> f32 {
     return f32(packed >> DIFFUSE_TRANSMISSION_SHIFT) / DIFFUSE_TRANSMISSION_MAX;
+}
+
+// Baked directional occlusion: how much of its surroundings a surface sees in each direction, for
+// a surface lit without the geometry that occludes it (one drawn in place of geometry kept out of
+// the ray-traced scene, say). It is an L1 spherical harmonic (b, v): the visibility of a unit
+// direction w is saturate(v + 3 b.w), v the visible share of the sphere and b the mean of the
+// visible directions, each component within [-1/4, 1/4]. A G-buffer pixel with
+// `DEFERRED_FLAGS_DIRECTIONAL_OCCLUSION_BIT` stores v in the diffuse occlusion byte, which the
+// deferred lighting pass reads as such, and b as three signed bytes of 4 b in the emissive word's
+// low 24 bits; it has no emissive and no clearcoat. WebGL2's G-buffer has no room for it.
+
+/// Directional occlusion that sees everything.
+const NO_DIRECTIONAL_OCCLUSION: vec4<f32> = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+
+/// Whether G-buffer pixel `gbuffer` carries baked directional occlusion.
+fn has_directional_occlusion(gbuffer: vec4<u32>) -> bool {
+    return (unpack_flags(gbuffer.a) & DEFERRED_FLAGS_DIRECTIONAL_OCCLUSION_BIT) != 0u;
+}
+
+/// The emissive of G-buffer pixel `gbuffer`: none where it carries baked directional occlusion.
+fn unpack_emissive(gbuffer: vec4<u32>) -> vec3<f32> {
+    return select(rgb9e5_to_vec3_(gbuffer.g), vec3(0.0), has_directional_occlusion(gbuffer));
+}
+
+/// The visibility of unit `direction` under directional occlusion `occlusion` (b, v).
+fn directional_visibility(occlusion: vec4<f32>, direction: vec3<f32>) -> f32 {
+    return saturate(occlusion.w + 3.0 * dot(occlusion.xyz, direction));
+}
+
+/// `gbuffer` with directional occlusion `occlusion` (b, v) in place of its emissive, clearcoat and
+/// diffuse occlusion, flagged with `DEFERRED_FLAGS_DIRECTIONAL_OCCLUSION_BIT`.
+@if(!WEBGL2)
+fn pack_directional_occlusion(gbuffer: vec4<u32>, occlusion: vec4<f32>) -> vec4<u32> {
+    let emissive = pack4x8snorm(vec4(occlusion.xyz * 4.0, 0.0)) & 0xFFFFFFu;
+    let v = u32(saturate(occlusion.w) * 255.0 + 0.5);
+    let props = (gbuffer.b & 0xFFFFu) | (v << 16u);
+    let normal_and_flags = gbuffer.a | (DEFERRED_FLAGS_DIRECTIONAL_OCCLUSION_BIT << 24u);
+    return vec4(gbuffer.r, emissive, props, normal_and_flags);
+}
+
+/// The directional occlusion (b, v) of a G-buffer pixel packed by `pack_directional_occlusion`.
+@if(!WEBGL2)
+fn unpack_directional_occlusion(gbuffer: vec4<u32>) -> vec4<f32> {
+    return vec4(unpack4x8snorm(gbuffer.g).xyz * 0.25, f32((gbuffer.b >> 16u) & 0xFFu) / 255.0);
 }

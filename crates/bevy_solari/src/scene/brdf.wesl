@@ -3,6 +3,7 @@ import bevy_pbr::render::pbr_lighting::{D_GGX, V_SmithGGXCorrelated, specular_mu
 import bevy_pbr::render::utils::{rand_f, sample_cosine_hemisphere};
 import bevy_render::maths::{PI, orthonormalize};
 import package::scene::sampling::{sample_ggx_vndf, ggx_vndf_pdf, ggx_vndf_sample_invalid};
+import bevy_pbr::deferred::types::directional_visibility;
 import package::scene::bindings::{ResolvedMaterial, MIRROR_ROUGHNESS_THRESHOLD, brdf_dfg_lut, brdf_dfg_lut_sampler};
 
 enable wgpu_ray_query;
@@ -84,7 +85,7 @@ fn evaluate_and_sample_brdf(
         if material.roughness <= MIRROR_ROUGHNESS_THRESHOLD {
             return EvaluateAndSampleBrdfResult(
                 wi,
-                evaluate_specular_brdf(wo, wi, world_normal, material, F_ab) / specular_weight,
+                evaluate_specular_brdf(wo, wi, world_normal, material, F_ab) * directional_visibility(material.directional_occlusion, wi) / specular_weight,
                 bitcast<f32>(0x7F800000u), // INF
                 false,
             );
@@ -96,6 +97,7 @@ fn evaluate_and_sample_brdf(
     return EvaluateAndSampleBrdfResult(wi, throughput, pdf, diffuse_selected);
 }
 
+/// The BRDF times the cosine, and times the material's directional visibility of `wi`.
 fn evaluate_brdf(
     wo: vec3<f32>,
     wi: vec3<f32>,
@@ -103,7 +105,8 @@ fn evaluate_brdf(
     material: ResolvedMaterial,
     F_ab: vec2<f32>,
 ) -> vec3<f32> {
-    return evaluate_diffuse_brdf(wo, wi, world_normal, material, F_ab) + evaluate_specular_brdf(wo, wi, world_normal, material, F_ab);
+    let brdf = evaluate_diffuse_brdf(wo, wi, world_normal, material, F_ab) + evaluate_specular_brdf(wo, wi, world_normal, material, F_ab);
+    return brdf * directional_visibility(material.directional_occlusion, wi);
 }
 
 /// Lambertian reflection into the front hemisphere and, for `diffuse_transmission`, its mirror
