@@ -112,8 +112,6 @@ impl FromWorld for RaytracingSceneBindings {
                     storage_buffer_read_only_sized(false, None),
                     storage_buffer_read_only_sized(false, None).count(MAX_MESH_SLAB_COUNT),
                     storage_buffer_read_only_sized(false, None),
-                    texture_2d(TextureSampleType::Float { filterable: false }),
-                    texture_2d(TextureSampleType::Float { filterable: false }),
                 ),
             ),
         );
@@ -280,12 +278,9 @@ pub fn prepare_raytracing_scene_resources(
 
     // Upload the above writes
     write_sparse_buffers(bindings, &render_device, &render_queue);
-    bindings.shadow_tiers.update(
-        shadow_tiers.as_deref(),
-        &texture_assets,
-        &render_device,
-        &render_queue,
-    );
+    bindings
+        .shadow_tiers
+        .update(shadow_tiers.as_deref(), &render_device, &render_queue);
 
     // Prepare the next TLAS
     let build_ready = !bindings.tlas.uses_raw_build()

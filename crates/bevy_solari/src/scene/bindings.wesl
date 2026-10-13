@@ -145,24 +145,9 @@ struct TierSphere {
 struct ShadowTiers {
     /// This frame's spheres, then the previous frame's.
     spheres: array<TierSphere, 2>,
-    flags: u32,
-    /// The greatest height the heightfield's ground or canopy reaches.
-    height_max: f32,
-    /// World XZ of the heightfield textures' first texel corner, and the metres they span.
-    origin: vec2<f32>,
-    extent: f32,
-    canopy_height_max: f32,
-    canopy_base: f32,
-    canopy_extinction: f32,
-    canopy_self_radius: f32,
-    ground_slack: f32,
-    canopy_surface_height: f32,
+    /// Whether directional shadow rays are split into tiers at all.
+    tiered: u32,
 }
-
-/// `ShadowTiers.flags`: directional shadow rays are split into tiers.
-const SHADOW_TIERS_TIERED = 1u;
-/// `ShadowTiers.flags`: `shadow_ground` and `shadow_canopy` are bound and marched.
-const SHADOW_TIERS_HEIGHTFIELD = 2u;
 
 @group(0) @binding(0) var<storage> vertex_buffers: binding_array<VertexBuffer>;
 @group(0) @binding(1) var<storage> index_buffers: binding_array<IndexBuffer>;
@@ -188,10 +173,6 @@ const SHADOW_TIERS_HEIGHTFIELD = 2u;
 @group(0) @binding(21) var<storage> previous_frame_instance_id_translations: array<u32>;
 @group(0) @binding(22) var<storage> mesh_metadata_buffers: binding_array<MeshMetadataBuffer>;
 @group(0) @binding(23) var<storage> shadow_tiers: ShadowTiers;
-/// `R32Float` ground height in metres, mips holding per-texel maxima.
-@group(0) @binding(24) var shadow_ground: texture_2d<f32>;
-/// r = canopy coverage, g = canopy height / `canopy_height_max`, b = its per-texel maximum.
-@group(0) @binding(25) var shadow_canopy: texture_2d<f32>;
 
 const RAY_T_MIN = 0.001f;
 const RAY_T_MAX = 100000.0f;
