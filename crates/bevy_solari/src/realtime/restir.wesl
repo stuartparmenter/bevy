@@ -1,6 +1,7 @@
 //! https://intro-to-restir.cwyman.org/presentations/2023ReSTIR_Course_Notes.pdf
 
 import bevy_core_pipeline::tonemapping::tonemapping_luminance as luminance;
+import bevy_pbr::deferred::types::NO_DIRECTIONAL_OCCLUSION;
 import bevy_pbr::render::utils::{rand_f, rand_u, sample_disk};
 import bevy_render::utils::{octahedral_decode, octahedral_encode};
 import package::scene::brdf::{brdf_pdf, evaluate_brdf, F_AB};
@@ -197,7 +198,7 @@ fn empty_neighbor_info() -> NeighborInfo {
 }
 
 fn empty_material() -> ResolvedMaterial {
-    return ResolvedMaterial(vec3(0.0), vec3(0.0), 0.0, 0.0, vec3(0.0), 0.0, 0.0, 0.0, 0.0, false);
+    return ResolvedMaterial(vec3(0.0), vec3(0.0), 0.0, 0.0, vec3(0.0), 0.0, 0.0, 0.0, 0.0, false, NO_DIRECTIONAL_OCCLUSION);
 }
 
 fn jacobian(

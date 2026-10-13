@@ -1,6 +1,5 @@
-import bevy_pbr::deferred::types::{decode_fresnel_ratio, unpack_24bit_normal, unpack_diffuse_transmission, unpack_specular_tint};
+import bevy_pbr::deferred::types::{NO_DIRECTIONAL_OCCLUSION, decode_fresnel_ratio, has_directional_occlusion, unpack_24bit_normal, unpack_directional_occlusion, unpack_diffuse_transmission, unpack_emissive, unpack_specular_tint};
 import bevy_pbr::render::pbr_functions::dielectric_reflectance;
-import bevy_pbr::render::rgb9e5::rgb9e5_to_vec3_;
 import bevy_render::utils::octahedral_decode;
 import bevy_render::view::{View, depth_ndc_to_view_z};
 import package::realtime::bindings::{gbuffer, gbuffer_specular_tint, previous_gbuffer, previous_gbuffer_specular_tint, previous_view, view};
@@ -39,10 +38,11 @@ fn gpixel_resolve(gpixel: vec4<u32>, gpixel_tint_transmission: u32, depth: f32, 
     let props = unpack4x8unorm(gpixel.b);
     let dielectric = dielectric_reflectance(decode_fresnel_ratio(props.r));
     let metallic = props.g;
-    let emissive = rgb9e5_to_vec3_(gpixel.g);
+    let emissive = unpack_emissive(gpixel);
+    let directional_occlusion = select(NO_DIRECTIONAL_OCCLUSION, unpack_directional_occlusion(gpixel), has_directional_occlusion(gpixel));
     let specular_tint = unpack_specular_tint(gpixel_tint_transmission);
     let diffuse_transmission = unpack_diffuse_transmission(gpixel_tint_transmission);
-    let material = ResolvedMaterial(base_color, emissive, dielectric.F0, dielectric.F90, specular_tint, perceptual_roughness, roughness, metallic, diffuse_transmission, false);
+    let material = ResolvedMaterial(base_color, emissive, dielectric.F0, dielectric.F90, specular_tint, perceptual_roughness, roughness, metallic, diffuse_transmission, false, directional_occlusion);
 
     return ResolvedGPixel(world_position, vec4(world_normal, NORMAL_OFFSET_ORIGIN), true, world_position, world_normal, material);
 }

@@ -6,9 +6,9 @@ import bevy_pbr::render::mesh_view_bindings::deferred_prepass_texture;
 import bevy_pbr::render::view_transformations::depth_ndc_to_view_z;
 import bevy_pbr::deferred::types::unpack_24bit_normal;
 import bevy_pbr::deferred::types::unpack_unorm4x8_;
+import bevy_pbr::deferred::types::unpack_emissive;
 import bevy_pbr::deferred::types::decode_fresnel_ratio;
 import bevy_pbr::deferred::types::unpack_unorm3x4_plus_unorm_20_;
-import bevy_pbr::render::rgb9e5::rgb9e5_to_vec3_;
 import bevy_render::utils::octahedral_decode;
 
 struct DebugBufferConfig {
@@ -95,7 +95,7 @@ fn fragment(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> 
 @if(DEBUG_DEFERRED_EMISSIVE) {
     @if(DEFERRED_PREPASS) {
         let deferred = textureLoad(deferred_prepass_texture, vec2<i32>(frag_coord.xy), 0);
-        let emissive = rgb9e5_to_vec3_(deferred.y);
+        let emissive = unpack_emissive(deferred);
         output_color = vec4(emissive, 1.0);
     }
     @else {
