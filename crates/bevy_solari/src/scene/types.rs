@@ -8,8 +8,8 @@ use bevy_mesh::Mesh;
 use bevy_pbr::{MeshMaterial3d, StandardMaterial};
 use bevy_reflect::{prelude::ReflectDefault, Reflect};
 use bevy_render::{
-    extract_resource::ExtractResource, render_resource::Buffer, sync_world::SyncToRenderWorld,
-    RenderApp,
+    extract_resource::ExtractResource, render_resource::Buffer, storage::ShaderBuffer,
+    sync_world::SyncToRenderWorld, RenderApp,
 };
 use bevy_transform::components::Transform;
 use derive_more::derive::From;
@@ -250,4 +250,56 @@ pub struct ShadowTiers {
     /// At least `near_radius`. Without a [`FarFieldVisibility`](super::FarFieldVisibility) the
     /// partial occluders are traced to any distance instead.
     pub mid_radius: f32,
+}
+
+/// One mesh of a [`RaytracingInstanceGroup`], with the material it is traced with.
+#[derive(Clone, Debug, PartialEq, Reflect)]
+#[reflect(Clone, PartialEq)]
+pub struct RaytracingInstanceGroupMember {
+    /// The mesh to trace. The same rules apply as for a static [`RaytracingMesh3d`].
+    pub mesh: Handle<Mesh>,
+    /// The material to trace it with. An emissive material makes every copy an area light.
+    pub material: Handle<StandardMaterial>,
+}
+
+/// Raytracing instances whose world-from-local transforms are written on the GPU.
+///
+/// The group traces `count` copies of `members`, `count * members.len()` instances in all, without
+/// a main-world entity per instance. Instance `copy * members.len() + member` traces
+/// `members[member]` with the transform at that index of `transforms`: three `vec4<f32>` rows of
+/// the world-from-local affine (row-major 3x4, 48 bytes), the layout of a TLAS instance's
+/// transform. Each frame Solari reads the buffer after the render world's preparation and before
+/// it builds the TLAS, and keeps the transforms it read the previous frame as the instances'
+/// previous transforms. Each instance is a render-world entity, created when the group changes.
+///
+/// Write `transforms` on the CPU by modifying the [`ShaderBuffer`] asset, or on the GPU with a
+/// compute pass recorded in [`RaytracingProducerEncoder`] during
+/// `RenderSystems::PrepareResources`, binding the buffer from
+/// `RenderAssets<GpuShaderBuffer>`. It must hold at least `count * members.len()` transforms and
+/// have `STORAGE` and `COPY_SRC` usage, as a [`ShaderBuffer`] has by default.
+///
+/// Changing only `count` creates or removes the instances past the smaller count; any other
+/// change re-creates all of the group's instances. GPU-written transforms need the raw TLAS build
+/// path (Vulkan); the `wgpu-core` path does not trace them. Instances trace nothing until the
+/// group's transforms are first copied in.
+///
+/// [`RaytracingProducerEncoder`]: super::RaytracingProducerEncoder
+#[derive(Component, Clone, Debug, Reflect)]
+#[reflect(Component, Clone)]
+pub struct RaytracingInstanceGroup {
+    /// The meshes each copy traces.
+    pub members: Vec<RaytracingInstanceGroupMember>,
+    /// How many copies of `members` to trace.
+    pub count: u32,
+    /// One transform per instance, written by the application.
+    pub transforms: Handle<ShaderBuffer>,
+    /// The mask of every instance in the group.
+    pub mask: RaytracingInstanceMask,
+}
+
+impl RaytracingInstanceGroup {
+    /// The number of instances the group traces.
+    pub fn instance_count(&self) -> u32 {
+        self.count * self.members.len() as u32
+    }
 }

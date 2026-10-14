@@ -14,6 +14,7 @@ use self::instances::{
     ChangedInstanceFilter, InstanceInputs, InstanceQueryData, InstanceQueryFilter, InstanceState,
     MAX_MESH_SLAB_COUNT,
 };
+pub(crate) use self::instances::{GpuTransform, GpuWrittenTransform};
 use self::lights::LightState;
 use self::shadow_tiers::ShadowTiersState;
 use self::tlas::TlasState;
@@ -71,6 +72,25 @@ pub struct RaytracingSceneBindings {
 }
 
 impl RaytracingSceneBindings {
+    /// The instance slot `entity`, a render entity traced through [`RaytracingMesh3d`] or
+    /// [`RaytracingGeometry`], holds.
+    pub(crate) fn instance_slot(&self, entity: Entity) -> Option<u32> {
+        self.instances.slot(entity)
+    }
+
+    /// The buffers of every instance slot's transform and previous-frame transform.
+    pub(crate) fn instance_transform_buffers(&self) -> Option<(&Buffer, &Buffer)> {
+        Some((
+            self.instances.transforms.buffer()?,
+            self.instances.previous_frame_transforms.buffer()?,
+        ))
+    }
+
+    /// Whether the TLAS is built from instance descriptors set up on the GPU.
+    pub(crate) fn uses_raw_tlas_build(&self) -> bool {
+        self.tlas.uses_raw_build()
+    }
+
     /// Marks both translation tables as consumed so the next frame can advance
     /// the light and instance snapshots.
     pub fn note_translations_consumed(&self) {
