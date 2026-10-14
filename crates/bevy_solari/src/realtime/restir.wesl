@@ -33,7 +33,7 @@ fn initial_and_temporal(@builtin(workgroup_id) workgroup_id: vec3<u32>, @builtin
     let raster_surface = load_gpixel(global_id.xy, depth);
     let surface = apply_receiver_override_texel(raster_surface, load_receiver_override(global_id.xy), false);
 
-    let initial = generate_initial_path(surface.ray_origin, surface.geometric_normal, surface.world_position, surface.world_normal, surface.material, workgroup_id.xy, global_id.xy, &rng);
+    let initial = generate_initial_path(surface.ray_origin, surface.geometric_normal, surface.world_position, surface.world_normal, surface.material, workgroup_id.xy, &rng);
     textureStore(view_output, global_id.xy, vec4(initial.radiance, 0.0));
 
     let temporal = load_temporal_reservoir(global_id.xy, depth, surface.world_position, surface.world_normal);
