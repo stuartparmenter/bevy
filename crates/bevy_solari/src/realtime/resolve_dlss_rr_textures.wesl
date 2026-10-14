@@ -2,10 +2,11 @@ import bevy_core_pipeline::tonemapping::tonemapping_luminance as luminance;
 import bevy_pbr::deferred::types::unpack_24bit_normal;
 import bevy_pbr::render::pbr_functions::calculate_diffuse_color;
 import bevy_render::utils::octahedral_decode;
-import package::realtime::gbuffer_utils::load_gpixel;
-import package::realtime::bindings::{gbuffer, depth_buffer, load_motion_vector, motion_vectors, previous_view, view, diffuse_albedo, specular_albedo, normal_roughness, dlss_rr_depth, specular_motion_vectors};
+import package::realtime::gbuffer_utils::{load_gpixel, ResolvedGPixel};
+import package::realtime::receiver_override::apply_receiver_override_texel;
+import package::realtime::bindings::{gbuffer, depth_buffer, load_motion_vector, load_receiver_override, motion_vectors, previous_view, view, diffuse_albedo, specular_albedo, normal_roughness, dlss_rr_depth, specular_motion_vectors};
 import package::scene::brdf::{evaluate_specular_brdf, F_AB, lobe_reflectances};
-import package::scene::bindings::{MIRROR_ROUGHNESS_THRESHOLD, ResolvedMaterial, ResolvedRayHitFull};
+import package::scene::bindings::{MIRROR_ROUGHNESS_THRESHOLD, NORMAL_OFFSET_ORIGIN, RAY_T_MAX, RAY_T_MIN, resolve_ray_hit_full, ResolvedMaterial, ResolvedRayHitFull, offset_surface_ray_origin, trace_ray};
 
 enable wgpu_ray_query;
 
@@ -23,6 +24,10 @@ const NORMAL_QUANTIZATION_FLOOR = 0.002;
 
 /// Distance, in meters, standing in for "infinitely far" when a mirror ray finds nothing.
 const ENVIRONMENT_VIRTUAL_DISTANCE = 10000.0;
+
+/// Rays a reflection is followed through a chain of perfect mirrors before the guide settles for the
+/// surface's own motion.
+const MAX_MIRROR_CHAIN_RAYS = 4u;
 
 @compute @workgroup_size(8, 8, 1)
 fn resolve_dlss_rr_textures(@builtin(global_invocation_id) global_id: vec3<u32>) {
@@ -51,22 +56,66 @@ fn resolve_dlss_rr_textures(@builtin(global_invocation_id) global_id: vec3<u32>)
     textureStore(specular_albedo, pixel_id, vec4(specular_albedo_approx(surface.material, surface.world_normal, wo), 0.0));
     textureStore(normal_roughness, pixel_id, vec4(surface.world_normal, surface.material.perceptual_roughness));
 
-    // Resetting to the specular motion vector on the frames we draw a diffuse lobe means we
-    // wouldn't be writing the motion vectors that frame, so it would alternate the guide between
-    // to values, and the denoiser blurs the reflection rather than reprojecting it.
-    if !needs_specular_motion_vector(surface.material.roughness) {
+    if needs_specular_motion_vector(surface.material.roughness) {
+        let receiver = apply_receiver_override_texel(surface, load_receiver_override(pixel_id), false);
+        trace_reflection_guides(pixel_id, receiver, wo);
+    } else {
         textureStore(specular_motion_vectors, pixel_id, vec4(surface_motion_vector, vec2(0.0)));
     }
+}
+
+/// Follows the primary surface's mirror direction, through any chain of perfect mirrors, to the
+/// surface its reflection shows, and writes that reflection's motion to the specular motion vector
+/// guide (and, for a perfect mirror, the reflected surface to every guide). The mirror direction
+/// rather than a sampled one keeps the guide on the same reflection every frame: a guide that moves
+/// between reflections makes the denoiser blur the reflection rather than reproject it.
+fn trace_reflection_guides(pixel_id: vec2<u32>, primary: ResolvedGPixel, primary_wo: vec3<f32>) {
+    let primary_F_ab = F_AB(primary.material.perceptual_roughness, max(dot(primary.world_normal, primary_wo), 0.0001));
+    var psr = psr_init(primary.world_normal, primary.material);
+    var origin = primary.ray_origin;
+    var geometric_normal = primary.geometric_normal;
+    var normal = primary.world_normal;
+    var wo = primary_wo;
+    var material = primary.material;
+    for (var mirror = 0u; mirror < MAX_MIRROR_CHAIN_RAYS; mirror++) {
+        // A shading normal facing away from the viewer has no reflection to follow.
+        if dot(wo, normal) <= 0.0 { break; }
+        let wi = reflect(-wo, normal);
+        let ray = trace_ray(offset_surface_ray_origin(origin, geometric_normal, wi), wi, RAY_T_MIN, RAY_T_MAX, RAY_FLAG_NONE);
+        if ray.kind == RAY_QUERY_INTERSECTION_NONE {
+            psr_environment_miss(pixel_id, primary_wo);
+            return;
+        }
+
+        let ray_hit = resolve_ray_hit_full(ray);
+        psr.reflection_length += ray.t;
+        if psr.replace_fully {
+            psr.throughput *= psr_bounce_reflectance(wo, wi, normal, material);
+        }
+
+        if primary_surface_glossy(primary.material) || !is_delta_mirror(ray_hit.material) {
+            replace_primary_surface(pixel_id, psr, ray_hit, primary.material, primary.world_position, primary.world_normal, primary_wo, primary_F_ab);
+            return;
+        }
+
+        // Still in the mirror chain, fold this mirror's reflection into the chain.
+        psr = psr_chain_mirror(psr, ray_hit.world_normal);
+        origin = ray_hit.world_position;
+        geometric_normal = vec4(ray_hit.geometric_world_normal, NORMAL_OFFSET_ORIGIN);
+        normal = ray_hit.world_normal;
+        wo = -wi;
+        material = ray_hit.material;
+    }
+    psr_surface_motion(pixel_id);
 }
 
 fn needs_specular_motion_vector(roughness: f32) -> bool {
     return roughness <= 0.0625;
 }
 
-/// Carried across every bounce of the path walk, so anything derivable from a value the walk already
-/// holds is derived at the end instead of stored. What is left is only what the walk itself produces.
+/// Carried along the mirror chain, so anything derivable from a value the chain already holds is
+/// derived at the end instead of stored. What is left is only what the chain itself produces.
 struct PsrState {
-    finished: bool,
     /// Whether this pixel's surface is being swapped out for the reflected one, or is only having its
     /// reflection's motion described. Keyed on the primary surface only, and false for anything glossy.
     replace_fully: bool,
@@ -86,7 +135,6 @@ struct PsrState {
 
 fn psr_init(world_normal: vec3<f32>, material: ResolvedMaterial) -> PsrState {
     var psr: PsrState;
-    psr.finished = !needs_specular_motion_vector(material.roughness);
     psr.replace_fully = is_delta_mirror(material);
     // The chain opens with the primary surface's own reflection, so parity starts odd.
     psr.mirror_rotor = mirror_chain_rotor(world_normal, false);
@@ -107,6 +155,11 @@ fn psr_chain_mirror(psr: PsrState, plane_normal: vec3<f32>) -> PsrState {
     chained.mirror_rotor = quaternion_multiply(psr.mirror_rotor, mirror_chain_rotor(plane_normal, psr.mirror_parity_odd));
     chained.mirror_parity_odd = !psr.mirror_parity_odd;
     return chained;
+}
+
+/// The specular motion vector guide for a reflection that can not be tracked: the surface's own motion.
+fn psr_surface_motion(pixel_id: vec2<u32>) {
+    textureStore(specular_motion_vectors, pixel_id, vec4(load_motion_vector(pixel_id), vec2(0.0)));
 }
 
 fn psr_environment_miss(pixel_id: vec2<u32>, primary_wo: vec3<f32>) {
@@ -133,7 +186,7 @@ fn replace_primary_surface(
 
     // Too curved to track the reflection; fall back to the surface's own motion so the guide is not stale
     if psr.replace_fully && 2.0 * reflector_curvature(pixel_id, primary_normal) * psr.reflection_length > MAX_VIRTUAL_DEPTH_JITTER * path_length {
-        textureStore(specular_motion_vectors, pixel_id, vec4(load_motion_vector(pixel_id), vec2(0.0)));
+        psr_surface_motion(pixel_id);
         return;
     }
 
@@ -185,11 +238,9 @@ fn specular_fraction(material: ResolvedMaterial, F_ab: vec2<f32>) -> f32 {
     return specular_luminance / max(specular_luminance + luminance(rho.diffuse), 0.0001);
 }
 
-fn psr_bounce_reflectance(wo: vec3<f32>, wi: vec3<f32>, normal: vec3<f32>, material: ResolvedMaterial, F_ab: vec2<f32>, delta: bool) -> vec3<f32> {
-    if delta {
-        return evaluate_specular_brdf(wo, wi, normal, material, F_ab);
-    }
-    return lobe_reflectances(material, F_ab).specular;
+/// Reflectance of one perfect mirror in the chain toward `wi`.
+fn psr_bounce_reflectance(wo: vec3<f32>, wi: vec3<f32>, normal: vec3<f32>, material: ResolvedMaterial) -> vec3<f32> {
+    return evaluate_specular_brdf(wo, wi, normal, material, F_AB(material.perceptual_roughness, max(dot(normal, wo), 0.0001)));
 }
 
 /// Angle, in radians, that the shading normal changes over one pixel in screen space.

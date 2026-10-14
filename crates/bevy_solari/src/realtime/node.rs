@@ -66,15 +66,11 @@ pub struct SolariLightingPipelines {
 
 struct RestirPipelines {
     initial_and_temporal: CachedComputePipelineId,
-    #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
-    initial_and_temporal_with_psr: CachedComputePipelineId,
     spatial_and_shade: CachedComputePipelineId,
 }
 
 struct NoRestirPipelines {
     initial_and_shade: CachedComputePipelineId,
-    #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
-    initial_and_shade_with_psr: CachedComputePipelineId,
 }
 
 #[cfg(any(not(feature = "dlss"), feature = "force_disable_dlss"))]
@@ -199,7 +195,6 @@ pub fn solari_lighting(
             .zip(view_prepass_textures.previous_depth_only_view()),
     );
 
-    #[cfg(any(not(feature = "dlss"), feature = "force_disable_dlss"))]
     let (initial_pipeline_id, spatial_pipeline_id) = if restir.is_some() {
         (
             pipelines.restir.initial_and_temporal,
@@ -208,21 +203,6 @@ pub fn solari_lighting(
     } else {
         (pipelines.no_restir.initial_and_shade, None)
     };
-
-    #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
-    let (initial_pipeline_id, spatial_pipeline_id) =
-        match (restir.is_some(), view_dlss_rr_textures.is_some()) {
-            (true, true) => (
-                pipelines.restir.initial_and_temporal_with_psr,
-                Some(pipelines.restir.spatial_and_shade),
-            ),
-            (true, false) => (
-                pipelines.restir.initial_and_temporal,
-                Some(pipelines.restir.spatial_and_shade),
-            ),
-            (false, true) => (pipelines.no_restir.initial_and_shade_with_psr, None),
-            (false, false) => (pipelines.no_restir.initial_and_shade, None),
-        };
 
     let (
         Some(decay_world_cache_pipeline),
@@ -429,9 +409,11 @@ pub fn solari_lighting(
 
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
     if let Some(bind_group_resolve_dlss_rr_textures) = &bind_group_resolve_dlss_rr_textures {
+        let d = diagnostics.time_span(&mut pass, "solari_lighting/resolve_dlss_rr_textures");
         pass.set_bind_group(extra_group, bind_group_resolve_dlss_rr_textures, &[]);
         pass.set_pipeline(resolve_dlss_rr_textures_pipeline);
         pass.dispatch_workgroups(dx, dy, 1);
+        d.end(&mut pass);
     }
 
     let d = diagnostics.time_span(&mut pass, "solari_lighting/presample_light_tiles");
@@ -495,10 +477,6 @@ pub fn solari_lighting(
         );
     }
 
-    #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
-    if let Some(bind_group_resolve_dlss_rr_textures) = &bind_group_resolve_dlss_rr_textures {
-        pass.set_bind_group(extra_group, bind_group_resolve_dlss_rr_textures, &[]);
-    }
     pass.set_pipeline(initial_pipeline);
     pass.dispatch_workgroups(dx, dy, 1);
 
@@ -820,15 +798,6 @@ pub fn init_solari_lighting_pipelines(
                 ExtraBindGroup::None,
                 vec![],
             ),
-            #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
-            initial_and_temporal_with_psr: create_pipeline(
-                "solari_lighting_initial_and_temporal_with_psr_pipeline",
-                "initial_and_temporal",
-                load_embedded_asset!(asset_server.as_ref(), "restir.wesl"),
-                true,
-                ExtraBindGroup::DlssRrGuideBuffers,
-                vec![],
-            ),
             spatial_and_shade: create_pipeline(
                 "solari_lighting_spatial_and_shade_pipeline",
                 "spatial_and_shade",
@@ -845,15 +814,6 @@ pub fn init_solari_lighting_pipelines(
                 load_embedded_asset!(asset_server.as_ref(), "no_restir.wesl"),
                 false,
                 ExtraBindGroup::None,
-                vec![],
-            ),
-            #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
-            initial_and_shade_with_psr: create_pipeline(
-                "solari_lighting_initial_and_shade_with_psr_pipeline",
-                "initial_and_shade",
-                load_embedded_asset!(asset_server.as_ref(), "no_restir.wesl"),
-                false,
-                ExtraBindGroup::DlssRrGuideBuffers,
                 vec![],
             ),
         },
