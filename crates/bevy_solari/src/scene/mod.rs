@@ -4,6 +4,7 @@ mod deformation;
 mod deformation_source;
 mod extract;
 mod far_field;
+mod instance_group;
 mod producer;
 #[cfg(test)]
 mod ray_origin_offset_tests;
@@ -24,8 +25,9 @@ pub use far_field::{FarFieldVisibility, FarFieldVisibilityBindGroup};
 pub use producer::RaytracingProducerEncoder;
 pub use types::{
     RaytracingGeometry, RaytracingGeometryBuffers, RaytracingGeometryPreviousVertices,
-    RaytracingGeometryTopologyGeneration, RaytracingGeometryUpdateMode, RaytracingInstanceMask,
-    RaytracingInstanceTag, RaytracingMesh3d, ShadowTiers,
+    RaytracingGeometryTopologyGeneration, RaytracingGeometryUpdateMode, RaytracingInstanceGroup,
+    RaytracingInstanceGroupMember, RaytracingInstanceMask, RaytracingInstanceTag, RaytracingMesh3d,
+    ShadowTiers,
 };
 
 use crate::SolariPlugins;
@@ -57,6 +59,11 @@ use extract::{
     extract_raytracing_spot_lights, update_raytracing_previous_global_transforms,
     ExtractedEnvironmentMapLight, StandardMaterialAssets,
 };
+use instance_group::{
+    extract_raytracing_instance_groups, prepare_raytracing_instance_groups,
+    write_raytracing_instance_group_transforms, RaytracingInstanceGroupPipeline,
+    RaytracingInstanceGroups,
+};
 use producer::submit_raytracing_producers;
 use tracing::warn;
 
@@ -72,6 +79,7 @@ impl Plugin for RaytracingScenePlugin {
         load_shader_library!(app, "shadow_tiers.wesl");
         embedded_asset!(app, "binder/setup_tlas_instances.wesl");
         embedded_asset!(app, "deformation.wesl");
+        embedded_asset!(app, "instance_group_transforms.wesl");
 
         // Meshlet raytracing entities can match both transform updaters.
         // Both write the same value, so their relative order does not matter.
@@ -113,10 +121,13 @@ impl Plugin for RaytracingScenePlugin {
             .init_gpu_resource::<RaytracingProducerEncoder>()
             .init_gpu_resource::<RaytracingSceneBindings>()
             .init_gpu_resource::<TlasInstanceSetupPipeline>()
+            .init_resource::<RaytracingInstanceGroups>()
+            .init_gpu_resource::<RaytracingInstanceGroupPipeline>()
             .add_systems(
                 ExtractSchedule,
                 (
                     extract_raytracing_scene_structural,
+                    extract_raytracing_instance_groups,
                     extract_mesh_deformations
                         .in_set(MeshDeformationSystems::Collect)
                         .after(extract_raytracing_scene_structural),
@@ -162,13 +173,20 @@ impl Plugin for RaytracingScenePlugin {
                     prepare_raytracing_scene_bind_group
                         .in_set(RenderSystems::PrepareBindGroups)
                         .after(prepare_raytracing_scene_resources),
+                    prepare_raytracing_instance_groups
+                        .in_set(RenderSystems::PrepareBindGroups)
+                        .after(prepare_raytracing_scene_resources)
+                        .before(submit_raytracing_producers),
                 ),
             )
             .add_systems(
                 RenderGraph,
                 (
-                    build_raytracing_tlas
+                    write_raytracing_instance_group_transforms
                         .after(update_sparse_buffers)
+                        .in_set(RenderGraphSystems::Begin),
+                    build_raytracing_tlas
+                        .after(write_raytracing_instance_group_transforms)
                         .in_set(RenderGraphSystems::Begin),
                     delete_raytracing_blas.in_set(RenderGraphSystems::Finish),
                 ),

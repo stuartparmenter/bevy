@@ -21,7 +21,8 @@ pub mod prelude {
     pub use crate::scene::{
         FarFieldVisibility, FarFieldVisibilityBindGroup, RaytracingGeometry,
         RaytracingGeometryBuffers, RaytracingGeometryPreviousVertices,
-        RaytracingGeometryTopologyGeneration, RaytracingGeometryUpdateMode, RaytracingInstanceMask,
+        RaytracingGeometryTopologyGeneration, RaytracingGeometryUpdateMode,
+        RaytracingInstanceGroup, RaytracingInstanceGroupMember, RaytracingInstanceMask,
         RaytracingInstanceTag, RaytracingMesh3d, RaytracingProducerEncoder, ShadowTiers,
     };
 }
