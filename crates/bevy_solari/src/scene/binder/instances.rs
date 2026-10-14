@@ -11,6 +11,7 @@ use crate::scene::{
 };
 use bevy_asset::AssetId;
 use bevy_ecs::{
+    component::Component,
     entity::{Entity, EntityHashMap, EntityHashSet},
     query::{Changed, Has, Or, QueryItem, With},
     system::Query,
@@ -63,7 +64,16 @@ const INDEX_BUFFER_OFFSET_U16: u32 = 1 << 31;
 /// A world-from-local affine transform, stored transposed as three rows.
 #[derive(Clone, Copy, Default, PartialEq, Pod, Zeroable)]
 #[repr(C)]
-pub struct GpuTransform([Vec4; 3]);
+pub(crate) struct GpuTransform([Vec4; 3]);
+
+/// Marks a raytracing instance whose slot transforms are written on the GPU, after the binder's
+/// uploads and before the TLAS build.
+///
+/// The binder never writes such a slot's transforms from the entity's [`GlobalTransform`]: the slot
+/// holds a zero transform, which traces nothing, until the writer first fills it. The `wgpu-core`
+/// TLAS build, which reads transforms on the CPU, leaves the instance out.
+#[derive(Component, Clone, Copy, Default)]
+pub(crate) struct GpuWrittenTransform;
 
 impl GpuTransform {
     /// The three rows as the flat row-major 3x4 a [`TlasInstance`] wants.
@@ -131,6 +141,8 @@ struct Instance {
     opacity: BlasOpacity,
     buffers: Option<InstanceBuffers>,
     geometry: Option<GeometryKey>,
+    /// Whether the instance carries [`GpuWrittenTransform`].
+    gpu_written_transform: bool,
 }
 
 /// The buffers an instance holds slots for in the binding arrays.
@@ -214,6 +226,11 @@ impl InstanceState {
         }
     }
 
+    /// The slot `entity` holds, drawable or not.
+    pub fn slot(&self, entity: Entity) -> Option<u32> {
+        self.records.get(&entity).map(|instance| instance.slot)
+    }
+
     /// The slot of `entity` while it is drawable.
     fn live_slot(&self, entity: Entity) -> Option<u32> {
         let slot = self.records.get(&entity)?.slot;
@@ -289,21 +306,24 @@ impl InstanceState {
     ///
     /// Only the `wgpu-core` TLAS build path needs this, to fill in the instance descriptors that
     /// the raw path sets up on the GPU. Slots with a null acceleration structure reference are not
-    /// currently drawable, and are left out.
+    /// currently drawable, and are left out, as are instances whose transforms are written on the
+    /// GPU.
     pub fn drawable(
         &self,
     ) -> impl Iterator<Item = (Entity, u32, Option<BlasKey>, [f32; 12], u8)> + '_ {
         self.records.iter().filter_map(|(entity, instance)| {
             let slot = instance.slot;
-            (self.blas_refs.get(slot) != GpuBlasRef::NONE).then(|| {
-                (
-                    *entity,
-                    slot,
-                    instance.blas_key(),
-                    self.transforms.get(slot).rows(),
-                    self.instance_masks.get(slot) as u8,
-                )
-            })
+            (!instance.gpu_written_transform && self.blas_refs.get(slot) != GpuBlasRef::NONE).then(
+                || {
+                    (
+                        *entity,
+                        slot,
+                        instance.blas_key(),
+                        self.transforms.get(slot).rows(),
+                        self.instance_masks.get(slot) as u8,
+                    )
+                },
+            )
         })
     }
 
@@ -323,6 +343,7 @@ pub type InstanceQueryData<'w> = (
     Option<&'w RaytracingGeometryTopologyGeneration>,
     Option<&'w RaytracingInstanceTag>,
     Option<&'w RaytracingInstanceMask>,
+    Has<GpuWrittenTransform>,
     &'w MeshMaterial3d<StandardMaterial>,
     &'w GlobalTransform,
     &'w PreviousGlobalTransform,
@@ -461,6 +482,7 @@ impl InstanceState {
             topology_generation,
             user_tag,
             mask,
+            gpu_written_transform,
             material,
             transform,
             previous_frame_transform,
@@ -496,9 +518,17 @@ impl InstanceState {
             u32::from(mask.map_or(RaytracingInstanceMask::ALL, |mask| *mask).0),
         );
 
-        // Seed only once. Later refreshes must not overwrite transforms written by extraction.
+        // Seed only once. Later refreshes must not overwrite transforms written by extraction or
+        // on the GPU.
         if previous.is_none() {
-            self.write_transforms(slot, transform, previous_frame_transform);
+            if gpu_written_transform {
+                self.transforms
+                    .set_if_changed(slot, GpuTransform::default());
+                self.previous_frame_transforms
+                    .set_if_changed(slot, GpuTransform::default());
+            } else {
+                self.write_transforms(slot, transform, previous_frame_transform);
+            }
         }
 
         let mut instance = Instance {
@@ -508,6 +538,7 @@ impl InstanceState {
             opacity: BlasOpacity::Opaque,
             buffers: previous.and_then(|instance| instance.buffers),
             geometry: previous.and_then(|instance| instance.geometry),
+            gpu_written_transform,
         };
         let resolved = self.resolve_instance(
             inputs,
@@ -816,7 +847,9 @@ impl RaytracingSceneBindings {
         transform: &GlobalTransform,
         previous_frame_transform: &PreviousGlobalTransform,
     ) {
-        if let Some(instance) = self.instances.records.get(&entity) {
+        if let Some(instance) = self.instances.records.get(&entity)
+            && !instance.gpu_written_transform
+        {
             self.instances
                 .write_transforms(instance.slot, transform, previous_frame_transform);
         }
@@ -845,6 +878,7 @@ mod tests {
                 index_buffer_offset: 0,
                 triangle_count: 4,
             }),
+            gpu_written_transform: false,
         };
         state.records.insert(entity, instance);
         state.set_blas_ref(entity, slot, GpuBlasRef(1));
