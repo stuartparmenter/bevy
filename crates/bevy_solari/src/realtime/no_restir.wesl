@@ -20,7 +20,7 @@ fn initial_and_shade(@builtin(workgroup_id) workgroup_id: vec3<u32>, @builtin(gl
     let raster_surface = load_gpixel(global_id.xy, depth);
     let surface = apply_receiver_override_texel(raster_surface, load_receiver_override(global_id.xy), false);
 
-    let path = generate_initial_path(surface.ray_origin, surface.geometric_normal, surface.world_position, surface.world_normal, surface.material, workgroup_id.xy, global_id.xy, &rng);
+    let path = generate_initial_path(surface.ray_origin, surface.geometric_normal, surface.world_position, surface.world_normal, surface.material, workgroup_id.xy, &rng);
 
     var pixel_color = path.radiance;
     pixel_color += surface.material.emissive;
