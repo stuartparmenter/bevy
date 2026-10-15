@@ -4,10 +4,10 @@ import bevy_core_pipeline::tonemapping::tonemapping_luminance as luminance;
 import bevy_pbr::render::utils::{rand_f, rand_u, sample_disk};
 import bevy_render::utils::{octahedral_decode, octahedral_encode};
 import package::scene::brdf::{brdf_pdf, evaluate_brdf, F_AB};
-import package::realtime::gbuffer_utils::{gpixel_resolve, permute_pixel, pixel_dissimilar, pixel_dissimilar_motion_compensated, temporal_object_motion_slack};
+import package::realtime::gbuffer_utils::{load_gpixel, load_previous_gpixel, permute_pixel, pixel_dissimilar, pixel_dissimilar_motion_compensated, temporal_object_motion_slack};
 import package::realtime::initial_path::{generate_initial_path, InitialSamplingResult, nee_probability};
 import package::realtime::receiver_override::apply_receiver_override_texel;
-import package::realtime::bindings::{depth_buffer, empty_reservoir, gbuffer, load_motion_vector, load_previous_receiver_override, load_receiver_override, NO_SAMPLE_POINT_INSTANCE, previous_depth_buffer, previous_gbuffer, previous_view, reservoirs_a, reservoirs_b, Reservoir, constants, view, view_output};
+import package::realtime::bindings::{depth_buffer, empty_reservoir, load_motion_vector, load_previous_receiver_override, load_receiver_override, NO_SAMPLE_POINT_INSTANCE, previous_depth_buffer, previous_view, reservoirs_a, reservoirs_b, Reservoir, constants, view, view_output};
 import package::scene::sampling::{balance_heuristic, calculate_resolved_light_contribution, isinf, isnan, LightSample, NULL_LIGHT_ID, power_heuristic, resolve_light_sample, ResolvedLightSample, trace_visibility_from_surface, trace_visibility_previous_frame_from_surface};
 import package::scene::bindings::{geometry_ids, INSTANCE_NOT_PRESENT_THIS_FRAME, light_sources, LIGHT_NOT_PRESENT_THIS_FRAME, previous_frame_instance_id_translations, previous_frame_light_id_translations, RAY_T_MAX, RAY_T_MIN, resolve_sample_point, ResolvedMaterial};
 import package::realtime::world_cache_query::{query_world_cache, WORLD_CACHE_CELL_LIFETIME};
@@ -28,7 +28,7 @@ fn initial_and_temporal(@builtin(workgroup_id) workgroup_id: vec3<u32>, @builtin
         reservoirs_b[pixel_index] = empty_reservoir();
         return;
     }
-    let raster_surface = gpixel_resolve(textureLoad(gbuffer, global_id.xy, 0), depth, global_id.xy, view.main_pass_viewport.zw, view.world_from_clip);
+    let raster_surface = load_gpixel(global_id.xy, depth);
     let surface = apply_receiver_override_texel(raster_surface, load_receiver_override(global_id.xy), false);
 
     let initial = generate_initial_path(surface.ray_origin, surface.geometric_normal, surface.world_position, surface.world_normal, surface.material, workgroup_id.xy, global_id.xy, &rng);
@@ -55,7 +55,7 @@ fn spatial_and_shade(@builtin(global_invocation_id) global_id: vec3<u32>) {
         reservoirs_a[pixel_index] = empty_reservoir();
         return;
     }
-    let raster_surface = gpixel_resolve(textureLoad(gbuffer, global_id.xy, 0), depth, global_id.xy, view.main_pass_viewport.zw, view.world_from_clip);
+    let raster_surface = load_gpixel(global_id.xy, depth);
     let surface = apply_receiver_override_texel(raster_surface, load_receiver_override(global_id.xy), false);
 
     let input_reservoir = reservoirs_b[pixel_index];
@@ -103,7 +103,7 @@ fn load_temporal_reservoir(pixel_id: vec2<u32>, depth: f32, world_position: vec3
         plane_slack = temporal_object_motion_slack(pixel_id, depth, world_position, motion_vector, view, previous_view.unjittered_clip_from_world);
     }
     let temporal_depth = textureLoad(previous_depth_buffer, permuted_temporal_pixel_id, 0);
-    let temporal_raster_surface = gpixel_resolve(textureLoad(previous_gbuffer, permuted_temporal_pixel_id, 0), temporal_depth, permuted_temporal_pixel_id, view.main_pass_viewport.zw, previous_view.world_from_clip);
+    let temporal_raster_surface = load_previous_gpixel(permuted_temporal_pixel_id, temporal_depth);
     let temporal_surface = apply_receiver_override_texel(temporal_raster_surface, load_previous_receiver_override(permuted_temporal_pixel_id), true);
     if !temporal_surface.ray_origin_valid || pixel_dissimilar_motion_compensated(depth, world_position, temporal_surface.world_position, world_normal, temporal_surface.world_normal, plane_slack, view) {
         return empty_neighbor_info();
@@ -163,7 +163,7 @@ fn load_spatial_reservoir(pixel_id: vec2<u32>, depth: f32, world_position: vec3<
         }
 
         let spatial_depth = textureLoad(depth_buffer, spatial_pixel_id, 0);
-        var spatial_surface = gpixel_resolve(textureLoad(gbuffer, spatial_pixel_id, 0), spatial_depth, spatial_pixel_id, view.main_pass_viewport.zw, view.world_from_clip);
+        var spatial_surface = load_gpixel(spatial_pixel_id, spatial_depth);
         if pixel_dissimilar(depth, world_position, spatial_surface.world_position, world_normal, spatial_surface.world_normal, view) {
             continue;
         }
@@ -196,7 +196,7 @@ fn empty_neighbor_info() -> NeighborInfo {
 }
 
 fn empty_material() -> ResolvedMaterial {
-    return ResolvedMaterial(vec3(0.0), vec3(0.0), 0.0, 0.0, 0.0, 0.0, false);
+    return ResolvedMaterial(vec3(0.0), vec3(0.0), 0.0, 0.0, vec3(0.0), 0.0, 0.0, 0.0, false);
 }
 
 fn jacobian(
