@@ -74,6 +74,7 @@ struct SolariLightingUniforms {
     reset: u32,
     history_reset: u32,
     receiver_overrides: u32,
+    world_cache_radiance_scale: f32,
 }
 
 impl SolariLightingUniforms {
@@ -101,6 +102,7 @@ impl SolariLightingUniforms {
             reset: reset as u32,
             history_reset: (reset || history_invalid) as u32,
             receiver_overrides: settings.receiver_overrides as u32,
+            world_cache_radiance_scale: settings.world_cache_radiance_scale.clamp(0.0, 1.0),
         }
     }
 }
@@ -491,6 +493,6 @@ mod lighting_history_tests {
 
     #[test]
     fn uniforms_match_shader_struct_size() {
-        assert_eq!(size_of::<SolariLightingUniforms>(), 56);
+        assert_eq!(size_of::<SolariLightingUniforms>(), 60);
     }
 }

@@ -255,6 +255,15 @@ pub struct SolariLighting {
     /// camera.
     pub world_cache_position_lod_scale: f32,
 
+    /// Factor every world cache cell's radiance is multiplied by each frame, clamped to `[0, 1]`.
+    ///
+    /// The cache follows new lighting only as fast as its cells update, and cells gather light
+    /// from each other, so after the lighting drops by orders of magnitude (such as a
+    /// fast-forwarded dusk) stale light can persist on high-albedo surfaces. Set this to the
+    /// frame's ratio of new to old illuminance to carry the cache down with the lighting, and
+    /// leave it at `1.0` otherwise.
+    pub world_cache_radiance_scale: f32,
+
     /// Set to true to delete the saved temporal history (past frames).
     ///
     /// Useful for preventing ghosting when the history is no longer
@@ -280,6 +289,7 @@ impl Default for SolariLighting {
             world_cache_cell_updates_soft_target: 40000,
             world_cache_position_base_cell_size: 0.15,
             world_cache_position_lod_scale: 15.0,
+            world_cache_radiance_scale: 1.0,
             reset: true, // No temporal history on the first frame
         }
     }

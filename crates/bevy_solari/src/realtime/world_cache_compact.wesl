@@ -21,6 +21,12 @@ fn decay_world_cache(@builtin(global_invocation_id) global_id: vec3<u32>) {
             world_cache.checksums[global_id.x] = WORLD_CACHE_EMPTY_CELL;
             world_cache.radiance[global_id.x] = vec4(0.0);
             world_cache.luminance_deltas[global_id.x] = 0.0;
+        } else if package::realtime::bindings::constants.world_cache_radiance_scale < 1.0 {
+            // Carry the cache down with the scene's lighting (`SolariLighting::world_cache_radiance_scale`).
+            let scale = package::realtime::bindings::constants.world_cache_radiance_scale;
+            let cell = world_cache.radiance[global_id.x];
+            world_cache.radiance[global_id.x] = vec4(cell.rgb * scale, cell.a);
+            world_cache.luminance_deltas[global_id.x] *= scale;
         }
     }
 }
