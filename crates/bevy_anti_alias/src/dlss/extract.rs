@@ -1,4 +1,7 @@
-use super::{prepare::DlssRenderContext, Dlss, DlssFeature};
+use super::{
+    prepare::{DlssExposure, DlssRenderContext},
+    Dlss, DlssFeature,
+};
 use bevy_camera::{Camera, Hdr, MainPassResolutionOverride, Projection};
 use bevy_ecs::{
     query::{Has, With},
@@ -35,7 +38,7 @@ pub fn extract_dlss<F: DlssFeature, F2: DlssFeature>(
             let other_still_extracting =
                 other_dlss_feature && camera.is_active && camera_projection.is_perspective();
             if !other_still_extracting {
-                entity_commands.remove::<MainPassResolutionOverride>();
+                entity_commands.remove::<(MainPassResolutionOverride, DlssExposure)>();
             }
         }
     }
