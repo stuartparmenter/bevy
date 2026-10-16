@@ -116,21 +116,29 @@ fn sky_view_lut_uv_to_zenith_azimuth(r: f32, uv: vec2<f32>) -> vec2<f32> {
 
 // LUT SAMPLING
 
-fn sample_transmittance_lut(r: f32, mu: f32) -> vec3<f32> {
+/// Optical depth from radius `r` along zenith cosine `mu` to the top of the atmosphere, or to
+/// the ground. The transmittance LUT stores optical depth because the transmittance toward a sun
+/// below the horizon underflows f16.
+fn sample_optical_depth_lut(r: f32, mu: f32) -> vec3<f32> {
     let uv = transmittance_lut_r_mu_to_uv(atmosphere, r, mu);
     return textureSampleLevel(transmittance_lut, atmosphere_lut_sampler, uv, 0.0).rgb;
 }
 
+fn sample_transmittance_lut(r: f32, mu: f32) -> vec3<f32> {
+    return exp(-sample_optical_depth_lut(r, mu));
+}
+
 fn sample_multiscattering_lut(r: f32, mu: f32) -> vec3<f32> {
     let uv = multiscattering_lut_r_mu_to_uv(r, mu);
-    return textureSampleLevel(multiscattering_lut, atmosphere_lut_sampler, uv, 0.0).rgb;
+    return exp(textureSampleLevel(multiscattering_lut, atmosphere_lut_sampler, uv, 0.0).rgb);
 }
 
 fn sample_sky_view_lut(r: f32, ray_dir_as: vec3<f32>) -> vec3<f32> {
     let mu = ray_dir_as.y;
     let azimuth = fast_atan2(ray_dir_as.x, -ray_dir_as.z);
     let uv = sky_view_lut_r_mu_azimuth_to_uv(r, mu, azimuth);
-    return textureSampleLevel(sky_view_lut, atmosphere_lut_sampler, uv, 0.0).rgb;
+    // The LUT is pre-exposed.
+    return textureSampleLevel(sky_view_lut, atmosphere_lut_sampler, uv, 0.0).rgb / view.exposure;
 }
 
 fn ndc_to_camera_dist(ndc: vec3<f32>) -> f32 {
@@ -159,8 +167,8 @@ fn sample_aerial_view_lut(uv: vec2<f32>, t: f32) -> vec3<f32> {
     // position to recover the correct integral value.
     let t_slice = t_max / num_slices;
     let fade = saturate(t / t_slice);
-    // Recover the values from log space
-    return exp(sample.rgb) * fade;
+    // Recover the values from log space and undo the pre-exposure
+    return exp(sample.rgb) / view.exposure * fade;
 }
 
 // ATMOSPHERE SAMPLING
@@ -251,7 +259,8 @@ fn calculate_visible_sun_ratio(atmosphere: Atmosphere, r: f32, mu: f32, sun_angu
     // Invert the horizon angle calculation to fix shading direction
     let horizon_cos = -sqrt(1.0 - (inner_radius * inner_radius) / (r * r));
     let horizon_angle = fast_acos_4(horizon_cos);
-    let sun_zenith_angle = fast_acos_4(mu);
+    // A zenith light's `mu` can round past 1, where `fast_acos_4` is NaN.
+    let sun_zenith_angle = fast_acos_4(clamp(mu, -1.0, 1.0));
 
     // If sun is completely above horizon
     if sun_zenith_angle + sun_angular_size * 0.5 <= horizon_angle {
@@ -270,7 +279,8 @@ fn calculate_visible_sun_ratio(atmosphere: Atmosphere, r: f32, mu: f32, sun_angu
 }
 
 /// Attenuation of a directional light reaching `world_position`: the transmittance toward the
-/// light times the fraction of its disk above the horizon.
+/// light times the fraction of its disk above the horizon. `transmittance_texture` is the
+/// transmittance LUT, which stores optical depth.
 ///
 /// Takes its resources as arguments so callers can bind them in any group.
 fn directional_light_attenuation(
@@ -286,8 +296,8 @@ fn directional_light_attenuation(
     let mu = dot(direction_to_light, normalize(position));
 
     let uv = transmittance_lut_r_mu_to_uv(atmosphere, r, mu);
-    let transmittance = textureSampleLevel(transmittance_texture, transmittance_sampler, uv, 0.0).rgb;
-    return transmittance * calculate_visible_sun_ratio(atmosphere, r, mu, sun_angular_size);
+    let optical_depth = textureSampleLevel(transmittance_texture, transmittance_sampler, uv, 0.0).rgb;
+    return exp(-optical_depth) * calculate_visible_sun_ratio(atmosphere, r, mu, sun_angular_size);
 }
 
 // TRANSFORM UTILITIES
