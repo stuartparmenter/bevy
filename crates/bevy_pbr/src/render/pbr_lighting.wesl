@@ -36,6 +36,7 @@ import package::{
     render::mesh_view_types::{POINT_LIGHT_FLAGS_SPOT_LIGHT_Y_NEGATIVE, RectLight},
     render::mesh_view_bindings as view_bindings,
     atmosphere::functions::directional_light_attenuation,
+    atmosphere::bruneton_functions::transmittance_lut_r_mu_to_uv,
 };
 import bevy_render::maths::{PI, orthonormalize, quat_rotate};
 
@@ -1220,4 +1221,14 @@ fn rect_light(
 } @else {
     return (spec_weight * spec + diffuse_color * diff) * (*light).color.rgb * range_falloff;
 }
+}
+
+
+@if(ATMOSPHERE)
+fn sample_transmittance_lut(r: f32, mu: f32) -> vec3<f32> {
+    let uv = transmittance_lut_r_mu_to_uv(view_bindings::atmosphere, r, mu);
+    // The LUT stores optical depth.
+    return exp(-textureSampleLevel(
+        view_bindings::atmosphere_transmittance_texture,
+        view_bindings::atmosphere_transmittance_sampler, uv, 0.0).rgb);
 }
