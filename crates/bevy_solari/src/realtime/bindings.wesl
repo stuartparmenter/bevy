@@ -70,6 +70,7 @@ struct SolariLightingSettings {
     /// Per-pixel history is invalid: `reset`, or the previous frame's lighting did not run.
     history_reset: u32,
     receiver_overrides: u32,
+    world_cache_radiance_scale: f32,
 }
 
 /// This frame's receiver override texel for `pixel`; see `receiver_override.wesl`.
