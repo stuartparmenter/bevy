@@ -10,21 +10,33 @@ use bevy_shape::{Aabb3d, BoundingSphere, BoundingVolume};
 use bevy_tasks::{AsyncComputeTaskPool, ParallelSlice};
 use bitvec::{order::Lsb0, vec::BitVec, view::BitView};
 use core::ops::Range;
-use itertools::Itertools;
 use meshopt::{
-    build_meshlets, ffi::meshopt_Meshlet, generate_position_remap,
-    simplify_with_attributes_and_locks, Meshlets, SimplifyOptions, VertexDataAdapter,
+    build_meshlets_flex, ffi::meshopt_Meshlet, generate_position_remap,
+    partition_clusters_with_positions, simplify_with_attributes_and_locks,
+    spatial_sort_remap_decoder, Meshlets, SimplifyOptions, VertexDataAdapter,
 };
-use metis::{option::Opt, Graph};
 use smallvec::SmallVec;
 use thiserror::Error;
 use tracing::debug_span;
 
-// Aim to have 8 meshlets per group
-const TARGET_MESHLETS_PER_GROUP: usize = 8;
-// Reject groups that keep over 60% of their original triangles. We'd much rather render a few
-// extra triangles than create too many meshlets, increasing cull overhead.
-const SIMPLIFICATION_FAILURE_PERCENTAGE: f32 = 0.60;
+// The visibility buffer addresses a meshlet's triangles in 7 bits, and a meshlet stores its
+// vertex count minus one in a byte.
+const MESHLET_MAX_TRIANGLES: usize = 128;
+const MESHLET_MAX_VERTICES: usize = 256;
+// Meshlets between these two sizes are split when their bounds outgrow the expected meshlet
+// size by more than the split factor. meshoptimizer 1.x takes any minimum; the "divisible by 4"
+// in meshopt-rs's docs is left over from 0.x's padded triangle data.
+const MESHLET_MIN_TRIANGLES: usize = MESHLET_MAX_TRIANGLES / 3;
+const MESHLET_SPLIT_FACTOR: f32 = 2.0;
+// Aim to have 24 meshlets per group; partitions come out at up to a third more.
+const TARGET_MESHLETS_PER_GROUP: usize = 24;
+// A group that keeps over 85% of its triangles is stuck. Its meshlets go on to the next LOD
+// unsimplified, where they are grouped with different neighbours.
+const SIMPLIFICATION_FAILURE_PERCENTAGE: f32 = 0.85;
+// Simplifier error weights for each vertex's normal and UV. With absolute errors an attribute's
+// deviation counts in units of the group's extent, clamped to the scale of its position error, so
+// the weights trade attribute fidelity against geometric error in the LOD and ray-bias error.
+const ATTRIBUTE_WEIGHTS: [f32; 5] = [0.5; 5];
 
 /// Default vertex position quantization factor for use with [`MeshletMesh::from_mesh`].
 ///
@@ -132,6 +144,10 @@ impl MeshletMesh {
         )
     }
 
+    /// Builds the LOD DAG with the rules of meshoptimizer's `clusterlod.h`, but in its own loop
+    /// rather than through `meshopt::clod_build`: groups within a level simplify in parallel, a
+    /// stuck group's meshlets are regrouped in the next level instead of becoming terminal,
+    /// permissive simplification is only a fallback, and the output feeds Bevy's own BVH.
     fn build(
         mesh: &Mesh,
         vertex_position_quantization_factor: u8,
@@ -157,7 +173,9 @@ impl MeshletMesh {
         let vertex_buffer = mesh.create_packed_vertex_buffer_data();
         let vertex_stride = mesh.get_vertex_size() as usize;
         let vertices = VertexDataAdapter::new(&vertex_buffer, vertex_stride, 0).unwrap();
-        let vertex_normals = bytemuck::cast_slice(&vertex_buffer[12..16]);
+        // Every vertex's attributes - normal, then UV - `vertex_stride` bytes apart from the
+        // first vertex's.
+        let vertex_attributes = bytemuck::cast_slice(&vertex_buffer[12..]);
 
         // Generate a position-only vertex buffer for determining triangle/meshlet connectivity
         let position_only_vertex_remap = generate_position_remap(&vertices);
@@ -177,8 +195,7 @@ impl MeshletMesh {
         };
 
         // Split the mesh into an initial list of meshlets (LOD 0)
-        let (mut meshlets, mut cull_data) =
-            compute_meshlets(&indices, &vertices, &position_only_vertex_remap, None);
+        let (mut meshlets, mut cull_data) = compute_meshlets(&indices, &vertices, None);
 
         let mut vertex_locks = vec![false; vertices.vertex_count];
 
@@ -187,23 +204,16 @@ impl MeshletMesh {
         let mut all_groups = Vec::new();
         let mut simplification_queue: Vec<_> = (0..meshlets.len() as u32).collect();
         let mut stuck = Vec::new();
-        while !simplification_queue.is_empty() {
+        while simplification_queue.len() > 1 {
             let s = debug_span!("simplify lod", meshlets = simplification_queue.len());
             let _e = s.enter();
 
-            // For each meshlet build a list of connected meshlets (meshlets that share a vertex)
-            let connected_meshlets_per_meshlet = find_connected_meshlets(
-                &simplification_queue,
-                &meshlets,
-                &position_only_vertex_remap,
-            );
-
-            // Group meshlets into roughly groups of size TARGET_MESHLETS_PER_GROUP,
-            // grouping meshlets with a high number of shared vertices
             let groups = group_meshlets(
                 &simplification_queue,
+                &meshlets,
                 &cull_data,
-                &connected_meshlets_per_meshlet,
+                &vertices,
+                &position_only_vertex_remap,
             );
             simplification_queue.clear();
 
@@ -217,86 +227,78 @@ impl MeshletMesh {
             );
 
             let simplified = groups.par_chunk_map(AsyncComputeTaskPool::get(), 1, |_, groups| {
-                let mut group = groups[0].clone();
-
-                // If the group only has a single meshlet we can't simplify it
-                if group.meshlets.len() == 1 {
-                    return Err(group);
-                }
+                let group = &groups[0];
 
                 let s = debug_span!("simplify group", meshlets = group.meshlets.len());
                 let _e = s.enter();
 
-                // Simplify the group to ~50% triangle count
-                let Some((simplified_group_indices, mut group_error)) = simplify_meshlet_group(
-                    &group,
+                let (simplified_group_indices, mut group_error) = simplify_meshlet_group(
+                    group,
                     &meshlets,
                     &vertices,
-                    vertex_normals,
-                    vertex_stride,
+                    vertex_attributes,
                     &vertex_locks,
-                ) else {
-                    // Couldn't simplify the group enough
-                    return Err(group);
-                };
+                )?;
 
                 // Force the group error to be atleast as large as all of its constituent meshlet's
                 // individual errors.
                 for &id in group.meshlets.iter() {
                     group_error = group_error.max(cull_data[id as usize].error);
                 }
-                group.parent_error = group_error;
 
                 // Build new meshlets using the simplified group
                 let new_meshlets = compute_meshlets(
                     &simplified_group_indices,
                     &vertices,
-                    &position_only_vertex_remap,
-                    Some((group.lod_bounds, group.parent_error)),
+                    Some((group.lod_bounds, group_error)),
                 );
 
-                Ok((group, new_meshlets))
+                Some((group_error, new_meshlets))
             });
 
             let first_group = all_groups.len() as u32;
-            let mut passed_tris = 0;
-            let mut stuck_tris = 0;
-            for group in simplified {
-                match group {
-                    Ok((group, (new_meshlets, new_cull_data))) => {
-                        let start = meshlets.len();
-                        merge_meshlets(&mut meshlets, new_meshlets);
-                        cull_data.extend(new_cull_data);
-                        let end = meshlets.len();
-                        let new_meshlet_ids = start as u32..end as u32;
+            for (mut group, simplified) in groups.into_iter().zip(simplified) {
+                let Some((parent_error, (new_meshlets, new_cull_data))) = simplified else {
+                    stuck.push(group);
+                    continue;
+                };
+                group.parent_error = parent_error;
 
-                        passed_tris += triangles_in_meshlets(&meshlets, new_meshlet_ids.clone());
-                        simplification_queue.extend(new_meshlet_ids);
-                        all_groups.push(group);
-                    }
-                    Err(group) => {
-                        stuck_tris +=
-                            triangles_in_meshlets(&meshlets, group.meshlets.iter().copied());
-                        stuck.push(group);
-                    }
-                }
+                let start = meshlets.len();
+                merge_meshlets(&mut meshlets, new_meshlets);
+                cull_data.extend(new_cull_data);
+                let end = meshlets.len();
+
+                simplification_queue.extend(start as u32..end as u32);
+                all_groups.push(group);
             }
 
-            // If we have enough triangles that passed, we can retry simplifying the stuck
-            // meshlets.
-            if passed_tris > stuck_tris / 3 {
-                simplification_queue.extend(stuck.drain(..).flat_map(|group| group.meshlets));
+            // A level where no group simplified is the last: its groups are the roots
+            if all_groups.len() as u32 == first_group {
+                break;
             }
-
             bvh.add_lod(first_group, &all_groups);
+
+            // Stuck meshlets go on to the next level, to be grouped with their simplified
+            // neighbours
+            simplification_queue.extend(stuck.drain(..).flat_map(|group| group.meshlets));
         }
 
-        // If there's any stuck meshlets left, add another LOD level with only them
-        if !stuck.is_empty() {
-            let first_group = all_groups.len() as u32;
-            all_groups.extend(stuck);
-            bvh.add_lod(first_group, &all_groups);
+        // A lone meshlet is a root of its own
+        if !simplification_queue.is_empty() {
+            stuck.extend(group_meshlets(
+                &simplification_queue,
+                &meshlets,
+                &cull_data,
+                &vertices,
+                &position_only_vertex_remap,
+            ));
         }
+
+        // The roots get the final LOD, with an unbounded error so that they are never replaced
+        let first_group = all_groups.len() as u32;
+        all_groups.extend(stuck);
+        bvh.add_lod(first_group, &all_groups);
 
         let (bvh, aabb, depth) = bvh.build(&mut meshlets, all_groups, &mut cull_data);
 
@@ -353,8 +355,7 @@ impl MeshletMesh {
     /// `pruned(e)` holds the geometry of the cut at the next float below `e` and can retain a
     /// little more than the `e` cut. Everything coarser survives with its packed vertex and index
     /// data compacted, and the BVH is rebuilt over the survivors, so the result is a smaller
-    /// upload rather than a view of the original. `pruned(0.0)` still shrinks a little, since
-    /// compaction drops the padding meshopt leaves between index runs.
+    /// upload rather than a view of the original.
     ///
     /// Error semantics afterwards: a surviving meshlet whose own error was below `min_error` has
     /// lost the finer children it would otherwise hand over to, so its error becomes `0.0` and
@@ -621,218 +622,127 @@ fn validate_input_mesh(mesh: &Mesh) -> Result<Cow<'_, [u32]>, MeshToMeshletMeshC
         );
     }
 
-    match mesh.indices() {
-        Some(Indices::U32(indices)) => Ok(Cow::Borrowed(indices.as_slice())),
-        Some(Indices::U16(indices)) => Ok(indices.iter().map(|i| *i as u32).collect()),
-        _ => Err(MeshToMeshletMeshConversionError::MeshMissingIndices),
+    let indices: Cow<'_, [u32]> = match mesh.indices() {
+        Some(Indices::U32(indices)) => Cow::Borrowed(indices.as_slice()),
+        Some(Indices::U16(indices)) => indices.iter().map(|i| *i as u32).collect(),
+        _ => return Err(MeshToMeshletMeshConversionError::MeshMissingIndices),
+    };
+    if indices.is_empty() || !indices.len().is_multiple_of(3) {
+        return Err(MeshToMeshletMeshConversionError::WrongIndexCount(
+            indices.len(),
+        ));
     }
+    let vertex_count = mesh.count_vertices();
+    if let Some(&index) = indices
+        .iter()
+        .find(|&&index| index as usize >= vertex_count)
+    {
+        return Err(MeshToMeshletMeshConversionError::IndexOutOfRange {
+            index,
+            vertex_count,
+        });
+    }
+    Ok(indices)
 }
 
-fn triangles_in_meshlets(meshlets: &Meshlets, ids: impl IntoIterator<Item = u32>) -> u32 {
-    ids.into_iter()
-        .map(|id| meshlets.get(id as _).triangles.len() as u32 / 3)
-        .sum()
-}
-
+/// Splits `indices` into meshlets. A simplified group's meshlets all carry the group's LOD sphere
+/// and error, `prev_lod_data`, so whatever group they join next merges conservatively; LOD 0
+/// meshlets carry their own bounds and no error.
 fn compute_meshlets(
     indices: &[u32],
     vertices: &VertexDataAdapter,
-    position_only_vertex_remap: &[u32],
     prev_lod_data: Option<(BoundingSphere, f32)>,
 ) -> (Meshlets, Vec<TempMeshletCullData>) {
-    // For each vertex, build a list of all triangles that use it. Sorting scales the scratch with
-    // this call's index count instead of the whole mesh's vertex count, and yields the same
-    // (ascending vertex, ascending triangle) visit order as bucketing by vertex id would.
-    let mut vertices_to_triangles: Vec<_> = indices
+    let mut meshlets = build_meshlets_flex(
+        indices,
+        vertices,
+        MESHLET_MAX_VERTICES,
+        MESHLET_MIN_TRIANGLES,
+        MESHLET_MAX_TRIANGLES,
+        0.0,
+        MESHLET_SPLIT_FACTOR,
+    );
+    // meshopt-rs rounds the end of the triangle buffer up to four bytes and keeps the worst-case
+    // capacity it reserved; drop both, so levels pack back to back and a level's groups don't
+    // hold several times their size until they are merged.
+    let used_triangle_bytes = meshlets.meshlets.last().map_or(0, |meshlet| {
+        meshlet.triangle_offset as usize + meshlet.triangle_count as usize * 3
+    });
+    meshlets.triangles.truncate(used_triangle_bytes);
+    meshlets.meshlets.shrink_to_fit();
+    meshlets.vertices.shrink_to_fit();
+    meshlets.triangles.shrink_to_fit();
+    let cull_data = meshlets
         .iter()
-        .enumerate()
-        .map(|(i, index)| (position_only_vertex_remap[*index as usize], i / 3))
-        .collect();
-    vertices_to_triangles.sort_unstable();
-
-    // For each triangle pair, count how many vertices they share
-    let mut triangle_pair_to_shared_vertex_count = <HashMap<_, _>>::default();
-    for vertex_triangle_ids in vertices_to_triangles.chunk_by(|(a, _), (b, _)| a == b) {
-        for (&(_, triangle_id1), &(_, triangle_id2)) in
-            vertex_triangle_ids.iter().tuple_combinations()
-        {
-            let count = triangle_pair_to_shared_vertex_count
-                .entry((
-                    triangle_id1.min(triangle_id2),
-                    triangle_id1.max(triangle_id2),
-                ))
-                .or_insert(0);
-            *count += 1;
-        }
-    }
-
-    // For each triangle, gather all other triangles that share at least one vertex along with their shared vertex count
-    let triangle_count = indices.len() / 3;
-    let mut connected_triangles_per_triangle = vec![Vec::new(); triangle_count];
-    for ((triangle_id1, triangle_id2), shared_vertex_count) in triangle_pair_to_shared_vertex_count
-    {
-        // We record both id1->id2 and id2->id1 as adjacency is symmetrical
-        connected_triangles_per_triangle[triangle_id1].push((triangle_id2, shared_vertex_count));
-        connected_triangles_per_triangle[triangle_id2].push((triangle_id1, shared_vertex_count));
-    }
-
-    // The order of triangles depends on hash traversal order; to produce deterministic results, sort them
-    // TODO: Wouldn't it be faster to use a `BTreeMap` above instead of `HashMap` + sorting?
-    for list in connected_triangles_per_triangle.iter_mut() {
-        list.sort_unstable();
-    }
-
-    let mut xadj = Vec::with_capacity(triangle_count + 1);
-    let mut adjncy = Vec::new();
-    let mut adjwgt = Vec::new();
-    for connected_triangles in connected_triangles_per_triangle {
-        xadj.push(adjncy.len() as i32);
-        for (connected_triangle_id, shared_vertex_count) in connected_triangles {
-            adjncy.push(connected_triangle_id as i32);
-            adjwgt.push(shared_vertex_count);
-            // TODO: Additional weight based on triangle center spatial proximity?
-        }
-    }
-    xadj.push(adjncy.len() as i32);
-
-    let mut options = [-1; metis::NOPTIONS];
-    options[metis::option::Seed::INDEX] = 17;
-    options[metis::option::UFactor::INDEX] = 1; // Important that there's very little imbalance between partitions
-
-    let mut meshlet_per_triangle = vec![0; triangle_count];
-    let partition_count = triangle_count.div_ceil(126); // Need to undershoot to prevent METIS from going over 128 triangles per meshlet
-    Graph::new(1, partition_count as i32, &xadj, &adjncy)
-        .unwrap()
-        .set_options(&options)
-        .set_adjwgt(&adjwgt)
-        .part_recursive(&mut meshlet_per_triangle)
-        .unwrap();
-
-    let mut indices_per_meshlet = vec![Vec::new(); partition_count];
-    for (triangle_id, meshlet) in meshlet_per_triangle.into_iter().enumerate() {
-        let meshlet_indices = &mut indices_per_meshlet[meshlet as usize];
-        let base_index = triangle_id * 3;
-        meshlet_indices.extend_from_slice(&indices[base_index..(base_index + 3)]);
-    }
-
-    // Use meshopt to build meshlets from the sets of triangles
-    let mut meshlets = Meshlets {
-        meshlets: Vec::new(),
-        vertices: Vec::new(),
-        triangles: Vec::new(),
-    };
-    let mut cull_data = Vec::new();
-    let get_vertex = |&v: &u32| {
-        *bytemuck::from_bytes::<Vec3>(
-            &vertices.reader.get_ref()
-                [vertices.position_offset + v as usize * vertices.vertex_stride..][..12],
-        )
-    };
-    for meshlet_indices in &indices_per_meshlet {
-        let meshlet = build_meshlets(meshlet_indices, vertices, 256, 128, 0.0);
-        for meshlet in meshlet.iter() {
+        .map(|meshlet| {
             let (lod_group_sphere, error) = prev_lod_data.unwrap_or_else(|| {
                 let bounds = meshopt::compute_meshlet_bounds(meshlet, vertices);
                 (BoundingSphere::new(bounds.center, bounds.radius), 0.0)
             });
-
-            cull_data.push(TempMeshletCullData {
+            TempMeshletCullData {
                 aabb: Aabb3d::from_point_cloud(
                     Isometry3d::IDENTITY,
-                    meshlet.vertices.iter().map(get_vertex),
+                    meshlet
+                        .vertices
+                        .iter()
+                        .map(|&vertex| vertex_position(vertices, vertex)),
                 ),
                 lod_group_sphere,
                 error,
-            });
-        }
-        merge_meshlets(&mut meshlets, meshlet);
-    }
+            }
+        })
+        .collect();
     (meshlets, cull_data)
 }
 
-fn find_connected_meshlets(
-    simplification_queue: &[u32],
-    meshlets: &Meshlets,
-    position_only_vertex_remap: &[u32],
-) -> Vec<Vec<(usize, usize)>> {
-    // For each vertex, build a list of all meshlets that use it
-    let mut vertices_to_meshlets = vec![Vec::new(); position_only_vertex_remap.len()];
-    for (id_index, &meshlet_id) in simplification_queue.iter().enumerate() {
-        let meshlet = meshlets.get(meshlet_id as _);
-        for index in meshlet.triangles {
-            let vertex_id = position_only_vertex_remap[meshlet.vertices[*index as usize] as usize];
-            let vertex_to_meshlets = &mut vertices_to_meshlets[vertex_id as usize];
-            // Meshlets are added in order, so we can just check the last element to deduplicate,
-            // in the case of two triangles sharing the same vertex within a single meshlet
-            if vertex_to_meshlets.last() != Some(&id_index) {
-                vertex_to_meshlets.push(id_index);
-            }
-        }
-    }
-
-    // For each meshlet pair, count how many vertices they share
-    let mut meshlet_pair_to_shared_vertex_count = <HashMap<_, _>>::default();
-    for vertex_meshlet_ids in vertices_to_meshlets {
-        for (meshlet_id1, meshlet_id2) in vertex_meshlet_ids.into_iter().tuple_combinations() {
-            let count = meshlet_pair_to_shared_vertex_count
-                .entry((meshlet_id1.min(meshlet_id2), meshlet_id1.max(meshlet_id2)))
-                .or_insert(0);
-            *count += 1;
-        }
-    }
-
-    // For each meshlet, gather all other meshlets that share at least one vertex along with their shared vertex count
-    let mut connected_meshlets_per_meshlet = vec![Vec::new(); simplification_queue.len()];
-    for ((meshlet_id1, meshlet_id2), shared_vertex_count) in meshlet_pair_to_shared_vertex_count {
-        // We record both id1->id2 and id2->id1 as adjacency is symmetrical
-        connected_meshlets_per_meshlet[meshlet_id1].push((meshlet_id2, shared_vertex_count));
-        connected_meshlets_per_meshlet[meshlet_id2].push((meshlet_id1, shared_vertex_count));
-    }
-
-    // The order of meshlets depends on hash traversal order; to produce deterministic results, sort them
-    // TODO: Wouldn't it be faster to use a `BTreeMap` above instead of `HashMap` + sorting?
-    for list in connected_meshlets_per_meshlet.iter_mut() {
-        list.sort_unstable();
-    }
-
-    connected_meshlets_per_meshlet
-}
-
-// METIS manual: https://github.com/KarypisLab/METIS/blob/e0f1b88b8efcb24ffa0ec55eabb78fbe61e58ae7/manual/manual.pdf
+/// Partitions the queued meshlets into groups of about [`TARGET_MESHLETS_PER_GROUP`], keeping
+/// meshlets that share vertices together and merging the ones that share none - the loose parts
+/// of a kitbashed mesh, foliage cards - with their nearest neighbours. Groups come out in
+/// spatial order, so nearby groups get nearby meshlets.
 fn group_meshlets(
     simplification_queue: &[u32],
+    meshlets: &Meshlets,
     meshlet_cull_data: &[TempMeshletCullData],
-    connected_meshlets_per_meshlet: &[Vec<(usize, usize)>],
+    vertices: &VertexDataAdapter,
+    position_only_vertex_remap: &[u32],
 ) -> Vec<TempMeshletGroup> {
-    let mut xadj = Vec::with_capacity(simplification_queue.len() + 1);
-    let mut adjncy = Vec::new();
-    let mut adjwgt = Vec::new();
-    for connected_meshlets in connected_meshlets_per_meshlet {
-        xadj.push(adjncy.len() as i32);
-        for (connected_meshlet_id, shared_vertex_count) in connected_meshlets {
-            adjncy.push(*connected_meshlet_id as i32);
-            adjwgt.push(*shared_vertex_count as i32);
-            // TODO: Additional weight based on meshlet spatial proximity
+    let mut group_per_meshlet = vec![0; simplification_queue.len()];
+    let mut group_count = 1;
+    if simplification_queue.len() > TARGET_MESHLETS_PER_GROUP {
+        // Connectivity is by position, so meshlets meeting at a UV or normal seam are neighbours
+        let mut cluster_indices = Vec::new();
+        let mut cluster_index_counts = Vec::with_capacity(simplification_queue.len());
+        for &meshlet_id in simplification_queue {
+            let meshlet = meshlets.get(meshlet_id as usize);
+            cluster_indices.extend(
+                meshlet
+                    .vertices
+                    .iter()
+                    .map(|&vertex| position_only_vertex_remap[vertex as usize]),
+            );
+            cluster_index_counts.push(meshlet.vertices.len() as u32);
+        }
+        group_count = partition_clusters_with_positions(
+            &mut group_per_meshlet,
+            &cluster_indices,
+            &cluster_index_counts,
+            vertices,
+            TARGET_MESHLETS_PER_GROUP,
+        );
+
+        // Any of a group's meshlets stands in for the group's position
+        let mut group_positions = vec![[0.0; 3]; group_count];
+        for (&group, &meshlet_id) in group_per_meshlet.iter().zip(simplification_queue) {
+            group_positions[group as usize] =
+                meshlet_cull_data[meshlet_id as usize].aabb.center().into();
+        }
+        let group_order = spatial_sort_remap_decoder(&group_positions);
+        for group in &mut group_per_meshlet {
+            *group = group_order[*group as usize];
         }
     }
-    xadj.push(adjncy.len() as i32);
 
-    let mut options = [-1; metis::NOPTIONS];
-    options[metis::option::Seed::INDEX] = 17;
-    options[metis::option::UFactor::INDEX] = 200;
-
-    let mut group_per_meshlet = vec![0; simplification_queue.len()];
-    let partition_count = simplification_queue
-        .len()
-        .div_ceil(TARGET_MESHLETS_PER_GROUP); // TODO: Nanite uses groups of 8-32, probably based on some kind of heuristic
-    Graph::new(1, partition_count as i32, &xadj, &adjncy)
-        .unwrap()
-        .set_options(&options)
-        .set_adjwgt(&adjwgt)
-        .part_recursive(&mut group_per_meshlet)
-        .unwrap();
-
-    let mut groups = vec![TempMeshletGroup::default(); partition_count];
+    let mut groups = vec![TempMeshletGroup::default(); group_count];
     for (i, meshlet_group) in group_per_meshlet.into_iter().enumerate() {
         let group = &mut groups[meshlet_group as usize];
         let meshlet_id = simplification_queue[i];
@@ -894,10 +804,8 @@ fn lock_group_borders(
     // Iterate over position-only based vertices of all meshlets in all groups
     for (group_id, group) in groups.iter().enumerate() {
         for &meshlet_id in group.meshlets.iter() {
-            let meshlet = meshlets.get(meshlet_id as usize);
-            for index in meshlet.triangles {
-                let vertex_id =
-                    position_only_vertex_remap[meshlet.vertices[*index as usize] as usize] as usize;
+            for &vertex in meshlets.get(meshlet_id as usize).vertices {
+                let vertex_id = position_only_vertex_remap[vertex as usize] as usize;
 
                 // If the vertex is not yet claimed by any group, or was already claimed by this group
                 if position_only_locks[vertex_id] == -1
@@ -919,12 +827,13 @@ fn lock_group_borders(
     }
 }
 
+/// Simplifies a group to about half its triangles, returning the new indices and their error, or
+/// `None` if the group is stuck.
 fn simplify_meshlet_group(
     group: &TempMeshletGroup,
     meshlets: &Meshlets,
     vertices: &VertexDataAdapter<'_>,
-    vertex_normals: &[f32],
-    vertex_stride: usize,
+    vertex_attributes: &[f32],
     vertex_locks: &[bool],
 ) -> Option<(Vec<u32>, f32)> {
     // Build a new index buffer into the mesh vertex data by combining all meshlet data in the group
@@ -939,21 +848,46 @@ fn simplify_meshlet_group(
                 .map(|&meshlet_index| meshlet.vertices[meshlet_index as usize])
         })
         .collect::<Vec<_>>();
+    let target_count = group_indices.len() / 6 * 3;
 
-    // Simplify the group to ~50% triangle count
-    let mut error = 0.0;
-    let simplified_group_indices = simplify_with_attributes_and_locks(
-        &group_indices,
-        vertices,
-        vertex_normals,
-        &[0.5; 3],
-        vertex_stride,
-        vertex_locks,
-        group_indices.len() / 2,
-        f32::MAX,
-        SimplifyOptions::Sparse | SimplifyOptions::ErrorAbsolute,
-        Some(&mut error),
-    );
+    let simplify = |options: SimplifyOptions| {
+        let mut error = 0.0;
+        let indices = simplify_with_attributes_and_locks(
+            &group_indices,
+            vertices,
+            vertex_attributes,
+            &ATTRIBUTE_WEIGHTS,
+            vertices.vertex_stride,
+            vertex_locks,
+            target_count,
+            f32::MAX,
+            SimplifyOptions::Sparse
+                | SimplifyOptions::ErrorAbsolute
+                | SimplifyOptions::ErrorClamped
+                | options,
+            Some(&mut error),
+        );
+        (indices, error)
+    };
+
+    let (mut simplified_group_indices, mut error) = simplify(SimplifyOptions::empty());
+
+    // UV and normal seams can stop the simplifier short of the target. Permissive simplification
+    // collapses across them, weighing what that does to the attributes in its error. It is only a
+    // fallback: the two sides of double-sided foliage meet at normal seams, and collapsing across
+    // them removes leaves wholesale, thinning a hedge long before its error grows perceptible.
+    if simplified_group_indices.len() > target_count {
+        let permissive = simplify(SimplifyOptions::Permissive);
+        if permissive.0.len() < simplified_group_indices.len() {
+            (simplified_group_indices, error) = permissive;
+        }
+    }
+
+    // Keep one triangle of a group that simplifies away entirely, so that every part of the mesh
+    // still ends in a root
+    if simplified_group_indices.is_empty() {
+        simplified_group_indices.extend_from_slice(&group_indices[..3]);
+    }
 
     // Check if we were able to simplify
     if simplified_group_indices.len() as f32 / group_indices.len() as f32
@@ -963,6 +897,13 @@ fn simplify_meshlet_group(
     }
 
     Some((simplified_group_indices, error))
+}
+
+fn vertex_position(vertices: &VertexDataAdapter<'_>, vertex: u32) -> Vec3 {
+    *bytemuck::from_bytes::<Vec3>(
+        &vertices.reader.get_ref()
+            [vertices.position_offset + vertex as usize * vertices.vertex_stride..][..12],
+    )
 }
 
 fn merge_meshlets(meshlets: &mut Meshlets, merge: Meshlets) {
@@ -999,8 +940,8 @@ fn build_and_compress_per_meshlet_vertex_data(
     let mut max_vertex_uv = Vec2::splat(f32::NEG_INFINITY);
 
     // Lossy vertex compression
-    let mut quantized_positions = [IVec3::ZERO; 256];
-    let mut uncompressed_uvs = [Vec2::ZERO; 256];
+    let mut quantized_positions = [IVec3::ZERO; MESHLET_MAX_VERTICES];
+    let mut uncompressed_uvs = [Vec2::ZERO; MESHLET_MAX_VERTICES];
     for (i, vertex_id) in meshlet_vertex_ids.iter().enumerate() {
         // Load source vertex attributes
         let vertex_id_byte = *vertex_id as usize * vertex_stride;
@@ -1535,6 +1476,10 @@ pub enum MeshToMeshletMeshConversionError {
     },
     #[error("Mesh has no indices")]
     MeshMissingIndices,
+    #[error("Mesh has {0} indices, which is not a whole number of triangles")]
+    WrongIndexCount(usize),
+    #[error("Mesh index {index} is out of range for its {vertex_count} vertices")]
+    IndexOutOfRange { index: u32, vertex_count: usize },
     #[error("Mesh has {required} vertices, but {provided} lock flags were given")]
     WrongLockCount { required: usize, provided: usize },
 }
@@ -1656,10 +1601,10 @@ mod tests {
         let mut uvs = Vec::new();
         for i in 0..MAJOR {
             let u = i as f32 / MAJOR as f32;
-            let (su, cu) = bevy_math::ops::sin_cos(u * f32::consts::TAU);
+            let (su, cu) = bevy_math::ops::sin_cos(u * core::f32::consts::TAU);
             for j in 0..MINOR {
                 let v = j as f32 / MINOR as f32;
-                let (sv, cv) = bevy_math::ops::sin_cos(v * f32::consts::TAU);
+                let (sv, cv) = bevy_math::ops::sin_cos(v * core::f32::consts::TAU);
                 let ring = 1.0 + 0.4 * cv;
                 positions.push([ring * cu, 0.4 * sv, ring * su]);
                 normals.push([cv * cu, sv, cv * su]);
@@ -1815,8 +1760,7 @@ mod tests {
         let pruned = mesh.pruned(0.0);
         assert_eq!(pruned.meshlets.len(), mesh.meshlets.len());
         assert_eq!(total_triangles(&pruned), total_triangles(&mesh));
-        // Compaction drops the padding meshopt puts between index runs, and nothing else.
-        assert!(pruned.packed_byte_len() <= mesh.packed_byte_len());
+        assert_eq!(pruned.packed_byte_len(), mesh.packed_byte_len());
         assert_eq!(pruned.vertex_positions.len(), mesh.vertex_positions.len());
         assert_eq!(pruned.vertex_normals.len(), mesh.vertex_normals.len());
         assert_eq!(pruned.bvh.len(), mesh.bvh.len());
@@ -2026,7 +1970,8 @@ mod tests {
     #[test]
     fn explicit_locks_pin_only_the_named_seam() {
         AsyncComputeTaskPool::get_or_init(bevy_tasks::TaskPool::default);
-        let n = 24u32;
+        // Large enough that every locked border needs several meshlets at the coarsest LOD
+        let n = 64u32;
         let (positions, mesh) = open_grid(n);
         let seam = |i: usize| (i as u32).is_multiple_of(n + 1);
         let locked: Vec<bool> = (0..positions.len()).map(seam).collect();
@@ -2075,6 +2020,129 @@ mod tests {
         assert!(
             pinned_triangles * 2 < bordered_triangles,
             "one locked edge left {pinned_triangles} triangles, every open edge {bordered_triangles}"
+        );
+    }
+
+    fn triangle_mesh(positions: Vec<[f32; 3]>, indices: Vec<u32>) -> Mesh {
+        let count = positions.len();
+        Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::all())
+            .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+            .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, vec![[0.0, 1.0, 0.0]; count])
+            .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, vec![[0.0, 0.0]; count])
+            .with_inserted_indices(Indices::U32(indices))
+    }
+
+    #[test]
+    fn rejects_indices_that_are_not_whole_triangles_of_its_vertices() {
+        let positions = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]];
+        assert!(matches!(
+            MeshletMesh::from_mesh(&triangle_mesh(positions.clone(), vec![]), 4),
+            Err(MeshToMeshletMeshConversionError::WrongIndexCount(0))
+        ));
+        assert!(matches!(
+            MeshletMesh::from_mesh(&triangle_mesh(positions.clone(), vec![0, 1, 2, 0]), 4),
+            Err(MeshToMeshletMeshConversionError::WrongIndexCount(4))
+        ));
+        assert!(matches!(
+            MeshletMesh::from_mesh(&triangle_mesh(positions, vec![0, 1, 3]), 4),
+            Err(MeshToMeshletMeshConversionError::IndexOutOfRange {
+                index: 3,
+                vertex_count: 3
+            })
+        ));
+    }
+
+    #[test]
+    fn a_single_meshlet_is_its_own_root() {
+        AsyncComputeTaskPool::get_or_init(bevy_tasks::TaskPool::default);
+        let mesh = triangle_mesh(
+            vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+            vec![0, 2, 1],
+        );
+        let meshlet = MeshletMesh::from_mesh(&mesh, 4).unwrap();
+        assert_eq!(meshlet.meshlets.len(), 1);
+        assert_eq!(coarsest(&meshlet).indices.len(), 3);
+        assert_eq!(meshlet.raytracing_geometry(0.0).achieved_error, 0.0);
+    }
+
+    #[test]
+    fn meshlet_triangles_pack_without_slack() {
+        let mesh = torus_meshlet_mesh();
+        assert_eq!(mesh.indices.len(), total_triangles(&mesh) * 3);
+    }
+
+    /// Half of a grid is locked, so its groups get stuck at every level and their meshlets are
+    /// carried into the next, alongside the free half's simplified meshlets.
+    #[test]
+    fn stuck_meshlets_carry_into_later_lods() {
+        AsyncComputeTaskPool::get_or_init(bevy_tasks::TaskPool::default);
+        let n = 64u32;
+        let (positions, mesh) = open_grid(n);
+        let locked_half = |i: usize| (i as u32 % (n + 1)) <= n / 2;
+        let locked: Vec<bool> = (0..positions.len()).map(locked_half).collect();
+        let meshlet = MeshletMesh::from_mesh_with_locks(&mesh, 4, &locked).unwrap();
+        verify_bvh_complete(&meshlet.bvh, &temp_cull_data(&meshlet.meshlet_cull_data));
+
+        let cut = coarsest(&meshlet);
+        for (i, p) in positions.iter().enumerate() {
+            if locked_half(i) {
+                assert!(contains_position(&cut, p), "locked vertex {p:?} moved");
+            }
+        }
+        let source_triangles = (n * n * 2) as usize;
+        assert!(
+            cut.indices.len() / 3 < source_triangles * 3 / 4,
+            "the free half did not simplify"
+        );
+
+        for error in leaf_errors(&meshlet) {
+            let pruned = meshlet.pruned(error);
+            verify_bvh_complete(&pruned.bvh, &temp_cull_data(&pruned.meshlet_cull_data));
+        }
+    }
+
+    /// Every quad has its own vertices with its own UVs, so every vertex sits on a UV seam and
+    /// only permissive simplification can collapse across them.
+    #[test]
+    fn uv_seams_simplify_through_the_permissive_fallback() {
+        AsyncComputeTaskPool::get_or_init(bevy_tasks::TaskPool::default);
+        let n = 32u32;
+        let mut positions = Vec::new();
+        let mut uvs = Vec::new();
+        let mut indices = Vec::new();
+        for y in 0..n {
+            for x in 0..n {
+                let base = positions.len() as u32;
+                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    let (px, py) = (x + dx, y + dy);
+                    let height = bevy_math::ops::sin(px as f32 * 0.3)
+                        * bevy_math::ops::sin(py as f32 * 0.2)
+                        * 0.2;
+                    positions.push([px as f32, height, py as f32]);
+                    uvs.push([dx as f32, dy as f32]);
+                }
+                indices.extend_from_slice(&[
+                    base,
+                    base + 2,
+                    base + 1,
+                    base + 1,
+                    base + 2,
+                    base + 3,
+                ]);
+            }
+        }
+        let count = positions.len();
+        let mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::all())
+            .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+            .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, vec![[0.0, 1.0, 0.0]; count])
+            .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+            .with_inserted_indices(Indices::U32(indices));
+        let meshlet = MeshletMesh::from_mesh(&mesh, 4).unwrap();
+        let source_triangles = (n * n * 2) as usize;
+        let coarsest_triangles = coarsest(&meshlet).indices.len() / 3;
+        assert!(
+            coarsest_triangles * 4 < source_triangles,
+            "seams held the mesh at {coarsest_triangles} of {source_triangles} triangles"
         );
     }
 }
