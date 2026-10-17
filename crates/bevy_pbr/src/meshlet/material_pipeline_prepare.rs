@@ -186,6 +186,7 @@ pub fn prepare_material_meshlet_meshes_main_opaque_pass(
                     mesh_key: ErasedMeshPipelineKey::new(view_key),
                     material_key: material.properties.material_key.clone(),
                     type_id,
+                    cull_mode: material.properties.cull_mode,
                 };
                 let material_pipeline_specializer = MaterialPipelineSpecializer {
                     pipeline: material_pipeline.clone(),
@@ -362,6 +363,7 @@ pub fn prepare_material_meshlet_meshes_prepass(
                     mesh_key: ErasedMeshPipelineKey::new(view_key),
                     material_key: material.properties.material_key.clone(),
                     type_id,
+                    cull_mode: material.properties.cull_mode,
                 };
                 let material_pipeline_specializer = PrepassPipelineSpecializer {
                     pipeline: prepass_pipeline.clone(),

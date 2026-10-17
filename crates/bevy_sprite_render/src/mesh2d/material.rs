@@ -949,6 +949,7 @@ pub fn specialize_material2d_meshes(
             type_id: item.material_type_id,
             mesh_key: ErasedMeshPipelineKey::new(item.mesh_key),
             material_key: item.properties.material_key.clone(),
+            cull_mode: item.properties.cull_mode,
         };
 
         let pipeline_id = base_specialize(world, key, &item.layout, &item.properties);
@@ -1309,6 +1310,7 @@ where
                 material_key,
                 render_phase_type,
                 reads_view_transmission_texture: false,
+                cull_mode: None,
                 draw_functions,
                 shaders,
                 prepass_specialize: None,

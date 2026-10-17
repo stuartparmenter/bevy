@@ -2,14 +2,15 @@ mod prepass_bindings;
 
 use crate::{
     alpha_mode_pipeline_key, binding_arrays_are_usable, buffer_layout,
-    collect_meshes_for_gpu_building, init_material_pipeline, set_mesh_motion_vector_flags,
-    setup_morph_and_skinning_defs, skin, visibility_ranges_min_binding_size,
-    DeferredAlphaMaskDrawFunction, DeferredFragmentShader, DeferredOpaqueDrawFunction,
-    DeferredVertexShader, DrawMesh, MaterialPipeline, MaterialPropertiesExt, MeshLayouts,
-    MeshPipeline, MeshPipelineKey, PreparedMaterial, PrepassAlphaMaskDrawFunction,
-    PrepassFragmentShader, PrepassOpaqueDepthOnlyDrawFunction, PrepassOpaqueDrawFunction,
-    PrepassVertexShader, RenderLightmaps, RenderMaterialInstances, RenderMeshInstanceFlags,
-    RenderMeshInstances, SetMaterialBindGroup, SetMeshBindGroup, ShadowView,
+    collect_meshes_for_gpu_building, init_material_pipeline, material_cull_mode,
+    set_mesh_motion_vector_flags, setup_morph_and_skinning_defs, skin,
+    visibility_ranges_min_binding_size, DeferredAlphaMaskDrawFunction, DeferredFragmentShader,
+    DeferredOpaqueDrawFunction, DeferredVertexShader, DrawMesh, MaterialPipeline,
+    MaterialPropertiesExt, MeshLayouts, MeshPipeline, MeshPipelineKey, PreparedMaterial,
+    PrepassAlphaMaskDrawFunction, PrepassFragmentShader, PrepassOpaqueDepthOnlyDrawFunction,
+    PrepassOpaqueDrawFunction, PrepassVertexShader, RenderLightmaps, RenderMaterialInstances,
+    RenderMeshInstanceFlags, RenderMeshInstances, SetMaterialBindGroup, SetMeshBindGroup,
+    ShadowView,
 };
 use bevy_app::{App, Plugin, PreUpdate};
 use bevy_asset::{embedded_asset, load_embedded_asset, AssetServer, Handle};
@@ -371,12 +372,13 @@ impl SpecializedMeshPipeline for PrepassPipelineSpecializer {
         if self.properties.bindless {
             shader_defs.push("BINDLESS".into());
         }
-        let mut descriptor = self.pipeline.specialize(
-            key.mesh_key.downcast(),
-            shader_defs,
-            layout,
-            &self.properties,
-        )?;
+        let mesh_key: MeshPipelineKey = key.mesh_key.downcast();
+        let mut descriptor =
+            self.pipeline
+                .specialize(mesh_key, shader_defs, layout, &self.properties)?;
+
+        // The prepass and shadow passes cull the same faces as the main pass
+        descriptor.primitive.cull_mode = material_cull_mode(key.cull_mode, mesh_key);
 
         // This is a bit risky because it's possible to change something that would
         // break the prepass but be fine in the main pass.
@@ -1244,6 +1246,7 @@ pub(crate) fn specialize_prepass_material_meshes(
             type_id: item.material_type_id,
             mesh_key: ErasedMeshPipelineKey::new(item.mesh_key),
             material_key: item.properties.material_key.clone(),
+            cull_mode: item.properties.cull_mode,
         };
 
         let emulate_unclipped_depth = item

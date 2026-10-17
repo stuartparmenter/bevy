@@ -74,6 +74,11 @@ pub struct ErasedMaterialPipelineKey {
     pub mesh_key: ErasedMeshPipelineKey,
     pub material_key: ErasedMaterialKey,
     pub type_id: TypeId,
+    /// The material's [`MaterialProperties::cull_mode`](crate::MaterialProperties::cull_mode).
+    ///
+    /// Part of the key so that two materials of the same type that cull different faces get
+    /// different pipelines.
+    pub cull_mode: Option<wgpu_types::Face>,
 }
 
 #[derive(Debug)]

@@ -2635,6 +2635,7 @@ pub(crate) fn specialize_shadows(
             type_id: item.material_type_id,
             mesh_key: ErasedMeshPipelineKey::new(item.mesh_key),
             material_key: item.properties.material_key.clone(),
+            cull_mode: item.properties.cull_mode,
         };
 
         let emulate_unclipped_depth = item
