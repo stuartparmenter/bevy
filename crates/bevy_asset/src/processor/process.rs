@@ -359,6 +359,7 @@ impl<'a> ProcessContext<'a> {
                 &mut self.reader,
                 false,
                 true,
+                true,
             )
             .await?;
         for (path, full_hash) in &loaded_asset.loader_dependencies {

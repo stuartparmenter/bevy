@@ -8,10 +8,12 @@ use crate::{
         AssetWriterError, ErasedAssetReader, MissingAssetSourceError, MissingAssetWriterError,
         MissingProcessedAssetReaderError, Reader,
     },
-    loader::{AssetLoader, ErasedAssetLoader, LoadContext, LoadedAsset},
+    loader::{
+        AssetLoader, DeferredLoad, DeferredLoadMode, ErasedAssetLoader, LoadContext, LoadedAsset,
+    },
     meta::{
-        loader_settings_meta_transform, AssetActionMinimal, AssetMetaDyn, AssetMetaMinimal,
-        MetaTransform, Settings,
+        loader_settings_meta_transform, AssetActionMinimal, AssetHash, AssetMetaDyn,
+        AssetMetaMinimal, MetaTransform, Settings,
     },
     path::AssetPath,
     Asset, AssetEvent, AssetHandleProvider, AssetId, AssetIndex, AssetLoadFailedEvent,
@@ -29,7 +31,8 @@ use atomicow::CowArc;
 use bevy_diagnostic::{DiagnosticPath, Diagnostics};
 use bevy_ecs::prelude::*;
 use bevy_platform::{
-    collections::HashSet,
+    cell::SyncCell,
+    collections::{HashMap, HashSet},
     sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard},
 };
 use bevy_tasks::IoTaskPool;
@@ -399,7 +402,15 @@ impl AssetServer {
         );
 
         if should_load {
-            self.spawn_load_task(handle.clone(), path, infos, guard);
+            // `get_or_create_path_handle_erased` always returns Strong variant, so this is safe.
+            let index = (&handle).try_into().unwrap();
+            match Self::take_on_demand_load(&mut infos, index) {
+                Some(task) => {
+                    drop(infos);
+                    self.spawn_deferred_load(index, task, guard);
+                }
+                None => self.spawn_load_task(handle.clone(), path, infos, guard),
+            }
         }
 
         handle
@@ -659,6 +670,14 @@ impl AssetServer {
         if !should_load && !force {
             return Ok(fetched_handle);
         }
+        // Requesting an on-demand deferred labeled asset starts it instead of loading its root.
+        if !force && let Some(asset_id) = asset_id {
+            let task = Self::take_on_demand_load(&mut self.write_infos(), asset_id);
+            if let Some(task) = task {
+                self.spawn_deferred_load(asset_id, task, ());
+                return Ok(fetched_handle);
+            }
+        }
 
         // We don't actually need to use _base_handle, but we do need to keep the handle alive.
         // Dropping it would cancel the load of the base asset, which would make the load of this
@@ -694,27 +713,38 @@ impl AssetServer {
                 &mut *reader,
                 true,
                 false,
+                false,
             )
             .await
         {
             Ok(loaded_asset) => {
                 let final_handle = if let Some(label) = path.label_cow() {
-                    match loaded_asset.label_to_asset_index.get(&label) {
-                        Some(labeled_asset) => {
-                            let labeled_asset = &loaded_asset.labeled_assets[*labeled_asset];
+                    let labeled_asset = match loaded_asset.label_to_asset_index.get(&label) {
+                        Some(index) => {
+                            let labeled_asset = &loaded_asset.labeled_assets[*index];
+                            Some((
+                                &labeled_asset.handle,
+                                labeled_asset.asset.value.asset_type_name(),
+                            ))
+                        }
+                        None => loaded_asset
+                            .deferred_labeled_assets
+                            .iter()
+                            .find(|deferred| deferred.label == label)
+                            .map(|deferred| (&deferred.handle, deferred.asset_type_name)),
+                    };
+                    match labeled_asset {
+                        Some((labeled_handle, labeled_type_name)) => {
                             // If we know the requested type then check it
                             // matches the labeled asset.
                             if let Some(asset_id) = asset_id
-                                && asset_id.type_id != labeled_asset.handle.type_id()
+                                && asset_id.type_id != labeled_handle.type_id()
                             {
                                 let error: AssetLoadError =
                                     Box::new(RequestedHandleTypeMismatchError {
                                         path: path.clone(),
                                         requested: asset_id.type_id,
-                                        actual_asset_name: labeled_asset
-                                            .asset
-                                            .value
-                                            .asset_type_name(),
+                                        actual_asset_name: labeled_type_name,
                                         loader_name: loader.type_path(),
                                     })
                                     .into();
@@ -725,12 +755,18 @@ impl AssetServer {
                                 });
                                 return Err(error);
                             }
-                            Some(labeled_asset.handle.clone())
+                            Some(labeled_handle.clone())
                         }
                         None => {
                             let mut all_labels: Vec<String> = loaded_asset
                                 .label_to_asset_index
                                 .keys()
+                                .chain(
+                                    loaded_asset
+                                        .deferred_labeled_assets
+                                        .iter()
+                                        .map(|deferred| &deferred.label),
+                                )
                                 .map(|s| (**s).to_owned())
                                 .collect();
                             all_labels.sort_unstable();
@@ -753,10 +789,12 @@ impl AssetServer {
                     fetched_handle
                 };
 
-                self.send_asset_event(InternalAssetEvent::Loaded {
-                    index: base_asset_id,
+                self.commit_loaded_asset(
+                    base_asset_id,
+                    &base_path,
+                    loader.type_path(),
                     loaded_asset,
-                });
+                );
                 Ok(final_handle)
             }
             Err(err) => {
@@ -770,6 +808,133 @@ impl AssetServer {
                 Err(err)
             }
         }
+    }
+
+    /// Sends `loaded_asset` to be committed as the asset at `index`, then starts its deferred
+    /// labeled assets. On-demand ones that were never requested wait in their [`AssetInfo`]
+    /// instead.
+    fn commit_loaded_asset(
+        &self,
+        index: ErasedAssetIndex,
+        path: &AssetPath<'static>,
+        loader_name: &'static str,
+        mut loaded_asset: ErasedLoadedAsset,
+    ) {
+        let deferred = core::mem::take(&mut loaded_asset.deferred_labeled_assets);
+        let mut start = Vec::new();
+        if !deferred.is_empty() {
+            // Update the deferred assets before the asset holding them can be committed, so it
+            // waits for the ones that start and not for the ones that wait to be requested. This
+            // also covers reloads, where the deferred assets still hold their previous values.
+            let mut infos = self.write_infos();
+            for deferred in deferred {
+                // `defer_labeled_asset` always creates a Strong handle, so this is safe.
+                let deferred_index: ErasedAssetIndex = (&deferred.handle).try_into().unwrap();
+                let Some(info) = infos.get_mut(deferred_index) else {
+                    continue;
+                };
+                let task = DeferredLoadTask {
+                    path: path.clone().with_label(deferred.label),
+                    loader_name,
+                    load: deferred.load,
+                };
+                // Any other state means it was requested, during this load or before a reload.
+                if deferred.mode == DeferredLoadMode::OnDemand
+                    && matches!(info.load_state, LoadState::NotLoaded)
+                {
+                    info.on_demand_load = Some(task);
+                } else {
+                    info.on_demand_load = None;
+                    info.load_state = LoadState::Loading;
+                    info.dep_load_state = DependencyLoadState::Loading;
+                    info.rec_dep_load_state = RecursiveDependencyLoadState::Loading;
+                    start.push((deferred.handle, deferred_index, task));
+                }
+            }
+        }
+        // Sending this first guarantees the asset is committed before its deferred assets.
+        self.send_asset_event(InternalAssetEvent::Loaded {
+            index,
+            loaded_asset,
+        });
+        for (handle, deferred_index, task) in start {
+            self.spawn_deferred_load(deferred_index, task, ());
+            // The handle kept the asset alive until its task was tracked, so dropping the last
+            // handle from now on cancels the task.
+            drop(handle);
+        }
+    }
+
+    /// Takes the work of the on-demand deferred labeled asset at `index` if it has not started.
+    fn take_on_demand_load(
+        infos: &mut AssetInfos,
+        index: ErasedAssetIndex,
+    ) -> Option<DeferredLoadTask> {
+        infos.get_mut(index)?.on_demand_load.take()
+    }
+
+    /// Spawns the task producing the deferred labeled asset at `index`. `guard` is dropped once
+    /// the task finishes.
+    fn spawn_deferred_load<G: Send + Sync + 'static>(
+        &self,
+        index: ErasedAssetIndex,
+        task: DeferredLoadTask,
+        guard: G,
+    ) {
+        let DeferredLoadTask {
+            path,
+            loader_name,
+            load,
+        } = task;
+        let load = SyncCell::to_inner(load);
+        let server = self.clone();
+        let task = IoTaskPool::get().spawn(async move {
+            let load = AssertUnwindSafe(load(server.clone())).catch_unwind();
+            #[cfg(feature = "trace")]
+            let load = {
+                use tracing::Instrument;
+
+                let span = tracing::info_span!(
+                    "deferred labeled asset loading",
+                    loader = loader_name,
+                    asset = path.to_string()
+                );
+                load.instrument(span)
+            };
+            let error = match load.await {
+                Ok(Ok(mut loaded_asset)) => {
+                    let root_path = path.without_label().into_owned();
+                    // The files read for a deferred asset belong to the asset that deferred it,
+                    // as they do when it is loaded inline, since reloading that reproduces it.
+                    let loader_dependencies =
+                        core::mem::take(&mut loaded_asset.loader_dependencies);
+                    if !loader_dependencies.is_empty() {
+                        server.send_asset_event(InternalAssetEvent::LoaderDependencies {
+                            path: root_path.clone(),
+                            loader_dependencies,
+                        });
+                    }
+                    server.commit_loaded_asset(index, &root_path, loader_name, loaded_asset);
+                    None
+                }
+                Ok(Err(error)) => Some(AssetLoadError::AssetLoaderError(AssetLoaderError {
+                    path: path.clone(),
+                    loader_name,
+                    error: error.into(),
+                })),
+                Err(_) => Some(AssetLoadError::AssetLoaderPanic {
+                    path: path.clone(),
+                    loader_name,
+                }),
+            };
+            if let Some(error) = error {
+                error!("{error}");
+                server.send_asset_event(InternalAssetEvent::Failed { index, path, error });
+            }
+            drop(guard);
+        });
+        // Replacing the task of a previous load of this asset cancels it.
+        self.write_infos().deferred_tasks.insert(index, task);
     }
 
     /// Kicks off a reload of the asset stored at the given path. This will only reload the asset if it currently loaded.
@@ -1478,6 +1643,11 @@ impl AssetServer {
         Ok((meta, loader, reader))
     }
 
+    /// Runs `loader` on `reader`.
+    ///
+    /// If `load_deferred_labeled_assets` is true, deferred labeled assets are loaded before this
+    /// returns, so the result is complete. Otherwise the caller must start them with
+    /// [`AssetServer::commit_loaded_asset`].
     pub(crate) async fn load_with_settings_loader_and_reader(
         &self,
         asset_path: &AssetPath<'_>,
@@ -1486,12 +1656,20 @@ impl AssetServer {
         reader: &mut dyn Reader,
         load_dependencies: bool,
         populate_hashes: bool,
+        load_deferred_labeled_assets: bool,
     ) -> Result<ErasedLoadedAsset, AssetLoadError> {
         // TODO: experiment with this
         let asset_path = asset_path.clone_owned();
         let load_context =
             LoadContext::new(self, asset_path.clone(), load_dependencies, populate_hashes);
-        let load = AssertUnwindSafe(loader.load(reader, settings, load_context)).catch_unwind();
+        let load = AssertUnwindSafe(async move {
+            let mut loaded_asset = loader.load(reader, settings, load_context).await?;
+            if load_deferred_labeled_assets {
+                loaded_asset.load_deferred_labeled_assets(self).await?;
+            }
+            Ok::<_, BevyError>(loaded_asset)
+        })
+        .catch_unwind();
         #[cfg(feature = "trace")]
         let load = {
             use tracing::Instrument;
@@ -1934,12 +2112,20 @@ pub fn handle_internal_asset_events(world: &mut World) {
                         .expect("Asset failed event sender should exist");
                     sender(world, index.index, path, error);
                 }
+                InternalAssetEvent::LoaderDependencies {
+                    path,
+                    loader_dependencies,
+                } => infos.add_loader_dependencies(path, loader_dependencies),
             }
         }
 
         if !untyped_failures.is_empty() {
             world.write_message_batch(untyped_failures);
         }
+
+        infos
+            .deferred_tasks
+            .retain(|_, deferred_task| !deferred_task.is_finished());
 
         // The following code all deals with hot-reloading, which we can skip if the server isn't
         // watching for changes.
@@ -2107,6 +2293,20 @@ pub(crate) enum InternalAssetEvent {
         path: AssetPath<'static>,
         error: AssetLoadError,
     },
+    /// Adds loader dependencies to the asset at `path`, for the files a deferred labeled asset of
+    /// it read.
+    LoaderDependencies {
+        path: AssetPath<'static>,
+        loader_dependencies: HashMap<AssetPath<'static>, AssetHash>,
+    },
+}
+
+/// The work producing a deferred labeled asset, kept until it starts.
+pub(crate) struct DeferredLoadTask {
+    /// The path of the labeled asset.
+    path: AssetPath<'static>,
+    loader_name: &'static str,
+    load: SyncCell<DeferredLoad>,
 }
 
 /// The load state of an asset.

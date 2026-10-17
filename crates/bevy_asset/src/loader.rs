@@ -1,5 +1,8 @@
 use crate::{
-    io::{AssetReaderError, MissingAssetSourceError, MissingProcessedAssetReaderError, Reader},
+    io::{
+        AssetReaderError, ErasedAssetReader, MissingAssetSourceError,
+        MissingProcessedAssetReaderError, Reader,
+    },
     loader_builders::NestedLoadBuilder,
     meta::{AssetHash, AssetMeta, AssetMetaDyn, ProcessedInfo, ProcessedInfoMinimal, Settings},
     path::AssetPath,
@@ -9,7 +12,10 @@ use crate::{
 use alloc::{boxed::Box, string::ToString, vec::Vec};
 use atomicow::CowArc;
 use bevy_ecs::{error::BevyError, world::World};
-use bevy_platform::collections::{hash_map::Entry, HashMap, HashSet};
+use bevy_platform::{
+    cell::SyncCell,
+    collections::{hash_map::Entry, HashMap, HashSet},
+};
 use bevy_reflect::TypePath;
 use bevy_tasks::{BoxedFuture, ConditionalSendFuture};
 use core::{
@@ -137,6 +143,61 @@ pub(crate) struct LabeledAsset {
     pub(crate) handle: UntypedHandle,
 }
 
+/// Produces a deferred labeled asset, given the server to build its [`LoadContext`] from.
+pub(crate) type DeferredLoad = Box<
+    dyn FnOnce(AssetServer) -> BoxedFuture<'static, Result<ErasedLoadedAsset, BevyError>> + Send,
+>;
+
+/// When a labeled asset added with [`LoadContext::defer_labeled_asset`] starts loading.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum DeferredLoadMode {
+    /// Starts as soon as the asset that added it is loaded.
+    #[default]
+    Eager,
+    /// Starts when it is requested through the [`AssetServer`], for example with
+    /// [`AssetServer::load`] and its labeled path. Holding its handle does not start it.
+    ///
+    /// Until it is requested, it is [`LoadState::NotLoaded`](crate::LoadState::NotLoaded) and
+    /// assets that depend on it do not wait for it.
+    OnDemand,
+}
+
+/// A labeled asset registered with [`LoadContext::defer_labeled_asset`], whose value has not been
+/// produced yet.
+pub(crate) struct DeferredLabeledAsset {
+    pub(crate) label: CowArc<'static, str>,
+    pub(crate) handle: UntypedHandle,
+    pub(crate) asset_type_name: &'static str,
+    pub(crate) mode: DeferredLoadMode,
+    pub(crate) load: SyncCell<DeferredLoad>,
+}
+
+/// Adds `asset` to a set of labeled assets, replacing any asset with the same label.
+fn insert_labeled_asset(
+    labeled_assets: &mut Vec<LabeledAsset>,
+    label_to_asset_index: &mut HashMap<CowArc<'static, str>, usize>,
+    asset_id_to_asset_index: &mut HashMap<UntypedAssetId, usize>,
+    label: CowArc<'static, str>,
+    asset: LabeledAsset,
+) {
+    match label_to_asset_index.entry(label) {
+        Entry::Occupied(entry) => {
+            // TODO: We should probably treat this as an error. It seems unlikely someone wants
+            // to replace a subasset - this is probably accidental.
+            let index = *entry.get();
+            // Note: we don't need to mess with the `asset_id_to_asset_index` here, since we
+            // know the same path to `get_or_create_path_handle` will return the same handle as
+            // long as the handle remains alive, and we hold the handle in `LabeledAsset`.
+            labeled_assets[index] = asset;
+        }
+        Entry::Vacant(entry) => {
+            entry.insert(labeled_assets.len());
+            asset_id_to_asset_index.insert(asset.handle.id(), labeled_assets.len());
+            labeled_assets.push(asset);
+        }
+    }
+}
+
 /// The successful result of an [`AssetLoader::load`] call. This contains the loaded "root" asset and any other "labeled" assets produced
 /// by the loader. It also holds the input [`AssetMeta`] (if it exists) and tracks dependencies:
 /// * normal dependencies: dependencies that must be loaded as part of this asset load (ex: assets a given asset has handles to).
@@ -154,6 +215,8 @@ pub struct LoadedAsset<A: Asset> {
     /// This is entirely redundant with [`Self::labeled_assets`], but it allows looking up the
     /// labeled asset by its asset ID.
     pub(crate) asset_id_to_asset_index: HashMap<UntypedAssetId, usize>,
+    /// The subassets of this asset that are produced after it is committed.
+    pub(crate) deferred_labeled_assets: Vec<DeferredLabeledAsset>,
 }
 
 impl<A: Asset> LoadedAsset<A> {
@@ -173,6 +236,7 @@ impl<A: Asset> LoadedAsset<A> {
             labeled_assets: Default::default(),
             label_to_asset_index: Default::default(),
             asset_id_to_asset_index: Default::default(),
+            deferred_labeled_assets: Vec::new(),
         }
     }
 
@@ -230,6 +294,8 @@ pub struct ErasedLoadedAsset {
     /// This is entirely redundant with [`Self::labeled_assets`], but it allows looking up the
     /// labeled asset by its asset ID.
     pub(crate) asset_id_to_asset_index: HashMap<UntypedAssetId, usize>,
+    /// The subassets of this asset that are produced after it is committed.
+    pub(crate) deferred_labeled_assets: Vec<DeferredLabeledAsset>,
 }
 
 impl<A: Asset> From<LoadedAsset<A>> for ErasedLoadedAsset {
@@ -241,6 +307,7 @@ impl<A: Asset> From<LoadedAsset<A>> for ErasedLoadedAsset {
             labeled_assets: asset.labeled_assets,
             label_to_asset_index: asset.label_to_asset_index,
             asset_id_to_asset_index: asset.asset_id_to_asset_index,
+            deferred_labeled_assets: asset.deferred_labeled_assets,
         }
     }
 }
@@ -308,12 +375,50 @@ impl ErasedLoadedAsset {
                 labeled_assets: self.labeled_assets,
                 label_to_asset_index: self.label_to_asset_index,
                 asset_id_to_asset_index: self.asset_id_to_asset_index,
+                deferred_labeled_assets: self.deferred_labeled_assets,
             }),
             Err(value) => {
                 self.value = value;
                 Err(self)
             }
         }
+    }
+
+    /// Runs every deferred labeled asset to completion, adding each as an ordinary labeled asset
+    /// so the result is complete. Used where the loaded value is consumed directly instead of
+    /// being committed to the [`World`], such as nested immediate loads and asset processing.
+    pub(crate) async fn load_deferred_labeled_assets(
+        &mut self,
+        asset_server: &AssetServer,
+    ) -> Result<(), BevyError> {
+        // Deferred assets may defer more labeled assets of their own.
+        while !self.deferred_labeled_assets.is_empty() {
+            for deferred in core::mem::take(&mut self.deferred_labeled_assets) {
+                let load = SyncCell::to_inner(deferred.load);
+                let mut asset = load(asset_server.clone()).await?;
+                self.deferred_labeled_assets
+                    .append(&mut asset.deferred_labeled_assets);
+                // The deferred asset's reads belong to this load, since that is what gets
+                // processed and hot-reloaded.
+                self.loader_dependencies.extend(
+                    asset
+                        .loader_dependencies
+                        .iter()
+                        .map(|(path, hash)| (path.clone(), *hash)),
+                );
+                insert_labeled_asset(
+                    &mut self.labeled_assets,
+                    &mut self.label_to_asset_index,
+                    &mut self.asset_id_to_asset_index,
+                    deferred.label,
+                    LabeledAsset {
+                        asset,
+                        handle: deferred.handle,
+                    },
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -395,6 +500,8 @@ pub struct LoadContext<'a> {
     /// This is entirely redundant with [`Self::labeled_assets`], but it allows looking up the
     /// labeled asset by its asset ID.
     pub(crate) asset_id_to_asset_index: HashMap<UntypedAssetId, usize>,
+    /// Stores the subassets registered with [`Self::defer_labeled_asset`].
+    pub(crate) deferred_labeled_assets: Vec<DeferredLabeledAsset>,
 }
 
 impl<'a> LoadContext<'a> {
@@ -415,6 +522,7 @@ impl<'a> LoadContext<'a> {
             labeled_assets: Default::default(),
             label_to_asset_index: Default::default(),
             asset_id_to_asset_index: Default::default(),
+            deferred_labeled_assets: Vec::new(),
         }
     }
 
@@ -530,7 +638,7 @@ impl<'a> LoadContext<'a> {
     fn add_erased_loaded_labeled_asset_internal(
         &mut self,
         label: CowArc<'static, str>,
-        loaded_asset: ErasedLoadedAsset,
+        mut loaded_asset: ErasedLoadedAsset,
         type_name: Option<&str>,
     ) -> UntypedHandle {
         let labeled_path = self.asset_path.clone().with_label(label.clone());
@@ -540,27 +648,114 @@ impl<'a> LoadContext<'a> {
             type_name,
             None,
         );
-        let asset = LabeledAsset {
-            asset: loaded_asset,
-            handle: handle.clone(),
-        };
-        match self.label_to_asset_index.entry(label) {
-            Entry::Occupied(entry) => {
-                // TODO: We should probably treat this as an error. It seems unlikely someone wants
-                // to replace a subasset - this is probably accidental.
-                let index = *entry.get();
-                // Note: we don't need to mess with the `asset_id_to_asset_index` here, since we
-                // know the same path to `get_or_create_path_handle` will return the same handle as
-                // long as the handle remains alive, and we hold the handle in `LabeledAsset`.
-                self.labeled_assets[index] = asset;
-            }
-            Entry::Vacant(entry) => {
-                entry.insert(self.labeled_assets.len());
-                self.asset_id_to_asset_index
-                    .insert(handle.id(), self.labeled_assets.len());
-                self.labeled_assets.push(asset);
-            }
-        }
+        // Labels are flat, so a labeled asset's deferred labeled assets belong to this context.
+        self.deferred_labeled_assets
+            .append(&mut loaded_asset.deferred_labeled_assets);
+        insert_labeled_asset(
+            &mut self.labeled_assets,
+            &mut self.label_to_asset_index,
+            &mut self.asset_id_to_asset_index,
+            label,
+            LabeledAsset {
+                asset: loaded_asset,
+                handle: handle.clone(),
+            },
+        );
+        handle
+    }
+
+    /// Adds a labeled asset whose value is produced after [`AssetLoader::load`] returns, and
+    /// returns its handle.
+    ///
+    /// The asset this context is loading is committed without waiting for `load`. `load` runs
+    /// later on the [`IoTaskPool`](bevy_tasks::IoTaskPool), like every asset load, with its own
+    /// [`LoadContext`] for the same asset path, and its asset is committed like any other labeled
+    /// asset once it finishes. Use this for labeled assets that are expensive to produce and
+    /// useful on their own, such as the meshes of a large scene, so they arrive as they finish
+    /// instead of all at once. `mode` decides when `load` starts:
+    ///
+    /// - [`DeferredLoadMode::Eager`]: once the asset this context is loading is committed. All
+    ///   eager labeled assets of a load start together, so loads requested after them queue
+    ///   behind them on the task pool.
+    /// - [`DeferredLoadMode::OnDemand`]: when the labeled asset is requested through the
+    ///   [`AssetServer`], for example with [`AssetServer::load`] and its labeled path. Holding the
+    ///   handle does not start it, so the caller decides how many are loading or resident at once.
+    ///
+    /// The deferred asset is [`LoadState::Loading`](crate::LoadState::Loading) from when it starts
+    /// until `load` finishes. Assets that depend on it, through a `#[dependency]` handle or
+    /// [`LoadContext::get_label_handle`], reach
+    /// [`RecursiveDependencyLoadState::Loaded`](crate::RecursiveDependencyLoadState::Loaded) only
+    /// after it does, unless it is an on-demand asset that was not requested when they were
+    /// committed. If `load` fails, the deferred asset fails to load and its dependents see a
+    /// dependency failure; the root asset stays loaded.
+    ///
+    /// Only handles keep the work alive. It is cancelled once every handle to the deferred asset
+    /// is dropped, so store the returned handle in the root asset (or another labeled asset) if
+    /// the deferred asset should stay available regardless of what else holds it. Reloading the
+    /// root asset restarts its eager deferred assets and the on-demand ones that were requested.
+    /// The files `load` reads are loader dependencies of the root asset.
+    ///
+    /// Deferral is not observable to code that consumes the loaded value directly instead of
+    /// through the [`AssetServer`]: nested immediate loads and asset processing run `load` before
+    /// returning, in either mode, so it behaves like [`LoadContext::labeled_asset_scope`] there.
+    ///
+    /// `label` must be unique among this load's labels. Labeled assets added through the
+    /// deferred [`LoadContext`] are committed together with the deferred asset.
+    ///
+    /// ```no_run
+    /// # use bevy_asset::{Asset, DeferredLoadMode, LoadContext};
+    /// # use bevy_reflect::TypePath;
+    /// # #[derive(Asset, TypePath)]
+    /// # struct Mesh(Vec<u8>);
+    /// # let load_context: &mut LoadContext = panic!();
+    /// let handle =
+    ///     load_context.defer_labeled_asset("Mesh0", DeferredLoadMode::Eager, |load_context| {
+    ///         Box::pin(async move {
+    ///             let bytes = load_context.read_asset_bytes("mesh0.bin").await?;
+    ///             Ok::<_, bevy_asset::ReadAssetBytesError>(Mesh(bytes))
+    ///         })
+    ///     });
+    /// ```
+    pub fn defer_labeled_asset<A, E, F>(
+        &mut self,
+        label: impl Into<CowArc<'static, str>>,
+        mode: DeferredLoadMode,
+        load: F,
+    ) -> Handle<A>
+    where
+        A: Asset,
+        E: Into<BevyError>,
+        F: for<'c, 'l> FnOnce(&'c mut LoadContext<'l>) -> BoxedFuture<'c, Result<A, E>>
+            + Send
+            + 'static,
+    {
+        let label = label.into();
+        let handle = self.asset_server.get_or_create_path_handle::<A>(
+            self.asset_path.clone().with_label(label.clone()),
+            None,
+        );
+        let asset_path = self.asset_path.clone();
+        let should_load_dependencies = self.should_load_dependencies;
+        let populate_hashes = self.populate_hashes;
+        let load: DeferredLoad = Box::new(move |asset_server: AssetServer| {
+            Box::pin(async move {
+                let mut load_context = LoadContext::new(
+                    &asset_server,
+                    asset_path,
+                    should_load_dependencies,
+                    populate_hashes,
+                );
+                let asset = load(&mut load_context).await.map_err(Into::into)?;
+                Ok(load_context.finish(asset).into())
+            })
+        });
+        self.deferred_labeled_assets.push(DeferredLabeledAsset {
+            label,
+            handle: handle.clone().untyped(),
+            asset_type_name: type_name::<A>(),
+            mode,
+            load: SyncCell::new(load),
+        });
         handle
     }
 
@@ -596,6 +791,7 @@ impl<'a> LoadContext<'a> {
             labeled_assets: self.labeled_assets,
             label_to_asset_index: self.label_to_asset_index,
             asset_id_to_asset_index: self.asset_id_to_asset_index,
+            deferred_labeled_assets: self.deferred_labeled_assets,
         }
     }
 
@@ -621,19 +817,9 @@ impl<'a> LoadContext<'a> {
             AssetServerMode::Processed => source.processed_reader()?,
         };
         let mut reader = asset_reader.read(path.path()).await?;
-        let hash = if self.populate_hashes {
-            // NOTE: ensure meta is read while the asset bytes reader is still active to ensure transactionality
-            // See `ProcessorGatedReader` for more info
-            let meta_bytes = asset_reader.read_meta_bytes(path.path()).await?;
-            let minimal: ProcessedInfoMinimal = ron::de::from_bytes(&meta_bytes)
-                .map_err(DeserializeMetaError::DeserializeMinimal)?;
-            let processed_info = minimal
-                .processed_info
-                .ok_or(ReadAssetBytesError::MissingAssetHash)?;
-            processed_info.full_hash
-        } else {
-            Default::default()
-        };
+        // NOTE: ensure meta is read while the asset bytes reader is still active to ensure transactionality
+        // See `ProcessorGatedReader` for more info
+        let hash = self.loader_dependency_hash(asset_reader, &path).await?;
         let mut bytes = Vec::new();
         reader
             .read_to_end(&mut bytes)
@@ -644,6 +830,48 @@ impl<'a> LoadContext<'a> {
             })?;
         self.loader_dependencies.insert(path.clone_owned(), hash);
         Ok(bytes)
+    }
+
+    /// Records the asset at `path` as a loader dependency of this load without reading it, as
+    /// [`LoadContext::read_asset_bytes`] does for the assets it reads.
+    ///
+    /// Changes to a loader dependency reload the asset being loaded. Use this for files the asset
+    /// is built from that are read later, such as by a deferred labeled asset that may never be
+    /// requested.
+    pub async fn add_loader_dependency<'b>(
+        &mut self,
+        path: impl Into<AssetPath<'b>>,
+    ) -> Result<(), ReadAssetBytesError> {
+        let path = path.into();
+        if path.path() == Path::new("") {
+            return Err(ReadAssetBytesError::EmptyPath(path.into_owned()));
+        }
+        let source = self.asset_server.get_source(path.source())?;
+        let asset_reader = match self.asset_server.mode() {
+            AssetServerMode::Unprocessed => source.reader(),
+            AssetServerMode::Processed => source.processed_reader()?,
+        };
+        let hash = self.loader_dependency_hash(asset_reader, &path).await?;
+        self.loader_dependencies.insert(path.into_owned(), hash);
+        Ok(())
+    }
+
+    /// The hash to record for loader dependency `path`, which is only known for processed assets.
+    async fn loader_dependency_hash(
+        &self,
+        asset_reader: &dyn ErasedAssetReader,
+        path: &AssetPath<'_>,
+    ) -> Result<AssetHash, ReadAssetBytesError> {
+        if !self.populate_hashes {
+            return Ok(Default::default());
+        }
+        let meta_bytes = asset_reader.read_meta_bytes(path.path()).await?;
+        let minimal: ProcessedInfoMinimal =
+            ron::de::from_bytes(&meta_bytes).map_err(DeserializeMetaError::DeserializeMinimal)?;
+        let processed_info = minimal
+            .processed_info
+            .ok_or(ReadAssetBytesError::MissingAssetHash)?;
+        Ok(processed_info.full_hash)
     }
 
     /// Returns a handle to an asset of type `A` with the label `label`. This [`LoadContext`] must produce an asset of the
@@ -695,6 +923,7 @@ impl<'a> LoadContext<'a> {
                 reader,
                 self.should_load_dependencies,
                 self.populate_hashes,
+                true,
             )
             .await
             .map_err(|error| LoadDirectError::LoadError {
@@ -746,4 +975,606 @@ pub enum ReadAssetBytesError {
     },
     #[error("The LoadContext for this read_asset_bytes call requires hash metadata, but it was not provided. This is likely an internal implementation error.")]
     MissingAssetHash,
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        io::{AssetSourceEvent, Reader},
+        tests::{create_app, create_app_with_source_event_sender, run_app_until},
+        Asset, AssetApp, AssetEvent, AssetLoadFailedEvent, AssetLoader, AssetServer, Assets,
+        DeferredLoadMode, ErasedAssetIndex, Handle, LoadContext, LoadState,
+        RecursiveDependencyLoadState,
+    };
+    use alloc::{boxed::Box, format, string::String, vec, vec::Vec};
+    use async_channel::{Receiver, Sender};
+    use bevy_app::App;
+    use bevy_ecs::{message::Messages, world::World};
+    use bevy_reflect::TypePath;
+    use futures_lite::AsyncReadExt;
+    use std::path::{Path, PathBuf};
+
+    #[derive(Asset, TypePath)]
+    struct Root {
+        #[dependency]
+        deferred: Handle<Deferred>,
+        #[dependency]
+        other: Handle<Deferred>,
+    }
+
+    #[derive(Asset, TypePath, Debug)]
+    struct Deferred {
+        value: u32,
+        #[dependency]
+        nested: Option<Handle<Deferred>>,
+    }
+
+    /// The labels of the deferred assets of a [`Root`].
+    const LABELS: [&str; 2] = ["deferred", "other"];
+
+    /// Reports how a deferred load of the given label went.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Outcome {
+        /// It got through its gate.
+        Started(&'static str),
+        /// Its work was dropped, after finishing or not.
+        Dropped(&'static str),
+    }
+
+    struct SendOnDrop(&'static str, crossbeam_channel::Sender<Outcome>);
+
+    impl Drop for SendOnDrop {
+        fn drop(&mut self) {
+            let _ = self.1.send(Outcome::Dropped(self.0));
+        }
+    }
+
+    /// Loads a [`Root`] whose labels in [`LABELS`] are deferred. Each waits for a message on its
+    /// gate, reads its value from `<label>.txt` and adds a `<label>_nested` labeled asset. The
+    /// root also depends on `lazy.txt` without reading it.
+    #[derive(TypePath)]
+    struct DeferringLoader {
+        mode: DeferredLoadMode,
+        gates: [Receiver<()>; 2],
+        fail: bool,
+        outcomes: crossbeam_channel::Sender<Outcome>,
+    }
+
+    impl AssetLoader for DeferringLoader {
+        type Asset = Root;
+        type Settings = ();
+        type Error = std::io::Error;
+
+        async fn load(
+            &self,
+            reader: &mut dyn Reader,
+            _settings: &Self::Settings,
+            load_context: &mut LoadContext<'_>,
+        ) -> Result<Self::Asset, Self::Error> {
+            let mut text = String::new();
+            reader.read_to_string(&mut text).await?;
+            load_context
+                .add_loader_dependency("lazy.txt")
+                .await
+                .map_err(std::io::Error::other)?;
+
+            let [deferred, other] = core::array::from_fn(|index| {
+                let label = LABELS[index];
+                let gate = self.gates[index].clone();
+                let fail = self.fail;
+                let outcomes = self.outcomes.clone();
+                let on_drop = SendOnDrop(label, self.outcomes.clone());
+                load_context.defer_labeled_asset(label, self.mode, move |load_context| {
+                    Box::pin(async move {
+                        let _on_drop = on_drop;
+                        gate.recv().await.map_err(std::io::Error::other)?;
+                        outcomes.send(Outcome::Started(label)).unwrap();
+                        if fail {
+                            return Err(std::io::Error::other("deferred load failed"));
+                        }
+                        let bytes = load_context
+                            .read_asset_bytes(format!("{label}.txt"))
+                            .await
+                            .map_err(std::io::Error::other)?;
+                        let value = String::from_utf8(bytes)
+                            .map_err(std::io::Error::other)?
+                            .trim()
+                            .parse()
+                            .map_err(std::io::Error::other)?;
+                        let nested = load_context.add_labeled_asset(
+                            format!("{label}_nested"),
+                            Deferred {
+                                value: value + 1,
+                                nested: None,
+                            },
+                        );
+                        Ok(Deferred {
+                            value,
+                            nested: Some(nested),
+                        })
+                    })
+                })
+            });
+            Ok(Root { deferred, other })
+        }
+
+        fn extensions(&self) -> &[&str] {
+            &["defer"]
+        }
+    }
+
+    struct Harness {
+        app: App,
+        server: AssetServer,
+        gates: [Sender<()>; 2],
+        outcomes: crossbeam_channel::Receiver<Outcome>,
+    }
+
+    impl Harness {
+        /// Lets one load of each label through its gate.
+        fn open_all(&self) {
+            for gate in &self.gates {
+                gate.send_blocking(()).unwrap();
+            }
+        }
+
+        fn outcomes(&self) -> Vec<Outcome> {
+            self.outcomes.try_iter().collect()
+        }
+
+        fn deferred_value(&self, handle: &Handle<Deferred>) -> Option<u32> {
+            self.app
+                .world()
+                .resource::<Assets<Deferred>>()
+                .get(handle)
+                .map(|deferred| deferred.value)
+        }
+
+        fn started_load_tasks(&self) -> usize {
+            self.server.read_infos().stats.started_load_tasks
+        }
+    }
+
+    fn setup(mode: DeferredLoadMode, fail: bool) -> Harness {
+        let (app, dir) = create_app();
+        setup_in(app, &dir, mode, fail)
+    }
+
+    fn setup_in(
+        mut app: App,
+        dir: &crate::io::memory::Dir,
+        mode: DeferredLoadMode,
+        fail: bool,
+    ) -> Harness {
+        dir.insert_asset_text(Path::new("root.defer"), "");
+        dir.insert_asset_text(Path::new("deferred.txt"), "7");
+        dir.insert_asset_text(Path::new("other.txt"), "17");
+        let (gate, gate_receiver) = async_channel::unbounded();
+        let (other_gate, other_gate_receiver) = async_channel::unbounded();
+        let (outcome_sender, outcomes) = crossbeam_channel::unbounded();
+        app.init_asset::<Root>()
+            .init_asset::<Deferred>()
+            .register_asset_loader(DeferringLoader {
+                mode,
+                gates: [gate_receiver, other_gate_receiver],
+                fail,
+                outcomes: outcome_sender,
+            });
+        let server = app.world().resource::<AssetServer>().clone();
+        Harness {
+            app,
+            server,
+            gates: [gate, other_gate],
+            outcomes,
+        }
+    }
+
+    fn drain_events<A: Asset>(world: &mut World) -> Vec<AssetEvent<A>> {
+        world
+            .resource_mut::<Messages<AssetEvent<A>>>()
+            .drain()
+            .collect()
+    }
+
+    /// Waits for `root` to be committed and returns the handles of its deferred assets.
+    fn wait_for_root(harness: &mut Harness, root: &Handle<Root>) -> [Handle<Deferred>; 2] {
+        let server = harness.server.clone();
+        run_app_until(&mut harness.app, |_| {
+            server.load_state(root).is_loaded().then_some(())
+        });
+        let root = harness
+            .app
+            .world()
+            .resource::<Assets<Root>>()
+            .get(root)
+            .unwrap();
+        [root.deferred.clone(), root.other.clone()]
+    }
+
+    #[test]
+    fn eager_deferred_labeled_assets_are_committed_after_root() {
+        let mut harness = setup(DeferredLoadMode::Eager, false);
+        let root = harness.server.load::<Root>("root.defer");
+        let [deferred, other] = wait_for_root(&mut harness, &root);
+
+        // The root is committed while its deferred assets are still waiting on their gates.
+        let server = harness.server.clone();
+        assert!(server.load_state(&deferred).is_loading());
+        assert!(server.load_state(&other).is_loading());
+        assert!(server.recursive_dependency_load_state(&root).is_loading());
+        assert_eq!(harness.deferred_value(&deferred), None);
+        let world = harness.app.world_mut();
+        assert_eq!(
+            drain_events::<Root>(world),
+            [AssetEvent::Added { id: root.id() }]
+        );
+        assert!(drain_events::<Deferred>(world).is_empty());
+
+        harness.gates[0].send_blocking(()).unwrap();
+        run_app_until(&mut harness.app, |_| {
+            server.is_loaded_with_dependencies(&deferred).then_some(())
+        });
+        assert!(server.load_state(&other).is_loading());
+        assert!(server.recursive_dependency_load_state(&root).is_loading());
+
+        harness.gates[1].send_blocking(()).unwrap();
+        let mut root_events = Vec::new();
+        run_app_until(&mut harness.app, |world| {
+            root_events.extend(drain_events::<Root>(world));
+            (!root_events.is_empty()).then_some(())
+        });
+        assert_eq!(
+            root_events,
+            [AssetEvent::LoadedWithDependencies { id: root.id() }]
+        );
+        assert!(server.recursive_dependency_load_state(&root).is_loaded());
+
+        let deferred_assets = harness.app.world().resource::<Assets<Deferred>>();
+        let deferred_value = deferred_assets.get(&deferred).unwrap();
+        assert_eq!(deferred_value.value, 7);
+        assert_eq!(deferred_assets.get(&other).unwrap().value, 17);
+        // Labeled assets added by the deferred load are committed with it.
+        let nested = deferred_value.nested.as_ref().unwrap();
+        assert_eq!(nested.path(), Some(&"root.defer#deferred_nested".into()));
+        assert_eq!(deferred_assets.get(nested).unwrap().value, 8);
+    }
+
+    #[test]
+    fn deferred_labeled_asset_failure_is_a_dependency_failure() {
+        let mut harness = setup(DeferredLoadMode::Eager, true);
+        harness.open_all();
+        let root = harness.server.load::<Root>("root.defer");
+        let [deferred, _other] = wait_for_root(&mut harness, &root);
+
+        let server = harness.server.clone();
+        let mut failures = Vec::new();
+        run_app_until(&mut harness.app, |world| {
+            failures.extend(
+                world
+                    .resource_mut::<Messages<AssetLoadFailedEvent<Deferred>>>()
+                    .drain(),
+            );
+            (failures.len() == 2).then_some(())
+        });
+        let failure = failures
+            .iter()
+            .find(|failure| failure.id == deferred.id())
+            .unwrap();
+        assert_eq!(failure.path, "root.defer#deferred".into());
+        assert!(matches!(server.load_state(&deferred), LoadState::Failed(_)));
+        assert!(server.load_state(&root).is_loaded());
+        assert!(matches!(
+            server.recursive_dependency_load_state(&root),
+            RecursiveDependencyLoadState::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn dropping_root_cancels_eager_deferred_labeled_assets() {
+        let mut harness = setup(DeferredLoadMode::Eager, false);
+        let root = harness.server.load::<Root>("root.defer");
+        let deferred_ids = wait_for_root(&mut harness, &root).map(|handle| handle.id());
+
+        // The root holds the only handles to the deferred assets, so dropping it cancels their
+        // loads before they get through their gates.
+        drop(root);
+        let mut outcomes = Vec::new();
+        run_app_until(&mut harness.app, |_| {
+            outcomes.extend(harness.outcomes.try_iter());
+            (outcomes.len() == 2).then_some(())
+        });
+        assert!(outcomes
+            .iter()
+            .all(|outcome| matches!(outcome, Outcome::Dropped(_))));
+        for id in deferred_ids {
+            assert!(harness.server.get_load_state(id).is_none());
+        }
+
+        // Opening the gates afterwards does nothing.
+        harness.open_all();
+        for _ in 0..10 {
+            harness.app.update();
+        }
+        assert!(drain_events::<Deferred>(harness.app.world_mut())
+            .iter()
+            .all(|event| matches!(event, AssetEvent::Unused { .. })));
+        assert_eq!(harness.outcomes(), []);
+    }
+
+    #[test]
+    fn deferred_labeled_asset_can_be_requested_directly() {
+        for mode in [DeferredLoadMode::Eager, DeferredLoadMode::OnDemand] {
+            let mut harness = setup(mode, false);
+            harness.open_all();
+            let deferred = harness.server.load::<Deferred>("root.defer#deferred");
+            assert!(harness.server.load_state(&deferred).is_loading());
+            let server = harness.server.clone();
+            run_app_until(&mut harness.app, |_| {
+                server.is_loaded_with_dependencies(&deferred).then_some(())
+            });
+            assert_eq!(harness.deferred_value(&deferred), Some(7), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn reload_reproduces_eager_deferred_labeled_assets() {
+        let mut harness = setup(DeferredLoadMode::Eager, false);
+        harness.open_all();
+        let root = harness.server.load::<Root>("root.defer");
+        let [deferred, _other] = wait_for_root(&mut harness, &root);
+        let server = harness.server.clone();
+        run_app_until(&mut harness.app, |_| {
+            server.is_loaded_with_dependencies(&root).then_some(())
+        });
+        drain_events::<Root>(harness.app.world_mut());
+        drain_events::<Deferred>(harness.app.world_mut());
+
+        // While the reloaded deferred assets wait on their gates, the root is committed and waits
+        // for them, and the previous values stay available.
+        server.reload("root.defer");
+        let mut root_events = Vec::new();
+        run_app_until(&mut harness.app, |world| {
+            root_events.extend(drain_events::<Root>(world));
+            (!root_events.is_empty()).then_some(())
+        });
+        assert_eq!(root_events, [AssetEvent::Modified { id: root.id() }]);
+        assert!(server.load_state(&deferred).is_loading());
+        assert!(server.recursive_dependency_load_state(&root).is_loading());
+        assert_eq!(harness.deferred_value(&deferred), Some(7));
+
+        harness.open_all();
+        let mut deferred_events = Vec::new();
+        run_app_until(&mut harness.app, |world| {
+            deferred_events.extend(drain_events::<Deferred>(world));
+            server.is_loaded_with_dependencies(&root).then_some(())
+        });
+        assert!(deferred_events.contains(&AssetEvent::Modified { id: deferred.id() }));
+    }
+
+    #[test]
+    fn on_demand_labeled_assets_wait_to_be_requested() {
+        let mut harness = setup(DeferredLoadMode::OnDemand, false);
+        harness.open_all();
+        let root = harness.server.load::<Root>("root.defer");
+        let [deferred, other] = wait_for_root(&mut harness, &root);
+
+        // The root does not wait for on-demand assets, and holding their handles does not start
+        // them.
+        let server = harness.server.clone();
+        run_app_until(&mut harness.app, |_| {
+            server.is_loaded_with_dependencies(&root).then_some(())
+        });
+        for _ in 0..10 {
+            harness.app.update();
+        }
+        for handle in [&deferred, &other] {
+            assert!(matches!(server.load_state(handle), LoadState::NotLoaded));
+            assert_eq!(harness.deferred_value(handle), None);
+        }
+        assert_eq!(harness.outcomes(), []);
+
+        // Requesting one starts only that one, without loading the root again.
+        let requested = server.load::<Deferred>("root.defer#deferred");
+        assert_eq!(requested, deferred);
+        assert!(server.load_state(&requested).is_loading());
+        run_app_until(&mut harness.app, |_| {
+            server.is_loaded_with_dependencies(&requested).then_some(())
+        });
+        assert_eq!(harness.deferred_value(&deferred), Some(7));
+        let nested = harness
+            .server
+            .get_handle::<Deferred>("root.defer#deferred_nested");
+        assert_eq!(harness.deferred_value(&nested.unwrap()), Some(8));
+        assert_eq!(
+            harness.outcomes(),
+            [Outcome::Started("deferred"), Outcome::Dropped("deferred")]
+        );
+        assert!(matches!(server.load_state(&other), LoadState::NotLoaded));
+        assert!(server.is_loaded_with_dependencies(&root));
+        assert_eq!(harness.started_load_tasks(), 1);
+    }
+
+    #[test]
+    fn on_demand_labeled_asset_failure_does_not_fail_root() {
+        let mut harness = setup(DeferredLoadMode::OnDemand, true);
+        harness.open_all();
+        let root = harness.server.load::<Root>("root.defer");
+        wait_for_root(&mut harness, &root);
+        let server = harness.server.clone();
+        let deferred = server.load::<Deferred>("root.defer#deferred");
+        run_app_until(&mut harness.app, |_| {
+            server.load_state(&deferred).is_failed().then_some(())
+        });
+        assert!(server.is_loaded_with_dependencies(&root));
+    }
+
+    #[test]
+    fn dropping_requested_on_demand_labeled_asset_cancels_it() {
+        let mut harness = setup(DeferredLoadMode::OnDemand, false);
+        let root = harness.server.load::<Root>("root.defer");
+        let held = wait_for_root(&mut harness, &root);
+        let server = harness.server.clone();
+        let requested = server.load::<Deferred>("root.defer#deferred");
+        let index: ErasedAssetIndex = (&requested).try_into().unwrap();
+        assert!(server.load_state(&requested).is_loading());
+        assert!(server.read_infos().deferred_tasks.contains_key(&index));
+
+        // Dropping every handle, including the ones the root holds, cancels the started load and
+        // drops the work of the one that was never requested.
+        drop((root, held, requested));
+        let mut outcomes = Vec::new();
+        run_app_until(&mut harness.app, |_| {
+            outcomes.extend(harness.outcomes.try_iter());
+            (outcomes.len() == 2).then_some(())
+        });
+        outcomes.sort_by_key(|outcome| format!("{outcome:?}"));
+        assert_eq!(
+            outcomes,
+            [Outcome::Dropped("deferred"), Outcome::Dropped("other")]
+        );
+        assert!(!server.read_infos().deferred_tasks.contains_key(&index));
+
+        harness.open_all();
+        for _ in 0..10 {
+            harness.app.update();
+        }
+        assert_eq!(harness.outcomes(), []);
+    }
+
+    #[test]
+    fn reload_restarts_requested_on_demand_labeled_assets() {
+        let mut harness = setup(DeferredLoadMode::OnDemand, false);
+        harness.open_all();
+        harness.open_all();
+        let root = harness.server.load::<Root>("root.defer");
+        let [deferred, other] = wait_for_root(&mut harness, &root);
+        let server = harness.server.clone();
+        let _requested = server.load::<Deferred>("root.defer#deferred");
+        run_app_until(&mut harness.app, |_| {
+            server.is_loaded_with_dependencies(&deferred).then_some(())
+        });
+        harness.outcomes();
+        drain_events::<Deferred>(harness.app.world_mut());
+
+        server.reload("root.defer");
+        let mut deferred_events = Vec::new();
+        run_app_until(&mut harness.app, |world| {
+            deferred_events.extend(drain_events::<Deferred>(world));
+            deferred_events
+                .contains(&AssetEvent::Modified { id: deferred.id() })
+                .then_some(())
+        });
+        // The work of `other` from the first load is replaced without starting.
+        let outcomes = harness.outcomes();
+        assert!(outcomes.contains(&Outcome::Started("deferred")));
+        assert!(!outcomes.contains(&Outcome::Started("other")));
+        assert!(matches!(server.load_state(&other), LoadState::NotLoaded));
+        assert!(server.is_loaded_with_dependencies(&root));
+    }
+
+    #[test]
+    fn deferred_labeled_asset_reads_reload_the_root() {
+        let (app, dir, source_events) = create_app_with_source_event_sender();
+        let mut harness = setup_in(app, &dir, DeferredLoadMode::Eager, false);
+        for _ in 0..3 {
+            harness.open_all();
+        }
+        let root = harness.server.load::<Root>("root.defer");
+        let [deferred, _other] = wait_for_root(&mut harness, &root);
+        let server = harness.server.clone();
+        run_app_until(&mut harness.app, |_| {
+            server.is_loaded_with_dependencies(&root).then_some(())
+        });
+        let root_path = crate::AssetPath::from("root.defer");
+        for dependency in ["deferred.txt", "lazy.txt"] {
+            let dependents =
+                server.read_infos().loader_dependents[&crate::AssetPath::from(dependency)].clone();
+            assert_eq!(dependents.len(), 1);
+            assert!(dependents.contains(&root_path));
+        }
+
+        // Changing a file a deferred asset read reloads the root once, which reproduces it.
+        dir.insert_asset_text(Path::new("deferred.txt"), "8");
+        source_events
+            .send_blocking(AssetSourceEvent::ModifiedAsset(PathBuf::from(
+                "deferred.txt",
+            )))
+            .unwrap();
+        run_app_until(&mut harness.app, |world| {
+            let value = world
+                .resource::<Assets<Deferred>>()
+                .get(&deferred)
+                .map(|d| d.value);
+            (value == Some(8)).then_some(())
+        });
+        assert_eq!(harness.started_load_tasks(), 2);
+
+        // So does changing a file the root depends on without reading it.
+        source_events
+            .send_blocking(AssetSourceEvent::ModifiedAsset(PathBuf::from("lazy.txt")))
+            .unwrap();
+        run_app_until(&mut harness.app, |_| {
+            (server.read_infos().stats.started_load_tasks == 3).then_some(())
+        });
+    }
+
+    #[derive(Asset, TypePath)]
+    struct Embedding(Vec<u32>);
+
+    /// Loads a [`Root`] as a value, and records the deferred asset's value.
+    #[derive(TypePath)]
+    struct EmbeddingLoader;
+
+    impl AssetLoader for EmbeddingLoader {
+        type Asset = Embedding;
+        type Settings = ();
+        type Error = crate::LoadDirectError;
+
+        async fn load(
+            &self,
+            _reader: &mut dyn Reader,
+            _settings: &Self::Settings,
+            load_context: &mut LoadContext<'_>,
+        ) -> Result<Self::Asset, Self::Error> {
+            let root = load_context
+                .load_builder()
+                .load_value::<Root>("root.defer")
+                .await?;
+            // The deferred asset is a labeled asset of the result like any other, holding its own
+            // labeled assets.
+            let deferred = root.get_labeled("deferred").unwrap();
+            let nested = deferred.get_labeled("deferred_nested").unwrap();
+            let values = [deferred, nested]
+                .into_iter()
+                .map(|labeled| labeled.get::<Deferred>().unwrap().value)
+                .collect();
+            Ok(Embedding(values))
+        }
+
+        fn extensions(&self) -> &[&str] {
+            &["embed"]
+        }
+    }
+
+    #[test]
+    fn immediate_load_runs_deferred_labeled_assets() {
+        for mode in [DeferredLoadMode::Eager, DeferredLoadMode::OnDemand] {
+            let (app, dir) = create_app();
+            dir.insert_asset_text(Path::new("a.embed"), "");
+            let mut harness = setup_in(app, &dir, mode, false);
+            harness
+                .app
+                .init_asset::<Embedding>()
+                .register_asset_loader(EmbeddingLoader);
+            harness.open_all();
+
+            let embedding = harness.server.load("a.embed");
+            run_app_until(&mut harness.app, |world| {
+                world
+                    .resource::<Assets<Embedding>>()
+                    .get(&embedding)
+                    .map(|embedding| assert_eq!(embedding.0, vec![7, 8], "{mode:?}"))
+            });
+        }
+    }
 }

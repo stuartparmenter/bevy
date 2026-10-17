@@ -2663,7 +2663,7 @@ mod tests {
 
     // Creates a basic app with the default asset source engineered to get back the asset event
     // sender.
-    fn create_app_with_source_event_sender() -> (App, Dir, Sender<AssetSourceEvent>) {
+    pub(crate) fn create_app_with_source_event_sender() -> (App, Dir, Sender<AssetSourceEvent>) {
         let mut app = App::new();
         let dir = Dir::default();
         let memory_reader = MemoryAssetReader { root: dir.clone() };

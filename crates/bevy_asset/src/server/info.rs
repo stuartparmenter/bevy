@@ -1,3 +1,4 @@
+use super::DeferredLoadTask;
 use crate::{
     meta::{AssetHash, MetaTransform},
     Asset, AssetHandleProvider, AssetIndex, AssetLoadError, AssetPath, DependencyLoadState,
@@ -47,6 +48,8 @@ pub(crate) struct AssetInfo {
     handle_drops_to_skip: usize,
     /// List of tasks waiting for this asset to complete loading
     pub(crate) waiting_tasks: Vec<Waker>,
+    /// The work producing this on-demand deferred labeled asset, until it is requested.
+    pub(crate) on_demand_load: Option<DeferredLoadTask>,
 }
 
 // Manual Debug impl since MetaTransform is not Debug.
@@ -81,6 +84,7 @@ impl core::fmt::Debug for AssetInfo {
             .field("loader_dependencies", &self.loader_dependencies)
             .field("handle_drops_to_skip", &self.handle_drops_to_skip)
             .field("waiting_tasks", &self.waiting_tasks)
+            .field("on_demand_load", &self.on_demand_load.is_some())
             .finish()
     }
 }
@@ -107,6 +111,7 @@ impl AssetInfo {
             dependents_waiting_on_recursive_dep_load: HashSet::default(),
             handle_drops_to_skip: 0,
             waiting_tasks: Vec::new(),
+            on_demand_load: None,
         }
     }
 }
@@ -136,6 +141,12 @@ pub(crate) struct AssetInfos {
     pub(crate) dependency_failed_event_sender:
         TypeIdHashMap<fn(&mut World, AssetIndex, AssetPath<'static>, AssetLoadError)>,
     pub(crate) pending_tasks: HashMap<ErasedAssetIndex, Task<()>>,
+    /// Tasks producing deferred labeled assets, keyed by the labeled asset.
+    ///
+    /// These are separate from `pending_tasks` because a labeled asset that was requested
+    /// directly already has the load task of its root asset there, and that task is the one
+    /// starting these.
+    pub(crate) deferred_tasks: HashMap<ErasedAssetIndex, Task<()>>,
     /// The stats that have collected during usage of the asset server.
     pub(crate) stats: AssetServerStats,
 }
@@ -436,6 +447,7 @@ impl AssetInfos {
             &mut self.loader_dependents,
             &mut self.living_labeled_assets,
             &mut self.pending_tasks,
+            &mut self.deferred_tasks,
             self.watching_for_changes,
             index,
         )
@@ -449,6 +461,10 @@ impl AssetInfos {
         world: &mut World,
         sender: &Sender<InternalAssetEvent>,
     ) {
+        debug_assert!(
+            loaded_asset.deferred_labeled_assets.is_empty(),
+            "deferred labeled assets must be started before their asset is committed"
+        );
         // Process all the labeled assets first so that they don't get skipped due to the "parent"
         // not having its handle alive.
         for asset in loaded_asset.labeled_assets {
@@ -480,6 +496,11 @@ impl AssetInfos {
         let mut rec_dep_error = None;
         loading_deps.retain(|dep_id| {
             if let Some(dep_info) = self.get_mut(*dep_id) {
+                if dep_info.on_demand_load.is_some() {
+                    // It loads only if something requests it, so do not wait for it.
+                    loading_rec_deps.remove(dep_id);
+                    return false;
+                }
                 match dep_info.rec_dep_load_state {
                     RecursiveDependencyLoadState::Loading
                     | RecursiveDependencyLoadState::NotLoaded => {
@@ -735,6 +756,33 @@ impl AssetInfos {
         }
     }
 
+    /// Adds `loader_dependencies` to the assets at `path`, so changes to them reload it.
+    pub(crate) fn add_loader_dependencies(
+        &mut self,
+        path: AssetPath<'static>,
+        loader_dependencies: HashMap<AssetPath<'static>, AssetHash>,
+    ) {
+        if !self.watching_for_changes {
+            return;
+        }
+        for loader_dependency in loader_dependencies.keys() {
+            self.loader_dependents
+                .entry(loader_dependency.clone())
+                .or_default()
+                .insert(path.clone());
+        }
+        let indices: Vec<_> = self.get_path_indices(&path).collect();
+        for index in indices {
+            if let Some(info) = self.infos.get_mut(&index) {
+                info.loader_dependencies.extend(
+                    loader_dependencies
+                        .iter()
+                        .map(|(path, hash)| (path.clone(), *hash)),
+                );
+            }
+        }
+    }
+
     fn remove_dependents_and_labels(
         info: &AssetInfo,
         loader_dependents: &mut HashMap<AssetPath<'static>, HashSet<AssetPath<'static>>>,
@@ -770,6 +818,7 @@ impl AssetInfos {
         loader_dependents: &mut HashMap<AssetPath<'static>, HashSet<AssetPath<'static>>>,
         living_labeled_assets: &mut HashMap<AssetPath<'static>, HashSet<Box<str>>>,
         pending_tasks: &mut HashMap<ErasedAssetIndex, Task<()>>,
+        deferred_tasks: &mut HashMap<ErasedAssetIndex, Task<()>>,
         watching_for_changes: bool,
         index: ErasedAssetIndex,
     ) -> bool {
@@ -785,6 +834,7 @@ impl AssetInfos {
         }
 
         pending_tasks.remove(&index);
+        deferred_tasks.remove(&index);
 
         let type_id = entry.key().type_id;
 
@@ -829,6 +879,7 @@ impl AssetInfos {
                         &mut self.loader_dependents,
                         &mut self.living_labeled_assets,
                         &mut self.pending_tasks,
+                        &mut self.deferred_tasks,
                         self.watching_for_changes,
                         id,
                     );
