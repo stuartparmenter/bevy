@@ -105,6 +105,9 @@ impl GltfExtensionHandler for GltfExtensionHandlerPbr {
     fn dyn_clone(&self) -> Box<dyn ErasedGltfExtensionHandler> {
         Box::new((*self).clone())
     }
+    fn handles_gltf_primitives(&self) -> bool {
+        false
+    }
     fn on_root(
         &mut self,
         load_context: &mut LoadContext<'_>,

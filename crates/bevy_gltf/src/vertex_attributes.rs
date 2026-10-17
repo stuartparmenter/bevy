@@ -46,17 +46,17 @@ pub enum AccessFailed {
 }
 
 /// Helper for reading buffer data
-struct BufferAccessor<'a> {
+struct BufferAccessor<'a, B> {
     accessor: gltf::Accessor<'a>,
-    buffer_data: &'a Vec<Vec<u8>>,
+    buffer_data: &'a [B],
     normalization: Normalization,
 }
 
-impl<'a> BufferAccessor<'a> {
+impl<'a, B: AsRef<[u8]>> BufferAccessor<'a, B> {
     /// Creates an iterator over the elements in this accessor
     fn iter<T: gltf::accessor::Item>(self) -> Result<gltf::accessor::Iter<'a, T>, AccessFailed> {
         gltf::accessor::Iter::new(self.accessor, |buffer: gltf::Buffer| {
-            self.buffer_data.get(buffer.index()).map(Vec::as_slice)
+            self.buffer_data.get(buffer.index()).map(AsRef::as_ref)
         })
         .ok_or(AccessFailed::MalformedData)
     }
@@ -169,7 +169,7 @@ impl<'a> VertexAttributeIter<'a> {
     /// Creates an iterator over the elements in a vertex attribute accessor
     fn from_accessor(
         accessor: gltf::Accessor<'a>,
-        buffer_data: &'a Vec<Vec<u8>>,
+        buffer_data: &'a [impl AsRef<[u8]>],
     ) -> Result<VertexAttributeIter<'a>, AccessFailed> {
         let normalization = Normalization(accessor.normalized());
         let format = (accessor.data_type(), accessor.dimensions());
@@ -372,7 +372,7 @@ pub enum ConvertAttributeError {
 pub fn convert_attribute(
     semantic: gltf::Semantic,
     accessor: gltf::Accessor,
-    buffer_data: &Vec<Vec<u8>>,
+    buffer_data: &[impl AsRef<[u8]>],
     custom_vertex_attributes: &HashMap<Box<str>, MeshVertexAttribute>,
     convert_coordinates: bool,
 ) -> Result<(MeshVertexAttribute, Values), ConvertAttributeError> {
@@ -521,7 +521,7 @@ pub(crate) fn insert_quantized_attribute(
     semantic: &gltf::Semantic,
     accessor: &gltf::Accessor,
     primitive: &gltf::Primitive,
-    buffer_data: &Vec<Vec<u8>>,
+    buffer_data: &[impl AsRef<[u8]>],
     convert: bool,
 ) -> Result<bool, ConvertAttributeError> {
     use VertexAttributeIter as It;
@@ -607,12 +607,12 @@ pub(crate) fn quantized_attribute_compression(
 /// The per-vertex displacements of each of the primitive's morph targets, in order.
 pub(crate) fn morph_targets(
     primitive: &gltf::Primitive,
-    buffer_data: &Vec<Vec<u8>>,
+    buffer_data: &[impl AsRef<[u8]>],
     convert_coordinates: bool,
 ) -> Result<Vec<MorphAttributes>, ConvertAttributeError> {
     fn read<'a>(
         accessor: Option<gltf::Accessor<'a>>,
-        buffer_data: &'a Vec<Vec<u8>>,
+        buffer_data: &'a [impl AsRef<[u8]>],
         into: impl FnOnce(VertexAttributeIter<'a>) -> Result<Vec<[f32; 3]>, AccessFailed>,
     ) -> Result<Vec<[f32; 3]>, ConvertAttributeError> {
         let Some(accessor) = accessor else {
@@ -674,7 +674,7 @@ mod tests {
         let normals = convert_attribute(
             gltf::Semantic::Normals,
             gltf.accessors().next().unwrap(),
-            &vec![vec![0; 4]],
+            &[vec![0; 4]],
             &HashMap::default(),
             false,
         );
@@ -723,7 +723,7 @@ mod tests {
         let buffer = [1.0f32, 2.0, 3.0].map(f32::to_le_bytes).concat();
         let primitive = gltf.meshes().next().unwrap().primitives().next().unwrap();
         assert_eq!(
-            morph_targets(&primitive, &vec![buffer], true).unwrap(),
+            morph_targets(&primitive, &[buffer], true).unwrap(),
             vec![
                 MorphAttributes::from([Vec3::new(-1.0, 2.0, -3.0), Vec3::ZERO, Vec3::ZERO]),
                 MorphAttributes::from([Vec3::ZERO; 3]),

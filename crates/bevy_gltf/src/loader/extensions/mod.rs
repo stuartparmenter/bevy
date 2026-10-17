@@ -27,8 +27,10 @@ use {bevy_animation::AnimationClip, bevy_platform::collections::HashSet};
 use crate::{GltfLoaderSettings, GltfMaterial, GltfMesh};
 
 pub(crate) use self::{
-    ext_mesh_gpu_instancing::instance_transforms, khr_materials_anisotropy::AnisotropyExtension,
-    khr_materials_clearcoat::ClearcoatExtension, khr_materials_specular::SpecularExtension,
+    ext_mesh_gpu_instancing::{instance_transform_accessors, instance_transforms},
+    khr_materials_anisotropy::AnisotropyExtension,
+    khr_materials_clearcoat::ClearcoatExtension,
+    khr_materials_specular::SpecularExtension,
 };
 
 /// Stores the `ErasedGltfExtensionHandler` implementations so that they
@@ -132,6 +134,15 @@ pub trait GltfExtensionHandler: Send + Sync + 'static {
         material_asset: &GltfMaterial,
         material_label: &str,
     ) {
+    }
+
+    /// Whether this handler implements [`GltfExtensionHandler::on_gltf_primitive`].
+    ///
+    /// [Deferred meshes](crate::GltfLoaderSettings::defer_meshes) are built without calling
+    /// `on_gltf_primitive`, so a load builds its meshes without deferral while any registered
+    /// handler returns true. Return false from handlers that keep the default `on_gltf_primitive`.
+    fn handles_gltf_primitives(&self) -> bool {
+        true
     }
 
     /// Called when an individual glTF primitive is processed
@@ -326,6 +337,9 @@ pub trait ErasedGltfExtensionHandler: Send + Sync + 'static {
         material_label: &str,
     );
 
+    /// Whether this handler implements `on_gltf_primitive`
+    fn handles_gltf_primitives(&self) -> bool;
+
     /// Called when an individual glTF primitive is processed
     fn on_gltf_primitive<'a>(
         &'a mut self,
@@ -462,6 +476,10 @@ impl<H: GltfExtensionHandler> ErasedGltfExtensionHandler for H {
             material_asset,
             material_label,
         );
+    }
+
+    fn handles_gltf_primitives(&self) -> bool {
+        GltfExtensionHandler::handles_gltf_primitives(self)
     }
 
     fn on_gltf_primitive<'a>(

@@ -1,3 +1,4 @@
+mod deferred_meshes;
 pub mod extensions;
 pub mod gltf_ext;
 
@@ -6,8 +7,8 @@ use async_lock::RwLock;
 #[cfg(feature = "bevy_animation")]
 use bevy_animation::{prelude::*, AnimatedBy, AnimationTargetId};
 use bevy_asset::{
-    io::Reader, AssetLoadError, AssetLoader, AssetPath, Handle, LoadContext, ParseAssetPathError,
-    ReadAssetBytesError, RenderAssetUsages,
+    io::Reader, AssetLoadError, AssetLoader, AssetPath, DeferredLoadMode, Handle, LoadContext,
+    ParseAssetPathError, ReadAssetBytesError, RenderAssetUsages,
 };
 use bevy_camera::{
     primitives::Aabb,
@@ -41,6 +42,7 @@ use bevy_reflect::TypePath;
 use bevy_tasks::IoTaskPool;
 use bevy_transform::components::Transform;
 use bevy_world_serialization::WorldAsset;
+use fixedbitset::FixedBitSet;
 use gltf::{
     accessor::Iter,
     image::Source,
@@ -70,6 +72,7 @@ use crate::{
 #[cfg(feature = "bevy_animation")]
 use self::gltf_ext::scene::collect_path;
 use self::{
+    deferred_meshes::DeferredMeshes,
     extensions::{instance_transforms, AnisotropyExtension, ClearcoatExtension, SpecularExtension},
     gltf_ext::{
         check_for_cycles, get_linear_textures,
@@ -284,6 +287,47 @@ pub struct GltfLoaderSettings {
     pub mesh_compression: Option<MeshCompressionArgs>,
     /// Optionally overrides [`GltfPlugin::preserve_quantization`](crate::GltfPlugin::preserve_quantization).
     pub preserve_quantization: Option<bool>,
+    /// Whether each primitive's [`Mesh`] is built after the [`Gltf`] asset loads, as a
+    /// [deferred labeled asset](LoadContext::defer_labeled_asset). See [`DeferMeshes`].
+    pub defer_meshes: DeferMeshes,
+}
+
+/// When the primitive meshes of a glTF are built, set by [`GltfLoaderSettings::defer_meshes`].
+///
+/// With deferral, the [`Gltf`], its scenes, nodes, materials and [`GltfMesh`](crate::GltfMesh)
+/// assets are available as soon as the file is parsed, and each primitive's [`Mesh`] is built
+/// later in its own task. Entities spawned from a scene render each mesh once it is built.
+///
+/// Buffers that only meshes use are read when the first mesh that needs them is built and
+/// released once every primitive that uses them is built or dropped, so for a `.gltf` with one
+/// buffer file per mesh, only the meshes being built are resident. Buffers inside a `.glb` file
+/// are read with the file and stay resident while any deferred mesh is unbuilt. Changing a buffer
+/// file reloads the [`Gltf`], as without deferral.
+///
+/// Deferral is ignored while a registered
+/// [`GltfExtensionHandler`](extensions::GltfExtensionHandler) handles primitives, as reported by
+/// [`handles_gltf_primitives`](extensions::GltfExtensionHandler::handles_gltf_primitives), since
+/// `on_gltf_primitive` sees every buffer during the load.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DeferMeshes {
+    /// Meshes are built during the load, before the [`Gltf`] is available.
+    #[default]
+    Off,
+    /// Every mesh starts building once the [`Gltf`] loads, in parallel. The [`Gltf`] reaches
+    /// [`RecursiveDependencyLoadState::Loaded`](bevy_asset::RecursiveDependencyLoadState) once
+    /// every mesh is built.
+    Eager,
+    /// A mesh is built only once it is requested by loading its labeled path, for example
+    /// `asset_server.load(primitive.mesh.path().unwrap().clone())` or
+    /// `asset_server.load("scene.gltf#Mesh0/Primitive0")`. This lets the application decide how
+    /// many meshes are being built or resident at once.
+    ///
+    /// The [`Gltf`] does not wait for meshes, and holding a mesh handle, as [`GltfPrimitive`]
+    /// and entities spawned from a scene do, does not start it: scenes show a mesh only once
+    /// something requests it.
+    ///
+    /// [`GltfPrimitive`]: crate::GltfPrimitive
+    OnDemand,
 }
 
 impl Default for GltfLoaderSettings {
@@ -302,6 +346,7 @@ impl Default for GltfLoaderSettings {
             skinned_mesh_bounds_policy: None,
             mesh_compression: None,
             preserve_quantization: None,
+            defer_meshes: DeferMeshes::Off,
         }
     }
 }
@@ -348,7 +393,25 @@ impl GltfLoader {
                 "Gltf file name invalid",
             ))))?
             .to_string();
-        let buffer_data = load_buffers(&gltf, load_context).await?;
+
+        let defer_meshes = match settings.defer_meshes {
+            DeferMeshes::Off => None,
+            _ if extensions
+                .iter()
+                .any(|extension| extension.handles_gltf_primitives()) =>
+            {
+                warn!(
+                    "Loading the meshes of {} without deferral, since a glTF extension handler handles primitives",
+                    load_context.path()
+                );
+                None
+            }
+            DeferMeshes::Eager => Some(DeferredLoadMode::Eager),
+            DeferMeshes::OnDemand => Some(DeferredLoadMode::OnDemand),
+        };
+        // With deferred meshes, the load only reads the buffers it uses itself.
+        let eager_buffers = defer_meshes.map(|_| deferred_meshes::eager_buffers(&gltf));
+        let buffer_data = load_buffers(&gltf, load_context, eager_buffers.as_ref()).await?;
 
         let linear_textures = get_linear_textures(&gltf.document);
 
@@ -801,6 +864,31 @@ impl GltfLoader {
                 meshes_on_non_skinned_nodes.insert(mesh.index());
             }
         }
+        let mesh_options = PrimitiveMeshOptions {
+            asset_usage: settings.load_meshes,
+            custom_vertex_attributes: loader.custom_vertex_attributes.clone(),
+            rotate_meshes: convert_coordinates.rotate_meshes,
+            skinned_mesh_bounds_policy,
+            mesh_compression: mesh_compression.clone(),
+            preserve_quantization,
+            file_name,
+        };
+        let deferred_meshes = match (defer_meshes, &eager_buffers) {
+            (Some(mode), Some(eager_buffers)) => {
+                let deferred_meshes = DeferredMeshes::new(
+                    &gltf,
+                    load_context.path(),
+                    eager_buffers,
+                    mode,
+                    mesh_options.clone(),
+                )?;
+                deferred_meshes
+                    .add_loader_dependencies(load_context)
+                    .await?;
+                Some(deferred_meshes)
+            }
+            _ => None,
+        };
         for gltf_mesh in gltf.meshes() {
             let mut primitives = vec![];
 
@@ -814,176 +902,59 @@ impl GltfLoader {
                     primitive: primitive.index(),
                 };
 
-                // a Mesh that can be generated by a user's extension,
-                // such as when decompressing draco buffers
-                let mut user_mesh: Option<Mesh> = None;
-                for extension in extensions.iter_mut() {
-                    extension
-                        .on_gltf_primitive(
-                            load_context,
-                            &gltf,
-                            &gltf_mesh,
-                            &primitive,
-                            &buffer_data,
-                            &loader.custom_vertex_attributes,
-                            gltf_mesh_on_skinned_nodes,
-                            gltf_mesh_on_non_skinned_nodes,
-                            &mut user_mesh,
-                        )
-                        .await;
-                }
-
-                let mut mesh = if let Some(user_mesh_provided) = user_mesh {
-                    user_mesh_provided
+                let mesh_handle = if let Some(deferred_meshes) = &deferred_meshes {
+                    // Report unsupported topologies from the load, as without deferral.
+                    primitive_topology(primitive.mode())?;
+                    deferred_meshes.defer_primitive(
+                        load_context,
+                        &gltf_mesh,
+                        &primitive,
+                        primitive_label,
+                        gltf_mesh_on_skinned_nodes,
+                        gltf_mesh_on_non_skinned_nodes,
+                    )
                 } else {
-                    let primitive_topology = primitive_topology(primitive.mode())?;
-
-                    let mut mesh = Mesh::new(primitive_topology, settings.load_meshes);
-
-                    // Read vertex attributes
-                    for (semantic, accessor) in primitive.attributes() {
-                        if [Semantic::Joints(0), Semantic::Weights(0)].contains(&semantic) {
-                            if !gltf_mesh_on_skinned_nodes {
-                                warn!(
-                                    "Ignoring attribute {:?} for skinned mesh {} used on non skinned nodes (NODE_SKINNED_MESH_WITHOUT_SKIN)",
-                                    semantic,
-                                    primitive_label
-                                );
-                                continue;
-                            } else if gltf_mesh_on_non_skinned_nodes {
-                                error!("Skinned mesh {} used on both skinned and non skin nodes, this is likely to cause an error (NODE_SKINNED_MESH_WITHOUT_SKIN)", primitive_label);
-                            }
-                        }
-                        if preserve_quantization {
-                            match insert_quantized_attribute(
-                                &mut mesh,
-                                &semantic,
-                                &accessor,
+                    // a Mesh that can be generated by a user's extension,
+                    // such as when decompressing draco buffers
+                    let mut user_mesh: Option<Mesh> = None;
+                    for extension in extensions.iter_mut() {
+                        extension
+                            .on_gltf_primitive(
+                                load_context,
+                                &gltf,
+                                &gltf_mesh,
                                 &primitive,
                                 &buffer_data,
-                                convert_coordinates.rotate_meshes,
-                            ) {
-                                Ok(false) => {}
-                                Ok(true) => continue,
-                                Err(err) => {
-                                    warn!("{}", err);
-                                    continue;
-                                }
-                            }
-                        }
-                        match convert_attribute(
-                            semantic,
-                            accessor,
-                            &buffer_data,
-                            &loader.custom_vertex_attributes,
-                            convert_coordinates.rotate_meshes,
-                        ) {
-                            Ok((attribute, values)) => mesh.insert_attribute(attribute, values),
-                            Err(err) => warn!("{}", err),
-                        }
+                                &loader.custom_vertex_attributes,
+                                gltf_mesh_on_skinned_nodes,
+                                gltf_mesh_on_non_skinned_nodes,
+                                &mut user_mesh,
+                            )
+                            .await;
                     }
 
-                    // Read vertex indices
-                    let reader =
-                        primitive.reader(|buffer| Some(buffer_data[buffer.index()].as_slice()));
-                    if let Some(indices) = reader.read_indices() {
-                        mesh.insert_indices(match indices {
-                            ReadIndices::U8(is) => Indices::U16(is.map(|x| x as u16).collect()),
-                            ReadIndices::U16(is) => Indices::U16(is.collect()),
-                            ReadIndices::U32(is) => Indices::U32(is.collect()),
-                        });
-                    };
-
-                    if primitive.morph_targets().len() != 0 {
-                        match morph_targets(
+                    let mesh = match user_mesh {
+                        Some(user_mesh) => user_mesh,
+                        None => read_primitive_mesh(
+                            &gltf_mesh,
                             &primitive,
+                            primitive_label,
                             &buffer_data,
-                            convert_coordinates.rotate_meshes,
-                        ) {
-                            Ok(targets) => {
-                                mesh.set_morph_targets(targets);
-
-                                let extras = gltf_mesh.extras().as_ref();
-                                if let Some(names) = extras.and_then(|extras| {
-                                    serde_json::from_str::<MorphTargetNames>(extras.get()).ok()
-                                }) {
-                                    mesh.set_morph_target_names(names.target_names);
-                                }
-                            }
-                            Err(err) => {
-                                warn!("Ignoring morph targets of {primitive_label}: {err}");
-                            }
-                        }
-                    }
-                    mesh
+                            &mesh_options,
+                            gltf_mesh_on_skinned_nodes,
+                            gltf_mesh_on_non_skinned_nodes,
+                        )?,
+                    };
+                    load_context.add_labeled_asset(
+                        primitive_label.to_string(),
+                        finish_primitive_mesh(
+                            mesh,
+                            &primitive,
+                            &mesh_options,
+                            gltf_mesh_on_skinned_nodes,
+                        ),
+                    )
                 };
-
-                if mesh.attribute(Mesh::ATTRIBUTE_NORMAL).is_none()
-                    && matches!(mesh.primitive_topology(), PrimitiveTopology::TriangleList)
-                {
-                    tracing::debug!(
-                        "Automatically calculating missing vertex normals for geometry."
-                    );
-                    let vertex_count_before = mesh.count_vertices();
-                    mesh.duplicate_vertices();
-                    mesh.compute_flat_normals();
-                    let vertex_count_after = mesh.count_vertices();
-                    if vertex_count_before != vertex_count_after {
-                        tracing::debug!("Missing vertex normals in indexed geometry, computing them as flat. Vertex count increased from {} to {}", vertex_count_before, vertex_count_after);
-                    } else {
-                        tracing::debug!(
-                            "Missing vertex normals in indexed geometry, computing them as flat."
-                        );
-                    }
-                }
-
-                if !mesh.contains_attribute(Mesh::ATTRIBUTE_TANGENT)
-                    && mesh.contains_attribute(Mesh::ATTRIBUTE_NORMAL)
-                    && needs_tangents(&primitive.material())
-                {
-                    tracing::debug!(
-                        "Missing vertex tangents for {}, computing them using the mikktspace algorithm. Consider using a tool such as Blender to pre-compute the tangents.", file_name
-                    );
-
-                    let generate_tangents_span = info_span!("generate_tangents", name = file_name);
-
-                    generate_tangents_span.in_scope(|| {
-                        if let Err(err) = mesh.generate_tangents() {
-                            warn!(
-                                "Failed to generate vertex tangents using the mikktspace algorithm: {}",
-                                err
-                            );
-                        }
-                    });
-                }
-
-                if (skinned_mesh_bounds_policy == GltfSkinnedMeshBoundsPolicy::Dynamic)
-                    && meshes_on_skinned_nodes.contains(&gltf_mesh.index())
-                    && let Err(err) = mesh.generate_skinned_mesh_bounds()
-                {
-                    warn!("Failed to generate skinned mesh bounds: {err}");
-                }
-
-                mesh.raytracing = match primitive.material().alpha_mode() {
-                    AlphaMode::Opaque => MeshRaytracingFlags::OPAQUE,
-                    AlphaMode::Mask => MeshRaytracingFlags::NON_OPAQUE,
-                    // TODO: Solari doesn't support transparency yet, so this is treated as opaque for now
-                    #[expect(clippy::match_same_arms, reason = "Transparency not yet supported")]
-                    AlphaMode::Blend => MeshRaytracingFlags::OPAQUE,
-                };
-
-                let mut compression = mesh_compression.clone();
-                if preserve_quantization {
-                    compression.compress_attributes |= quantized_attribute_compression(&primitive);
-                }
-                let mesh_handle = load_context.add_labeled_asset(
-                    primitive_label.to_string(),
-                    mesh.compressed_mesh(&compression)
-                        .unwrap_or_else(|(mesh, err)| {
-                            tracing::debug!("Failed to compress mesh: {:?}", err);
-                            mesh
-                        }),
-                );
                 primitives.push(super::GltfPrimitive::new(
                     &gltf_mesh,
                     &primitive,
@@ -1277,6 +1248,11 @@ impl GltfLoader {
             scenes.push(scene_handle);
         }
 
+        if let Some(deferred_meshes) = deferred_meshes {
+            // The deferred meshes run once this load returns.
+            deferred_meshes.set_eager_buffers(buffer_data);
+        }
+
         Ok(Gltf {
             default_scene: gltf
                 .default_scene()
@@ -1324,6 +1300,174 @@ impl AssetLoader for GltfLoader {
     fn extensions(&self) -> &[&str] {
         &["gltf", "glb"]
     }
+}
+
+/// The settings that apply to building every primitive's [`Mesh`] in a load.
+#[derive(Clone)]
+struct PrimitiveMeshOptions {
+    asset_usage: RenderAssetUsages,
+    custom_vertex_attributes: HashMap<Box<str>, MeshVertexAttribute>,
+    rotate_meshes: bool,
+    skinned_mesh_bounds_policy: GltfSkinnedMeshBoundsPolicy,
+    mesh_compression: MeshCompressionArgs,
+    preserve_quantization: bool,
+    file_name: String,
+}
+
+/// Reads the vertex attributes, indices and morph targets of `primitive` from `buffer_data`.
+fn read_primitive_mesh(
+    gltf_mesh: &gltf::Mesh,
+    primitive: &gltf::Primitive,
+    primitive_label: GltfAssetLabel,
+    buffer_data: &[impl AsRef<[u8]>],
+    options: &PrimitiveMeshOptions,
+    on_skinned_nodes: bool,
+    on_non_skinned_nodes: bool,
+) -> Result<Mesh, GltfError> {
+    let primitive_topology = primitive_topology(primitive.mode())?;
+
+    let mut mesh = Mesh::new(primitive_topology, options.asset_usage);
+
+    // Read vertex attributes
+    for (semantic, accessor) in primitive.attributes() {
+        if [Semantic::Joints(0), Semantic::Weights(0)].contains(&semantic) {
+            if !on_skinned_nodes {
+                warn!(
+                    "Ignoring attribute {:?} for skinned mesh {} used on non skinned nodes (NODE_SKINNED_MESH_WITHOUT_SKIN)",
+                    semantic,
+                    primitive_label
+                );
+                continue;
+            } else if on_non_skinned_nodes {
+                error!("Skinned mesh {} used on both skinned and non skin nodes, this is likely to cause an error (NODE_SKINNED_MESH_WITHOUT_SKIN)", primitive_label);
+            }
+        }
+        if options.preserve_quantization {
+            match insert_quantized_attribute(
+                &mut mesh,
+                &semantic,
+                &accessor,
+                primitive,
+                buffer_data,
+                options.rotate_meshes,
+            ) {
+                Ok(false) => {}
+                Ok(true) => continue,
+                Err(err) => {
+                    warn!("{}", err);
+                    continue;
+                }
+            }
+        }
+        match convert_attribute(
+            semantic,
+            accessor,
+            buffer_data,
+            &options.custom_vertex_attributes,
+            options.rotate_meshes,
+        ) {
+            Ok((attribute, values)) => mesh.insert_attribute(attribute, values),
+            Err(err) => warn!("{}", err),
+        }
+    }
+
+    // Read vertex indices
+    let reader = primitive.reader(|buffer| buffer_data.get(buffer.index()).map(AsRef::as_ref));
+    if let Some(indices) = reader.read_indices() {
+        mesh.insert_indices(match indices {
+            ReadIndices::U8(is) => Indices::U16(is.map(|x| x as u16).collect()),
+            ReadIndices::U16(is) => Indices::U16(is.collect()),
+            ReadIndices::U32(is) => Indices::U32(is.collect()),
+        });
+    };
+
+    if primitive.morph_targets().len() != 0 {
+        match morph_targets(primitive, buffer_data, options.rotate_meshes) {
+            Ok(targets) => {
+                mesh.set_morph_targets(targets);
+
+                let extras = gltf_mesh.extras().as_ref();
+                if let Some(names) = extras
+                    .and_then(|extras| serde_json::from_str::<MorphTargetNames>(extras.get()).ok())
+                {
+                    mesh.set_morph_target_names(names.target_names);
+                }
+            }
+            Err(err) => {
+                warn!("Ignoring morph targets of {primitive_label}: {err}");
+            }
+        }
+    }
+    Ok(mesh)
+}
+
+/// Generates the normals, tangents and skinned bounds `mesh` is missing, sets its ray tracing
+/// flags, and compresses it.
+fn finish_primitive_mesh(
+    mut mesh: Mesh,
+    primitive: &gltf::Primitive,
+    options: &PrimitiveMeshOptions,
+    on_skinned_nodes: bool,
+) -> Mesh {
+    if mesh.attribute(Mesh::ATTRIBUTE_NORMAL).is_none()
+        && matches!(mesh.primitive_topology(), PrimitiveTopology::TriangleList)
+    {
+        tracing::debug!("Automatically calculating missing vertex normals for geometry.");
+        let vertex_count_before = mesh.count_vertices();
+        mesh.duplicate_vertices();
+        mesh.compute_flat_normals();
+        let vertex_count_after = mesh.count_vertices();
+        if vertex_count_before != vertex_count_after {
+            tracing::debug!("Missing vertex normals in indexed geometry, computing them as flat. Vertex count increased from {} to {}", vertex_count_before, vertex_count_after);
+        } else {
+            tracing::debug!("Missing vertex normals in indexed geometry, computing them as flat.");
+        }
+    }
+
+    if !mesh.contains_attribute(Mesh::ATTRIBUTE_TANGENT)
+        && mesh.contains_attribute(Mesh::ATTRIBUTE_NORMAL)
+        && needs_tangents(&primitive.material())
+    {
+        tracing::debug!(
+            "Missing vertex tangents for {}, computing them using the mikktspace algorithm. Consider using a tool such as Blender to pre-compute the tangents.", options.file_name
+        );
+
+        let generate_tangents_span = info_span!("generate_tangents", name = options.file_name);
+
+        generate_tangents_span.in_scope(|| {
+            if let Err(err) = mesh.generate_tangents() {
+                warn!(
+                    "Failed to generate vertex tangents using the mikktspace algorithm: {}",
+                    err
+                );
+            }
+        });
+    }
+
+    if (options.skinned_mesh_bounds_policy == GltfSkinnedMeshBoundsPolicy::Dynamic)
+        && on_skinned_nodes
+        && let Err(err) = mesh.generate_skinned_mesh_bounds()
+    {
+        warn!("Failed to generate skinned mesh bounds: {err}");
+    }
+
+    mesh.raytracing = match primitive.material().alpha_mode() {
+        AlphaMode::Opaque => MeshRaytracingFlags::OPAQUE,
+        AlphaMode::Mask => MeshRaytracingFlags::NON_OPAQUE,
+        // TODO: Solari doesn't support transparency yet, so this is treated as opaque for now
+        #[expect(clippy::match_same_arms, reason = "Transparency not yet supported")]
+        AlphaMode::Blend => MeshRaytracingFlags::OPAQUE,
+    };
+
+    let mut compression = options.mesh_compression.clone();
+    if options.preserve_quantization {
+        compression.compress_attributes |= quantized_attribute_compression(primitive);
+    }
+    mesh.compressed_mesh(&compression)
+        .unwrap_or_else(|(mesh, err)| {
+            tracing::debug!("Failed to compress mesh: {:?}", err);
+            mesh
+        })
 }
 
 /// Loads a glTF texture as a bevy [`Image`] and returns it together with its label.
@@ -2094,14 +2238,21 @@ fn spawn_primitives(
 }
 
 /// Loads the raw glTF buffer data for a specific glTF file.
+///
+/// If `only` is set, buffers outside it are left empty.
 async fn load_buffers(
     gltf: &gltf::Gltf,
     load_context: &mut LoadContext<'_>,
+    only: Option<&FixedBitSet>,
 ) -> Result<Vec<Vec<u8>>, GltfError> {
     const VALID_MIME_TYPES: &[&str] = &["application/octet-stream", "application/gltf-buffer"];
 
     let mut buffer_data = Vec::new();
     for buffer in gltf.buffers() {
+        if only.is_some_and(|only| !only.contains(buffer.index())) {
+            buffer_data.push(Vec::new());
+            continue;
+        }
         #[cfg(feature = "meshopt")]
         if extensions::khr_meshopt_compression::is_fallback_buffer(&buffer) {
             // `decode_buffer_views` fills it in below, so any URI goes unread.
@@ -2146,7 +2297,11 @@ async fn load_buffers(
     }
 
     #[cfg(feature = "meshopt")]
-    extensions::khr_meshopt_compression::decode_buffer_views(&gltf.document, &mut buffer_data)?;
+    extensions::khr_meshopt_compression::decode_buffer_views_into(
+        &gltf.document,
+        &mut buffer_data,
+        |buffer| only.is_none_or(|only| only.contains(buffer)),
+    )?;
 
     Ok(buffer_data)
 }
@@ -2307,6 +2462,8 @@ pub struct MorphTargetNames {
 
 #[cfg(test)]
 mod test {
+    use alloc::sync::Arc;
+    use bevy_platform::collections::HashMap;
     use std::path::Path;
 
     use crate::{Gltf, GltfAssetLabel, GltfLoaderSettings, GltfMaterial, GltfNode, GltfSkin};
@@ -3556,5 +3713,553 @@ mod test {
             LoadState::Loading => None,
             state => panic!("Unexpected load state: {state:?}"),
         });
+    }
+
+    /// Two meshes whose positions live in their own buffer files: mesh 0 has two primitives in
+    /// `a.bin`, mesh 1 one primitive in `b.bin`.
+    const DEFERRED_MESHES_GLTF: &str = r#"
+{
+    "asset": { "version": "2.0" },
+    "buffers": [
+        { "uri": "a.bin", "byteLength": 72 },
+        { "uri": "b.bin", "byteLength": 36 }
+    ],
+    "bufferViews": [
+        { "buffer": 0, "byteOffset": 0, "byteLength": 36 },
+        { "buffer": 0, "byteOffset": 36, "byteLength": 36 },
+        { "buffer": 1, "byteOffset": 0, "byteLength": 36 }
+    ],
+    "accessors": [
+        { "bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3", "min": [0, 0, 0], "max": [1, 1, 0] },
+        { "bufferView": 1, "componentType": 5126, "count": 3, "type": "VEC3", "min": [0, 0, 0], "max": [2, 2, 0] },
+        { "bufferView": 2, "componentType": 5126, "count": 3, "type": "VEC3", "min": [0, 0, 0], "max": [3, 3, 0] }
+    ],
+    "meshes": [
+        { "primitives": [{ "attributes": { "POSITION": 0 } }, { "attributes": { "POSITION": 1 } }] },
+        { "primitives": [{ "attributes": { "POSITION": 2 } }] }
+    ],
+    "nodes": [{ "mesh": 0 }, { "mesh": 1 }],
+    "scene": 0,
+    "scenes": [{ "nodes": [0, 1] }]
+}
+"#;
+
+    /// The buffer data of a triangle scaled by `scale`.
+    fn triangle_bytes(scale: f32) -> Vec<u8> {
+        [[0.0, 0.0, 0.0], [scale, 0.0, 0.0], [0.0, scale, 0.0]]
+            .iter()
+            .flatten()
+            .flat_map(|c: &f32| c.to_le_bytes())
+            .collect()
+    }
+
+    fn primitive_meshes(app: &App, gltf: &Handle<Gltf>) -> Vec<Handle<bevy_mesh::Mesh>> {
+        let gltf_meshes = app.world().resource::<Assets<crate::GltfMesh>>();
+        app.world()
+            .resource::<Assets<Gltf>>()
+            .get(gltf)
+            .unwrap()
+            .meshes
+            .iter()
+            .flat_map(|mesh| &gltf_meshes.get(mesh).unwrap().primitives)
+            .map(|primitive| primitive.mesh.clone())
+            .collect()
+    }
+
+    fn load_deferred(
+        asset_server: &AssetServer,
+        path: &'static str,
+        mode: super::DeferMeshes,
+    ) -> Handle<Gltf> {
+        asset_server
+            .load_builder()
+            .with_settings(move |settings: &mut GltfLoaderSettings| settings.defer_meshes = mode)
+            .load(path)
+    }
+
+    /// Holds back each read of a gated path until the gate is opened for it, and records the
+    /// paths whose reads went through.
+    #[derive(Clone)]
+    struct GatedReader {
+        reader: MemoryAssetReader,
+        gates: Arc<HashMap<&'static Path, Arc<async_lock::Semaphore>>>,
+        reads: Arc<std::sync::Mutex<Vec<std::path::PathBuf>>>,
+    }
+
+    impl GatedReader {
+        fn open(&self, path: &str) {
+            self.gates[Path::new(path)].add_permits(1);
+        }
+
+        fn reads(&self, path: &str) -> usize {
+            let reads = self.reads.lock().unwrap();
+            reads.iter().filter(|read| *read == Path::new(path)).count()
+        }
+    }
+
+    /// An app reading from `dir`, with reads of `gated` paths held back by the returned reader.
+    fn gated_app(dir: Dir, gated: &[&'static str]) -> (App, GatedReader) {
+        let gates = gated
+            .iter()
+            .map(|path| (Path::new(*path), Arc::new(async_lock::Semaphore::new(0))))
+            .collect();
+        let reader = GatedReader {
+            reader: MemoryAssetReader { root: dir },
+            gates: Arc::new(gates),
+            reads: Default::default(),
+        };
+        let gates = reader.clone();
+        let mut app = App::new();
+        app.register_asset_source(
+            AssetSourceId::Default,
+            AssetSourceBuilder::new(move || Box::new(reader.clone())),
+        )
+        .add_plugins((
+            LogPlugin::default(),
+            TaskPoolPlugin::default(),
+            AssetPlugin::default(),
+            WorldSerializationPlugin,
+            MeshPlugin,
+            crate::GltfPlugin::default(),
+        ));
+        app.finish();
+        app.cleanup();
+        (app, gates)
+    }
+
+    impl bevy_asset::io::AssetReader for GatedReader {
+        async fn read<'a>(
+            &'a self,
+            path: &'a Path,
+        ) -> Result<impl bevy_asset::io::Reader + 'a, bevy_asset::io::AssetReaderError> {
+            if let Some(gate) = self.gates.get(path) {
+                core::mem::forget(gate.acquire().await);
+            }
+            self.reads.lock().unwrap().push(path.to_path_buf());
+            self.reader.read(path).await
+        }
+
+        async fn read_meta<'a>(
+            &'a self,
+            path: &'a Path,
+        ) -> Result<impl bevy_asset::io::Reader + 'a, bevy_asset::io::AssetReaderError> {
+            self.reader.read_meta(path).await
+        }
+
+        async fn read_directory<'a>(
+            &'a self,
+            path: &'a Path,
+        ) -> Result<Box<bevy_asset::io::PathStream>, bevy_asset::io::AssetReaderError> {
+            self.reader.read_directory(path).await
+        }
+
+        async fn is_directory<'a>(
+            &'a self,
+            path: &'a Path,
+        ) -> Result<bool, bevy_asset::io::AssetReaderError> {
+            self.reader.is_directory(path).await
+        }
+    }
+
+    #[test]
+    fn deferred_meshes_arrive_as_their_buffers_are_read() {
+        use bevy_asset::RecursiveDependencyLoadState;
+        use bevy_mesh::Mesh;
+
+        let dir = Dir::default();
+        for path in ["deferred.gltf", "eager.gltf"] {
+            dir.insert_asset_text(Path::new(path), DEFERRED_MESHES_GLTF);
+        }
+        let mut a_bin = triangle_bytes(1.0);
+        a_bin.extend(triangle_bytes(2.0));
+        dir.insert_asset(Path::new("a.bin"), a_bin);
+        dir.insert_asset(Path::new("b.bin"), triangle_bytes(3.0));
+        let (mut app, gates) = gated_app(dir, &["deferred.gltf", "eager.gltf", "a.bin", "b.bin"]);
+
+        let asset_server = app.world().resource::<AssetServer>().clone();
+        gates.open("deferred.gltf");
+        let gltf = load_deferred(&asset_server, "deferred.gltf", super::DeferMeshes::Eager);
+
+        // The glTF loads without reading any mesh buffer.
+        run_app_until(&mut app, |_| match asset_server.load_state(&gltf) {
+            LoadState::Loaded => Some(()),
+            LoadState::Failed(err) => panic!("{err}"),
+            _ => None,
+        });
+        let meshes = primitive_meshes(&app, &gltf);
+        assert_eq!(meshes.len(), 3);
+        for mesh in &meshes {
+            assert!(asset_server.load_state(mesh).is_loading());
+        }
+        assert!(
+            asset_server
+                .recursive_dependency_load_state(&gltf)
+                .is_loading(),
+            "{:?}",
+            asset_server.recursive_dependency_load_state(&gltf)
+        );
+
+        // Mesh 0 arrives once its buffer can be read, while mesh 1 still waits for its own. Both
+        // primitives of mesh 0 share one read of their buffer.
+        gates.open("a.bin");
+        run_app_until(&mut app, |_| {
+            (asset_server.is_loaded(&meshes[0]) && asset_server.is_loaded(&meshes[1])).then_some(())
+        });
+        assert_eq!(gates.reads("a.bin"), 1);
+        assert!(asset_server.load_state(&meshes[2]).is_loading());
+        assert!(asset_server
+            .recursive_dependency_load_state(&gltf)
+            .is_loading());
+
+        gates.open("b.bin");
+        run_app_until(&mut app, |_| {
+            matches!(
+                asset_server.recursive_dependency_load_state(&gltf),
+                RecursiveDependencyLoadState::Loaded
+            )
+            .then_some(())
+        });
+
+        // The meshes match the ones loaded without deferral.
+        for path in ["eager.gltf", "a.bin", "b.bin"] {
+            gates.open(path);
+        }
+        let eager: Handle<Gltf> = asset_server.load("eager.gltf");
+        run_app_until(&mut app, |_| {
+            asset_server
+                .is_loaded_with_dependencies(&eager)
+                .then_some(())
+        });
+        let mesh_assets = app.world().resource::<Assets<Mesh>>();
+        for (deferred, eager) in meshes.iter().zip(primitive_meshes(&app, &eager)) {
+            let deferred = mesh_assets.get(deferred).unwrap();
+            let eager = mesh_assets.get(&eager).unwrap();
+            assert_eq!(
+                deferred.attribute(Mesh::ATTRIBUTE_POSITION),
+                eager.attribute(Mesh::ATTRIBUTE_POSITION)
+            );
+            assert_eq!(
+                deferred.attribute(Mesh::ATTRIBUTE_NORMAL),
+                eager.attribute(Mesh::ATTRIBUTE_NORMAL)
+            );
+        }
+    }
+
+    #[test]
+    fn on_demand_meshes_are_built_when_requested() {
+        use bevy_mesh::{Mesh, VertexAttributeValues};
+
+        let dir = Dir::default();
+        dir.insert_asset_text(Path::new("on_demand.gltf"), DEFERRED_MESHES_GLTF);
+        let mut a_bin = triangle_bytes(1.0);
+        a_bin.extend(triangle_bytes(2.0));
+        dir.insert_asset(Path::new("a.bin"), a_bin);
+        dir.insert_asset(Path::new("b.bin"), triangle_bytes(3.0));
+        let (mut app, gates) = gated_app(dir, &[]);
+        let asset_server = app.world().resource::<AssetServer>().clone();
+        let gltf = load_deferred(
+            &asset_server,
+            "on_demand.gltf",
+            super::DeferMeshes::OnDemand,
+        );
+
+        // The glTF and its dependencies load without building or reading any mesh.
+        run_app_until(&mut app, |_| match asset_server.load_state(&gltf) {
+            LoadState::Failed(err) => panic!("{err}"),
+            _ => asset_server
+                .is_loaded_with_dependencies(&gltf)
+                .then_some(()),
+        });
+        for _ in 0..10 {
+            app.update();
+        }
+        let meshes = primitive_meshes(&app, &gltf);
+        for mesh in &meshes {
+            assert!(matches!(
+                asset_server.load_state(mesh),
+                LoadState::NotLoaded
+            ));
+        }
+        assert_eq!((gates.reads("a.bin"), gates.reads("b.bin")), (0, 0));
+
+        // Requesting a mesh builds only that one, reading only its buffer.
+        let requested: Handle<Mesh> = asset_server.load("on_demand.gltf#Mesh1/Primitive0");
+        assert_eq!(requested, meshes[2]);
+        run_app_until(&mut app, |_| {
+            asset_server.is_loaded(&requested).then_some(())
+        });
+        let mesh = app
+            .world()
+            .resource::<Assets<Mesh>>()
+            .get(&requested)
+            .unwrap();
+        assert_eq!(
+            mesh.attribute(Mesh::ATTRIBUTE_POSITION),
+            Some(&VertexAttributeValues::Float32x3(vec![
+                [0.0, 0.0, 0.0],
+                [3.0, 0.0, 0.0],
+                [0.0, 3.0, 0.0]
+            ]))
+        );
+        for mesh in &meshes[..2] {
+            assert!(matches!(
+                asset_server.load_state(mesh),
+                LoadState::NotLoaded
+            ));
+        }
+        assert_eq!((gates.reads("a.bin"), gates.reads("b.bin")), (0, 1));
+        assert_eq!(gates.reads("on_demand.gltf"), 1);
+    }
+
+    /// An extension handler that reports whether it handles primitives.
+    #[derive(Clone)]
+    struct PrimitiveHandler(bool);
+
+    impl super::extensions::GltfExtensionHandler for PrimitiveHandler {
+        fn dyn_clone(&self) -> Box<dyn super::extensions::ErasedGltfExtensionHandler> {
+            Box::new(self.clone())
+        }
+
+        fn handles_gltf_primitives(&self) -> bool {
+            self.0
+        }
+    }
+
+    #[test]
+    fn only_handlers_of_primitives_disable_deferred_meshes() {
+        for handles_primitives in [false, true] {
+            let dir = Dir::default();
+            dir.insert_asset_text(Path::new("handled.gltf"), DEFERRED_MESHES_GLTF);
+            dir.insert_asset(
+                Path::new("a.bin"),
+                [triangle_bytes(1.0), triangle_bytes(2.0)].concat(),
+            );
+            dir.insert_asset(Path::new("b.bin"), triangle_bytes(3.0));
+            let mut app = test_app(dir);
+            app.world()
+                .resource::<super::extensions::GltfExtensionHandlers>()
+                .0
+                .write_blocking()
+                .push(Box::new(PrimitiveHandler(handles_primitives)));
+            let asset_server = app.world().resource::<AssetServer>().clone();
+            let gltf = load_deferred(&asset_server, "handled.gltf", super::DeferMeshes::OnDemand);
+            run_app_until(&mut app, |_| {
+                asset_server.load_state(&gltf).is_loaded().then_some(())
+            });
+
+            // Without deferral, the meshes are committed with the glTF.
+            for mesh in primitive_meshes(&app, &gltf) {
+                assert_eq!(asset_server.is_loaded(&mesh), handles_primitives);
+            }
+        }
+    }
+
+    #[test]
+    fn deferred_mesh_reads_inline_buffers_from_the_load() {
+        use bevy_mesh::{Mesh, VertexAttributeValues};
+
+        // A data URI buffer is part of the glTF, so the load reads it.
+        let uri = format!(
+            "data:application/octet-stream;base64,{}",
+            base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                triangle_bytes(1.0)
+            )
+        );
+        let json = DEFERRED_MESHES_GLTF
+            .replace(r#"{ "uri": "a.bin", "byteLength": 72 },"#, "")
+            .replace("b.bin", &uri)
+            .replace(r#""buffer": 1"#, r#""buffer": 0"#)
+            .replace(r#"{ "primitives": [{ "attributes": { "POSITION": 0 } }, { "attributes": { "POSITION": 1 } }] },"#, "")
+            .replace(r#""POSITION": 2"#, r#""POSITION": 0"#)
+            .replace(r#""bufferView": 2"#, r#""bufferView": 0"#)
+            .replace(r#""nodes": [{ "mesh": 0 }, { "mesh": 1 }]"#, r#""nodes": [{ "mesh": 0 }]"#)
+            .replace(r#""nodes": [0, 1]"#, r#""nodes": [0]"#);
+        let dir = Dir::default();
+        dir.insert_asset_text(Path::new("inline.gltf"), &json);
+        let mut app = test_app(dir);
+        let asset_server = app.world().resource::<AssetServer>().clone();
+        let gltf = load_deferred(&asset_server, "inline.gltf", super::DeferMeshes::Eager);
+        run_app_until(&mut app, |_| {
+            asset_server
+                .is_loaded_with_dependencies(&gltf)
+                .then_some(())
+        });
+
+        let mesh = &primitive_meshes(&app, &gltf)[0];
+        let mesh = app.world().resource::<Assets<Mesh>>().get(mesh).unwrap();
+        // Without normals, the mesh is de-indexed for flat normals, which keeps this triangle.
+        assert_eq!(
+            mesh.attribute(Mesh::ATTRIBUTE_POSITION),
+            Some(&VertexAttributeValues::Float32x3(vec![
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0]
+            ]))
+        );
+    }
+
+    /// Loads meshopt-compressed geometry with deferred meshes, both from a `.gltf` whose
+    /// compressed buffer is a separate file and from a `.glb`.
+    #[cfg(feature = "meshopt")]
+    #[test]
+    fn deferred_meshes_decode_meshopt() {
+        use super::extensions::khr_meshopt_compression::fixture::{
+            fixture, indices, positions, triangles,
+        };
+        use bevy_mesh::{Mesh, VertexAttributeValues};
+
+        for extension in super::MESHOPT_COMPRESSION_EXTENSIONS {
+            let positions = positions(97);
+            let indices = indices(3 * 61, positions.len());
+            let (mut json, compressed) = fixture(extension, &positions, &indices);
+            let dir = Dir::default();
+            dir.insert_asset_text(Path::new("mesh.gltf"), &json.to_string());
+            dir.insert_asset(Path::new("mesh.bin"), compressed.clone());
+            json["buffers"][0].as_object_mut().unwrap().remove("uri");
+            let glb = gltf::binary::Glb {
+                header: gltf::binary::Header {
+                    magic: *b"glTF",
+                    version: 2,
+                    length: 0,
+                },
+                json: serde_json::to_vec(&json).unwrap().into(),
+                bin: Some(compressed.into()),
+            }
+            .to_vec()
+            .unwrap();
+            dir.insert_asset(Path::new("mesh.glb"), glb);
+
+            let mut app = test_app(dir);
+            let asset_server = app.world().resource::<AssetServer>().clone();
+            for path in ["mesh.gltf", "mesh.glb"] {
+                let gltf = load_deferred(&asset_server, path, super::DeferMeshes::Eager);
+                run_app_until(&mut app, |_| match asset_server.load_state(&gltf) {
+                    LoadState::Failed(err) => panic!("{err}"),
+                    _ => asset_server
+                        .is_loaded_with_dependencies(&gltf)
+                        .then_some(()),
+                });
+                let mesh = &primitive_meshes(&app, &gltf)[0];
+                let mesh = app.world().resource::<Assets<Mesh>>().get(mesh).unwrap();
+                let Some(VertexAttributeValues::Float32x3(loaded)) =
+                    mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+                else {
+                    panic!("positions missing");
+                };
+                // See `load_meshopt_glb`.
+                let loaded: Vec<u32> = loaded.iter().map(|p| (p[0] * 2.0) as u32).collect();
+                assert_eq!(triangles(&loaded), triangles(&indices), "{path}");
+            }
+        }
+    }
+
+    /// Moves the data URI buffer of the glTF `json` into a `<name>.bin` file in `dir`, and adds
+    /// the glTF as `<name>.gltf`.
+    fn insert_with_external_buffer(dir: &Dir, name: &str, json: &str) {
+        let mut json: serde_json::Value = serde_json::from_str(json).unwrap();
+        let uri = json["buffers"][0]["uri"].as_str().unwrap();
+        let (_, data) = uri.split_once("base64,").unwrap();
+        let bin = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data).unwrap();
+        json["buffers"][0]["uri"] = format!("{name}.bin").into();
+        dir.insert_asset(Path::new(&format!("{name}.bin")), bin);
+        dir.insert_asset_text(Path::new(&format!("{name}.gltf")), &json.to_string());
+    }
+
+    #[test]
+    fn deferred_meshes_preserve_quantization() {
+        use bevy_mesh::{Mesh, MeshVertexAttribute};
+
+        let dir = Dir::default();
+        insert_with_external_buffer(&dir, "quantized", &quantized_gltf());
+        let mut app = test_app(dir);
+        let asset_server = app.world().resource::<AssetServer>().clone();
+        let eager: Handle<Gltf> = asset_server.load("quantized.gltf");
+        let deferred = load_deferred(&asset_server, "quantized.gltf", super::DeferMeshes::Eager);
+        let on_demand = load_deferred(
+            &asset_server,
+            "quantized.gltf",
+            super::DeferMeshes::OnDemand,
+        );
+        run_app_until(&mut app, |_| {
+            [&eager, &deferred, &on_demand]
+                .iter()
+                .all(|gltf| asset_server.is_loaded_with_dependencies(*gltf))
+                .then_some(())
+        });
+        let requested: Handle<Mesh> = asset_server.load(
+            primitive_meshes(&app, &on_demand)[0]
+                .path()
+                .unwrap()
+                .clone(),
+        );
+        run_app_until(&mut app, |_| {
+            asset_server.is_loaded(&requested).then_some(())
+        });
+
+        // The deferred meshes keep the quantized attributes, like the eager one.
+        let meshes = app.world().resource::<Assets<Mesh>>();
+        let mesh = |gltf| meshes.get(&primitive_meshes(&app, gltf)[0]).unwrap();
+        let attributes: [MeshVertexAttribute; 4] = [
+            Mesh::ATTRIBUTE_POSITION,
+            Mesh::ATTRIBUTE_NORMAL,
+            Mesh::ATTRIBUTE_TANGENT,
+            Mesh::ATTRIBUTE_UV_0,
+        ];
+        let eager = mesh(&eager);
+        assert!(!eager.attribute_compression().is_empty());
+        for deferred in [mesh(&deferred), mesh(&on_demand)] {
+            assert_eq!(
+                deferred.attribute_compression(),
+                eager.attribute_compression()
+            );
+            for attribute in &attributes {
+                assert_eq!(
+                    deferred.attribute(attribute.id),
+                    eager.attribute(attribute.id)
+                );
+            }
+            assert_eq!(deferred.final_aabb, eager.final_aabb);
+        }
+    }
+
+    #[test]
+    fn deferred_meshes_spawn_mesh_gpu_instancing_instances() {
+        use bevy_ecs::hierarchy::ChildOf;
+        use bevy_mesh::Mesh3d;
+        use bevy_world_serialization::WorldAsset;
+
+        // The instance transforms share the buffer file with the mesh, so the load reads it.
+        let dir = Dir::default();
+        insert_with_external_buffer(&dir, "instanced", &mesh_gpu_instancing_gltf(3));
+        let mut app = test_app(dir);
+        let asset_server = app.world().resource::<AssetServer>().clone();
+        let gltf = load_deferred(&asset_server, "instanced.gltf", super::DeferMeshes::Eager);
+        run_app_until(&mut app, |_| match asset_server.load_state(&gltf) {
+            LoadState::Failed(err) => panic!("{err}"),
+            _ => asset_server
+                .is_loaded_with_dependencies(&gltf)
+                .then_some(()),
+        });
+
+        // Every instance's mesh entity draws the deferred mesh.
+        let meshes = primitive_meshes(&app, &gltf);
+        let scene = app
+            .world()
+            .resource::<Assets<Gltf>>()
+            .get(&gltf)
+            .unwrap()
+            .scenes[0]
+            .clone();
+        let mut scenes = app.world_mut().resource_mut::<Assets<WorldAsset>>();
+        let world = &mut scenes.get_mut(&scene).unwrap().world;
+        let mesh_entities: Vec<_> = world
+            .query::<(&ChildOf, &Mesh3d)>()
+            .iter(world)
+            .map(|(_, mesh)| mesh.0.clone())
+            .collect();
+        assert_eq!(mesh_entities.len(), 5);
+        assert!(mesh_entities.iter().all(|mesh| *mesh == meshes[0]));
+        assert!(asset_server.is_loaded(&meshes[0]));
     }
 }

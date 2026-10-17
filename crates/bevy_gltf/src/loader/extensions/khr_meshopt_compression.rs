@@ -81,37 +81,78 @@ pub fn decode_buffer_views(
     document: &gltf::Document,
     buffer_data: &mut [Vec<u8>],
 ) -> Result<(), GltfError> {
+    decode_buffer_views_into(document, buffer_data, |_| true)
+}
+
+/// Like [`decode_buffer_views`], but only decodes the views whose fallback buffer satisfies
+/// `decode`.
+pub(crate) fn decode_buffer_views_into(
+    document: &gltf::Document,
+    buffer_data: &mut [Vec<u8>],
+    decode: impl Fn(usize) -> bool,
+) -> Result<(), GltfError> {
     for view in document.views() {
-        let Some((extension, value)) = meshopt_extension(|name| view.extension_value(name)) else {
+        if !decode(view.buffer().index()) {
+            continue;
+        }
+        let Some(source) = compressed_source(&view)? else {
             continue;
         };
-        decode_view(extension, value, &view, buffer_data).map_err(|message| {
-            GltfError::InvalidMeshoptCompression {
-                buffer_view: view.index(),
-                message,
-            }
-        })?;
+        let dst_buffer = view.buffer().index();
+        let [src, dst] = buffer_data
+            .get_disjoint_mut([source, dst_buffer])
+            .map_err(|_| invalid(&view, format!("compressed buffer {source} does not exist")))?;
+        decode_view(&view, src, dst)?;
     }
     Ok(())
 }
 
-fn decode_view(
+fn invalid(view: &gltf::buffer::View, message: String) -> GltfError {
+    GltfError::InvalidMeshoptCompression {
+        buffer_view: view.index(),
+        message,
+    }
+}
+
+/// The index of the buffer holding `view`'s compressed data, if it is compressed.
+pub(crate) fn compressed_source(view: &gltf::buffer::View) -> Result<Option<usize>, GltfError> {
+    let Some((_, value)) = meshopt_extension(|name| view.extension_value(name)) else {
+        return Ok(None);
+    };
+    let ext = ViewExtension::deserialize(value).map_err(|err| invalid(view, err.to_string()))?;
+    let dst_buffer = view.buffer().index();
+    if ext.buffer == dst_buffer {
+        return Err(invalid(
+            view,
+            format!("compressed data and buffer view both live in buffer {dst_buffer}"),
+        ));
+    }
+    Ok(Some(ext.buffer))
+}
+
+/// Decodes the compressed `view` from its compressed buffer `src` into its fallback buffer `dst`.
+///
+/// Does nothing if `view` is not compressed.
+pub(crate) fn decode_view(
+    view: &gltf::buffer::View,
+    src: &[u8],
+    dst: &mut [u8],
+) -> Result<(), GltfError> {
+    let Some((extension, value)) = meshopt_extension(|name| view.extension_value(name)) else {
+        return Ok(());
+    };
+    decode_view_inner(extension, value, view, src, dst).map_err(|message| invalid(view, message))
+}
+
+fn decode_view_inner(
     extension: &str,
     value: &serde_json::Value,
     view: &gltf::buffer::View,
-    buffer_data: &mut [Vec<u8>],
+    src: &[u8],
+    dst: &mut [u8],
 ) -> Result<(), String> {
     let ext = ViewExtension::deserialize(value).map_err(|err| err.to_string())?;
-
     let dst_buffer = view.buffer().index();
-    if ext.buffer == dst_buffer {
-        return Err(format!(
-            "compressed data and buffer view both live in buffer {dst_buffer}"
-        ));
-    }
-    let [src, dst] = buffer_data
-        .get_disjoint_mut([ext.buffer, dst_buffer])
-        .map_err(|_| format!("compressed buffer {} does not exist", ext.buffer))?;
 
     let src = src
         .get(ext.byte_offset..)

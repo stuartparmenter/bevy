@@ -121,6 +121,27 @@ pub(crate) fn instance_transforms(
     Ok(transforms)
 }
 
+/// The transform accessors [`instance_transforms`] reads for `node`.
+///
+/// Malformed extension data yields no accessors; [`instance_transforms`] reports it.
+pub(crate) fn instance_transform_accessors<'a>(
+    document: &'a Document,
+    node: &Node,
+) -> Vec<Accessor<'a>> {
+    let Some(extension) = node
+        .extension_value(EXT_MESH_GPU_INSTANCING)
+        .and_then(|value| NodeExtension::deserialize(value).ok())
+    else {
+        return Vec::new();
+    };
+    extension
+        .attributes
+        .iter()
+        .filter(|(name, _)| matches!(name.as_str(), "TRANSLATION" | "ROTATION" | "SCALE"))
+        .filter_map(|(_, &index)| document.accessors().nth(index))
+        .collect()
+}
+
 /// Iterates over the elements of `accessor`, whose type the caller checks.
 fn read<'a, 's, T: Item>(
     accessor: Accessor<'a>,
