@@ -27,7 +27,7 @@ pub use self::asset::{
 #[cfg(feature = "meshlet_processor")]
 pub use self::from_mesh::{
     quantize_vertex_position, vertex_position_quantization_scale, MeshToMeshletMeshConversionError,
-    MESHLET_DEFAULT_VERTEX_POSITION_QUANTIZATION_FACTOR,
+    MeshletMeshBuilder, MESHLET_DEFAULT_VERTEX_POSITION_QUANTIZATION_FACTOR,
 };
 use self::{
     instance_manager::extract_meshlet_mesh_entities,

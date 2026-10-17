@@ -7,7 +7,7 @@ use bevy_mesh::{Indices, Mesh, MeshAttributeCompressionFlags, MeshVertexAttribut
 use bevy_platform::collections::HashMap;
 use bevy_render::render_resource::PrimitiveTopology;
 use bevy_shape::{Aabb3d, BoundingSphere, BoundingVolume};
-use bevy_tasks::{AsyncComputeTaskPool, ParallelSlice};
+use bevy_tasks::{AsyncComputeTaskPool, ParallelSlice, TaskPool};
 use bitvec::{order::Lsb0, vec::BitVec, view::BitView};
 use core::ops::Range;
 use meshopt::{
@@ -87,11 +87,16 @@ impl MeshletMesh {
     ///   * Ensure that their [`bevy_transform::components::Transform::translation`]s are a multiple of 1/2^x centimeters (note that translations are in meters)
     ///   * Ensure that their [`bevy_transform::components::Transform::scale`]s are the same
     ///   * Ensure that their [`bevy_transform::components::Transform::rotation`]s are a multiple of 90 degrees
+    ///
+    /// Simplification runs on [`AsyncComputeTaskPool`], which must be initialized; use
+    /// [`MeshletMeshBuilder`] to choose another pool or none.
     pub fn from_mesh(
         mesh: &Mesh,
         vertex_position_quantization_factor: u8,
     ) -> Result<Self, MeshToMeshletMeshConversionError> {
-        Self::build(mesh, vertex_position_quantization_factor, InputLocks::None)
+        MeshletMeshBuilder::new(vertex_position_quantization_factor)
+            .with_task_pool(AsyncComputeTaskPool::get())
+            .build(mesh)
     }
 
     /// Like [`Self::from_mesh`], but keeps every vertex on an open edge of the
@@ -115,11 +120,10 @@ impl MeshletMesh {
         mesh: &Mesh,
         vertex_position_quantization_factor: u8,
     ) -> Result<Self, MeshToMeshletMeshConversionError> {
-        Self::build(
-            mesh,
-            vertex_position_quantization_factor,
-            InputLocks::OpenBorders,
-        )
+        MeshletMeshBuilder::new(vertex_position_quantization_factor)
+            .with_locked_borders()
+            .with_task_pool(AsyncComputeTaskPool::get())
+            .build(mesh)
     }
 
     /// Like [`Self::from_mesh`], but keeps the vertices `locked` marks (one
@@ -137,22 +141,80 @@ impl MeshletMesh {
         vertex_position_quantization_factor: u8,
         locked: &[bool],
     ) -> Result<Self, MeshToMeshletMeshConversionError> {
-        Self::build(
-            mesh,
+        MeshletMeshBuilder::new(vertex_position_quantization_factor)
+            .with_locks(locked)
+            .with_task_pool(AsyncComputeTaskPool::get())
+            .build(mesh)
+    }
+}
+
+/// Builds a [`MeshletMesh`] from a [`Mesh`], choosing what [`MeshletMesh::from_mesh`] and its
+/// variants fix: which vertices stay put, and where simplification runs.
+///
+/// ```ignore
+/// let meshlet_mesh = MeshletMeshBuilder::new(MESHLET_DEFAULT_VERTEX_POSITION_QUANTIZATION_FACTOR)
+///     .with_task_pool(&task_pool)
+///     .build(&mesh)?;
+/// ```
+///
+/// The output depends only on the mesh, the quantization factor and the locks, not on the task
+/// pool or its size.
+#[derive(Clone, Copy, Debug)]
+pub struct MeshletMeshBuilder<'a> {
+    vertex_position_quantization_factor: u8,
+    locks: InputLocks<'a>,
+    task_pool: Option<&'a TaskPool>,
+}
+
+impl<'a> MeshletMeshBuilder<'a> {
+    /// A builder that snaps vertices to `vertex_position_quantization_factor` (see
+    /// [`MeshletMesh::from_mesh`]), locks only the borders between meshlet groups, and builds
+    /// entirely on the calling thread.
+    pub fn new(vertex_position_quantization_factor: u8) -> Self {
+        Self {
             vertex_position_quantization_factor,
-            InputLocks::Explicit(locked),
-        )
+            locks: InputLocks::None,
+            task_pool: None,
+        }
+    }
+
+    /// Locks every vertex on an open edge of the mesh, as
+    /// [`MeshletMesh::from_mesh_with_locked_borders`] does.
+    pub fn with_locked_borders(mut self) -> Self {
+        self.locks = InputLocks::OpenBorders;
+        self
+    }
+
+    /// Locks the vertices `locked` marks, one entry per input vertex, as
+    /// [`MeshletMesh::from_mesh_with_locks`] does.
+    pub fn with_locks(mut self, locked: &'a [bool]) -> Self {
+        self.locks = InputLocks::Explicit(locked);
+        self
+    }
+
+    /// Simplifies each LOD's meshlet groups in parallel on `task_pool`.
+    ///
+    /// The rest of the build runs on the calling thread. While it waits for a level's groups,
+    /// that thread runs any of `task_pool`'s queued tasks, not only its own, so a caller that is
+    /// itself a task on `task_pool` can start further builds on its stack. Callers that build
+    /// many meshes at once should do so from threads outside the pool.
+    pub fn with_task_pool(mut self, task_pool: &'a TaskPool) -> Self {
+        self.task_pool = Some(task_pool);
+        self
     }
 
     /// Builds the LOD DAG with the rules of meshoptimizer's `clusterlod.h`, but in its own loop
-    /// rather than through `meshopt::clod_build`: groups within a level simplify in parallel, a
+    /// rather than through `meshopt::clod_build`: groups within a level simplify independently, a
     /// stuck group's meshlets are regrouped in the next level instead of becoming terminal,
     /// permissive simplification is only a fallback, and the output feeds Bevy's own BVH.
-    fn build(
-        mesh: &Mesh,
-        vertex_position_quantization_factor: u8,
-        locks: InputLocks<'_>,
-    ) -> Result<Self, MeshToMeshletMeshConversionError> {
+    ///
+    /// The mesh must meet the requirements listed on [`MeshletMesh::from_mesh`].
+    pub fn build(&self, mesh: &Mesh) -> Result<MeshletMesh, MeshToMeshletMeshConversionError> {
+        let Self {
+            vertex_position_quantization_factor,
+            locks,
+            task_pool,
+        } = *self;
         let s = debug_span!("build meshlet mesh");
         let _e = s.enter();
 
@@ -226,9 +288,7 @@ impl MeshletMesh {
                 &position_only_vertex_remap,
             );
 
-            let simplified = groups.par_chunk_map(AsyncComputeTaskPool::get(), 1, |_, groups| {
-                let group = &groups[0];
-
+            let simplify = |group: &TempMeshletGroup| {
                 let s = debug_span!("simplify group", meshlets = group.meshlets.len());
                 let _e = s.enter();
 
@@ -254,7 +314,22 @@ impl MeshletMesh {
                 );
 
                 Some((group_error, new_meshlets))
-            });
+            };
+            let simplified: Vec<_> = match task_pool {
+                Some(task_pool) => {
+                    // A few chunks per thread balance groups of uneven cost without flooding the
+                    // pool's queue with one task per group.
+                    let chunk_size = (groups.len() / (4 * task_pool.thread_num().max(1))).max(1);
+                    groups
+                        .par_chunk_map(task_pool, chunk_size, |_, chunk| {
+                            chunk.iter().map(simplify).collect::<Vec<_>>()
+                        })
+                        .into_iter()
+                        .flatten()
+                        .collect()
+                }
+                None => groups.iter().map(simplify).collect(),
+            };
 
             let first_group = all_groups.len() as u32;
             for (mut group, simplified) in groups.into_iter().zip(simplified) {
@@ -322,7 +397,7 @@ impl MeshletMesh {
         }
         vertex_positions.set_uninitialized(false);
 
-        Ok(Self {
+        Ok(MeshletMesh {
             vertex_positions: vertex_positions.into_vec().into(),
             vertex_normals: vertex_normals.into(),
             vertex_uvs: vertex_uvs.into(),
@@ -1486,6 +1561,7 @@ pub enum MeshToMeshletMeshConversionError {
 
 /// Which input vertices the simplifier must keep in place at every LOD, on
 /// top of the group borders it always locks.
+#[derive(Clone, Copy, Debug)]
 enum InputLocks<'a> {
     None,
     /// Every vertex on an edge only one triangle uses.
@@ -1513,7 +1589,7 @@ mod tests {
 
     #[test]
     fn raytracing_geometry_selects_a_complete_meshlet_lod() {
-        AsyncComputeTaskPool::get_or_init(bevy_tasks::TaskPool::default);
+        AsyncComputeTaskPool::get_or_init(TaskPool::default);
         const SIDE: usize = 24;
         let mut positions = Vec::with_capacity((SIDE + 1) * (SIDE + 1));
         let mut normals = Vec::with_capacity(positions.capacity());
@@ -1561,7 +1637,7 @@ mod tests {
 
     #[test]
     fn raytracing_geometry_reports_the_error_it_achieved_not_the_one_requested() {
-        AsyncComputeTaskPool::get_or_init(bevy_tasks::TaskPool::default);
+        AsyncComputeTaskPool::get_or_init(TaskPool::default);
         // Two triangles cannot be simplified, so this deviates from the reference by nothing no
         // matter how loose a bound it is asked for. Reporting the request instead lets one such
         // mesh set a scene-wide ray bias it has no error to justify.
@@ -1591,9 +1667,13 @@ mod tests {
         assert!(meshlet.raytracing_geometry(0.0).achieved_error <= 0.0);
     }
 
-    /// A closed torus dense enough to simplify through several LODs.
     fn torus_meshlet_mesh() -> MeshletMesh {
-        AsyncComputeTaskPool::get_or_init(bevy_tasks::TaskPool::default);
+        AsyncComputeTaskPool::get_or_init(TaskPool::default);
+        MeshletMesh::from_mesh(&torus_mesh(), 4).unwrap()
+    }
+
+    /// A closed torus dense enough to simplify through several LODs.
+    fn torus_mesh() -> Mesh {
         const MAJOR: u32 = 128;
         const MINOR: u32 = 64;
         let mut positions = Vec::new();
@@ -1621,12 +1701,36 @@ mod tests {
                 indices.extend_from_slice(&[a, c, b, b, c, d]);
             }
         }
-        let mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::all())
+        Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::all())
             .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
             .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
             .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
-            .with_inserted_indices(Indices::U32(indices));
-        MeshletMesh::from_mesh(&mesh, 4).unwrap()
+            .with_inserted_indices(Indices::U32(indices))
+    }
+
+    /// Chunks of several groups (one thread), single groups (eight) and the serial build agree
+    /// byte for byte.
+    #[test]
+    fn the_task_pool_does_not_change_the_build() {
+        let (_, mesh) = open_grid(160);
+        let encoded = |builder: MeshletMeshBuilder| {
+            let mut file = Vec::new();
+            builder.build(&mesh).unwrap().write(&mut file).unwrap();
+            file
+        };
+        let serial = encoded(MeshletMeshBuilder::new(4).with_locked_borders());
+        for threads in [1, 3, 8] {
+            let task_pool = bevy_tasks::TaskPoolBuilder::new()
+                .num_threads(threads)
+                .build();
+            let builder = MeshletMeshBuilder::new(4)
+                .with_locked_borders()
+                .with_task_pool(&task_pool);
+            assert!(
+                encoded(builder) == serial,
+                "{threads} threads built a different mesh"
+            );
+        }
     }
 
     fn total_triangles(mesh: &MeshletMesh) -> usize {
@@ -1934,7 +2038,7 @@ mod tests {
 
     #[test]
     fn locked_borders_pin_a_partition_seam_through_every_lod() {
-        AsyncComputeTaskPool::get_or_init(bevy_tasks::TaskPool::default);
+        AsyncComputeTaskPool::get_or_init(TaskPool::default);
         // Every interior vertex is free to move; the border must not.
         let n = 24u32;
         let (positions, mesh) = open_grid(n);
@@ -1969,7 +2073,7 @@ mod tests {
     /// the whole must simplify far below what locking every open edge allows.
     #[test]
     fn explicit_locks_pin_only_the_named_seam() {
-        AsyncComputeTaskPool::get_or_init(bevy_tasks::TaskPool::default);
+        AsyncComputeTaskPool::get_or_init(TaskPool::default);
         // Large enough that every locked border needs several meshlets at the coarsest LOD
         let n = 64u32;
         let (positions, mesh) = open_grid(n);
@@ -2054,7 +2158,7 @@ mod tests {
 
     #[test]
     fn a_single_meshlet_is_its_own_root() {
-        AsyncComputeTaskPool::get_or_init(bevy_tasks::TaskPool::default);
+        AsyncComputeTaskPool::get_or_init(TaskPool::default);
         let mesh = triangle_mesh(
             vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
             vec![0, 2, 1],
@@ -2075,7 +2179,7 @@ mod tests {
     /// carried into the next, alongside the free half's simplified meshlets.
     #[test]
     fn stuck_meshlets_carry_into_later_lods() {
-        AsyncComputeTaskPool::get_or_init(bevy_tasks::TaskPool::default);
+        AsyncComputeTaskPool::get_or_init(TaskPool::default);
         let n = 64u32;
         let (positions, mesh) = open_grid(n);
         let locked_half = |i: usize| (i as u32 % (n + 1)) <= n / 2;
@@ -2105,7 +2209,7 @@ mod tests {
     /// only permissive simplification can collapse across them.
     #[test]
     fn uv_seams_simplify_through_the_permissive_fallback() {
-        AsyncComputeTaskPool::get_or_init(bevy_tasks::TaskPool::default);
+        AsyncComputeTaskPool::get_or_init(TaskPool::default);
         let n = 32u32;
         let mut positions = Vec::new();
         let mut uvs = Vec::new();
