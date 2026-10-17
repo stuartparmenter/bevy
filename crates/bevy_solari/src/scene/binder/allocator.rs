@@ -78,6 +78,10 @@ impl<K: Eq + Hash> SlotAllocator<K> {
         self.slots.contains_key(key)
     }
 
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
     pub fn get_or_allocate(&mut self, key: K) -> u32 {
         if let Some(&slot) = self.slots.get(&key) {
             return slot;

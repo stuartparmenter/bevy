@@ -13,7 +13,9 @@ use bevy_platform::collections::{HashMap, HashSet};
 use bevy_render::{
     impl_atomic_pod,
     render_asset::{ExtractedAssets, RenderAssets},
-    render_resource::{AtomicPod, AtomicSparseBufferVec, BufferUsages, Sampler, TextureView},
+    render_resource::{
+        AtomicPod, AtomicSparseBufferVec, BufferUsages, Sampler, TextureChannel, TextureView,
+    },
     texture::GpuImage,
 };
 use bevy_utils::once;
@@ -26,6 +28,7 @@ const TEXTURE_MAP_NONE: u32 = u32::MAX;
 
 const MATERIAL_FLAG_DOUBLE_SIDED: u32 = 1 << 0;
 const MATERIAL_FLAG_FLIP_NORMAL_MAP_Y: u32 = 1 << 1;
+const MATERIAL_FLAG_METALLIC_ROUGHNESS_RG: u32 = 1 << 2;
 
 /// The four textures a [`StandardMaterial`] can reference, in [`GpuMaterial`] field order.
 type MaterialTextures = [Option<AssetId<Image>>; 4];
@@ -51,6 +54,20 @@ pub struct GpuMaterial {
 }
 
 impl_atomic_pod!(GpuMaterial, GpuMaterialBlob);
+
+/// Same decision as `StandardMaterial::as_bind_group_shader_type`, so a surface shades the same
+/// whether a raster pass or a ray resolves it. The caller skips any material whose textures are
+/// not all `GpuImage`s yet, so a missing metallic-roughness texture here means there is none.
+fn metallic_roughness_is_rg(
+    material: &StandardMaterial,
+    texture_assets: &RenderAssets<GpuImage>,
+) -> bool {
+    material
+        .metallic_roughness_texture
+        .as_ref()
+        .and_then(|handle| texture_assets.get(handle.id()))
+        .is_some_and(|texture| texture.texture_descriptor.format.channels() == TextureChannel::RG)
+}
 
 /// Stable material and texture slots, plus the retry state for assets that aren't ready yet.
 pub struct AssetState {
@@ -231,6 +248,9 @@ impl AssetState {
         if material.flip_normal_map_y {
             flags |= MATERIAL_FLAG_FLIP_NORMAL_MAP_Y;
         }
+        if metallic_roughness_is_rg(material, texture_assets) {
+            flags |= MATERIAL_FLAG_METALLIC_ROUGHNESS_RG;
+        }
 
         self.materials.grow_and_set(
             slot,
@@ -312,6 +332,31 @@ impl AssetState {
         };
         for image_id in textures.into_iter().flatten() {
             self.textures.release(&image_id);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        MATERIAL_FLAG_DOUBLE_SIDED, MATERIAL_FLAG_FLIP_NORMAL_MAP_Y,
+        MATERIAL_FLAG_METALLIC_ROUGHNESS_RG,
+    };
+
+    #[test]
+    fn material_flags_match_the_shader_constants() {
+        let shader = include_str!("../bindings.wesl");
+        for (name, flag) in [
+            ("DOUBLE_SIDED", MATERIAL_FLAG_DOUBLE_SIDED),
+            ("FLIP_NORMAL_MAP_Y", MATERIAL_FLAG_FLIP_NORMAL_MAP_Y),
+            ("METALLIC_ROUGHNESS_RG", MATERIAL_FLAG_METALLIC_ROUGHNESS_RG),
+        ] {
+            let shift = flag.trailing_zeros();
+            assert_eq!(flag, 1 << shift);
+            assert!(
+                shader.contains(&format!("const MATERIAL_FLAG_{name} = 1u << {shift}u;")),
+                "{name}"
+            );
         }
     }
 }

@@ -1,7 +1,7 @@
 use super::{
     allocator::{IndexAllocator, RetainedBindingArray},
     assets::AssetState,
-    lights::{GpuLightSource, LightSourceId, LightState},
+    lights::{emissive_triangle_chunks, GpuLightSource, LightSourceId, LightState},
     BlasKey, BlasManager, BlasOpacity, RaytracingMesh3d, RaytracingSceneBindings,
 };
 use bevy_asset::AssetId;
@@ -12,7 +12,10 @@ use bevy_ecs::{
 };
 use bevy_math::{Affine3, Affine3Ext, Vec4};
 use bevy_mesh::Mesh;
-use bevy_pbr::{MeshMaterial3d, PreviousGlobalTransform, StandardMaterial};
+use bevy_pbr::{
+    world_geometry_error, MeshGeometryError, MeshMaterial3d, PreviousGlobalTransform,
+    StandardMaterial,
+};
 use bevy_platform::collections::HashMap;
 use bevy_render::{
     impl_atomic_pod,
@@ -40,7 +43,15 @@ pub struct GpuInstanceGeometryIds {
     /// [`NO_MESH_METADATA`] for meshes without allocator metadata.
     metadata_buffer_id: u32,
     metadata_offset: u32,
+    vertex_stride_words: u32,
+    world_geometry_error: f32,
+    /// [`VERTEX_FLAG_HAS_TANGENT`] when the vertices carry a tangent.
+    vertex_flags: u32,
 }
+
+/// Set in `vertex_flags` when the vertices end in a tangent. Without one, the shaders reconstruct
+/// the tangent frame from the UVs.
+const VERTEX_FLAG_HAS_TANGENT: u32 = 1 << 0;
 
 /// The `metadata_buffer_id` of meshes without allocator metadata, whose attributes are all
 /// uncompressed.
@@ -88,6 +99,14 @@ struct Instance {
     material: AssetId<StandardMaterial>,
     opacity: BlasOpacity,
     buffers: Option<InstanceBuffers>,
+    /// Triangles this instance currently contributes emissive light chunks for. Zero when it is
+    /// not an emissive light.
+    emissive_triangles: u32,
+    /// The instance's simplification error in world units, as of its last refresh. A ray leaving
+    /// this surface can only self-intersect this instance's own simplified BLAS, so the bias it
+    /// pays is per instance; the scene-wide maximum is only the fallback for a rasterized surface
+    /// whose G-buffer texel states no error at all.
+    world_geometry_error: f32,
 }
 
 /// The mesh slabs an instance holds slots for in the binding arrays.
@@ -173,6 +192,7 @@ impl InstanceState {
 pub type InstanceQueryData<'w> = (
     &'w RaytracingMesh3d,
     &'w MeshMaterial3d<StandardMaterial>,
+    &'w MeshGeometryError,
     &'w GlobalTransform,
     &'w PreviousGlobalTransform,
 );
@@ -182,6 +202,7 @@ pub type ChangedInstanceFilter = (
     Or<(
         Changed<RaytracingMesh3d>,
         Changed<MeshMaterial3d<StandardMaterial>>,
+        Changed<MeshGeometryError>,
     )>,
 );
 
@@ -287,7 +308,7 @@ impl InstanceState {
         inputs: &InstanceInputs,
         lights: &mut LightState,
         entity: Entity,
-        (mesh, material, transform, previous_frame_transform): InstanceQueryData,
+        (mesh, material, geometry_error, transform, previous_frame_transform): InstanceQueryData,
     ) {
         let mesh_id = mesh.id();
         let material_id = material.id();
@@ -323,6 +344,10 @@ impl InstanceState {
             material: material_id,
             opacity: BlasOpacity::Opaque,
             buffers: previous.and_then(|instance| instance.buffers),
+            emissive_triangles: previous.map_or(0, |instance| instance.emissive_triangles),
+            // Refreshes recompute this from the current transform's scale; a transform change
+            // alone does not, which is fine while nothing in the scene scales dynamically.
+            world_geometry_error: world_geometry_error(geometry_error.0, &transform.affine()),
         };
         let resolved = self.resolve_instance(inputs, lights, entity, &mut instance);
 
@@ -373,14 +398,15 @@ impl InstanceState {
             Some(index_format),
             Some(material_slot),
             Some(blas_address),
+            Some(vertex_layout),
         ) = (
             inputs.mesh_allocator.mesh_vertex_slice(&instance.mesh),
             inputs.mesh_allocator.mesh_index_slice(&instance.mesh),
             inputs.blas_manager.index_format(&instance.mesh),
             material_slot,
             blas_address,
-        )
-        else {
+            inputs.blas_manager.vertex_layout(&instance.mesh),
+        ) else {
             self.deactivate_instance(lights, entity, instance);
             return false;
         };
@@ -443,6 +469,13 @@ impl InstanceState {
                 triangle_count,
                 metadata_buffer_id,
                 metadata_offset,
+                vertex_stride_words: vertex_layout.stride / 4,
+                world_geometry_error: instance.world_geometry_error,
+                vertex_flags: if vertex_layout.has_tangent {
+                    VERTEX_FLAG_HAS_TANGENT
+                } else {
+                    0
+                },
             },
         );
         self.material_ids.grow_and_set(slot, material_slot);
@@ -452,14 +485,8 @@ impl InstanceState {
             .assets
             .emissive_materials
             .contains(&instance.material);
-        if is_emissive {
-            lights.add_light(
-                LightSourceId::EmissiveMesh(entity),
-                GpuLightSource::new_emissive_mesh_light(slot, triangle_count),
-            );
-        } else {
-            lights.remove_light(LightSourceId::EmissiveMesh(entity));
-        }
+        let emissive_triangles = if is_emissive { triangle_count } else { 0 };
+        sync_emissive_lights(lights, entity, instance, emissive_triangles);
         true
     }
 
@@ -502,8 +529,18 @@ impl InstanceState {
         instance: &mut Instance,
     ) {
         self.set_blas_ref(instance.slot, GpuBlasRef::NONE);
-        lights.remove_light(LightSourceId::EmissiveMesh(entity));
+        sync_emissive_lights(lights, entity, instance, 0);
         self.release_buffers(instance.buffers.take());
+    }
+
+    /// The largest live instance's world geometry error, the fallback a rasterized surface pays
+    /// when its G-buffer texel carries no geometry error of its own.
+    pub fn max_world_geometry_error(&self) -> f32 {
+        self.records
+            .values()
+            .filter(|instance| self.blas_refs.get(instance.slot) != GpuBlasRef::NONE)
+            .map(|instance| instance.world_geometry_error)
+            .fold(0.0, f32::max)
     }
 
     fn release_buffers(&mut self, buffers: Option<InstanceBuffers>) {
@@ -521,6 +558,38 @@ impl InstanceState {
         unlink(&mut self.mesh_instances, &instance.mesh, entity);
         unlink(&mut self.material_instances, &instance.material, entity);
     }
+}
+
+/// Brings an instance's emissive light chunks in line with `new_triangles`.
+///
+/// A mesh larger than one 65535-triangle chunk contributes one light source per chunk, keyed by
+/// its first triangle. Chunk starts below the new count keep their ids, and the shaders re-derive
+/// each chunk's length from the instance's triangle count, so only the tail chunks need removing.
+/// Zero clears every chunk.
+fn sync_emissive_lights(
+    lights: &mut LightState,
+    entity: Entity,
+    instance: &mut Instance,
+    new_triangles: u32,
+) {
+    for (first_triangle, _) in emissive_triangle_chunks(instance.emissive_triangles) {
+        if first_triangle >= new_triangles {
+            lights.remove_light(LightSourceId::EmissiveMesh {
+                entity,
+                first_triangle,
+            });
+        }
+    }
+    for (first_triangle, _) in emissive_triangle_chunks(new_triangles) {
+        lights.add_light(
+            LightSourceId::EmissiveMesh {
+                entity,
+                first_triangle,
+            },
+            GpuLightSource::new_emissive_mesh_light(instance.slot, first_triangle),
+        );
+    }
+    instance.emissive_triangles = new_triangles;
 }
 
 impl RaytracingSceneBindings {

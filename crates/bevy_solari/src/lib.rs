@@ -18,7 +18,10 @@ pub mod scene;
 pub mod prelude {
     pub use super::SolariPlugins;
     pub use crate::realtime::SolariLighting;
-    pub use crate::scene::RaytracingMesh3d;
+    pub use crate::scene::{
+        RaytracingMesh3d, RaytracingSceneStatus, RaytracingSceneStatusSnapshot,
+    };
+    pub use bevy_pbr::MeshGeometryError;
 }
 
 use crate::realtime::SolariLightingPlugin;
