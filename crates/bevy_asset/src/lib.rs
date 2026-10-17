@@ -742,7 +742,7 @@ mod tests {
         Asset, AssetApp, AssetEvent, AssetId, AssetLoadError, AssetLoadFailedEvent, AssetPath,
         AssetPlugin, AssetServer, Assets, InvalidGenerationError, LoadState, LoadedAsset,
         LoadedUntypedAsset, UnapprovedPathMode, UntypedHandle, VisitAssetDependencies,
-        WriteDefaultMetaError,
+        WaitForAssetError, WriteDefaultMetaError,
     };
     use alloc::{
         boxed::Box,
@@ -1509,6 +1509,78 @@ mod tests {
         });
 
         assert_eq!(get_started_load_count(app.world()), 4);
+    }
+
+    /// Records whether it was woken.
+    #[derive(Default)]
+    struct WakeFlag(core::sync::atomic::AtomicBool);
+
+    impl alloc::task::Wake for WakeFlag {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, core::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl WakeFlag {
+        fn woken(&self) -> bool {
+            self.0.load(core::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[test]
+    fn wait_for_asset_wakes_when_a_dependency_fails() {
+        let malformed_ron = r#"
+(
+    text: "malformed",
+    OH NO THIS ASSET IS MALFORMED
+)"#;
+        let dir = Dir::default();
+        dir.insert_asset_text(Path::new("before.cool.ron"), malformed_ron);
+        dir.insert_asset_text(Path::new("after.cool.ron"), malformed_ron);
+        let (mut app, gate_opener) = create_app_with_gate(dir);
+        app.init_asset::<CoolText>()
+            .register_asset_loader(CoolTextLoader);
+        let asset_server = app.world().resource::<AssetServer>().clone();
+
+        // Polls a wait for an asset that depends on `dependency`, leaving a waker behind.
+        let wait_for_dependent = |dependency: &Handle<CoolText>| {
+            let dependent = asset_server.add(CoolText {
+                dependencies: vec![dependency.clone()],
+                ..Default::default()
+            });
+            let flag = Arc::new(WakeFlag::default());
+            let server = asset_server.clone();
+            let mut wait = Box::pin(async move { server.wait_for_asset(&dependent).await });
+            let waker = core::task::Waker::from(flag.clone());
+            assert!(wait
+                .as_mut()
+                .poll(&mut core::task::Context::from_waker(&waker))
+                .is_pending());
+            (flag, wait)
+        };
+
+        // The dependency has already failed when its dependent is committed.
+        let before: Handle<CoolText> = asset_server.load("before.cool.ron");
+        gate_opener.open("before.cool.ron");
+        run_app_until(&mut app, |_| {
+            asset_server.load_state(&before).is_failed().then_some(())
+        });
+        let (flag, wait) = wait_for_dependent(&before);
+        app.update();
+        assert!(flag.woken());
+        assert_matches!(block_on(wait), Err(WaitForAssetError::DependencyFailed(_)));
+
+        // The dependency fails after its dependent is committed.
+        let after: Handle<CoolText> = asset_server.load("after.cool.ron");
+        let (flag, wait) = wait_for_dependent(&after);
+        app.update();
+        assert!(!flag.woken());
+        gate_opener.open("after.cool.ron");
+        run_app_until(&mut app, |_| {
+            asset_server.load_state(&after).is_failed().then_some(())
+        });
+        assert!(flag.woken());
+        assert_matches!(block_on(wait), Err(WaitForAssetError::DependencyFailed(_)));
     }
 
     #[test]

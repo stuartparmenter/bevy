@@ -575,6 +575,12 @@ impl AssetInfos {
             info.load_state = LoadState::Loaded;
             info.dep_load_state = dep_load_state;
             info.rec_dep_load_state = rec_dep_load_state.clone();
+            // Tasks waiting for a successful load are woken by `LoadedWithDependencies`.
+            if rec_dep_load_state.is_failed() {
+                for waker in info.waiting_tasks.drain(..) {
+                    waker.wake();
+                }
+            }
             if watching_for_changes {
                 info.loader_dependencies = loaded_asset.loader_dependencies;
             }
@@ -668,6 +674,9 @@ impl AssetInfos {
             info.loading_rec_dependencies.remove(&failed_id);
             info.failed_rec_dependencies.insert(failed_id);
             info.rec_dep_load_state = RecursiveDependencyLoadState::Failed(error.clone());
+            for waker in info.waiting_tasks.drain(..) {
+                waker.wake();
+            }
             Some(core::mem::take(
                 &mut info.dependents_waiting_on_recursive_dep_load,
             ))
