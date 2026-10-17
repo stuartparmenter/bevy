@@ -1,7 +1,9 @@
 //! Resolves the [`DisplayTarget`] each view encodes for.
 //!
-//! Windows have it as a required component. Other render targets register
-//! one in [`ManualDisplayTargets`].
+//! Windows have it as a required component, and
+//! [`resolve_display_targets`](super::window::resolve_display_targets)
+//! resolves it in the main world with what the display reports. Other render
+//! targets register one in [`ManualDisplayTargets`].
 //! [`extract_cameras`](crate::camera::extract_cameras) writes the result to
 //! [`ViewDisplayTarget`] every frame.
 
@@ -59,10 +61,14 @@ fn resolve_manual_display_target(display_target: &DisplayTarget) -> ResolvedDisp
 
 /// Resolves the [`ViewDisplayTarget`] for a render target.
 ///
-/// A window resolves [`ExtractedWindow::display_target`] with the color
-/// space the surface negotiated in the previous frame, or with
-/// [`SurfaceColorSpace::Srgb`] before the surface is configured. An image or
-/// texture view looks up
+/// A window takes [`ExtractedWindow::resolved_display_target`] when its color
+/// space is the one the surface negotiated in the previous frame. When the
+/// two differ, the surface wins: the request is resolved again for the
+/// surface's color space with [`DisplayTarget::resolve`], so calibrated
+/// values are kept and the rest take the defaults of that color space. The
+/// main world resolves one frame behind the surface, and its result for
+/// another color space would give a PQ frame the SDR peak, or an SDR frame
+/// the HDR peak. An image or texture view looks up
 /// [`ManualDisplayTargets`] by the whole [`NormalizedRenderTarget`], so an
 /// image entry must also match the scale factor. Anything else, including a
 /// missing entry, is [`DisplayTarget::default`] resolved as SDR sRGB.
@@ -76,11 +82,13 @@ pub fn resolve_view_display_target<'a>(
             .into_iter()
             .find(|(entity, _)| *entity == window_ref.entity())
             .map(|(_, window)| {
-                window.display_target.resolve(
-                    window
-                        .resolved_color_space
-                        .unwrap_or(SurfaceColorSpace::Srgb),
-                )
+                let resolved = window.resolved_display_target;
+                match window.resolved_color_space {
+                    Some(color_space) if color_space != resolved.color_space => {
+                        window.display_target.resolve(color_space)
+                    }
+                    _ => resolved,
+                }
             }),
         Some(
             target @ (NormalizedRenderTarget::Image(_) | NormalizedRenderTarget::TextureView(_)),
@@ -98,10 +106,13 @@ mod tests {
     use bevy_asset::Handle;
     use bevy_camera::{ImageRenderTarget, ManualTextureViewHandle};
     use bevy_image::Image;
-    use bevy_window::{CompositeAlphaMode, PresentMode, WindowRef};
+    use bevy_window::{
+        CompositeAlphaMode, DisplayProvenance, FieldProvenance, PresentMode, WindowRef,
+    };
 
     fn extracted_window(
         display_target: DisplayTarget,
+        resolved_display_target: ResolvedDisplayTarget,
         resolved_color_space: Option<SurfaceColorSpace>,
     ) -> ExtractedWindow {
         ExtractedWindow {
@@ -117,8 +128,11 @@ mod tests {
             present_mode_changed: false,
             alpha_mode: CompositeAlphaMode::Auto,
             display_target,
+            resolved_display_target,
+            display_reports_sdr: false,
             color_space_request_changed: false,
             resolved_color_space,
+            request_display_requery: false,
             needs_initial_present: false,
         }
     }
@@ -183,6 +197,7 @@ mod tests {
                 paper_white_nits: 203.0,
                 peak_luminance_nits: 1000.0,
                 min_luminance_nits: 0.005,
+                provenance: DisplayProvenance::USER,
             }
         );
         // There is no surface to negotiate an HDR color space with.
@@ -243,7 +258,7 @@ mod tests {
     }
 
     #[test]
-    fn window_targets_resolve_with_the_negotiated_color_space() {
+    fn window_targets_take_the_main_world_result_with_the_surface_color_space() {
         let window_entity = Entity::from_raw_u32(3).unwrap();
         let target = NormalizedRenderTarget::Window(
             WindowRef::Entity(window_entity).normalize(None).unwrap(),
@@ -254,36 +269,45 @@ mod tests {
             paper_white_nits: Some(300.0),
             ..Default::default()
         };
+        // The main world resolved the request with what the display reports.
+        let resolved = ResolvedDisplayTarget {
+            color_space: SurfaceColorSpace::Pq,
+            paper_white_nits: 300.0,
+            peak_luminance_nits: 1500.0,
+            min_luminance_nits: 0.01,
+            provenance: DisplayProvenance {
+                paper_white: FieldProvenance::User,
+                peak_luminance: FieldProvenance::Os,
+                min_luminance: FieldProvenance::Os,
+            },
+        };
 
-        // The negotiated color space fills the uncalibrated fields.
-        let window = extracted_window(requested, Some(SurfaceColorSpace::Pq));
+        // The surface agrees: the result passes through.
+        let window = extracted_window(requested, resolved, Some(SurfaceColorSpace::Pq));
         assert_eq!(
             resolve_view_display_target(Some(&target), [(window_entity, &window)], &manual).0,
-            ResolvedDisplayTarget {
-                color_space: SurfaceColorSpace::Pq,
-                paper_white_nits: 300.0,
-                peak_luminance_nits: 1000.0,
-                min_luminance_nits: 0.0,
-            }
+            resolved
         );
 
-        // Before the surface is configured, the view is SDR.
-        let window = extracted_window(requested, None);
+        // The surface fell back to SDR after the main world resolved: the
+        // surface wins, and the request is resolved again for its color
+        // space. The calibrated paper white is kept, and the sensed values
+        // take the SDR defaults until the main world catches up.
+        let window = extracted_window(requested, resolved, Some(SurfaceColorSpace::Srgb));
+        let view = resolve_view_display_target(Some(&target), [(window_entity, &window)], &manual);
+        assert!(!view.is_hdr());
+        assert_eq!(view.0, requested.resolve(SurfaceColorSpace::Srgb));
+        assert_eq!(view.0.paper_white_nits, 300.0);
+        assert_eq!(view.0.peak_luminance_nits, 300.0);
+        assert_eq!(view.0.provenance.peak_luminance, FieldProvenance::Default);
+
+        // Before the surface is configured, the main world result is used as
+        // is.
+        let unconfigured = requested.resolve(SurfaceColorSpace::Srgb);
+        let window = extracted_window(requested, unconfigured, None);
         assert_eq!(
             resolve_view_display_target(Some(&target), [(window_entity, &window)], &manual).0,
-            ResolvedDisplayTarget {
-                color_space: SurfaceColorSpace::Srgb,
-                paper_white_nits: 300.0,
-                peak_luminance_nits: 300.0,
-                min_luminance_nits: 0.0,
-            }
-        );
-
-        // A surface that fell back to SDR resolves the request as SDR.
-        let window = extracted_window(requested, Some(SurfaceColorSpace::Srgb));
-        assert!(
-            !resolve_view_display_target(Some(&target), [(window_entity, &window)], &manual)
-                .is_hdr()
+            unconfigured
         );
     }
 }

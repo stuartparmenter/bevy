@@ -17,6 +17,12 @@ use {bevy_ecs::prelude::ReflectComponent, bevy_reflect::Reflect};
 ///
 /// This component is synchronized with `winit` through `bevy_winit`, but is effectively
 /// read-only as `winit` does not support changing monitor properties.
+///
+/// # HDR capability
+///
+/// The luminance and gamut the platform reports for the display are in
+/// [`MonitorDisplayCapability`](crate::MonitorDisplayCapability) on the same
+/// entity.
 #[derive(Component, Debug, Clone)]
 #[require(HasWindows)]
 #[cfg_attr(
