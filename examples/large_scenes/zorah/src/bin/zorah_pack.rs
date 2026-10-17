@@ -40,7 +40,7 @@ use zorah_bundle::{
 
 const DEFAULT_GEOMETRY_SHARD_BYTES: u64 = 512 * 1024 * 1024;
 const DEFAULT_TEXTURE_SHARD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-/// Meshlet building is dominated by serial METIS/meshopt phases, so throughput
+/// Meshlet building is dominated by serial meshopt phases, so throughput
 /// scales with concurrent partitions, not with threads inside one. Each lane
 /// peaks at a few hundred MiB of scratch; leave four cores for the task pools
 /// that absorb `from_mesh`'s parallel simplification bursts.

@@ -51,8 +51,8 @@ thiserror = "2"
 # Sizes the default bake worker count from the machine's total memory.
 sysinfo = "0.39"
 futures-io = "0.3"
-# The bake's threads allocate constantly inside meshopt and metis, and the
-# system heap serialises them.
+# The bake's threads allocate constantly inside meshopt, and the system heap
+# serialises them.
 mimalloc = { version = "0.1", default-features = false, optional = true }
 
 [features]

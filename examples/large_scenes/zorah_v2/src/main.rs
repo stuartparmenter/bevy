@@ -8,7 +8,7 @@
 )]
 
 // Windows' heap serialises the bake's threads, which allocate constantly
-// inside meshopt and metis; mimalloc keeps them off each other.
+// inside meshopt; mimalloc keeps them off each other.
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;

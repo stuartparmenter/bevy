@@ -22,7 +22,7 @@ bevy = { path = "../../..", default-features = false, features = [
   "meshlet",
   # The candle flames build their shared 168-triangle lathe at startup rather
   # than loading it from the packed bundles, so a stale assets tree cannot leave
-  # ThroneRoom without its flames. It costs the runtime build metis and meshopt.
+  # ThroneRoom without its flames. It costs the runtime build meshopt.
   "meshlet_processor",
   "multi_threaded",
   "ktx2",

@@ -53,9 +53,9 @@ use crate::geometry::{
 };
 
 /// Bumped whenever the bake's own logic changes what it writes (partition
-/// rules, seam locking, attribute synthesis, winding repair), so stale
-/// caches rebake.
-pub const BAKE_PIPELINE_VERSION: u32 = 4;
+/// rules, seam locking, attribute synthesis, winding repair) or the meshlet
+/// builder it calls changes its output, so stale caches rebake.
+pub const BAKE_PIPELINE_VERSION: u32 = 5;
 pub const MANIFEST_FILE: &str = "manifest.json";
 
 /// How the bake runs and where it writes.
