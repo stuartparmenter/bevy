@@ -4,6 +4,12 @@
 #[allow(dead_code)]
 mod zorah_bundle;
 
+// Windows' heap serialises the geometry jobs, which allocate constantly;
+// mimalloc keeps them off each other. `main` hands it meshoptimizer's C++
+// scratch as well.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs::{self, File},
@@ -130,6 +136,17 @@ fn parse_texture_quality(name: &str) -> Option<ImageCompressorQuality> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // meshoptimizer allocates its scratch through `operator new`, which
+    // reaches the CRT heap rather than the global allocator.
+    // SAFETY: nothing has called into meshopt yet, so no meshopt call runs
+    // concurrently and nothing it allocated is outstanding; `mi_malloc` and
+    // `mi_free` are a matching pair with the C signatures it expects.
+    unsafe {
+        meshopt::ffi::meshopt_setAllocator(
+            Some(libmimalloc_sys::mi_malloc),
+            Some(libmimalloc_sys::mi_free),
+        );
+    }
     let args: Args = argh::from_env();
     AsyncComputeTaskPool::get_or_init(TaskPool::default);
     ComputeTaskPool::get_or_init(TaskPool::default);

@@ -37,12 +37,12 @@ use bevy::{
     math::Vec3,
     mesh::{Indices, Mesh},
     pbr::experimental::meshlet::{
-        vertex_position_quantization_scale, MeshletMesh, MeshletMeshSaver,
+        vertex_position_quantization_scale, MeshletMesh, MeshletMeshBuilder, MeshletMeshSaver,
         MESHLET_MESH_ASSET_VERSION,
     },
     platform::collections::HashMap as FastHashMap,
     render::render_resource::PrimitiveTopology,
-    tasks::{block_on, AsyncComputeTaskPool, TaskPool},
+    tasks::{block_on, TaskPool, TaskPoolBuilder},
 };
 use futures_io::AsyncWrite;
 use serde::{Deserialize, Serialize};
@@ -65,9 +65,16 @@ pub struct BakeSettings {
     pub scene_root: PathBuf,
     /// One subdirectory per mesh stem goes here.
     pub cache_dir: PathBuf,
-    /// Threads building parts concurrently. Each builds one part at a time and
-    /// at most `workers` decoded meshes are held between them.
+    /// Threads building parts concurrently. Each builds one part at a time,
+    /// running its serial phases itself and helping the build pool with its
+    /// simplification.
     pub workers: usize,
+    /// Threads in the bake's own task pool, which opens meshes' primitives and
+    /// simplifies every part's meshlet groups.
+    pub build_threads: usize,
+    /// Source triangles of the meshes held decoded at once. A mesh opens when
+    /// it fits beside the meshes already open, or when none is.
+    pub triangle_budget: u64,
     /// Primitives above this many triangles are cut into spatial partitions
     /// before the meshlet build, which is superlinear in triangle count.
     pub partition_triangles: usize,
@@ -411,21 +418,28 @@ impl Drop for BakeHandle {
 
 /// Starts baking `jobs` on `settings.workers` threads.
 ///
-/// Work is scheduled per part. A worker that finds nothing queued opens the
-/// next mesh, largest first, and queues its parts; since a mesh is opened
-/// only when the queue is empty, at most `workers` decoded meshes are live.
+/// Work is scheduled per part. Meshes open largest first and queue their
+/// parts, the next whenever the queue runs short and it fits in
+/// `triangle_budget` beside the meshes already open; workers build queued
+/// parts otherwise.
 ///
-/// `MeshletMesh::from_mesh` spreads its simplification over bevy's
-/// `AsyncComputeTaskPool`, which is initialised here if no `App` has done so
-/// yet (the call is a no-op otherwise).
+/// The meshlet builds simplify on a task pool of the bake's own, so they
+/// neither queue behind nor delay the app's `AsyncComputeTaskPool` work
+/// (pipeline compilation, part loads). The workers are plain threads outside
+/// that pool: a worker waiting on its part's groups runs other parts' groups
+/// meanwhile, but never starts another part on its stack.
 pub fn start(settings: BakeSettings, jobs: Vec<MeshJob>) -> BakeHandle {
-    AsyncComputeTaskPool::get_or_init(TaskPool::default);
     let mut order: Vec<usize> = (0..jobs.len()).collect();
     order.sort_by_key(|&job| std::cmp::Reverse(jobs[job].triangles()));
+    let build_pool = TaskPoolBuilder::new()
+        .num_threads(settings.build_threads.max(1))
+        .thread_name(String::from("Meshlet Build"))
+        .build();
     let shared = Arc::new(Shared {
         settings,
         jobs,
         order,
+        build_pool,
         counters: Counters::default(),
         scheduler: Scheduler::default(),
     });
@@ -454,6 +468,9 @@ struct Shared {
     jobs: Vec<MeshJob>,
     /// Job indices, largest first.
     order: Vec<usize>,
+    /// Runs the meshlet builds' parallel work. Its threads exit once the bake
+    /// is over and the last `Arc<Shared>` drops.
+    build_pool: TaskPool,
     counters: Counters,
     scheduler: Scheduler,
 }
@@ -462,12 +479,12 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// The part queue and the cursor into `Shared::order`.
+/// The part queue, the cursor into `Shared::order`, and the triangle budget.
 #[derive(Default)]
 struct Scheduler {
     state: Mutex<SchedulerState>,
-    /// Signalled when parts are queued, an opening finishes, or the bake is
-    /// cancelled.
+    /// Signalled when parts are queued, an opening finishes, a mesh frees its
+    /// share of the budget, or the bake is cancelled.
     ready: Condvar,
     cancel: AtomicBool,
 }
@@ -479,6 +496,8 @@ struct SchedulerState {
     /// Workers between claiming a job and queueing its parts; a worker with
     /// nothing to do waits for them rather than exiting.
     opening: usize,
+    /// Source triangles of the meshes claimed and not yet finished.
+    open_triangles: u64,
 }
 
 enum Claim {
@@ -488,22 +507,35 @@ enum Claim {
 
 impl Scheduler {
     /// The next thing for a worker to do, waiting while another worker may
-    /// still queue parts; `None` once the bake is over or cancelled.
-    fn claim(&self, order: &[usize]) -> Option<Claim> {
+    /// still queue parts or free budget; `None` once the bake is over or
+    /// cancelled.
+    ///
+    /// The next mesh opens once fewer parts are queued than there are workers,
+    /// so its parts arrive before the queue runs dry, and only if it fits in
+    /// the budget beside the open meshes or none is open.
+    fn claim(&self, shared: &Shared) -> Option<Claim> {
         let mut state = lock(&self.state);
         loop {
             if self.cancel.load(Ordering::Acquire) {
                 return None;
             }
+            if state.queue.len() < shared.settings.workers
+                && let Some(&job) = shared.order.get(state.next)
+            {
+                let triangles = shared.jobs[job].triangles();
+                if state.open_triangles == 0
+                    || state.open_triangles + triangles <= shared.settings.triangle_budget
+                {
+                    state.next += 1;
+                    state.opening += 1;
+                    state.open_triangles += triangles;
+                    return Some(Claim::Open(job));
+                }
+            }
             if let Some(task) = state.queue.pop_front() {
                 return Some(Claim::Part(task));
             }
-            if let Some(&job) = order.get(state.next) {
-                state.next += 1;
-                state.opening += 1;
-                return Some(Claim::Open(job));
-            }
-            if state.opening == 0 {
+            if state.next == shared.order.len() && state.opening == 0 {
                 return None;
             }
             state = self
@@ -513,12 +545,22 @@ impl Scheduler {
         }
     }
 
-    /// Queues the parts of a mesh a `Claim::Open` produced (none, if it was
-    /// reused or failed).
-    fn opened(&self, tasks: Vec<PartTask>) {
+    /// Queues the parts of a mesh a `Claim::Open` produced. A mesh with none
+    /// (reused, or failed) is finished here and frees its `triangles`.
+    fn opened(&self, triangles: u64, tasks: Vec<PartTask>) {
         let mut state = lock(&self.state);
         state.opening -= 1;
+        if tasks.is_empty() {
+            state.open_triangles -= triangles;
+        }
         state.queue.extend(tasks);
+        self.ready.notify_all();
+    }
+
+    /// Frees the budget of a mesh whose last part has finished.
+    fn finished(&self, triangles: u64) {
+        let mut state = lock(&self.state);
+        state.open_triangles -= triangles;
         self.ready.notify_all();
     }
 
@@ -602,12 +644,12 @@ struct OpenPrimitive {
 }
 
 fn run_worker(shared: &Shared, sender: &Sender<BakeEvent>) {
-    while let Some(claim) = shared.scheduler.claim(&shared.order) {
+    while let Some(claim) = shared.scheduler.claim(shared) {
         match claim {
             Claim::Part(task) => run_part(shared, task, sender),
             Claim::Open(job) => {
                 let tasks = open_job(shared, job, sender);
-                shared.scheduler.opened(tasks);
+                shared.scheduler.opened(shared.jobs[job].triangles(), tasks);
             }
         }
     }
@@ -629,7 +671,7 @@ fn open_job(shared: &Shared, job: usize, sender: &Sender<BakeEvent>) -> Vec<Part
         report(sender, event, &shared.counters.reused);
         return Vec::new();
     }
-    match caught(|| open_mesh(&shared.settings, job, spec, dir, stamp)) {
+    match caught(|| open_mesh(shared, job, spec, dir, stamp)) {
         Ok(tasks) => tasks,
         Err(error) => {
             let event = BakeEvent::Failed { job, error };
@@ -674,12 +716,13 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// Decodes a mesh's wrapper, partitions its primitives, finds the vertices
 /// its parts share, and returns one task per part.
 fn open_mesh(
-    settings: &BakeSettings,
+    shared: &Shared,
     job: usize,
     spec: &MeshJob,
     dir: PathBuf,
     stamp: BakeStamp,
 ) -> Result<Vec<PartTask>, BakeError> {
+    let settings = &shared.settings;
     let meshes_dir = settings.scene_root.join("meshes");
     let wrapper_path = meshes_dir.join(format!("{}.mesh.gltf", spec.stem));
     let gltf = gltf::Gltf::from_slice_without_validation(&fs::read(&wrapper_path)?)?;
@@ -721,7 +764,7 @@ fn open_mesh(
     // this one until its parts are queued.
     let buffers = &buffers;
     let threshold = settings.partition_triangles;
-    let read = AsyncComputeTaskPool::get().scope(|scope| {
+    let read = shared.build_pool.scope(|scope| {
         for (primitive, expected) in wrapper_primitives.iter().zip(&spec.primitives) {
             scope.spawn(async move {
                 let mut geometry = read_primitive(primitive, buffers, expected)?;
@@ -926,6 +969,7 @@ fn run_part(shared: &Shared, task: PartTask, sender: &Sender<BakeEvent>) {
         drop((primitive, triangles));
         build_part(
             &shared.settings,
+            &shared.build_pool,
             &dir,
             part,
             locked,
@@ -945,6 +989,7 @@ fn run_part(shared: &Shared, task: PartTask, sender: &Sender<BakeEvent>) {
         return;
     };
     let spec = &shared.jobs[mesh.job];
+    shared.scheduler.finished(spec.triangles());
     let written = finished.and_then(|parts| {
         let manifest = MeshManifest {
             stamp: mesh.stamp.clone(),
@@ -1004,6 +1049,7 @@ struct PartSlot {
 /// `p<primitive>_<partition>.meshlet_mesh` under `dir`.
 fn build_part(
     settings: &BakeSettings,
+    build_pool: &TaskPool,
     dir: &Path,
     part: Geometry,
     locked: Vec<bool>,
@@ -1023,12 +1069,13 @@ fn build_part(
         .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, part.normals)
         .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, part.uvs)
         .with_inserted_indices(Indices::U32(part.indices));
-    let meshlet = if locked.is_empty() {
-        MeshletMesh::from_mesh(&mesh, settings.quantization)
-    } else {
-        MeshletMesh::from_mesh_with_locks(&mesh, settings.quantization, &locked)
+    let mut builder = MeshletMeshBuilder::new(settings.quantization).with_task_pool(build_pool);
+    if !locked.is_empty() {
+        builder = builder.with_locks(&locked);
     }
-    .map_err(|error| BakeError::Meshlet(error.to_string()))?;
+    let meshlet = builder
+        .build(&mesh)
+        .map_err(|error| BakeError::Meshlet(error.to_string()))?;
     // Both are the size of the whole part: freed before the encode holds a
     // third copy.
     drop(mesh);
@@ -1177,6 +1224,8 @@ mod tests {
             scene_root: dir.to_path_buf(),
             cache_dir: dir.to_path_buf(),
             workers: 1,
+            build_threads: 1,
+            triangle_budget: u64::MAX,
             partition_triangles: 500_000,
             quantization: 4,
         }

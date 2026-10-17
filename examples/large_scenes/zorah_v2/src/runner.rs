@@ -344,6 +344,7 @@ fn poll_bake(pending: &mut PendingScene, scene: &SceneData) {
         );
         if let Some(bake) = pending.bake.take() {
             bake.stop();
+            crate::heap::collect();
         }
     } else if pending.bake_last_report.elapsed() >= BAKE_PROGRESS_INTERVAL {
         info!(

@@ -38,11 +38,24 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 futures-io = "0.3"
 lz4_flex = { version = "0.13", default-features = false, features = ["frame"], optional = true }
+# zorah_pack's geometry jobs allocate constantly, in Rust and in
+# meshoptimizer's C++, and the system heap serialises them.
+mimalloc = { version = "0.1", default-features = false, optional = true }
+# mimalloc's C entry points, for meshoptimizer's allocator.
+libmimalloc-sys = { version = "0.1.49", default-features = false, optional = true }
+# Only for `meshopt_setAllocator`; the version bevy_pbr builds against.
+meshopt = { version = "0.7", optional = true }
 
 [features]
 default = ["dlss"]
 dlss = ["bevy/dlss"]
-packer = ["bevy/compressed_image_saver", "dep:lz4_flex"]
+packer = [
+  "bevy/compressed_image_saver",
+  "dep:lz4_flex",
+  "dep:mimalloc",
+  "dep:libmimalloc-sys",
+  "dep:meshopt",
+]
 
 [target.'cfg(windows)'.dependencies]
 bevy = { path = "../../..", default-features = false, features = ["bevy_winit"] }

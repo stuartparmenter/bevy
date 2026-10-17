@@ -7,8 +7,9 @@
     reason = "an example binary always has std"
 )]
 
-// Windows' heap serialises the bake's threads, which allocate constantly
-// inside meshopt; mimalloc keeps them off each other.
+// Windows' heap serialises the bake's threads, which allocate constantly;
+// mimalloc keeps them off each other. This covers Rust's allocations, and
+// `heap::route_meshopt` hands it meshoptimizer's C++ scratch as well.
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -16,6 +17,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod bake;
 mod environment;
 mod geometry;
+mod heap;
 mod lod;
 mod materials;
 mod report;
@@ -32,7 +34,6 @@ use std::{
 
 use argh::FromArgs;
 use bevy::{
-    app::{TaskPoolOptions, TaskPoolPlugin},
     asset::{io::AssetSourceBuilder, AssetMetaCheck},
     camera_controller::free_camera::FreeCameraPlugin,
     diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin},
@@ -83,9 +84,13 @@ struct Args {
     #[argh(option)]
     cache_dir: Option<PathBuf>,
 
-    /// threads building bake parts (or measuring them under --report-lod-budget) at once; default clamp((RAM - 8 GiB) / 2 GiB, 1, cores)
+    /// threads building bake parts (or measuring them under --report-lod-budget) at once; default cores - 2
     #[argh(option)]
     bake_workers: Option<usize>,
+
+    /// source triangles the bake holds decoded at once; a larger mesh still bakes, alone
+    #[argh(option, default = "128_000_000")]
+    bake_triangle_budget: u64,
 
     /// cut primitives above this many triangles into spatial partitions before the meshlet build
     #[argh(option, default = "500_000")]
@@ -306,42 +311,27 @@ fn single_gltf_in(dir: &Path) -> Option<PathBuf> {
     found.next().is_none().then_some(first)
 }
 
-/// One worker per 2 GiB beyond an 8 GiB floor for the app and the OS, up to
-/// one per core: the bake holds up to `workers` decoded meshes, and the
-/// largest here run to tens of millions of triangles. A worker's meshlet
-/// build fans its simplification out over the compute pool, but its
-/// clustering, partitioning and BVH build run on the worker itself, and
-/// sixteen workers on thirty-two cores measured seventeen busy.
+/// A worker per core but the main and render threads'. A part's clustering,
+/// partitioning and BVH build run on its worker and dominate the meshlet
+/// build, so throughput follows the parts in flight; memory is bounded by
+/// `--bake-triangle-budget`, not by the worker count.
 fn default_bake_workers() -> usize {
-    let cores = bevy::tasks::available_parallelism();
-    let mut system = sysinfo::System::new();
-    system.refresh_memory();
-    let total = system.total_memory();
-    let spare = total.saturating_sub(8 << 30);
-    ((spare / (2 << 30)) as usize).clamp(1, cores)
+    bevy::tasks::available_parallelism()
+        .saturating_sub(2)
+        .max(1)
 }
 
-/// The pools an `App` builds for the bake to run under. `MeshletMesh::from_mesh`
-/// simplifies each LOD's groups across `AsyncComputeTaskPool`, which
-/// `TaskPoolPlugin` sizes to a quarter of the cores capped at four; every bake
-/// worker would queue behind those four threads. A pool's `min_threads` wins
-/// over the share it is offered, so that pool and the compute pool the
-/// schedule runs on each get a thread per core; idle threads cost nothing.
-fn task_pool_plugin() -> TaskPoolPlugin {
-    let cores = bevy::tasks::available_parallelism();
-    let mut options = TaskPoolOptions::default();
-    // The defaults cap the async pool at four threads; raising only the
-    // minimum above that cap is a clamp with min > max, which panics.
-    options.async_compute.min_threads = cores;
-    options.async_compute.max_threads = cores;
-    options.compute.min_threads = cores;
-    options.compute.max_threads = cores;
-    TaskPoolPlugin {
-        task_pool_options: options,
-    }
+/// The bake's build pool, which runs the parts' simplification: a thread per
+/// core but four, left to the main and render threads, pipeline compilation
+/// and texture decoding on the IO pool.
+fn default_build_threads() -> usize {
+    bevy::tasks::available_parallelism()
+        .saturating_sub(4)
+        .max(1)
 }
 
 fn main() -> ExitCode {
+    heap::route_meshopt();
     let args: Args = argh::from_env();
     let prepared = match prepare(&args) {
         Ok(prepared) => prepared,
@@ -484,6 +474,8 @@ fn prepare(args: &Args) -> Result<Prepared, String> {
         scene_root: root.dir.clone(),
         cache_dir: root.cache_dir.clone(),
         workers,
+        build_threads: default_build_threads(),
+        triangle_budget: args.bake_triangle_budget,
         partition_triangles: args.partition_triangles.max(1),
         quantization: args.quantization,
     };
@@ -491,8 +483,8 @@ fn prepare(args: &Args) -> Result<Prepared, String> {
     let summary = format!(
         "{}: {} nodes, {} meshes, {} materials, {placed} placed instances; \
          {} instances of {} selected meshes spawn; {} geometry files ({triangles} triangles) \
-         bake with {workers} workers into {}; parts load pruned to {} m with BLAS cuts at {} m; \
-         parsed in {:.1?}",
+         bake with {workers} workers and {} build threads, {} triangles open at most, into {}; \
+         parts load pruned to {} m with BLAS cuts at {} m; parsed in {:.1?}",
         root.gltf.display(),
         document.nodes().count(),
         document.meshes().count(),
@@ -500,6 +492,8 @@ fn prepare(args: &Args) -> Result<Prepared, String> {
         instances.len(),
         selected.len(),
         jobs.len(),
+        settings.build_threads,
+        settings.triangle_budget,
         root.cache_dir.display(),
         lod.raster_error,
         lod.blas_error(),
@@ -656,7 +650,6 @@ fn run_app(args: &Args, prepared: Prepared) -> ExitCode {
         )
         .add_plugins((
             DefaultPlugins
-                .set(task_pool_plugin())
                 .set(AssetPlugin {
                     // Textures load by the root glTF's own relative URIs.
                     file_path: root.dir.to_string_lossy().into_owned(),

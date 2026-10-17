@@ -65,22 +65,24 @@ quantization grid since the export's tiles agree only to within a few ulps.
 Nothing else is locked; an edge that is open in the source mesh meets nothing
 and simplifies freely. The manifest records each part's `locked_vertices`.
 
-Work is scheduled per part: `--bake-workers` threads take parts from a
-queue, and a worker that finds it empty opens the next mesh - decodes it,
-partitions it, finds its seams - and queues its parts, largest meshes first,
-so a 32 M-triangle mesh spreads over every worker instead of holding one for
-an hour. At most `workers` decoded meshes are held at once; the largest
-here (32 M triangles across 12 primitives) is about 1 GiB decoded, and a part
-under construction adds its meshlet build on top. The default worker count
-is `clamp((total RAM - 8 GiB) / 2 GiB, 1, cores)`. Each part's
-simplification fans out over bevy's `AsyncComputeTaskPool`, which the app sizes to a
-thread per core for exactly this (the default pool would cap it at four
-threads and every worker would queue behind them), but a part's clustering,
-partitioning and BVH build run on its worker, so fewer workers than cores
-leaves cores idle: sixteen on thirty-two measured seventeen busy. Lower
-`--bake-workers` if the machine runs short of memory. The `mimalloc`
-feature (on by default) replaces the system allocator, which on Windows
-serialises the bake's threads. Progress is logged every 5 s; a mesh whose
+Work is scheduled per part: `--bake-workers` threads (default: cores - 2)
+take parts from a queue. Meshes open largest first - a worker decodes the
+mesh, partitions it, finds its seams - and queue their parts, so a
+32 M-triangle mesh spreads over every worker instead of holding one for an
+hour. The next mesh opens once fewer parts are queued than there are
+workers, and only if its source triangles fit in `--bake-triangle-budget`
+beside the meshes already open (a mesh larger than the budget opens alone).
+The budget bounds the bake's memory: on the full scene the default 128 M
+peaks at 18 GiB and bakes as fast as 256 M (31 GiB), while 64 M (13 GiB) is
+about 10% slower. Lower it if the machine runs short of memory. A part's
+clustering, partitioning and BVH build run on its worker; its
+simplification, and the decode of a mesh's primitives, run on the bake's own
+"Meshlet Build" task pool (cores - 4 threads), so they neither wait behind
+nor delay bevy's `AsyncComputeTaskPool`, which compiles pipelines and
+prepares parts as they load. The `mimalloc` feature (on by default) replaces
+the system allocator, which on Windows serialises the bake's threads, for
+Rust's allocations and meshoptimizer's C++ scratch alike, and returns the
+bake's memory to the OS once it is over. Progress is logged every 5 s; a mesh whose
 part fails (or panics inside the meshlet builder) is reported and skipped
 rather than aborting the bake, and the rest of its parts still finish.
 
@@ -202,7 +204,8 @@ scaled to -0.5 EV before ACES), and `--exposure-bias` adds to it.
 | --- | --- | --- |
 | `--scene-root <dir or .gltf>` | `ZORAH_ROOT` | The export. |
 | `--cache-dir <dir>` | `<scene root>/.bevy_zorah_cache` | Bake output. |
-| `--bake-workers N` | `clamp((RAM - 8 GiB) / 2 GiB, 1, cores)` | Threads building bake parts, or report threads. |
+| `--bake-workers N` | cores - 2 | Threads building bake parts, or report threads. |
+| `--bake-triangle-budget N` | `128000000` | Source triangles the bake holds decoded at once; a larger mesh bakes alone. |
 | `--partition-triangles N` | `500000` | Cut larger primitives into spatial partitions. |
 | `--raster-error m` | `0.004` | Geometric error the finest resident meshlet LOD may carry; parts are pruned to it at load. |
 | `--raytracing-error m` | `0.05` | Geometric error the BLAS LOD cut may carry (never below `--raster-error`). |

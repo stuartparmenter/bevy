@@ -48,12 +48,16 @@ gltf = { version = "1.4", default-features = false, features = [
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-# Sizes the default bake worker count from the machine's total memory.
-sysinfo = "0.39"
 futures-io = "0.3"
-# The bake's threads allocate constantly inside meshopt, and the system heap
-# serialises them.
+# The bake's threads allocate constantly, in Rust and in meshoptimizer's C++,
+# and the system heap serialises them.
 mimalloc = { version = "0.1", default-features = false, optional = true }
+# mimalloc's C entry points, for meshoptimizer's allocator and `mi_collect`.
+libmimalloc-sys = { version = "0.1.49", default-features = false, features = [
+  "extended",
+], optional = true }
+# Only for `meshopt_setAllocator`; the version bevy_pbr builds against.
+meshopt = { version = "0.7", optional = true }
 
 [features]
 # DLSS Ray Reconstruction denoises the Solari path. On by default (needs an
@@ -61,7 +65,7 @@ mimalloc = { version = "0.1", default-features = false, optional = true }
 # `--no-default-features --features mimalloc` to run Solari without DLSS.
 default = ["dlss", "mimalloc"]
 dlss = ["bevy/dlss"]
-mimalloc = ["dep:mimalloc"]
+mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys", "dep:meshopt"]
 
 [target.'cfg(windows)'.dependencies]
 bevy = { path = "../../..", default-features = false, features = ["bevy_winit"] }
