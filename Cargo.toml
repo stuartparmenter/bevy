@@ -5909,3 +5909,7 @@ bevy_pbr = { path = "crates/bevy_pbr" }
 bevy_core_pipeline = { path = "crates/bevy_core_pipeline" }
 bevy_sprite_render = { path = "crates/bevy_sprite_render" }
 bevy_ui_render = { path = "crates/bevy_ui_render" }
+
+# meshopt 0.7 (meshoptimizer 1.3) is not on crates.io yet.
+[patch.crates-io]
+meshopt = { git = "https://github.com/gwihlidal/meshopt-rs", rev = "971b7177e085b123de788667cf9ed4e492ea2930" }

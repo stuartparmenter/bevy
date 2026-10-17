@@ -78,7 +78,7 @@ derive_more = { version = "2", default-features = false, features = ["from"] }
 lz4_flex = { version = "0.14", default-features = false, features = [
   "frame",
 ], optional = true }
-meshopt = { version = "0.6.2", optional = true }
+meshopt = { version = "0.7", optional = true }
 metis = { version = "0.2.2", optional = true }
 itertools = { version = "0.14", optional = true }
 bitvec = { version = "1", optional = true }
