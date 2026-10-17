@@ -1,7 +1,7 @@
 import bevy_pbr::render::pbr_lighting::D_GGX;
 import bevy_pbr::render::utils::{rand_vec2f, rand_u, rand_range_u, sample_uniform_sphere};
 import bevy_render::maths::{PI_2, orthonormalize};
-import package::scene::bindings::{trace_ray, trace_ray_previous_frame, RAY_T_MIN, RAY_T_MAX, light_sources, directional_lights, point_lights, rect_lights, environment_map, environment_map_sampler, environment_map_light, LightSource, light_source_kind, emissive_mesh_triangle_count, LIGHT_SOURCE_KIND_EMISSIVE_MESH, LIGHT_SOURCE_KIND_DIRECTIONAL, LIGHT_SOURCE_KIND_POINT, LIGHT_SOURCE_KIND_RECT, resolve_triangle_data_full, ResolvedRayHitFull, MIRROR_ROUGHNESS_THRESHOLD};
+import package::scene::bindings::{trace_ray, trace_ray_previous_frame, RAY_T_MIN, RAY_T_MAX, light_sources, directional_lights, point_lights, rect_lights, environment_map, environment_map_sampler, environment_map_light, LightSource, light_source_kind, emissive_mesh_triangle_count, LIGHT_SOURCE_KIND_EMISSIVE_MESH, LIGHT_SOURCE_KIND_DIRECTIONAL, LIGHT_SOURCE_KIND_POINT, LIGHT_SOURCE_KIND_RECT, LIGHT_SOURCE_KIND_ENVIRONMENT, resolve_triangle_data_full, ResolvedRayHitFull, MIRROR_ROUGHNESS_THRESHOLD, sample_environment_direction};
 
 enable wgpu_ray_query;
 
@@ -91,6 +91,10 @@ fn isnan(x: f32) -> bool {
     return (bitcast<u32>(x) & 0x7fffffffu) > 0x7f800000u;
 }
 
+fn isfinite(x: f32) -> bool {
+    return !isinf(x) && !isnan(x);
+}
+
 const NULL_LIGHT_ID = 0xFFFFFFFFu;
 
 struct LightSample {
@@ -119,7 +123,7 @@ struct ResolvedLightSample {
     /// 0 if emission is the same in every direction, e.g. point and spot lights with no radius.
     emission_cosine_exponent: f32,
     /// Whether rays can hit this light, needed for MIS between NEE and BRDF sampling.
-    /// Only emissive meshes can be hit. Analytic lights (directional, point, spot, rect) can only be found via NEE.
+    /// Emissive meshes and the environment (a missed ray collects its radiance) can be hit. Analytic lights (directional, point, spot, rect) can only be found via NEE.
     brdf_rays_can_hit: bool,
 }
 
@@ -133,6 +137,7 @@ struct LightContribution {
     inverse_solid_angle_pdf: f32,
     wi: vec3<f32>,
     brdf_rays_can_hit: bool,
+    is_environment: bool,
 }
 
 struct GenerateRandomLightSampleResult {
@@ -140,9 +145,20 @@ struct GenerateRandomLightSampleResult {
     resolved_light_sample: ResolvedLightSample,
 }
 
+// True when a missed BRDF ray would collect this light's radiance from sample_environment_map_light,
+// so the two strategies have to be MIS-weighted. Sun disks are directional but are not part of the
+// environment radiance, so they stay NEE-only.
+fn light_sample_is_environment(light_sample: LightSample) -> bool {
+    if light_sample.light_id == NULL_LIGHT_ID {
+        return false;
+    }
+    return light_source_kind(light_sources[light_sample.light_id >> 16u]) == LIGHT_SOURCE_KIND_ENVIRONMENT;
+}
+
 fn sample_random_light(ray_origin: vec3<f32>, origin_world_normal: vec3<f32>, rng: ptr<function, u32>) -> LightContribution {
     let sample = generate_random_light_sample(rng);
     var light_contribution = calculate_resolved_light_contribution(sample.resolved_light_sample, ray_origin, origin_world_normal);
+    light_contribution.is_environment = light_sample_is_environment(sample.light_sample);
     light_contribution.radiance *= trace_visibility(ray_origin, sample.resolved_light_sample.world_position);
     return light_contribution;
 }
@@ -185,7 +201,36 @@ fn generate_random_light_sample(rng: ptr<function, u32>) -> GenerateRandomLightS
 
 fn resolve_light_sample(light_sample: LightSample, light_source: LightSource) -> ResolvedLightSample {
     let kind = light_source_kind(light_source);
-    if kind == LIGHT_SOURCE_KIND_DIRECTIONAL {
+    if kind == LIGHT_SOURCE_KIND_ENVIRONMENT {
+        // Deterministic per seed: ReSTIR re-resolves (light_id, seed) every frame. After
+        // generate_random_light_sample multiplies inverse_pdf by the light count, its reciprocal is
+        // exactly environment_light_pdf(direction), which every MIS site relies on.
+        let sample = sample_environment_direction(light_sample.seed);
+        if !(sample.pdf > 0.0) {
+            return ResolvedLightSample(
+                vec4(0.0, 1.0, 0.0, 0.0),
+                vec3(0.0, -1.0, 0.0),
+                vec3(0.0),
+                0.0,
+                vec3(0.0, -1.0, 0.0),
+                NO_EMISSION_CONE,
+                NO_EMISSION_CONE,
+                1.0,
+                true,
+            );
+        }
+        return ResolvedLightSample(
+            vec4(sample.world_direction, 0.0),
+            -sample.world_direction,
+            sample_environment_map_light(sample.world_direction),
+            1.0 / sample.pdf,
+            -sample.world_direction,
+            NO_EMISSION_CONE,
+            NO_EMISSION_CONE,
+            1.0,
+            true,
+        );
+    } else if kind == LIGHT_SOURCE_KIND_DIRECTIONAL {
         let directional_light = directional_lights[light_source.id];
 
         var direction_to_light: vec3<f32>;
@@ -303,7 +348,9 @@ fn calculate_resolved_light_contribution(resolved_light_sample: ResolvedLightSam
     let radiance = resolved_light_sample.radiance * (emission / light_distance_squared);
     let inverse_solid_angle_pdf = resolved_light_sample.inverse_pdf * (cos_theta_light / light_distance_squared);
 
-    return LightContribution(radiance, resolved_light_sample.inverse_pdf, inverse_solid_angle_pdf, wi, resolved_light_sample.brdf_rays_can_hit);
+    // The packed tile sample cannot say whether it came from the environment: callers that know
+    // the light source set is_environment themselves.
+    return LightContribution(radiance, resolved_light_sample.inverse_pdf, inverse_solid_angle_pdf, wi, resolved_light_sample.brdf_rays_can_hit, false);
 }
 
 const NO_EMISSION_CONE = -1.0;

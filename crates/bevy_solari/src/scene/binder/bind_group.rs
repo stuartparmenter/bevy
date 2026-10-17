@@ -1,8 +1,8 @@
 use super::{
-    allocator::RetainedBindingArray, lights::GpuLightSource, RaytracingSceneBindings,
-    TlasInstanceSetupPipeline,
+    allocator::RetainedBindingArray, environment_cubemap, lights::GpuLightSource,
+    RaytracingSceneBindings, TlasInstanceSetupPipeline,
 };
-use crate::scene::extract::ExtractedEnvironmentMapLight;
+use crate::scene::{environment::EnvironmentImportanceMaps, extract::ExtractedEnvironmentMapLight};
 use bevy_ecs::system::{Res, ResMut};
 use bevy_math::Mat3;
 use bevy_pbr::DfgLut;
@@ -24,10 +24,11 @@ use tracing::info_span;
 pub struct BindGroupCacheState {
     cached: [Option<BindGroup>; 2],
     pub invalid: bool,
-    last_buffer_ids: Option<[BufferId; 11]>,
+    last_buffer_ids: Option<[BufferId; 12]>,
     last_dfg_ids: Option<(TextureViewId, SamplerId)>,
     last_light_count: u32,
     last_environment_map_light_id: Option<TextureViewId>,
+    last_environment_importance_map_id: Option<TextureViewId>,
     pub dummy_buffer: Buffer,
 }
 
@@ -49,6 +50,7 @@ impl BindGroupCacheState {
             last_dfg_ids: None,
             last_light_count: 0,
             last_environment_map_light_id: None,
+            last_environment_importance_map_id: None,
             dummy_buffer,
         }
     }
@@ -71,7 +73,7 @@ fn buffer_bindings<'a>(
 
 impl RaytracingSceneBindings {
     /// The id of each buffer in the bind group.
-    fn buffer_ids(&self) -> [BufferId; 11] {
+    fn buffer_ids(&self) -> [BufferId; 12] {
         [
             self.assets.materials.buffer(),
             self.instances.transforms.buffer(),
@@ -84,6 +86,7 @@ impl RaytracingSceneBindings {
             self.lights.rect_lights.buffer(),
             self.environment_map_light_buffer.buffer(),
             self.lights.previous_frame_id_translations.buffer(),
+            self.scene_parameters.buffer(),
         ]
         .map(|buffer| {
             buffer
@@ -97,6 +100,7 @@ impl RaytracingSceneBindings {
         dfg_view: &TextureView,
         dfg_sampler: &Sampler,
         environment_map_light: &TextureView,
+        environment_importance_map: &TextureView,
     ) -> bool {
         let mut invalid = self.bind_groups.invalid;
         self.bind_groups.invalid = false;
@@ -134,6 +138,12 @@ impl RaytracingSceneBindings {
             invalid = true;
         }
 
+        let environment_importance_map_id = Some(environment_importance_map.id());
+        if self.bind_groups.last_environment_importance_map_id != environment_importance_map_id {
+            self.bind_groups.last_environment_importance_map_id = environment_importance_map_id;
+            invalid = true;
+        }
+
         invalid
     }
 
@@ -146,6 +156,7 @@ impl RaytracingSceneBindings {
         dfg_view: &TextureView,
         dfg_sampler: &Sampler,
         environment_map_light: &TextureView,
+        environment_importance_map: &TextureView,
     ) -> BindGroup {
         let _span = info_span!("create_bind_group").entered();
         let dummy = &self.bind_groups.dummy_buffer;
@@ -184,6 +195,12 @@ impl RaytracingSceneBindings {
             .filter(|_| self.tlas.built[current_index ^ 1])
             .unwrap_or(current);
 
+        let scene_parameters = self
+            .scene_parameters
+            .buffer()
+            .unwrap()
+            .as_entire_buffer_binding();
+
         render_device.create_bind_group(
             "raytracing_scene_bind_group",
             layout,
@@ -213,6 +230,8 @@ impl RaytracingSceneBindings {
                     .binding()
                     .unwrap(),
                 metadata_buffers.as_slice(),
+                scene_parameters,
+                environment_importance_map,
             )),
         )
     }
@@ -226,6 +245,7 @@ impl RaytracingSceneBindings {
         dfg_view: &TextureView,
         dfg_sampler: &Sampler,
         environment_map_light: &TextureView,
+        environment_importance_map: &TextureView,
     ) -> BindGroup {
         if let Some(bind_group) = &self.bind_groups.cached[current_index] {
             return bind_group.clone();
@@ -241,6 +261,7 @@ impl RaytracingSceneBindings {
             dfg_view,
             dfg_sampler,
             environment_map_light,
+            environment_importance_map,
         );
         if self.tlas.previous_binding_is_stable() {
             self.bind_groups.cached[current_index] = Some(bind_group.clone());
@@ -255,6 +276,7 @@ pub fn prepare_raytracing_scene_bind_group(
     fallback_texture: Res<FallbackImage>,
     dfg_lut: Res<DfgLut>,
     extracted_environment_map_light: Res<ExtractedEnvironmentMapLight>,
+    environment_importance_maps: Res<EnvironmentImportanceMaps>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
     pipeline_cache: Res<PipelineCache>,
@@ -307,7 +329,14 @@ pub fn prepare_raytracing_scene_bind_group(
         &render_queue,
     );
 
-    if bindings.take_bind_group_invalidation(dfg_view, dfg_sampler, environment_map_light) {
+    let environment_importance_map = &environment_importance_maps.pyramid.view;
+
+    if bindings.take_bind_group_invalidation(
+        dfg_view,
+        dfg_sampler,
+        environment_map_light,
+        environment_importance_map,
+    ) {
         bindings.bind_groups.cached = [None, None];
     }
 
@@ -320,6 +349,7 @@ pub fn prepare_raytracing_scene_bind_group(
         dfg_view,
         dfg_sampler,
         environment_map_light,
+        environment_importance_map,
     ));
 }
 
@@ -337,13 +367,10 @@ fn prepare_environment_map_light<'a>(
     render_device: &RenderDevice,
     render_queue: &RenderQueue,
 ) -> &'a TextureView {
-    let cubemap = extracted_environment_map_light
-        .cubemap
-        .as_ref()
-        .and_then(|cubemap| texture_assets.get(cubemap));
+    let cubemap = environment_cubemap(extracted_environment_map_light, texture_assets);
 
     let (texture, uniform) = match cubemap {
-        Some(cubemap) => (
+        Some((_, cubemap)) => (
             &cubemap.texture_view,
             GpuEnvironmentMapLight {
                 light_from_world: Mat3::from_quat(

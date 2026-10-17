@@ -8,13 +8,14 @@ use bevy_ecs::{
     component::Component,
     lifecycle::RemovedComponents,
     message::MessageReader,
-    query::{Added, Changed, Or, With},
+    query::{Added, Changed, Has, Or, With},
     resource::Resource,
     system::{Commands, Query, Res, ResMut},
 };
 use bevy_image::Image;
 use bevy_light::{
-    DirectionalLight, EnvironmentMapLight, PointLight, RectLight, SpotLight, SunDisk,
+    AtmosphereEnvironmentMapLight, DirectionalLight, EnvironmentMapLight,
+    GeneratedEnvironmentMapLight, PointLight, RectLight, SpotLight, SunDisk,
 };
 use bevy_math::{ops::cos, Quat, Vec3};
 use bevy_pbr::{MeshMaterial3d, PreviousGlobalTransform, StandardMaterial};
@@ -197,6 +198,10 @@ pub struct ExtractedEnvironmentMapLight {
     pub cubemap: Option<Handle<Image>>,
     pub intensity: f32,
     pub rotation: Quat,
+    /// The cubemap is rewritten on the GPU every frame (an `AtmosphereEnvironmentMapLight` renders
+    /// into it, a `GeneratedEnvironmentMapLight` is filtered into it), so the importance pyramid is
+    /// rebuilt every frame.
+    pub contents_change_every_frame: bool,
 }
 
 /// Lights whose extracted data needs updating.
@@ -394,12 +399,19 @@ pub fn extract_raytracing_rect_lights(
 ///
 /// Only mip 0 of the specular cubemap is sampled.
 pub fn extract_raytracing_environment_map_light(
-    cameras: Extract<Query<(&Camera, Option<&EnvironmentMapLight>)>>,
+    cameras: Extract<
+        Query<(
+            &Camera,
+            Option<&EnvironmentMapLight>,
+            Has<GeneratedEnvironmentMapLight>,
+            Has<AtmosphereEnvironmentMapLight>,
+        )>,
+    >,
     mut environment_map_light: ResMut<ExtractedEnvironmentMapLight>,
 ) {
     let mut extracted_env_map_light = ExtractedEnvironmentMapLight::default();
 
-    for (camera, env_map) in &cameras {
+    for (camera, env_map, generated, atmosphere) in &cameras {
         if !camera.is_active {
             continue;
         }
@@ -412,6 +424,7 @@ pub fn extract_raytracing_environment_map_light(
             cubemap: Some(env_map.specular_map.clone()),
             intensity: env_map.intensity,
             rotation: env_map.rotation,
+            contents_change_every_frame: generated || atmosphere,
         };
 
         if extracted_env_map_light.cubemap.is_none() {

@@ -20,6 +20,7 @@ const LIGHT_SOURCE_KIND_EMISSIVE_MESH: u32 = 0;
 const LIGHT_SOURCE_KIND_DIRECTIONAL: u32 = 1;
 const LIGHT_SOURCE_KIND_POINT: u32 = 2;
 const LIGHT_SOURCE_KIND_RECT: u32 = 3;
+const LIGHT_SOURCE_KIND_ENVIRONMENT: u32 = 4;
 
 #[derive(Clone, Copy, Default, PartialEq, Pod, Zeroable)]
 #[repr(C)]
@@ -36,6 +37,8 @@ pub enum LightSourceId {
     PointLight(Entity),
     SpotLight(Entity),
     RectLight(Entity),
+    /// The single environment slot, the scene's environment map light.
+    Environment,
 }
 
 #[derive(Default)]
@@ -121,6 +124,15 @@ impl GpuLightSource {
         Self {
             kind: LIGHT_SOURCE_KIND_RECT,
             id: rect_light_id,
+        }
+    }
+
+    /// The one environment entry: resolved through the importance pyramid, and flagged so the
+    /// shaders MIS-weight it against the environment radiance a missed BRDF ray picks up.
+    fn new_environment_light() -> GpuLightSource {
+        Self {
+            kind: LIGHT_SOURCE_KIND_ENVIRONMENT,
+            id: 0,
         }
     }
 }
@@ -367,7 +379,17 @@ impl LightState {
         }
     }
 
-    pub fn finish_update(&mut self) {
+    pub fn finish_update(&mut self, environment_present: bool) {
+        if environment_present {
+            self.add_light(
+                LightSourceId::Environment,
+                GpuLightSource::new_environment_light(),
+            );
+        } else {
+            self.remove_light(LightSourceId::Environment);
+        }
+
+        self.pin_environment_last();
         self.write_light_id_translations();
 
         if self.index.len() > u16::MAX as usize {
@@ -385,6 +407,21 @@ impl LightState {
         if self.point_light_slots.remove(&id).is_some() {
             self.remove_light(id);
         }
+    }
+
+    /// Moves the environment source to the end of the list. The shaders derive the environment's
+    /// selection probability from the last entry's kind, so it has to stay there.
+    fn pin_environment_last(&mut self) {
+        let Some(index) = self.index.get(&LightSourceId::Environment) else {
+            return;
+        };
+        if index == self.index.len() as u32 - 1 {
+            return;
+        }
+        self.remove_light(LightSourceId::Environment);
+        let index = self.index.insert(LightSourceId::Environment);
+        self.sources
+            .grow_and_set(index, GpuLightSource::new_environment_light());
     }
 
     pub fn add_light(&mut self, id: LightSourceId, source: GpuLightSource) {
@@ -464,7 +501,7 @@ impl LightState {
 
 #[cfg(test)]
 mod tests {
-    use super::{LightIndex, LightSourceId};
+    use super::{GpuLightSource, LightIndex, LightSourceId, LIGHT_SOURCE_KIND_BITS};
     use bevy_ecs::entity::Entity;
 
     const ENTITY: Entity = Entity::PLACEHOLDER;
@@ -541,5 +578,24 @@ mod tests {
         assert_eq!(lights.remove(emissive), Some((0, 1)));
         assert_eq!(lights.remove(directional), Some((0, 0)));
         assert!(lights.is_empty());
+    }
+
+    #[test]
+    fn light_source_kinds_match_the_shader_constants() {
+        let shader = include_str!("../bindings.wesl");
+
+        let environment = GpuLightSource::new_environment_light();
+        assert_eq!(environment.id, 0);
+        assert!(shader.contains(&format!(
+            "const LIGHT_SOURCE_KIND_ENVIRONMENT = {}u;",
+            environment.kind
+        )));
+        // The environment kind has to fit the kind bits so light_source_kind() reads it back.
+        assert_eq!(environment.kind >> LIGHT_SOURCE_KIND_BITS, 0);
+        // The shader derives the environment's selection probability from the last entry's kind,
+        // so the light set must keep pinning it last.
+        assert!(shader.contains(
+            "light_source_kind(light_sources[light_count - 1u]) != LIGHT_SOURCE_KIND_ENVIRONMENT"
+        ));
     }
 }
