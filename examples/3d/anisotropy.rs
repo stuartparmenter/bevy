@@ -119,7 +119,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>, app_status: Res
         Mesh3d(
             asset_server.add(
                 Mesh::from(Sphere::new(0.1))
-                    .with_generated_tangents()
+                    .with_computed_tangents(Default::default())
                     .unwrap(),
             ),
         ),

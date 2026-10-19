@@ -269,7 +269,7 @@ fn setup(
                 // NOTE: for normal maps and depth maps to work, the mesh
                 // needs tangents generated.
                 Mesh::from(Cuboid::default())
-                    .with_generated_tangents()
+                    .with_computed_tangents(Default::default())
                     .unwrap(),
             ),
         ),
@@ -279,7 +279,7 @@ fn setup(
 
     let background_cube = meshes.add(
         Mesh::from(Cuboid::new(40.0, 40.0, 40.0))
-            .with_generated_tangents()
+            .with_computed_tangents(Default::default())
             .unwrap(),
     );
 

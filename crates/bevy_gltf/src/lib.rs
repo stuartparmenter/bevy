@@ -153,7 +153,7 @@ use bevy_app::prelude::*;
 use bevy_asset::AssetApp;
 use bevy_ecs::prelude::Resource;
 use bevy_image::{CompressedImageFormatSupport, CompressedImageFormats, ImageSamplerDescriptor};
-use bevy_mesh::{MeshCompressionArgs, MeshVertexAttribute};
+use bevy_mesh::{MeshCompressionArgs, MeshVertexAttribute, TangentAlgorithm};
 
 /// The glTF prelude.
 ///
@@ -242,6 +242,10 @@ pub struct GltfPlugin {
 
     /// Mesh attribute compression arguments applied when loading meshes.
     pub mesh_compression: MeshCompressionArgs,
+
+    /// Algorithm used to generate missing tangents for normal mapping and anisotropy.
+    /// Can be overridden per asset with [`GltfLoaderSettings::tangent_algorithm`].
+    pub tangent_algorithm: TangentAlgorithm,
 }
 
 impl Default for GltfPlugin {
@@ -252,6 +256,7 @@ impl Default for GltfPlugin {
             convert_coordinates: GltfConvertCoordinates::default(),
             skinned_mesh_bounds_policy: Default::default(),
             mesh_compression: MeshCompressionArgs::none(),
+            tangent_algorithm: TangentAlgorithm::default(),
         }
     }
 }
@@ -309,6 +314,7 @@ impl Plugin for GltfPlugin {
             extensions: extensions.0.clone(),
             default_skinned_mesh_bounds_policy: self.skinned_mesh_bounds_policy,
             default_mesh_compression: self.mesh_compression.clone(),
+            default_tangent_algorithm: self.tangent_algorithm,
         });
     }
 }

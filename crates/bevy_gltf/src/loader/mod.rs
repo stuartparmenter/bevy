@@ -33,7 +33,7 @@ use bevy_mesh::{
     morph::{MeshMorphWeights, MorphAttributes, MorphWeights},
     skinning::{SkinnedMesh, SkinnedMeshInverseBindposes},
     Indices, Mesh, Mesh3d, MeshCompressionArgs, MeshRaytracingFlags, MeshVertexAttribute,
-    PrimitiveTopology,
+    PrimitiveTopology, TangentAlgorithm,
 };
 use bevy_platform::collections::{HashMap, HashSet};
 use bevy_reflect::TypePath;
@@ -209,6 +209,8 @@ pub struct GltfLoader {
     pub default_skinned_mesh_bounds_policy: GltfSkinnedMeshBoundsPolicy,
     /// Default mesh compression arguments for the loaded meshes.
     pub default_mesh_compression: MeshCompressionArgs,
+    /// Default algorithm for generating missing mesh tangents.
+    pub default_tangent_algorithm: TangentAlgorithm,
 }
 
 /// Specifies optional settings for processing gltfs at load time. By default, all recognized contents of
@@ -266,6 +268,10 @@ pub struct GltfLoaderSettings {
     /// Mesh attribute compression arguments for the loaded meshes.
     /// If `None`, uses the global default set by [`GltfPlugin::mesh_compression`](crate::GltfPlugin::mesh_compression).
     pub mesh_compression: Option<MeshCompressionArgs>,
+    /// Overrides [`GltfPlugin::tangent_algorithm`](crate::GltfPlugin::tangent_algorithm).
+    /// Only used when tangents are missing and required by the material.
+    /// Tangents supplied by the asset are preserved.
+    pub tangent_algorithm: Option<TangentAlgorithm>,
 }
 
 impl Default for GltfLoaderSettings {
@@ -283,6 +289,7 @@ impl Default for GltfLoaderSettings {
             convert_coordinates: None,
             skinned_mesh_bounds_policy: None,
             mesh_compression: None,
+            tangent_algorithm: None,
         }
     }
 }
@@ -897,16 +904,19 @@ impl GltfLoader {
                     && mesh.contains_attribute(Mesh::ATTRIBUTE_NORMAL)
                     && needs_tangents(&primitive.material())
                 {
+                    let algorithm = settings
+                        .tangent_algorithm
+                        .unwrap_or(loader.default_tangent_algorithm);
                     tracing::debug!(
-                        "Missing vertex tangents for {}, computing them using the mikktspace algorithm. Consider using a tool such as Blender to pre-compute the tangents.", file_name
+                        "Missing vertex tangents for {}, computing them using {algorithm:?}. Consider using a tool such as Blender to pre-compute the tangents.", file_name
                     );
 
                     let generate_tangents_span = info_span!("generate_tangents", name = file_name);
 
                     generate_tangents_span.in_scope(|| {
-                        if let Err(err) = mesh.generate_tangents() {
+                        if let Err(err) = mesh.compute_tangents(algorithm) {
                             warn!(
-                                "Failed to generate vertex tangents using the mikktspace algorithm: {}",
+                                "Failed to generate vertex tangents using {algorithm:?}: {}",
                                 err
                             );
                         }

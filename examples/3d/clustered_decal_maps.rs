@@ -200,7 +200,7 @@ fn spawn_plane_mesh(
         .build()
         .with_duplicated_vertices()
         .with_computed_flat_normals()
-        .with_generated_tangents()
+        .with_computed_tangents(Default::default())
         .unwrap(),
     );
 
