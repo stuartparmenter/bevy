@@ -7,7 +7,7 @@ use bevy::{
     diagnostic::{Diagnostic, DiagnosticPath, DiagnosticsStore},
     gltf::GltfMaterialName,
     image::{ImageAddressMode, ImageLoaderSettings},
-    mesh::{Indices, VertexAttributeValues},
+    mesh::{Indices, TangentAlgorithm, VertexAttributeValues},
     post_process::bloom::Bloom,
     prelude::*,
     render::{diagnostic::RenderDiagnosticsPlugin, render_resource::TextureUsages},
@@ -216,7 +216,7 @@ fn setup_many_lights(
         .mesh()
         .size(400.0, 400.0)
         .build()
-        .with_generated_tangents()
+        .with_computed_tangents(TangentAlgorithm::Mikktspace)
         .unwrap();
     match plane_mesh.attribute_mut(Mesh::ATTRIBUTE_UV_0).unwrap() {
         VertexAttributeValues::Float32x2(items) => {
@@ -229,14 +229,14 @@ fn setup_many_lights(
         Cuboid::default()
             .mesh()
             .build()
-            .with_generated_tangents()
+            .with_computed_tangents(TangentAlgorithm::Mikktspace)
             .unwrap(),
     );
     let sphere_mesh = meshes.add(
         Sphere::new(1.0)
             .mesh()
             .build()
-            .with_generated_tangents()
+            .with_computed_tangents(TangentAlgorithm::Mikktspace)
             .unwrap(),
     );
 
@@ -414,7 +414,7 @@ fn add_raytracing_meshes_on_scene_load(
                 );
             }
             if !mesh.contains_attribute(Mesh::ATTRIBUTE_TANGENT) {
-                mesh.generate_tangents().unwrap();
+                mesh.compute_tangents(TangentAlgorithm::Mikktspace).unwrap();
             }
             if mesh.contains_attribute(Mesh::ATTRIBUTE_UV_1) {
                 mesh.remove_attribute(Mesh::ATTRIBUTE_UV_1);
