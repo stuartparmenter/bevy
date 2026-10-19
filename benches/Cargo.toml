@@ -87,6 +87,9 @@ bench_ecs = [
 
 bench_math = ["dep:bevy_math", "dep:bevy_curve", "dep:bevy_shape"]
 
+bench_mesh = ["dep:bevy_mesh", "dep:bevy_asset", "dep:bevy_math"]
+meshopt = ["bevy_mesh?/meshopt"]
+
 bench_picking = ["dep:bevy_picking", "dep:bevy_math", "dep:bevy_shape"]
 
 bench_platform = [
@@ -250,3 +253,9 @@ name = "text"
 path = "benches/bevy_text/main.rs"
 harness = false
 required-features = ["bench_text"]
+
+[[bench]]
+name = "mesh"
+path = "benches/bevy_mesh/main.rs"
+harness = false
+required-features = ["bench_mesh"]
