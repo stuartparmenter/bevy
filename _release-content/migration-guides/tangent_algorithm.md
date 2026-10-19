@@ -10,3 +10,5 @@ pull_requests: []
 `GltfLoaderSettings::tangent_algorithm` optionally overrides the plugin choice for an individual asset. It defaults to `None`; add this field to exhaustive settings literals. Existing tangents in glTF assets are preserved regardless of the selected algorithm.
 
 With the optional `meshopt` feature, select `TangentAlgorithm::MeshoptCompatible` for meshoptimizer's MikkTSpace-compatible mode, or `TangentAlgorithm::Meshopt` for its default weighting. This feature requires a C++ compiler but not libclang with meshopt's default pregenerated bindings. It does not enable glTF meshopt decoding or change the default tangent algorithm.
+
+`TangentAlgorithm::GramSchmidt` adds an approximation for procedural meshes without normal maps baked using MikkTSpace. It requires no additional features.
