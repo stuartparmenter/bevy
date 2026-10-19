@@ -30,6 +30,13 @@ pub enum TangentAlgorithm {
     /// triangles. Requires unit-length normals.
     #[cfg(feature = "meshopt")]
     MeshoptCompatible,
+    /// Averages each triangle's UV-derived tangent at its vertices, then makes it
+    /// perpendicular to the normal with Gram-Schmidt.
+    ///
+    /// For meshes whose normal maps weren't baked with `MikkTSpace`. Needs no Cargo feature.
+    /// Requires finite attributes and nonzero normals. Triangles with degenerate UVs or
+    /// positions get an arbitrary tangent perpendicular to the normal.
+    GramSchmidt,
 }
 
 #[derive(Error, Debug)]
@@ -52,6 +59,10 @@ pub enum GenerateTangentsError {
     MikktspaceError(#[from] bevy_mikktspace::GenerateTangentSpaceError),
     #[error("morph target data does not contain a whole number of targets")]
     InvalidMorphTargetLength,
+    #[error("the '{0}' vertex attribute contains non-finite values")]
+    NonFiniteVertexAttribute(&'static str),
+    #[error("vertex {0} has a zero normal")]
+    ZeroNormal(usize),
     #[error("Mesh access error: {0}")]
     MeshAccessError(#[from] MeshAccessError),
 }
@@ -117,6 +128,9 @@ pub(crate) fn generate_tangents_for_mesh(
         return Err(GenerateTangentsError::InvalidIndex(index, len));
     }
     let mut tangents = match algorithm {
+        TangentAlgorithm::GramSchmidt => {
+            crate::gram_schmidt::generate_tangents(indices, positions, normals, uvs)?
+        }
         #[cfg(feature = "bevy_mikktspace")]
         TangentAlgorithm::Mikktspace => {
             crate::mikktspace::generate_tangents(indices, positions, normals, uvs)?
