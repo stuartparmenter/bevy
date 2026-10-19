@@ -36,10 +36,3 @@ cargo bench -p benches -- --baseline before
 Bevy's benchmarks use [Criterion](https://crates.io/crates/criterion). If you want to learn more about using Criterion for comparing performance against a baseline or generating detailed reports, you can read the [Criterion.rs documentation](https://bheisler.github.io/criterion.rs/book/criterion_rs.html).
 
 You can generate nicely formatted comparison tables of named benchmark runs (baselines) using the [critcmp](https://github.com/BurntSushi/critcmp) tool.
-
-Compare vertex deduplication with and without meshoptimizer:
-
-```sh
-cargo bench -p benches --bench mesh --no-default-features --features bench_mesh
-cargo bench -p benches --bench mesh --no-default-features --features bench_mesh,meshopt
-```
