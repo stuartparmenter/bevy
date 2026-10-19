@@ -8,13 +8,33 @@ use wgpu_types::{PrimitiveTopology, VertexFormat};
 /// The algorithm used by [`Mesh::compute_tangents`](crate::Mesh::compute_tangents).
 ///
 /// All algorithms require a triangle list with position, normal and UV 0 attributes.
+/// `MikkTSpace` is the default when the `bevy_mikktspace` feature is enabled.
+/// Enabling `meshopt` adds choices without changing the default. Without
+/// `bevy_mikktspace`, choose an algorithm explicitly; no `Default` is provided.
+///
 /// Choose an algorithm compatible with the one used to bake your normal maps.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Reflect)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Reflect)]
 #[cfg_attr(feature = "serialize", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "bevy_mikktspace", derive(Default))]
 pub enum TangentAlgorithm {
     /// Morten S. Mikkelsen's `MikkTSpace` algorithm, used by many normal-map bakers.
+    #[cfg(feature = "bevy_mikktspace")]
     #[default]
     Mikktspace,
+    /// Meshoptimizer's tangent generator with its default weighting.
+    /// Requires unit-length normals.
+    ///
+    /// Uses different weighting from `MikkTSpace`. For normal maps baked with
+    /// `MikkTSpace`, use `MeshoptCompatible`.
+    #[cfg(feature = "meshopt")]
+    Meshopt,
+    /// Meshoptimizer's `MikkTSpace`-compatible weighting mode.
+    /// Requires unit-length normals.
+    ///
+    /// Intended for `MikkTSpace` normal-map bakes, but not bit-identical to `MikkTSpace`.
+    /// Differences can occur around degenerate triangles and tangent discontinuities.
+    #[cfg(feature = "meshopt")]
+    MeshoptCompatible,
 }
 
 #[derive(Error, Debug)]
@@ -102,8 +122,25 @@ pub(crate) fn generate_tangents_for_mesh(
         return Err(GenerateTangentsError::InvalidIndex(index, len));
     }
     let mut tangents = match algorithm {
+        #[cfg(feature = "bevy_mikktspace")]
         TangentAlgorithm::Mikktspace => {
             crate::mikktspace::generate_tangents(indices, positions, normals, uvs)?
+        }
+        #[cfg(feature = "meshopt")]
+        TangentAlgorithm::Meshopt | TangentAlgorithm::MeshoptCompatible => {
+            let options = if algorithm == TangentAlgorithm::MeshoptCompatible {
+                meshopt::TangentOptions::Compatible
+            } else {
+                meshopt::TangentOptions::None
+            };
+            crate::meshopt::generate_tangents(
+                indices,
+                positions,
+                normals,
+                uvs,
+                corner_count,
+                options,
+            )
         }
     };
 
@@ -120,7 +157,14 @@ mod tests {
     use bevy_asset::RenderAssetUsages;
 
     fn algorithms() -> &'static [TangentAlgorithm] {
-        &[TangentAlgorithm::Mikktspace]
+        &[
+            #[cfg(feature = "bevy_mikktspace")]
+            TangentAlgorithm::Mikktspace,
+            #[cfg(feature = "meshopt")]
+            TangentAlgorithm::Meshopt,
+            #[cfg(feature = "meshopt")]
+            TangentAlgorithm::MeshoptCompatible,
+        ]
     }
 
     fn quad() -> Mesh {
