@@ -58,7 +58,7 @@ fn spawn_scene(
             .mesh()
             .kind(SphereKind::Ico { subdivisions: 50 })
             .build()
-            .with_generated_tangents()
+            .with_computed_tangents(Default::default())
             .unwrap(),
     );
 

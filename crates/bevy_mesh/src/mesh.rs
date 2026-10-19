@@ -395,8 +395,8 @@ impl Mesh {
         MeshVertexAttribute::new("Vertex_Uv_1", 3, VertexFormat::Float32x2);
 
     /// The direction of the vertex tangent. Used for normal mapping.
-    /// Usually generated with [`generate_tangents`](Mesh::generate_tangents) or
-    /// [`with_generated_tangents`](Mesh::with_generated_tangents).
+    /// Usually generated with [`compute_tangents`](Mesh::compute_tangents) or
+    /// [`with_computed_tangents`](Mesh::with_computed_tangents).
     ///
     /// The format of this attribute is [`VertexFormat::Float32x4`].
     pub const ATTRIBUTE_TANGENT: MeshVertexAttribute =
@@ -2187,15 +2187,19 @@ impl Mesh {
         Ok(self)
     }
 
-    /// Generate tangents for the mesh using the `mikktspace` algorithm.
+    /// Computes tangents using the selected algorithm.
     ///
-    /// Sets the [`Mesh::ATTRIBUTE_TANGENT`] attribute if successful.
-    /// Requires a [`PrimitiveTopology::TriangleList`] topology and the [`Mesh::ATTRIBUTE_POSITION`], [`Mesh::ATTRIBUTE_NORMAL`] and [`Mesh::ATTRIBUTE_UV_0`] attributes set.
+    /// Sets [`Mesh::ATTRIBUTE_TANGENT`] on success. Requires a triangle list and
+    /// [`Mesh::ATTRIBUTE_POSITION`], [`Mesh::ATTRIBUTE_NORMAL`] and [`Mesh::ATTRIBUTE_UV_0`].
+    /// Existing normals are not modified. Use the algorithm used to bake your normal maps.
     /// Vertices shared by corners with different tangents are split, copying all
     /// attributes and morph target deltas. Indices may be promoted from `u16` to `u32`.
     #[cfg(feature = "bevy_mikktspace")]
-    pub fn generate_tangents(&mut self) -> Result<(), super::GenerateTangentsError> {
-        let mut corners = super::generate_tangents_for_mesh(self)?;
+    pub fn compute_tangents(
+        &mut self,
+        algorithm: super::TangentAlgorithm,
+    ) -> Result<(), super::GenerateTangentsError> {
+        let mut corners = super::generate_tangents_for_mesh(self, algorithm)?;
         let vertex_count = self.try_attribute(Self::ATTRIBUTE_POSITION)?.len();
         let Some(indices) = self.try_indices_option()? else {
             corners.resize(vertex_count, [0., 0., 0., -0.]);
@@ -2305,16 +2309,15 @@ impl Mesh {
         Ok(())
     }
 
-    /// Consumes the mesh and returns a mesh with tangents generated using the `mikktspace` algorithm.
+    /// Consumes the mesh and computes tangents using the selected algorithm.
     ///
-    /// The resulting mesh will have the [`Mesh::ATTRIBUTE_TANGENT`] attribute if successful.
-    ///
-    /// (Alternatively, you can use [`Mesh::generate_tangents`] to mutate an existing mesh in-place)
-    ///
-    /// Requires a [`PrimitiveTopology::TriangleList`] topology and the [`Mesh::ATTRIBUTE_POSITION`], [`Mesh::ATTRIBUTE_NORMAL`] and [`Mesh::ATTRIBUTE_UV_0`] attributes set.
+    /// See [`Mesh::compute_tangents`] for requirements.
     #[cfg(feature = "bevy_mikktspace")]
-    pub fn with_generated_tangents(mut self) -> Result<Mesh, super::GenerateTangentsError> {
-        self.generate_tangents()?;
+    pub fn with_computed_tangents(
+        mut self,
+        algorithm: super::TangentAlgorithm,
+    ) -> Result<Self, super::GenerateTangentsError> {
+        self.compute_tangents(algorithm)?;
         Ok(self)
     }
 
