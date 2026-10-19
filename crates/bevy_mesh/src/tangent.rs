@@ -35,6 +35,16 @@ pub enum TangentAlgorithm {
     /// Differences can occur around degenerate triangles and tangent discontinuities.
     #[cfg(feature = "meshopt")]
     MeshoptCompatible,
+    /// A fast approximation that averages triangle UV derivatives at each vertex,
+    /// then projects the tangent perpendicular to the normal using Gram–Schmidt.
+    ///
+    /// Intended for procedural meshes without normal maps baked using `MikkTSpace`.
+    /// Only corners that already share a vertex are averaged. Mirrored UVs can
+    /// split vertices. Degenerate derivatives use a unit tangent perpendicular
+    /// to the normal.
+    /// Requires finite attributes and nonzero normals, which need not be unit length.
+    /// Available without additional Cargo features.
+    GramSchmidt,
 }
 
 #[derive(Error, Debug)]
@@ -57,6 +67,10 @@ pub enum GenerateTangentsError {
     MikktspaceError(#[from] bevy_mikktspace::GenerateTangentSpaceError),
     #[error("morph target data does not contain a whole number of targets")]
     InvalidMorphTargetLength,
+    #[error("the '{0}' vertex attribute contains non-finite values")]
+    NonFiniteVertexAttribute(&'static str),
+    #[error("vertex {0} has a zero normal")]
+    ZeroNormal(usize),
     #[error("Mesh access error: {0}")]
     MeshAccessError(#[from] MeshAccessError),
 }
@@ -122,6 +136,9 @@ pub(crate) fn generate_tangents_for_mesh(
         return Err(GenerateTangentsError::InvalidIndex(index, len));
     }
     let mut tangents = match algorithm {
+        TangentAlgorithm::GramSchmidt => {
+            crate::gram_schmidt::generate_tangents(indices, positions, normals, uvs)?
+        }
         #[cfg(feature = "bevy_mikktspace")]
         TangentAlgorithm::Mikktspace => {
             crate::mikktspace::generate_tangents(indices, positions, normals, uvs)?
@@ -158,6 +175,7 @@ mod tests {
 
     fn algorithms() -> &'static [TangentAlgorithm] {
         &[
+            TangentAlgorithm::GramSchmidt,
             #[cfg(feature = "bevy_mikktspace")]
             TangentAlgorithm::Mikktspace,
             #[cfg(feature = "meshopt")]
