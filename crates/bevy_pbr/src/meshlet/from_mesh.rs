@@ -75,7 +75,7 @@ impl MeshletMesh {
         let vertex_buffer = mesh.create_packed_vertex_buffer_data();
         let vertex_stride = mesh.get_vertex_size() as usize;
         let vertices = VertexDataAdapter::new(&vertex_buffer, vertex_stride, 0).unwrap();
-        let vertex_normals = bytemuck::cast_slice(&vertex_buffer[12..16]);
+        let vertex_normals = interleaved_normals(&vertex_buffer);
 
         // Generate a position-only vertex buffer for determining triangle/meshlet connectivity
         let position_only_vertex_remap = generate_position_remap(&vertices);
@@ -241,6 +241,12 @@ impl MeshletMesh {
             bvh_depth: depth,
         })
     }
+}
+
+fn interleaved_normals(vertex_buffer: &[u8]) -> &[f32] {
+    // Normals start after the first position and repeat at the packed vertex stride.
+    // Include the remaining buffer so the slice covers every strided normal.
+    bytemuck::cast_slice(&vertex_buffer[12..])
 }
 
 fn validate_input_mesh(mesh: &Mesh) -> Result<Cow<'_, [u32]>, MeshToMeshletMeshConversionError> {
@@ -1096,4 +1102,22 @@ pub enum MeshToMeshletMeshConversionError {
     },
     #[error("Mesh has no indices")]
     MeshMissingIndices,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_mesh::{MeshBuilder, Meshable};
+    use bevy_shape::Plane3d;
+
+    #[test]
+    fn interleaved_normals_cover_all_vertices() {
+        let mesh = Plane3d::default().mesh().build();
+        let vertex_buffer = mesh.create_packed_vertex_buffer_data();
+        let normals = interleaved_normals(&vertex_buffer);
+        let stride = mesh.get_vertex_size() as usize / size_of::<f32>();
+        for vertex in 0..mesh.count_vertices() {
+            assert_eq!(&normals[vertex * stride..][..3], &[0., 1., 0.]);
+        }
+    }
 }
