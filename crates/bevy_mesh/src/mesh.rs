@@ -2191,10 +2191,117 @@ impl Mesh {
     ///
     /// Sets the [`Mesh::ATTRIBUTE_TANGENT`] attribute if successful.
     /// Requires a [`PrimitiveTopology::TriangleList`] topology and the [`Mesh::ATTRIBUTE_POSITION`], [`Mesh::ATTRIBUTE_NORMAL`] and [`Mesh::ATTRIBUTE_UV_0`] attributes set.
+    /// Vertices shared by corners with different tangents are split, copying all
+    /// attributes and morph target deltas. Indices may be promoted from `u16` to `u32`.
     #[cfg(feature = "bevy_mikktspace")]
     pub fn generate_tangents(&mut self) -> Result<(), super::GenerateTangentsError> {
-        let tangents = super::generate_tangents_for_mesh(self)?;
+        let mut corners = super::generate_tangents_for_mesh(self)?;
+        let vertex_count = self.try_attribute(Self::ATTRIBUTE_POSITION)?.len();
+        let Some(indices) = self.try_indices_option()? else {
+            corners.resize(vertex_count, [0.; 4]);
+            self.try_insert_attribute(Mesh::ATTRIBUTE_TANGENT, corners)?;
+            return Ok(());
+        };
+        let mut tangents = vec![[0.; 4]; vertex_count];
+        let mut duplicates = Vec::new();
+        let mut replacement_indices = None;
+        let mut assigned = vec![false; vertex_count];
+        let mut split_indices = HashMap::new();
+        for (corner, (index, tangent)) in indices.iter().zip(corners).enumerate() {
+            let new_index = if !assigned[index] {
+                assigned[index] = true;
+                tangents[index] = tangent;
+                index
+            } else if tangents[index] == tangent {
+                index
+            } else {
+                // Treat 0.0 and -0.0 as equal, as `==` does.
+                let tangent_key =
+                    tangent.map(|value| if value == 0. { 0 } else { value.to_bits() });
+                *split_indices
+                    .entry((index, tangent_key))
+                    .or_insert_with(|| {
+                        let new_index = tangents.len();
+                        duplicates.push(index);
+                        tangents.push(tangent);
+                        new_index
+                    })
+            };
+            if new_index != index {
+                let indices = replacement_indices
+                    .get_or_insert_with(|| indices.iter().map(|i| i as u32).collect::<Vec<_>>());
+                indices[corner] =
+                    u32::try_from(new_index).expect("The number of vertices exceeds u32::MAX");
+            }
+        }
+        if !duplicates.is_empty() {
+            self.duplicate_tangent_seam_vertices(vertex_count, &duplicates)?;
+        }
+        if let Some(indices) = replacement_indices {
+            let indices = if matches!(self.try_indices_option()?, Some(Indices::U16(_)))
+                && indices.iter().all(|&i| i < u32::from(u16::MAX))
+            {
+                Indices::U16(indices.into_iter().map(|i| i as u16).collect())
+            } else {
+                Indices::U32(indices)
+            };
+            self.try_insert_indices(indices)?;
+        }
         self.try_insert_attribute(Mesh::ATTRIBUTE_TANGENT, tangents)?;
+        Ok(())
+    }
+
+    #[cfg(feature = "bevy_mikktspace")]
+    fn duplicate_tangent_seam_vertices(
+        &mut self,
+        vertex_count: usize,
+        duplicates: &[usize],
+    ) -> Result<(), super::GenerateTangentsError> {
+        // Check lengths before changing the mesh. Tangents are skipped because the
+        // caller replaces them.
+        for attribute in self.attributes.as_ref()?.values() {
+            if attribute.attribute.id == Self::ATTRIBUTE_TANGENT.id {
+                continue;
+            }
+            if attribute.values.len() != vertex_count {
+                return Err(super::GenerateTangentsError::InvalidVertexAttributeLength(
+                    attribute.attribute.name,
+                ));
+            }
+        }
+        #[cfg(feature = "morph")]
+        let new_morph_targets = if let Some(targets) = self.morph_targets.as_ref_option()? {
+            if !targets.len().is_multiple_of(vertex_count) {
+                return Err(super::GenerateTangentsError::InvalidMorphTargetLength);
+            }
+            let mut output = Vec::with_capacity(
+                targets.len() / vertex_count * (vertex_count + duplicates.len()),
+            );
+            for target in targets.chunks_exact(vertex_count) {
+                output.extend_from_slice(target);
+                output.extend(duplicates.iter().map(|&i| target[i]));
+            }
+            Some(output)
+        } else {
+            None
+        };
+
+        for attribute in self.attributes.as_mut()?.values_mut() {
+            if attribute.attribute.id == Self::ATTRIBUTE_TANGENT.id {
+                continue;
+            }
+            let mut copies = VertexAttributeValues::new(VertexFormat::from(&attribute.values));
+            for &index in duplicates {
+                copies.push_from(&attribute.values, index);
+            }
+            for index in 0..duplicates.len() {
+                attribute.values.push_from(&copies, index);
+            }
+        }
+        #[cfg(feature = "morph")]
+        if let Some(targets) = new_morph_targets {
+            self.morph_targets.replace(Some(targets))?;
+        }
         Ok(())
     }
 
