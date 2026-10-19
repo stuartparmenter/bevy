@@ -7,13 +7,15 @@ mod components;
 mod conversions;
 mod index;
 mod mesh;
+#[cfg(feature = "meshopt")]
+mod meshopt;
 #[cfg(feature = "bevy_mikktspace")]
 mod mikktspace;
 #[cfg(feature = "morph")]
 pub mod morph;
 pub mod primitives;
 pub mod skinning;
-#[cfg(feature = "bevy_mikktspace")]
+#[cfg(any(feature = "bevy_mikktspace", feature = "meshopt"))]
 mod tangent;
 mod vertex;
 use bevy_app::{App, Plugin, PostUpdate};
@@ -24,7 +26,7 @@ pub use components::*;
 pub use index::*;
 pub use mesh::*;
 pub use primitives::*;
-#[cfg(feature = "bevy_mikktspace")]
+#[cfg(any(feature = "bevy_mikktspace", feature = "meshopt"))]
 pub use tangent::*;
 pub use vertex::*;
 use wgpu_types::IndexFormat;

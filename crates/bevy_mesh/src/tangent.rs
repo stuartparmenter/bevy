@@ -8,12 +8,28 @@ use wgpu_types::{PrimitiveTopology, VertexFormat};
 /// An algorithm for [`Mesh::compute_tangents`](crate::Mesh::compute_tangents).
 ///
 /// Normal maps look correct only with tangents from the algorithm they were baked with.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Reflect)]
+/// Defaults to `Mikktspace`, which requires the `bevy_mikktspace` feature. Without that
+/// feature there is no default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Reflect)]
 #[cfg_attr(feature = "serialize", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "bevy_mikktspace", derive(Default))]
 pub enum TangentAlgorithm {
     /// The `MikkTSpace` algorithm, which most normal map bakers use.
+    #[cfg(feature = "bevy_mikktspace")]
     #[default]
     Mikktspace,
+    /// meshoptimizer's tangent generator with its default weighting.
+    ///
+    /// It weights triangles differently from `MikkTSpace`, so use `MeshoptCompatible` for
+    /// normal maps baked with `MikkTSpace`. Requires unit-length normals.
+    #[cfg(feature = "meshopt")]
+    Meshopt,
+    /// meshoptimizer's tangent generator with `MikkTSpace`-compatible weighting.
+    ///
+    /// The results are close to `MikkTSpace` but not identical, mostly near degenerate
+    /// triangles. Requires unit-length normals.
+    #[cfg(feature = "meshopt")]
+    MeshoptCompatible,
 }
 
 #[derive(Error, Debug)]
@@ -31,6 +47,7 @@ pub enum GenerateTangentsError {
     InvalidVertexAttributeLength(&'static str),
     #[error("index {0} is out of bounds for {1} vertices")]
     InvalidIndex(usize, usize),
+    #[cfg(feature = "bevy_mikktspace")]
     #[error("mesh not suitable for tangent generation")]
     MikktspaceError(#[from] bevy_mikktspace::GenerateTangentSpaceError),
     #[error("morph target data does not contain a whole number of targets")]
@@ -77,7 +94,8 @@ pub(crate) fn generate_tangents_for_mesh(
     };
 
     let len = positions.len();
-    // Extra attribute values and an incomplete trailing triangle are ignored.
+    // Extra attribute values and an incomplete trailing triangle are ignored. meshopt
+    // doesn't bounds-check indices, so out-of-range indices must be rejected here.
     if normals.len() < len {
         return Err(GenerateTangentsError::InvalidVertexAttributeLength(
             Mesh::ATTRIBUTE_NORMAL.name,
@@ -99,9 +117,28 @@ pub(crate) fn generate_tangents_for_mesh(
         return Err(GenerateTangentsError::InvalidIndex(index, len));
     }
     let mut tangents = match algorithm {
+        #[cfg(feature = "bevy_mikktspace")]
         TangentAlgorithm::Mikktspace => {
             crate::mikktspace::generate_tangents(indices, positions, normals, uvs)?
         }
+        #[cfg(feature = "meshopt")]
+        TangentAlgorithm::Meshopt => crate::meshopt::generate_tangents(
+            indices,
+            positions,
+            normals,
+            uvs,
+            corner_count,
+            meshopt::TangentOptions::None,
+        ),
+        #[cfg(feature = "meshopt")]
+        TangentAlgorithm::MeshoptCompatible => crate::meshopt::generate_tangents(
+            indices,
+            positions,
+            normals,
+            uvs,
+            corner_count,
+            meshopt::TangentOptions::Compatible,
+        ),
     };
 
     // Bevy uses the opposite bitangent sign convention.

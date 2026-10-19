@@ -160,6 +160,7 @@ This is the complete `bevy` cargo feature list, without "profiles" or "collectio
 |mesh_picking|Provides an implementation for picking meshes|
 |meshlet|Enables the meshlet renderer for dense high-poly scenes (experimental)|
 |meshlet_processor|Enables processing meshes into meshlet meshes for `bevy_pbr`|
+|meshopt|Adds meshoptimizer tangent algorithms. Requires a C++ compiler.|
 |morph|Enables support for morph target weights in bevy_mesh|
 |morph_animation|Enables bevy_mesh and bevy_animation morph weight support|
 |mouse|Mouse support. Automatically enabled by `bevy_window`.|
