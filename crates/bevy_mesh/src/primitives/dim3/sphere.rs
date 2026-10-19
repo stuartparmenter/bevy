@@ -165,6 +165,9 @@ impl SphereMeshBuilder {
     /// Creates a UV sphere [`Mesh`] with the given number of
     /// longitudinal sectors and latitudinal stacks, aka horizontal and vertical resolution.
     ///
+    /// Includes analytic tangents following lines of latitude, continuous across the
+    /// longitude seam away from the poles.
+    ///
     /// A good default is `32` sectors and `18` stacks.
     #[expect(
         clippy::explicit_counter_loop,
@@ -179,10 +182,11 @@ impl SphereMeshBuilder {
         let sector_step = 2. * PI / sectors_f32;
         let stack_step = PI / stacks_f32;
 
-        let n_vertices = (stacks * sectors) as usize;
+        let n_vertices = ((stacks + 1) * (sectors + 1)) as usize;
         let mut vertices: Vec<[f32; 3]> = Vec::with_capacity(n_vertices);
         let mut normals: Vec<[f32; 3]> = Vec::with_capacity(n_vertices);
         let mut uvs: Vec<[f32; 2]> = Vec::with_capacity(n_vertices);
+        let mut tangents: Vec<[f32; 4]> = Vec::with_capacity(n_vertices);
         let mut indices: Vec<u32> = Vec::with_capacity(n_vertices * 2 * 3);
 
         for i in 0..stacks + 1 {
@@ -192,12 +196,14 @@ impl SphereMeshBuilder {
 
             for j in 0..sectors + 1 {
                 let sector_angle = (j as f32) * sector_step;
-                let x = xy * ops::cos(sector_angle);
-                let y = xy * ops::sin(sector_angle);
+                let (sin, cos) = ops::sin_cos(sector_angle);
+                let x = xy * cos;
+                let y = xy * sin;
 
                 vertices.push([x, y, z]);
                 normals.push([x * length_inv, y * length_inv, z * length_inv]);
                 uvs.push([(j as f32) / sectors_f32, (i as f32) / stacks_f32]);
+                tangents.push([-sin, cos, 0.0, 1.0]);
             }
         }
 
@@ -233,6 +239,7 @@ impl SphereMeshBuilder {
         .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, vertices)
         .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
         .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_TANGENT, tangents)
     }
 }
 
@@ -265,5 +272,60 @@ impl Meshable for Sphere {
 impl From<Sphere> for Mesh {
     fn from(sphere: Sphere) -> Self {
         sphere.mesh().build()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::VertexAttributeValues;
+    use bevy_math::Vec3;
+
+    #[test]
+    fn uv_sphere_tangents_follow_uv_directions_and_join_at_seam() {
+        for (sectors, stacks) in [(3, 2), (32, 18)] {
+            let mesh = Sphere::default().mesh().uv(sectors, stacks);
+            let positions = mesh
+                .attribute(Mesh::ATTRIBUTE_POSITION)
+                .unwrap()
+                .as_float3()
+                .unwrap();
+            let normals = mesh
+                .attribute(Mesh::ATTRIBUTE_NORMAL)
+                .unwrap()
+                .as_float3()
+                .unwrap();
+            let VertexAttributeValues::Float32x4(tangents) =
+                mesh.attribute(Mesh::ATTRIBUTE_TANGENT).unwrap()
+            else {
+                panic!("expected Float32x4 tangents");
+            };
+            let row_length = sectors as usize + 1;
+            for stack in 0..=stacks as usize {
+                let row = stack * row_length;
+                let first = Vec3::from_slice(&tangents[row][..3]);
+                let last = Vec3::from_slice(&tangents[row + sectors as usize][..3]);
+                assert!(first.abs_diff_eq(last, 1e-6));
+                for sector in 0..=sectors as usize {
+                    let index = row + sector;
+                    let normal = Vec3::from(normals[index]);
+                    let tangent = Vec3::from_slice(&tangents[index][..3]);
+                    assert!((tangent.length_squared() - 1.0).abs() < 1e-6);
+                    assert!(normal.dot(tangent).abs() < 1e-6);
+                    if stack == 0 || stack == stacks as usize {
+                        continue;
+                    }
+                    let next = row + (sector + 1) % sectors as usize;
+                    let previous = row + (sector + sectors as usize - 1) % sectors as usize;
+                    let du = Vec3::from(positions[next]) - Vec3::from(positions[previous]);
+                    assert!(tangent.dot(du.normalize()) > 0.99999);
+                    let dv = Vec3::from(positions[index + row_length])
+                        - Vec3::from(positions[index - row_length]);
+                    // Bevy's bitangent points opposite increasing texture V.
+                    let bitangent = normal.cross(tangent) * tangents[index][3];
+                    assert!(bitangent.dot(dv.normalize()) < -0.99999);
+                }
+            }
+        }
     }
 }
