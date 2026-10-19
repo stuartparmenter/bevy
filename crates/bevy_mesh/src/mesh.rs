@@ -2194,7 +2194,7 @@ impl Mesh {
     /// Existing normals are not modified. Use the algorithm used to bake your normal maps.
     /// Vertices shared by corners with different tangents are split, copying all
     /// attributes and morph target deltas. Indices may be promoted from `u16` to `u32`.
-    #[cfg(feature = "bevy_mikktspace")]
+    #[cfg(any(feature = "bevy_mikktspace", feature = "meshopt"))]
     pub fn compute_tangents(
         &mut self,
         algorithm: super::TangentAlgorithm,
@@ -2255,7 +2255,7 @@ impl Mesh {
         Ok(())
     }
 
-    #[cfg(feature = "bevy_mikktspace")]
+    #[cfg(any(feature = "bevy_mikktspace", feature = "meshopt"))]
     fn duplicate_tangent_seam_vertices(
         &mut self,
         vertex_count: usize,
@@ -2312,7 +2312,7 @@ impl Mesh {
     /// Consumes the mesh and computes tangents using the selected algorithm.
     ///
     /// See [`Mesh::compute_tangents`] for requirements.
-    #[cfg(feature = "bevy_mikktspace")]
+    #[cfg(any(feature = "bevy_mikktspace", feature = "meshopt"))]
     pub fn with_computed_tangents(
         mut self,
         algorithm: super::TangentAlgorithm,
