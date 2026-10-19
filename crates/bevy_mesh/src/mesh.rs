@@ -1549,6 +1549,11 @@ impl Mesh {
             },
         }
 
+        #[cfg(feature = "meshopt")]
+        if self.try_merge_duplicate_vertices_meshopt()? {
+            return Ok(());
+        }
+
         #[derive(Copy, Clone)]
         struct VertexRef<'a> {
             mesh_attributes: &'a BTreeMap<MeshVertexAttributeId, MeshAttributeData>,
@@ -1632,6 +1637,44 @@ impl Mesh {
         self.indices = MeshExtractableData::Data(Indices::U32(indices));
 
         Ok(())
+    }
+
+    #[cfg(feature = "meshopt")]
+    fn try_merge_duplicate_vertices_meshopt(&mut self) -> Result<bool, MeshAccessError> {
+        let attributes = self.attributes.as_ref()?;
+        let Some((unique_count, remap)) =
+            crate::meshopt::generate_vertex_remap(attributes, self.count_vertices())
+        else {
+            return Ok(false);
+        };
+        let mut unique_vertices = Vec::with_capacity(unique_count);
+        for (old_index, &new_index) in remap.iter().enumerate() {
+            if new_index as usize == unique_vertices.len() {
+                unique_vertices.push(old_index);
+            }
+        }
+        let new_attributes = attributes
+            .iter()
+            .map(|(&id, attribute)| {
+                let mut values = VertexAttributeValues::new(VertexFormat::from(&attribute.values));
+                // The remapper numbers unique vertices in order of first appearance,
+                // preserving both the Rust implementation's vertex and index order.
+                for &old_index in &unique_vertices {
+                    values.push_from(&attribute.values, old_index);
+                }
+                values.shrink_to_fit();
+                (
+                    id,
+                    MeshAttributeData {
+                        attribute: attribute.attribute,
+                        values,
+                    },
+                )
+            })
+            .collect();
+        self.attributes = MeshExtractableData::Data(new_attributes);
+        self.indices = MeshExtractableData::Data(Indices::U32(remap));
+        Ok(true)
     }
 
     /// Consumes the mesh and returns a mesh with merged vertices.
@@ -3357,8 +3400,8 @@ mod tests {
     use super::SerializedMesh;
     use crate::mesh::{Indices, MeshWindingInvertError, VertexAttributeValues};
     use crate::{
-        AttributeQuantization, MeshAttributeCompressionFlags, MeshVertexAttribute,
-        PrimitiveTopology,
+        AttributeQuantization, MeshAttributeCompressionFlags, MeshMergeDuplicateVerticesError,
+        MeshVertexAttribute, PrimitiveTopology,
     };
     use bevy_asset::RenderAssetUsages;
     use bevy_math::{Vec2, Vec3, Vec3A, Vec4};
@@ -3819,6 +3862,101 @@ mod tests {
         };
         assert_eq!(&positions, new_positions);
         assert_eq!(&uvs, new_uvs);
+    }
+
+    #[test]
+    fn deduplication_preserves_float_bits_and_custom_attributes() {
+        let nan = f32::from_bits(0x7fc0_0001);
+        let other_nan = f32::from_bits(0x7fc0_0002);
+        let values = [0., -0., nan, nan, other_nan, 0., 0.];
+        let custom = MeshVertexAttribute::new("custom", 100, wgpu_types::VertexFormat::Uint8x2);
+        let mut mesh = Mesh::new(PrimitiveTopology::PointList, RenderAssetUsages::default())
+            .with_inserted_attribute(
+                Mesh::ATTRIBUTE_POSITION,
+                values.iter().map(|&x| [x, 0., 0.]).collect::<Vec<_>>(),
+            )
+            .with_inserted_attribute(
+                custom,
+                VertexAttributeValues::Uint8x2(vec![
+                    [1, 2],
+                    [1, 2],
+                    [1, 2],
+                    [1, 2],
+                    [1, 2],
+                    [1, 2],
+                    [2, 1],
+                ]),
+            );
+        mesh.merge_duplicate_vertices().unwrap();
+        assert_eq!(
+            mesh.indices(),
+            Some(&Indices::U32(vec![0, 1, 2, 2, 3, 0, 4]))
+        );
+        let VertexAttributeValues::Float32x3(positions) =
+            mesh.attribute(Mesh::ATTRIBUTE_POSITION).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(
+            positions.iter().map(|p| p[0].to_bits()).collect::<Vec<_>>(),
+            vec![
+                0_f32.to_bits(),
+                (-0_f32).to_bits(),
+                nan.to_bits(),
+                other_nan.to_bits(),
+                0_f32.to_bits()
+            ]
+        );
+        assert_eq!(mesh.attribute(custom).unwrap().len(), 5);
+        assert!(matches!(
+            mesh.merge_duplicate_vertices(),
+            Err(MeshMergeDuplicateVerticesError::IndicesAlreadySet)
+        ));
+    }
+
+    #[test]
+    fn deduplication_supports_empty_and_many_attribute_meshes() {
+        for attribute_count in [0, 1, 16, 17] {
+            for vertex_count in [0, 6] {
+                let mut mesh = Mesh::new(
+                    PrimitiveTopology::TriangleList,
+                    RenderAssetUsages::default(),
+                );
+                for attribute in 0..attribute_count {
+                    let id = MeshVertexAttribute::new(
+                        "custom",
+                        100 + attribute,
+                        wgpu_types::VertexFormat::Uint32,
+                    );
+                    mesh.insert_attribute(
+                        id,
+                        (0..vertex_count)
+                            .map(|i| (i % 3) as u32)
+                            .collect::<Vec<_>>(),
+                    );
+                }
+                mesh.merge_duplicate_vertices().unwrap();
+                let expected = if attribute_count == 0 || vertex_count == 0 {
+                    vec![]
+                } else {
+                    vec![0, 1, 2, 0, 1, 2]
+                };
+                assert_eq!(mesh.indices(), Some(&Indices::U32(expected)));
+                for (_, values) in mesh.attributes() {
+                    assert_eq!(values.len(), vertex_count.min(3));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn deduplication_truncates_attributes_to_the_shortest_stream() {
+        let mut mesh = Mesh::new(PrimitiveTopology::PointList, RenderAssetUsages::default())
+            .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, vec![[0.; 3]; 4])
+            .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, vec![[0.; 2]; 3]);
+        mesh.merge_duplicate_vertices().unwrap();
+        assert_eq!(mesh.indices(), Some(&Indices::U32(vec![0, 0, 0])));
+        assert_eq!(mesh.count_vertices(), 1);
     }
 
     #[test]
