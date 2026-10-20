@@ -29,7 +29,8 @@ fn load_previous_gpixel(pixel_id: vec2<u32>, depth: f32) -> ResolvedGPixel {
 
 fn gpixel_resolve(gpixel: vec4<u32>, gpixel_tint_transmission: u32, depth: f32, pixel_id: vec2<u32>, view_size: vec2<f32>, world_from_clip: mat4x4<f32>) -> ResolvedGPixel {
     let world_position = reconstruct_world_position(pixel_id, depth, view_size, world_from_clip);
-    let world_normal = octahedral_decode(unpack_24bit_normal(gpixel.a));
+    let wo = normalize(reconstruct_world_position(pixel_id, 1.0, view_size, world_from_clip) - world_position);
+    let world_normal = face_view(octahedral_decode(unpack_24bit_normal(gpixel.a)), wo);
 
     let base_rough = unpack4x8unorm(gpixel.r);
     let base_color = pow(base_rough.rgb, vec3(2.2));
@@ -119,4 +120,17 @@ fn permute_pixel(pixel_id: vec2<u32>, frame_index: u32, view_size: vec2<f32>) ->
         return pixel_id;
     }
     return vec2<u32>(shifted_pixel_id);
+}
+
+/// Least cosine between a primary surface's shading normal and the direction to the camera.
+const MIN_PRIMARY_N_DOT_V = 0.01;
+
+/// `normal` leaned toward `wo` until it faces the camera. A normal map tilts some texels of a
+/// surface seen edge-on past its silhouette, where the BRDF has no value and the pixel goes black.
+fn face_view(normal: vec3<f32>, wo: vec3<f32>) -> vec3<f32> {
+    let n_dot_v = dot(normal, wo);
+    if n_dot_v >= MIN_PRIMARY_N_DOT_V {
+        return normal;
+    }
+    return normalize(normal + (MIN_PRIMARY_N_DOT_V - n_dot_v) * wo);
 }
