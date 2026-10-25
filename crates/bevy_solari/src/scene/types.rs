@@ -141,10 +141,10 @@ pub struct RaytracingInstanceTag(pub u32);
 /// Which rays trace a raytracing instance: the mask of its TLAS instance.
 ///
 /// Bit 0 ([`Self::ALL_RAYS`]) makes the instance visible to every ray. A directional shadow ray
-/// past [`ShadowTiers::near_radius`] instead picks one of bits 1 to 7 uniformly at random, so an
-/// instance set in `k` of them occludes `k / 7` of that light ([`Self::partial_occluder`]).
-/// Insert it beside [`RaytracingMesh3d`] or [`RaytracingGeometry`]; absence is
-/// [`Self::ALL_RAYS`].
+/// past its handoff from the near tier of [`ShadowTiers`] instead picks one of bits 1 to 7
+/// uniformly at random, so an instance set in `k` of them occludes `k / 7` of that light
+/// ([`Self::partial_occluder`]). Insert it beside [`RaytracingMesh3d`] or [`RaytracingGeometry`];
+/// absence is [`Self::ALL_RAYS`].
 #[derive(Component, Clone, Copy, Debug, PartialEq, Eq, Reflect)]
 #[reflect(Component, Default, Clone, PartialEq)]
 pub struct RaytracingInstanceMask(pub u8);
@@ -152,15 +152,15 @@ pub struct RaytracingInstanceMask(pub u8);
 impl RaytracingInstanceMask {
     /// Visible to every ray and every shadow tier.
     pub const ALL: Self = Self(0xFF);
-    /// Visible to every ray that is not a directional shadow ray past the near radius.
+    /// Visible to every ray that is not a directional shadow ray past the near tier.
     pub const ALL_RAYS: Self = Self(1);
-    /// Bits a directional shadow ray past the near radius picks one of.
+    /// Bits a directional shadow ray past the near tier picks one of.
     pub const PARTIAL_BITS: u8 = 0xFE;
     /// How many it picks among: the shader's `partial_mask` takes `rand % PARTIAL_COUNT`.
     pub const PARTIAL_COUNT: u32 = Self::PARTIAL_BITS.count_ones();
 
     /// Occludes `opacity` (clamped to `[0, 1]`, in sevenths) of directional light past the near
-    /// radius, and nothing else. `salt` rotates which bits are set: a ray through occluders of
+    /// tier, and nothing else. `salt` rotates which bits are set: a ray through occluders of
     /// different salts is blocked by their union, so they compound like independent ones, while
     /// occluders of one salt block only as much as the most opaque of them.
     pub fn partial_occluder(opacity: f32, salt: u32) -> Self {
@@ -250,6 +250,19 @@ pub struct ShadowTiers {
     /// At least `near_radius`. Without a [`FarFieldVisibility`](super::FarFieldVisibility) the
     /// partial occluders are traced to any distance instead.
     pub mid_radius: f32,
+    /// Width of the band inside `near_radius` across which shadow rays hand off from the near tier
+    /// to the mid tier, clamped to `[0, near_radius]`. 0 hands off at `near_radius`, a hard edge
+    /// where an occluder's full geometry gives way to its stand-in.
+    ///
+    /// Each ray hands off at a radius drawn uniformly from the band, so the share of rays that
+    /// trace an occluder in full falls linearly across it and the denoiser blends the tiers into a
+    /// gradient. The draw varies with the light sample's direction: under a light without an
+    /// angular size the band is a fixed dither instead.
+    ///
+    /// Inside the band the scene's instances with bit 0 and the partial occluders both cast:
+    /// keep the former in the TLAS out to `near_radius` and the latter from
+    /// `near_radius - near_transition_width` on.
+    pub near_transition_width: f32,
 }
 
 /// One mesh of a [`RaytracingInstanceGroup`], with the material it is traced with.

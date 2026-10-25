@@ -11,6 +11,7 @@ struct GpuTierSphere {
     center: Vec3,
     near_radius: f32,
     mid_radius: f32,
+    near_transition_width: f32,
 }
 
 /// `ShadowTiers` in `bindings.wesl`.
@@ -45,6 +46,7 @@ impl ShadowTiersState {
                 center: tiers.center,
                 near_radius: tiers.near_radius,
                 mid_radius: tiers.mid_radius.max(tiers.near_radius),
+                near_transition_width: tiers.near_transition_width.min(tiers.near_radius).max(0.0),
             };
             let previous = if last.tiered == 1 {
                 last.spheres[0]

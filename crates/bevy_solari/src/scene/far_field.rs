@@ -16,10 +16,11 @@ use bevy_shader::Shader;
 /// The module defines
 /// `fn far_field_visibility(origin: vec3<f32>, direction: vec3<f32>, near_t: f32, mid_t: f32, previous: bool) -> f32`:
 /// the transmittance of the light along the unit `direction` from `origin`. The scene's
-/// instances block nothing up to `near_t` and its partial occluders nothing up to `mid_t`, where
-/// the ray leaves the near and mid spheres (`near_t <= mid_t`, each 0 when the origin is outside
-/// its sphere), in the previous frame's world when `previous`. The module's bindings are group
-/// [`Self::BIND_GROUP`] of `bind_group_layout`, bound from [`FarFieldVisibilityBindGroup`].
+/// instances block nothing up to `near_t`, where the ray leaves the near tier, and its partial
+/// occluders nothing up to `mid_t`, where it leaves the mid sphere (`near_t <= mid_t`, each 0
+/// when the origin is already past it), in the previous frame's world when `previous`. The
+/// module's bindings are group [`Self::BIND_GROUP`] of `bind_group_layout`, bound from
+/// [`FarFieldVisibilityBindGroup`].
 /// Inside the module `package` is `bevy_solari`, so it may import `package::scene::bindings`.
 #[derive(Resource)]
 pub struct FarFieldVisibility {

@@ -144,6 +144,7 @@ struct TierSphere {
     center: vec3<f32>,
     near_radius: f32,
     mid_radius: f32,
+    near_transition_width: f32,
 }
 
 /// `ShadowTiers` of the scene. See `shadow_tiers.wesl`.
