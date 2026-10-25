@@ -1,5 +1,5 @@
-//! Numerical scenarios for `offset_surface_ray_origin` in `bindings.wesl`, mirrored in f32
-//! and intersected against the true triangle plane.
+//! Numerical scenarios for `offset_surface_ray_origin` and `offset_ray_origin_along_normal` in
+//! `bindings.wesl`, mirrored in f32 and intersected against the true triangle plane.
 
 use bevy_math::Vec3;
 
@@ -199,12 +199,44 @@ fn grazing_ray_does_not_hit_its_own_finite_triangle() {
 /// `RAY_T_MIN` in `bindings.wesl`.
 const RAY_T_MIN: f32 = 0.001;
 
+/// `ray_origin_offset` in `bindings.wesl`.
+fn ray_origin_offset(p: Vec3) -> f32 {
+    (4.0 * f32::EPSILON * p.abs().max_element()).max(RAY_T_MIN)
+}
+
 /// `offset_ray_origin_along_normal`, the `NORMAL_OFFSET_ORIGIN` policy.
 fn offset_along_normal(p: Vec3, n: Vec3, d: Vec3) -> Vec3 {
-    p + n * if n.dot(d) >= 0.0 {
-        RAY_T_MIN
-    } else {
-        -RAY_T_MIN
+    let offset = ray_origin_offset(p);
+    p + n * if n.dot(d) >= 0.0 { offset } else { -offset }
+}
+
+/// A world position 15 km from the origin, where one f32 ULP of its largest coordinate is about
+/// 1 mm and a fixed `RAY_T_MIN` offset is a single ULP.
+const DISTANT_POSITION: Vec3 = Vec3::new(9000.0, 410.0, 15000.0);
+
+#[test]
+fn normal_offset_scales_with_distance_from_the_origin() {
+    let plane = DISTANT_POSITION;
+    // A side wall and flat ground: a position reconstructed from depth carries the rounding of its
+    // largest coordinate along either normal, here three ULPs of 15 km.
+    for n in [Vec3::Z, Vec3::Y] {
+        for side in [-1.0, 1.0] {
+            let d = (n * (0.8 * side) + n.cross(Vec3::X).normalize() * 0.6).normalize();
+            let p = plane - n * (side * 0.003);
+            assert!(
+                plane_hit(p + n * (side * RAY_T_MIN), d, plane, n) > 0.0,
+                "a fixed RAY_T_MIN offset leaves the origin behind its own plane"
+            );
+            let shifted = offset_along_normal(p, n, d);
+            assert!(
+                plane_hit(shifted, d, plane, n) < 0.0,
+                "own plane is behind the ray"
+            );
+            assert!(
+                plane_hit(shifted, d, plane + n * (0.02 * side), n) > 0.001,
+                "an occluder 2 cm away stays visible"
+            );
+        }
     }
 }
 

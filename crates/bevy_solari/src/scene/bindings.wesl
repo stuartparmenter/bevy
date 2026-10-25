@@ -190,15 +190,25 @@ const RAY_MASK_ALL_RAYS = 0x01u;
 /// Cross, normalize and dot are still f32, so exact tangency is not decidable.
 const EXACT_NORMAL_TANGENT_GUARD = 0.000001;
 
-/// `geometric_normal.w` of a surface whose rays leave `RAY_T_MIN` along its normal, on the ray's
-/// side: in front for reflected rays, behind for transmitted ones.
+/// `geometric_normal.w` of a surface whose rays leave `ray_origin_offset` along its normal, on the
+/// ray's side: in front for reflected rays, behind for transmitted ones.
 const NORMAL_OFFSET_ORIGIN = -1.0f;
+
+/// How far a ray origin leaves a surface at `position`: `RAY_T_MIN`, or four f32 epsilons of the
+/// position's largest coordinate where that is larger (beyond about 2 km from the origin). A
+/// position reconstructed from depth carries the rounding of every coordinate in every direction,
+/// so the allowance follows the largest coordinate, not the extent along the normal. A heuristic,
+/// not an error bound for arbitrary depth transforms.
+fn ray_origin_offset(position: vec3<f32>) -> f32 {
+    let p = abs(position);
+    return max(RAY_T_MIN, 4.0 * 1.1920928955078125e-7 * max(p.x, max(p.y, p.z)));
+}
 
 /// Moves the origin of a ray leaving a surface to the ray's side of it.
 ///
 /// With `geometric_normal.w` of `NORMAL_OFFSET_ORIGIN`, `geometric_normal.xyz` is the surface's
-/// normal and the origin moves `RAY_T_MIN` along it, on the ray's side: a ray transmitted through
-/// a closed mesh starts inside it, as through a thin one. Otherwise the surface is a thin
+/// normal and the origin moves `ray_origin_offset` along it, on the ray's side: a ray transmitted
+/// through a closed mesh starts inside it, as through a thin one. Otherwise the surface is a thin
 /// two-sided primary surface: `geometric_normal.xyz` is its face normal, of either sign, and
 /// `geometric_normal.w` the sine of that normal's angular uncertainty: a ray closer to the surface
 /// plane than that leaves from an unknown side and is not offset. `EXACT_NORMAL_TANGENT_GUARD` is
@@ -222,9 +232,10 @@ fn offset_surface_ray_origin(position: vec3<f32>, geometric_normal: vec4<f32>, d
     return position + normal * distance;
 }
 
-/// `position` moved `RAY_T_MIN` along `normal` to the side `direction` leaves by.
+/// `position` moved `ray_origin_offset` along `normal` to the side `direction` leaves by.
 fn offset_ray_origin_along_normal(position: vec3<f32>, normal: vec3<f32>, direction: vec3<f32>) -> vec3<f32> {
-    return position + normal * select(-RAY_T_MIN, RAY_T_MIN, dot(normal, direction) >= 0.0);
+    let offset = ray_origin_offset(position);
+    return position + normal * select(-offset, offset, dot(normal, direction) >= 0.0);
 }
 
 fn trace_ray(ray_origin: vec3<f32>, ray_direction: vec3<f32>, ray_t_min: f32, ray_t_max: f32, ray_flag: u32) -> RayIntersection {

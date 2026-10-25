@@ -2,7 +2,7 @@ import bevy_pbr::render::pbr_lighting::D_GGX;
 import bevy_pbr::render::utils::{rand_vec2f, rand_u, rand_range_u, sample_uniform_sphere};
 import bevy_render::maths::{PI_2, orthonormalize};
 import package::scene::shadow_tiers::directional_visibility;
-import package::scene::bindings::{offset_surface_ray_origin, occluded, RAY_MASK_ALL_RAYS, RAY_T_MIN, RAY_T_MAX, light_sources, directional_lights, point_lights, rect_lights, environment_map, environment_map_sampler, environment_map_light, LightSource, light_source_kind, emissive_mesh_triangle_count, LIGHT_SOURCE_KIND_EMISSIVE_MESH, LIGHT_SOURCE_KIND_DIRECTIONAL, LIGHT_SOURCE_KIND_POINT, LIGHT_SOURCE_KIND_RECT, resolve_triangle_data_full, ResolvedRayHitFull, MIRROR_ROUGHNESS_THRESHOLD};
+import package::scene::bindings::{offset_surface_ray_origin, occluded, ray_origin_offset, RAY_MASK_ALL_RAYS, RAY_T_MIN, RAY_T_MAX, light_sources, directional_lights, point_lights, rect_lights, environment_map, environment_map_sampler, environment_map_light, LightSource, light_source_kind, emissive_mesh_triangle_count, LIGHT_SOURCE_KIND_EMISSIVE_MESH, LIGHT_SOURCE_KIND_DIRECTIONAL, LIGHT_SOURCE_KIND_POINT, LIGHT_SOURCE_KIND_RECT, resolve_triangle_data_full, ResolvedRayHitFull, MIRROR_ROUGHNESS_THRESHOLD};
 
 enable wgpu_ray_query;
 
@@ -358,7 +358,8 @@ fn visibility(ray_origin: vec3<f32>, point: vec4<f32>, previous: bool) -> f32 {
     }
     let ray = point.xyz - ray_origin;
     let dist = length(ray);
-    let ray_t_max = dist - RAY_T_MIN;
+    // Stop short of the target's own surface by the same allowance an origin leaves by.
+    let ray_t_max = dist - ray_origin_offset(point.xyz);
     if ray_t_max < RAY_T_MIN { return 0.0; }
     return f32(!occluded(previous, ray_origin, ray / dist, RAY_T_MIN, ray_t_max, RAY_FLAG_NONE, RAY_MASK_ALL_RAYS));
 }

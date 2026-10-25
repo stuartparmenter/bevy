@@ -4,7 +4,7 @@ import bevy_render::maths::PI;
 import package::realtime::presample_light_tiles::unpack_resolved_light_sample;
 import package::realtime::atmosphere::calculate_light_contribution;
 import package::scene::sampling::{trace_visibility, sample_environment_map_light};
-import package::scene::bindings::{trace_ray, resolve_ray_hit_full, RAY_T_MIN};
+import package::scene::bindings::{trace_ray, resolve_ray_hit_full, offset_ray_origin_along_normal, RAY_T_MIN};
 import package::realtime::world_cache_query::query_world_cache_diffuse;
 import package::realtime::bindings::{
     light_tile_resolved_samples,
@@ -41,7 +41,7 @@ fn sample_gi(@builtin(workgroup_id) workgroup_id: vec3<u32>, @builtin(global_inv
     if rand_f(&rng) >= f32(constants.world_cache_cell_updates_soft_target) / f32(world_cache.active_cells_count) { return; }
 
     let ray_direction = sample_cosine_hemisphere(geometry_data.world_normal, &rng);
-    let ray = trace_ray(geometry_data.world_position + (geometry_data.world_normal * RAY_T_MIN), ray_direction, RAY_T_MIN, constants.world_cache_max_gi_ray_distance, RAY_FLAG_NONE);
+    let ray = trace_ray(offset_ray_origin_along_normal(geometry_data.world_position, geometry_data.world_normal, ray_direction), ray_direction, RAY_T_MIN, constants.world_cache_max_gi_ray_distance, RAY_FLAG_NONE);
     if ray.kind != RAY_QUERY_INTERSECTION_NONE {
         let ray_hit = resolve_ray_hit_full(ray);
         let cell_life = atomicLoad(&world_cache.life[cell_index]);
@@ -118,7 +118,7 @@ fn sample_random_light_ris(world_position: vec3<f32>, world_normal: vec3<f32>, w
         let inverse_target_function = select(0.0, 1.0 / selected_sample_target_function, selected_sample_target_function > 0.0);
         unbiased_contribution_weight = weight_sum * inverse_target_function;
 
-        unbiased_contribution_weight *= trace_visibility(world_position + (world_normal * RAY_T_MIN), selected_sample_world_position);
+        unbiased_contribution_weight *= trace_visibility(offset_ray_origin_along_normal(world_position, world_normal, world_normal), selected_sample_world_position);
     }
 
     return selected_sample_radiance * unbiased_contribution_weight;
