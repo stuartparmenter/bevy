@@ -370,7 +370,7 @@ bevy_image = ["bevy_internal/bevy_image"]
 # Provides a mesh format and some primitive meshing routines.
 bevy_mesh = ["bevy_internal/bevy_mesh"]
 
-# Provides vertex tangent generation for use with bevy_mesh.
+# Provides MikkTSpace vertex tangent generation for use with bevy_mesh.
 bevy_mikktspace = ["bevy_internal/bevy_mikktspace"]
 
 # Adds meshoptimizer tangent algorithms. Requires a C++ compiler.
