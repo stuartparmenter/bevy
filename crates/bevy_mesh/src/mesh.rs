@@ -1549,6 +1549,11 @@ impl Mesh {
             },
         }
 
+        #[cfg(feature = "meshopt")]
+        if self.try_merge_duplicate_vertices_meshopt()? {
+            return Ok(());
+        }
+
         #[derive(Copy, Clone)]
         struct VertexRef<'a> {
             mesh_attributes: &'a BTreeMap<MeshVertexAttributeId, MeshAttributeData>,
@@ -1632,6 +1637,44 @@ impl Mesh {
         self.indices = MeshExtractableData::Data(Indices::U32(indices));
 
         Ok(())
+    }
+
+    #[cfg(feature = "meshopt")]
+    fn try_merge_duplicate_vertices_meshopt(&mut self) -> Result<bool, MeshAccessError> {
+        let attributes = self.attributes.as_ref()?;
+        let Some((unique_count, remap)) =
+            crate::meshopt::generate_vertex_remap(attributes, self.count_vertices())
+        else {
+            return Ok(false);
+        };
+        let mut unique_vertices = Vec::with_capacity(unique_count);
+        for (old_index, &new_index) in remap.iter().enumerate() {
+            if new_index as usize == unique_vertices.len() {
+                unique_vertices.push(old_index);
+            }
+        }
+        let new_attributes = attributes
+            .iter()
+            .map(|(&id, attribute)| {
+                let mut values = VertexAttributeValues::new(VertexFormat::from(&attribute.values));
+                // meshoptimizer numbers vertices in order of first appearance, as the
+                // Rust path does.
+                for &old_index in &unique_vertices {
+                    values.push_from(&attribute.values, old_index);
+                }
+                values.shrink_to_fit();
+                (
+                    id,
+                    MeshAttributeData {
+                        attribute: attribute.attribute,
+                        values,
+                    },
+                )
+            })
+            .collect();
+        self.attributes = MeshExtractableData::Data(new_attributes);
+        self.indices = MeshExtractableData::Data(Indices::U32(remap));
+        Ok(true)
     }
 
     /// Consumes the mesh and returns a mesh with merged vertices.
