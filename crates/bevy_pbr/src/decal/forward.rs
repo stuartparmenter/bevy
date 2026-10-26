@@ -34,7 +34,7 @@ impl Plugin for ForwardDecalPlugin {
                 .mesh()
                 .build()
                 .rotated_by(Quat::from_rotation_arc(Vec3::Z, Vec3::Y))
-                .with_generated_tangents()
+                .with_computed_tangents(Default::default())
                 .unwrap(),
         );
 

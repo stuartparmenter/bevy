@@ -27,6 +27,7 @@ use bevy::{
     image::ImageLoaderSettings,
     light::Skybox,
     math::vec3,
+    mesh::TangentAlgorithm,
     prelude::*,
     ui_widgets::{radio_self_update, ValueChange},
 };
@@ -98,7 +99,7 @@ fn create_sphere_mesh(meshes: &mut Assets<Mesh>) -> Handle<Mesh> {
 
     let mut sphere_mesh = Sphere::new(1.0).mesh().build();
     sphere_mesh
-        .generate_tangents()
+        .compute_tangents(TangentAlgorithm::Mikktspace)
         .expect("Failed to generate tangents");
     meshes.add(sphere_mesh)
 }

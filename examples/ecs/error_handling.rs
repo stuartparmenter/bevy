@@ -2,6 +2,7 @@
 //! syntax.
 
 use bevy::ecs::{entity::SpawnError, error::warn, world::DeferredWorld};
+use bevy::mesh::TangentAlgorithm;
 use bevy::prelude::*;
 use bevy::shape::sampling::UniformMeshSampler;
 
@@ -88,7 +89,7 @@ fn setup(
 
     // Create a new sphere mesh:
     let mut sphere_mesh = Sphere::new(1.0).mesh().ico(7)?;
-    sphere_mesh.generate_tangents()?;
+    sphere_mesh.compute_tangents(TangentAlgorithm::Mikktspace)?;
 
     // Spawn the mesh into the scene:
     let mut sphere = commands.spawn((

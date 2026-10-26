@@ -3,7 +3,7 @@
 use bevy::{
     camera::Hdr,
     light::{CascadeShadowConfigBuilder, DirectionalLightShadowMap},
-    mesh::SphereKind,
+    mesh::{SphereKind, TangentAlgorithm},
     prelude::*,
 };
 use std::{
@@ -58,7 +58,7 @@ fn spawn_scene(
             .mesh()
             .kind(SphereKind::Ico { subdivisions: 50 })
             .build()
-            .with_generated_tangents()
+            .with_computed_tangents(TangentAlgorithm::Mikktspace)
             .unwrap(),
     );
 
