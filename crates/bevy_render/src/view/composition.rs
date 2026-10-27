@@ -96,6 +96,7 @@ pub fn resolve_composition_spaces(
                     main_texture_key(camera, view, texture_usage, *msaa),
                     SpaceInput {
                         entity,
+                        main_entity: view.retained_view_entity.main_entity.id(),
                         sorted_index: camera.sorted_camera_index_for_target,
                         // Extraction seeded each component with the camera's
                         // own request.
@@ -152,6 +153,8 @@ pub fn resolve_composition_spaces(
 /// Per-view input to [`resolve_spaces`].
 struct SpaceInput {
     entity: Entity,
+    /// The camera's main world entity, which warnings name.
+    main_entity: Entity,
     /// The camera's position in its render target's sorted camera order.
     sorted_index: usize,
     request: Option<CompositingSpace>,
@@ -244,7 +247,7 @@ fn resolve_spaces(
             if first_space != last_space {
                 diagnostics.push(
                     CompositingSpaceResolutionError::PreviousFrameSpaceMismatch {
-                        first: first.entity,
+                        first: first.main_entity,
                         first_space,
                         last_space,
                     },
@@ -289,7 +292,7 @@ fn resolve_members(
             diagnostics.push(CompositingSpaceResolutionError::ConflictingStackRequests {
                 requests: members
                     .iter()
-                    .filter_map(|member| member.request.map(|space| (member.entity, space)))
+                    .filter_map(|member| member.request.map(|space| (member.main_entity, space)))
                     .collect(),
             });
             None
@@ -303,7 +306,7 @@ fn resolve_members(
                 non_camera_2d: members
                     .iter()
                     .filter(|member| !member.is_camera_2d)
-                    .map(|member| member.entity)
+                    .map(|member| member.main_entity)
                     .collect(),
             });
         }
@@ -312,7 +315,7 @@ fn resolve_members(
 
     if space == Some(CompositingSpace::Oklab) && !members[0].signed_storage {
         diagnostics.push(CompositingSpaceResolutionError::OklabWithoutSignedStorage {
-            entities: members.iter().map(|member| member.entity).collect(),
+            entities: members.iter().map(|member| member.main_entity).collect(),
         });
         space = None;
     }
@@ -355,6 +358,7 @@ mod tests {
             ),
             SpaceInput {
                 entity: entity(raw),
+                main_entity: entity(raw),
                 sorted_index: index,
                 request,
                 clears: false,
