@@ -53,7 +53,7 @@ use bevy_render::{
     render_resource::{
         binding_types::{storage_buffer, storage_buffer_read_only, texture_2d, uniform_buffer},
         BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries,
-        BindingResource, Buffer, BufferBinding, BufferVec, CachedComputePipelineId,
+        BindingResource, Buffer, BufferBinding, BufferVec, CachedComputePipelineId, ComputePass,
         ComputePassDescriptor, ComputePipelineDescriptor, DynamicBindGroupLayoutEntries,
         PartialBufferVec, PipelineCache, RawBufferVec, ShaderStages, ShaderType,
         SparseBufferUpdateBindGroups, SparseBufferUpdateJobs, SparseBufferUpdatePipelines,
@@ -490,6 +490,14 @@ type WithAnyPrepass = Or<(
     With<DeferredPrepass>,
 )>;
 
+/// Matches the views that need indirect parameters built for the prepass.
+type PrepassIndirectParametersFilter = (
+    With<PreprocessBindGroups>,
+    Without<SkipGpuPreprocess>,
+    Without<NoIndirectDrawing>,
+    Or<(WithAnyPrepass, With<ShadowView>)>,
+);
+
 impl Plugin for GpuMeshPreprocessPlugin {
     fn build(&self, app: &mut App) {
         embedded_asset!(app, "mesh_preprocess.wesl");
@@ -540,30 +548,8 @@ impl Plugin for GpuMeshPreprocessPlugin {
             .add_systems(
                 Core3d,
                 (
-                    (
-                        allocate_uniforms,
-                        unpack_bins,
-                        early_gpu_preprocess,
-                        early_prepass_build_indirect_parameters.run_if(any_match_filter::<(
-                            With<PreprocessBindGroups>,
-                            Without<SkipGpuPreprocess>,
-                            Without<NoIndirectDrawing>,
-                            Or<(WithAnyPrepass, With<ShadowView>)>,
-                        )>),
-                    )
-                        .chain()
-                        .before(early_prepass),
-                    (
-                        late_gpu_preprocess,
-                        late_prepass_build_indirect_parameters.run_if(any_match_filter::<(
-                            With<PreprocessBindGroups>,
-                            Without<SkipGpuPreprocess>,
-                            Without<NoIndirectDrawing>,
-                            Or<(WithAnyPrepass, With<ShadowView>)>,
-                            With<OcclusionCulling>,
-                        )>),
-                    )
-                        .chain()
+                    early_gpu_preprocess.before(early_prepass),
+                    late_gpu_preprocess
                         .after(early_downsample_depth)
                         .before(late_prepass),
                     main_build_indirect_parameters
@@ -572,7 +558,7 @@ impl Plugin for GpuMeshPreprocessPlugin {
                             Without<SkipGpuPreprocess>,
                             Without<NoIndirectDrawing>,
                         )>)
-                        .after(late_prepass_build_indirect_parameters)
+                        .after(late_gpu_preprocess)
                         .after(late_deferred_prepass)
                         .before(Core3dSystems::MainPass),
                 ),
@@ -580,25 +566,20 @@ impl Plugin for GpuMeshPreprocessPlugin {
     }
 }
 
-/// A rendering system that invokes a compute shader for each batch set in order
-/// to determine where `MeshUniform`s should be placed.
+/// Invokes a compute shader for each batch set in order to determine where
+/// `MeshUniform`s should be placed.
 ///
 /// This shader exists because a single batch set could contain many meshes. By
 /// performing this on the GPU, we avoid having to traverse every visible mesh
 /// on the CPU every frame.
-pub fn allocate_uniforms(
-    current_view: ViewQuery<Option<&ViewLightEntities>, Without<SkipGpuPreprocess>>,
-    view_query: Query<&ExtractedView, Without<SkipGpuPreprocess>>,
-    light_query: Query<&LightEntity>,
-    batched_instance_buffers: Res<BatchedInstanceBuffers<MeshUniform, MeshInputUniform>>,
-    pipeline_cache: Res<PipelineCache>,
-    preprocess_pipelines: Res<PreprocessPipelines>,
-    uniform_allocation_bind_groups: Res<UniformAllocationBindGroups>,
-    mut render_context: RenderContext,
+fn allocate_uniforms(
+    compute_pass: &mut ComputePass,
+    retained_view_entities: impl Iterator<Item = RetainedViewEntity>,
+    batched_instance_buffers: &BatchedInstanceBuffers<MeshUniform, MeshInputUniform>,
+    pipeline_cache: &PipelineCache,
+    preprocess_pipelines: &PreprocessPipelines,
+    uniform_allocation_bind_groups: &UniformAllocationBindGroups,
 ) {
-    let diagnostics = render_context.diagnostic_recorder();
-    let diagnostics = diagnostics.as_deref();
-
     // Don't run if the shaders haven't been compiled yet.
 
     let (
@@ -633,31 +614,13 @@ pub fn allocate_uniforms(
         return;
     };
 
-    let command_encoder = render_context.command_encoder();
-    let mut compute_pass = command_encoder.begin_compute_pass(&ComputePassDescriptor {
-        label: Some("uniform allocation"),
-        timestamp_writes: None,
-    });
-
-    let pass_span = diagnostics.pass_span(&mut compute_pass, "uniform_allocation");
-
-    // Gather up all views.
-    let view_entity = current_view.entity();
-    let shadow_cascade_views = current_view.into_inner();
-    let all_views =
-        gather_shadow_cascades_for_view(view_entity, shadow_cascade_views, &light_query);
-
     // Loop over each view…
-    for view_entity in all_views {
-        let Ok(view) = view_query.get(view_entity) else {
-            continue;
-        };
-
+    for retained_view_entity in retained_view_entities {
         // …and each phase within each view.
         for phase_type_id in batched_instance_buffers.phase_instance_buffers.keys() {
             let uniform_allocation_buffers_key = SceneUnpackingBuffersKey {
                 phase: *phase_type_id,
-                view: view.retained_view_entity,
+                view: retained_view_entity,
             };
 
             // Fetch the bind groups for this (view, phase) combination.
@@ -700,44 +663,23 @@ pub fn allocate_uniforms(
             }
         }
     }
-
-    pass_span.end(&mut compute_pass);
 }
 
-/// A rendering system that invokes a compute shader for each batch set in order
-/// to generate preprocessing jobs for the subsequent mesh preprocessing shader.
+/// Invokes a compute shader for each batch set in order to generate
+/// preprocessing jobs for the subsequent mesh preprocessing shader.
 ///
 /// This shader exists because performing the unpack operation on the CPU is
 /// slow when there are many entities. By caching the bins on the GPU from frame
 /// to frame, we avoid having to perform a CPU-side traversal of every mesh
 /// instance every frame.
-pub fn unpack_bins(
-    current_view: ViewQuery<Option<&ViewLightEntities>, Without<SkipGpuPreprocess>>,
-    view_query: Query<&ExtractedView, Without<SkipGpuPreprocess>>,
-    light_query: Query<&LightEntity>,
-    batched_instance_buffers: Res<BatchedInstanceBuffers<MeshUniform, MeshInputUniform>>,
-    pipeline_cache: Res<PipelineCache>,
-    preprocess_pipelines: Res<PreprocessPipelines>,
-    bin_unpacking_bind_groups: Res<BinUnpackingBindGroups>,
-    mut render_context: RenderContext,
+fn unpack_bins(
+    compute_pass: &mut ComputePass,
+    retained_view_entities: impl Iterator<Item = RetainedViewEntity>,
+    batched_instance_buffers: &BatchedInstanceBuffers<MeshUniform, MeshInputUniform>,
+    pipeline_cache: &PipelineCache,
+    preprocess_pipelines: &PreprocessPipelines,
+    bin_unpacking_bind_groups: &BinUnpackingBindGroups,
 ) {
-    let diagnostics = render_context.diagnostic_recorder();
-    let diagnostics = diagnostics.as_deref();
-
-    let command_encoder = render_context.command_encoder();
-    let mut compute_pass = command_encoder.begin_compute_pass(&ComputePassDescriptor {
-        label: Some("bin unpacking"),
-        timestamp_writes: None,
-    });
-
-    let pass_span = diagnostics.pass_span(&mut compute_pass, "bin_unpacking");
-
-    // Gather up all views.
-    let view_entity = current_view.entity();
-    let shadow_cascade_views = current_view.into_inner();
-    let all_views =
-        gather_shadow_cascades_for_view(view_entity, shadow_cascade_views, &light_query);
-
     // Don't run if the shaders haven't been compiled yet.
     if let Some(bin_unpacking_pipeline_id) = preprocess_pipelines.bin_unpacking.pipeline_id
         && let Some(bin_unpacking_pipeline) =
@@ -746,16 +688,12 @@ pub fn unpack_bins(
         compute_pass.set_pipeline(bin_unpacking_pipeline);
 
         // Loop over each view…
-        for view_entity in all_views {
-            let Ok(view) = view_query.get(view_entity) else {
-                continue;
-            };
-
+        for retained_view_entity in retained_view_entities {
             // …and each phase within each view.
             for phase_type_id in batched_instance_buffers.phase_instance_buffers.keys() {
                 let scene_unpacking_buffers_key = SceneUnpackingBuffersKey {
                     phase: *phase_type_id,
-                    view: view.retained_view_entity,
+                    view: retained_view_entity,
                 };
 
                 // Fetch the bind groups for this (view, phase) combination.
@@ -783,53 +721,24 @@ pub fn unpack_bins(
             }
         }
     }
-
-    pass_span.end(&mut compute_pass);
 }
 
-pub fn early_gpu_preprocess(
-    current_view: ViewQuery<Option<&ViewLightEntities>, Without<SkipGpuPreprocess>>,
-    view_query: Query<
-        (
-            &ExtractedView,
-            Option<&PreprocessBindGroups>,
-            Option<&ViewUniformOffset>,
-            Has<NoIndirectDrawing>,
-            Has<OcclusionCulling>,
-        ),
-        Without<SkipGpuPreprocess>,
-    >,
-    light_query: Query<&LightEntity>,
-    batched_instance_buffers: Res<BatchedInstanceBuffers<MeshUniform, MeshInputUniform>>,
-    pipeline_cache: Res<PipelineCache>,
-    preprocess_pipelines: Res<PreprocessPipelines>,
-    mut ctx: RenderContext,
+/// Invokes the mesh preprocessing shader for the early phase on each of the
+/// given views.
+fn early_preprocess_meshes(
+    compute_pass: &mut ComputePass,
+    views: &[(
+        &ExtractedView,
+        Option<&PreprocessBindGroups>,
+        Option<&ViewUniformOffset>,
+        bool,
+        bool,
+    )],
+    batched_instance_buffers: &BatchedInstanceBuffers<MeshUniform, MeshInputUniform>,
+    pipeline_cache: &PipelineCache,
+    preprocess_pipelines: &PreprocessPipelines,
 ) {
-    let diagnostics = ctx.diagnostic_recorder();
-    let diagnostics = diagnostics.as_deref();
-
-    let command_encoder = ctx.command_encoder();
-
-    let mut compute_pass = command_encoder.begin_compute_pass(&ComputePassDescriptor {
-        label: Some("early_mesh_preprocessing"),
-        timestamp_writes: None,
-    });
-
-    let pass_span = diagnostics.pass_span(&mut compute_pass, "early_mesh_preprocessing");
-
-    let view_entity = current_view.entity();
-    let shadow_cascade_views = current_view.into_inner();
-    let all_views =
-        gather_shadow_cascades_for_view(view_entity, shadow_cascade_views, &light_query);
-
-    // Run the compute passes.
-    for view_entity in all_views {
-        let Ok((view, bind_groups, view_uniform_offset, no_indirect_drawing, occlusion_culling)) =
-            view_query.get(view_entity)
-        else {
-            continue;
-        };
-
+    for &(view, bind_groups, view_uniform_offset, no_indirect_drawing, occlusion_culling) in views {
         let Some(bind_groups) = bind_groups else {
             continue;
         };
@@ -974,8 +883,6 @@ pub fn early_gpu_preprocess(
             }
         }
     }
-
-    pass_span.end(&mut compute_pass);
 }
 
 /// A helper function that returns all the shadow cascades that need to be
@@ -1003,24 +910,16 @@ fn gather_shadow_cascades_for_view(
     all_views
 }
 
-pub fn late_gpu_preprocess(
-    current_view: ViewQuery<
-        (&ExtractedView, &PreprocessBindGroups, &ViewUniformOffset),
-        (
-            Without<SkipGpuPreprocess>,
-            Without<NoIndirectDrawing>,
-            With<OcclusionCulling>,
-            With<DepthPrepass>,
-        ),
-    >,
-    batched_instance_buffers: Res<BatchedInstanceBuffers<MeshUniform, MeshInputUniform>>,
-    pipeline_cache: Res<PipelineCache>,
-    preprocess_pipelines: Res<PreprocessPipelines>,
-    mut ctx: RenderContext,
+/// Invokes the mesh preprocessing shader for the late phase on the given view.
+fn late_preprocess_meshes(
+    compute_pass: &mut ComputePass,
+    view: &ExtractedView,
+    bind_groups: &PreprocessBindGroups,
+    view_uniform_offset: &ViewUniformOffset,
+    batched_instance_buffers: &BatchedInstanceBuffers<MeshUniform, MeshInputUniform>,
+    pipeline_cache: &PipelineCache,
+    preprocess_pipelines: &PreprocessPipelines,
 ) {
-    let (view, bind_groups, view_uniform_offset) = current_view.into_inner();
-
-    // Fetch the pipeline BEFORE starting diagnostic spans to avoid panic on early return
     let maybe_pipeline_id = preprocess_pipelines
         .late_gpu_occlusion_culling_preprocess
         .pipeline_id;
@@ -1035,18 +934,6 @@ pub fn late_gpu_preprocess(
         // This will happen while the pipeline is being compiled and is fine.
         return;
     };
-
-    let diagnostics = ctx.diagnostic_recorder();
-    let diagnostics = diagnostics.as_deref();
-
-    let command_encoder = ctx.command_encoder();
-
-    let mut compute_pass = command_encoder.begin_compute_pass(&ComputePassDescriptor {
-        label: Some("late_mesh_preprocessing"),
-        timestamp_writes: None,
-    });
-
-    let pass_span = diagnostics.pass_span(&mut compute_pass, "late_mesh_preprocessing");
 
     compute_pass.set_pipeline(preprocess_pipeline);
 
@@ -1133,61 +1020,191 @@ pub fn late_gpu_preprocess(
             );
         }
     }
-
-    pass_span.end(&mut compute_pass);
 }
 
-/// A render graph system, run for each view, that builds the indirect
-/// parameters for multi-draw indirect calls for the early prepass.
-///
-/// The early prepass is the prepass that draws objects that were visible in the
+/// A render graph system, run for each view, that prepares meshes on the GPU
+/// for the early prepass, which draws the meshes that were visible in the
 /// previous frame.
-pub fn early_prepass_build_indirect_parameters(
-    current_view: ViewQuery<&ExtractedView>,
-    preprocess_pipelines: Res<PreprocessPipelines>,
-    build_indirect_params_bind_groups: Option<Res<BuildIndirectParametersBindGroups>>,
+///
+/// For the view and its directional light shadow cascades, this allocates mesh
+/// uniforms, generates the preprocessing work items, and transforms and culls
+/// the meshes. It then builds the view's indirect parameters for the early
+/// prepass. All of this is recorded in one compute pass.
+pub fn early_gpu_preprocess(
+    current_view: ViewQuery<(
+        &ExtractedView,
+        Option<&ViewLightEntities>,
+        Has<SkipGpuPreprocess>,
+    )>,
+    view_query: Query<
+        (
+            &ExtractedView,
+            Option<&PreprocessBindGroups>,
+            Option<&ViewUniformOffset>,
+            Has<NoIndirectDrawing>,
+            Has<OcclusionCulling>,
+        ),
+        Without<SkipGpuPreprocess>,
+    >,
+    indirect_parameters_views: Query<(), PrepassIndirectParametersFilter>,
+    light_query: Query<&LightEntity>,
+    batched_instance_buffers: Res<BatchedInstanceBuffers<MeshUniform, MeshInputUniform>>,
     pipeline_cache: Res<PipelineCache>,
+    preprocess_pipelines: Res<PreprocessPipelines>,
+    uniform_allocation_bind_groups: Res<UniformAllocationBindGroups>,
+    bin_unpacking_bind_groups: Res<BinUnpackingBindGroups>,
+    build_indirect_params_bind_groups: Option<Res<BuildIndirectParametersBindGroups>>,
     indirect_parameters_buffers: Option<Res<IndirectParametersBuffers>>,
     build_indirect_parameters_uniform_indices: Res<BuildIndirectParametersMetadata>,
     mut ctx: RenderContext,
 ) {
-    run_build_indirect_parameters(
-        &mut ctx,
-        current_view.into_inner().retained_view_entity,
-        build_indirect_params_bind_groups.as_deref(),
-        &pipeline_cache,
-        indirect_parameters_buffers.as_deref(),
-        &build_indirect_parameters_uniform_indices,
-        &preprocess_pipelines.early_phase,
-        "early_prepass_indirect_parameters_building",
-    );
+    let view_entity = current_view.entity();
+    let (view, view_light_entities, skip_gpu_preprocess) = current_view.into_inner();
+
+    // This checks all views, not only the current one.
+    let build_indirect_parameters = !indirect_parameters_views.is_empty();
+
+    if skip_gpu_preprocess && !build_indirect_parameters {
+        return;
+    }
+
+    let diagnostics = ctx.diagnostic_recorder();
+    let diagnostics = diagnostics.as_deref();
+
+    let mut compute_pass = ctx
+        .command_encoder()
+        .begin_compute_pass(&ComputePassDescriptor {
+            label: Some("early_gpu_preprocess"),
+            timestamp_writes: None,
+        });
+
+    if !skip_gpu_preprocess {
+        let views: SmallVec<[_; 8]> =
+            gather_shadow_cascades_for_view(view_entity, view_light_entities, &light_query)
+                .into_iter()
+                .filter_map(|view_entity| view_query.get(view_entity).ok())
+                .collect();
+        let retained_view_entities = || views.iter().map(|(view, ..)| view.retained_view_entity);
+
+        let pass_span = diagnostics.pass_span(&mut compute_pass, "uniform_allocation");
+        allocate_uniforms(
+            &mut compute_pass,
+            retained_view_entities(),
+            &batched_instance_buffers,
+            &pipeline_cache,
+            &preprocess_pipelines,
+            &uniform_allocation_bind_groups,
+        );
+        pass_span.end(&mut compute_pass);
+
+        let pass_span = diagnostics.pass_span(&mut compute_pass, "bin_unpacking");
+        unpack_bins(
+            &mut compute_pass,
+            retained_view_entities(),
+            &batched_instance_buffers,
+            &pipeline_cache,
+            &preprocess_pipelines,
+            &bin_unpacking_bind_groups,
+        );
+        pass_span.end(&mut compute_pass);
+
+        let pass_span = diagnostics.pass_span(&mut compute_pass, "early_mesh_preprocessing");
+        early_preprocess_meshes(
+            &mut compute_pass,
+            &views,
+            &batched_instance_buffers,
+            &pipeline_cache,
+            &preprocess_pipelines,
+        );
+        pass_span.end(&mut compute_pass);
+    }
+
+    if build_indirect_parameters {
+        run_build_indirect_parameters(
+            &mut compute_pass,
+            view.retained_view_entity,
+            build_indirect_params_bind_groups.as_deref(),
+            &pipeline_cache,
+            indirect_parameters_buffers.as_deref(),
+            &build_indirect_parameters_uniform_indices,
+            &preprocess_pipelines.early_phase,
+        );
+    }
 }
 
-/// A render graph system, run for each view, that builds the indirect
-/// parameters for multi-draw indirect calls for the late prepass.
+/// A render graph system, run for each view, that prepares meshes on the GPU
+/// for the late prepass, which draws the meshes that weren't visible in the
+/// previous frame but became visible in this one.
 ///
-/// The late prepass is the prepass that draws objects that weren't visible in
-/// the previous frame but became visible this frame (disocclusions). It'll be
-/// skipped if occlusion culling is disabled.
-pub fn late_prepass_build_indirect_parameters(
+/// For a view with [`OcclusionCulling`] and a [`DepthPrepass`], this transforms
+/// and culls again the meshes that the early phase culled as occluded. It then
+/// builds the view's indirect parameters for the late prepass. Both are
+/// recorded in one compute pass.
+pub fn late_gpu_preprocess(
     current_view: ViewQuery<&ExtractedView>,
+    preprocess_views: Query<
+        (&PreprocessBindGroups, &ViewUniformOffset),
+        (
+            Without<SkipGpuPreprocess>,
+            Without<NoIndirectDrawing>,
+            With<OcclusionCulling>,
+            With<DepthPrepass>,
+        ),
+    >,
+    indirect_parameters_views: Query<(), (PrepassIndirectParametersFilter, With<OcclusionCulling>)>,
+    batched_instance_buffers: Res<BatchedInstanceBuffers<MeshUniform, MeshInputUniform>>,
+    pipeline_cache: Res<PipelineCache>,
     preprocess_pipelines: Res<PreprocessPipelines>,
     build_indirect_params_bind_groups: Option<Res<BuildIndirectParametersBindGroups>>,
-    pipeline_cache: Res<PipelineCache>,
     indirect_parameters_buffers: Option<Res<IndirectParametersBuffers>>,
     build_indirect_parameters_uniform_indices: Res<BuildIndirectParametersMetadata>,
     mut ctx: RenderContext,
 ) {
-    run_build_indirect_parameters(
-        &mut ctx,
-        current_view.into_inner().retained_view_entity,
-        build_indirect_params_bind_groups.as_deref(),
-        &pipeline_cache,
-        indirect_parameters_buffers.as_deref(),
-        &build_indirect_parameters_uniform_indices,
-        &preprocess_pipelines.late_phase,
-        "late_prepass_indirect_parameters_building",
-    );
+    let preprocess_view = preprocess_views.get(current_view.entity()).ok();
+    let view = current_view.into_inner();
+
+    // This checks all views, not only the current one.
+    let build_indirect_parameters = !indirect_parameters_views.is_empty();
+
+    if preprocess_view.is_none() && !build_indirect_parameters {
+        return;
+    }
+
+    let diagnostics = ctx.diagnostic_recorder();
+    let diagnostics = diagnostics.as_deref();
+
+    let mut compute_pass = ctx
+        .command_encoder()
+        .begin_compute_pass(&ComputePassDescriptor {
+            label: Some("late_gpu_preprocess"),
+            timestamp_writes: None,
+        });
+
+    if let Some((bind_groups, view_uniform_offset)) = preprocess_view {
+        let pass_span = diagnostics.pass_span(&mut compute_pass, "late_mesh_preprocessing");
+        late_preprocess_meshes(
+            &mut compute_pass,
+            view,
+            bind_groups,
+            view_uniform_offset,
+            &batched_instance_buffers,
+            &pipeline_cache,
+            &preprocess_pipelines,
+        );
+        pass_span.end(&mut compute_pass);
+    }
+
+    if build_indirect_parameters {
+        run_build_indirect_parameters(
+            &mut compute_pass,
+            view.retained_view_entity,
+            build_indirect_params_bind_groups.as_deref(),
+            &pipeline_cache,
+            indirect_parameters_buffers.as_deref(),
+            &build_indirect_parameters_uniform_indices,
+            &preprocess_pipelines.late_phase,
+        );
+    }
 }
 
 /// A render graph system, run for each view, that builds the indirect
@@ -1202,29 +1219,33 @@ pub fn main_build_indirect_parameters(
     build_indirect_parameters_uniform_indices: Res<BuildIndirectParametersMetadata>,
     mut ctx: RenderContext,
 ) {
+    let mut compute_pass = ctx
+        .command_encoder()
+        .begin_compute_pass(&ComputePassDescriptor {
+            label: Some("main_indirect_parameters_building"),
+            timestamp_writes: None,
+        });
     run_build_indirect_parameters(
-        &mut ctx,
+        &mut compute_pass,
         current_view.into_inner().retained_view_entity,
         build_indirect_params_bind_groups.as_deref(),
         &pipeline_cache,
         indirect_parameters_buffers.as_deref(),
         &build_indirect_parameters_uniform_indices,
         &preprocess_pipelines.main_phase,
-        "main_indirect_parameters_building",
     );
 }
 
-/// Shared logic common to all render graph systems that build indirect
-/// parameters for multi-draw indirect calls.
+/// Records the dispatches that build indirect parameters for multi-draw
+/// indirect calls into the given compute pass.
 pub(crate) fn run_build_indirect_parameters(
-    ctx: &mut RenderContext,
+    compute_pass: &mut ComputePass,
     retained_view_entity: RetainedViewEntity,
     build_indirect_params_bind_groups: Option<&BuildIndirectParametersBindGroups>,
     pipeline_cache: &PipelineCache,
     indirect_parameters_buffers: Option<&IndirectParametersBuffers>,
     build_indirect_parameters_uniform_indices: &BuildIndirectParametersMetadata,
     preprocess_phase_pipelines: &PreprocessPhasePipelines,
-    label: &'static str,
 ) {
     let Some(build_indirect_params_bind_groups) = build_indirect_params_bind_groups else {
         return;
@@ -1237,13 +1258,6 @@ pub(crate) fn run_build_indirect_parameters(
     else {
         return;
     };
-
-    let command_encoder = ctx.command_encoder();
-
-    let mut compute_pass = command_encoder.begin_compute_pass(&ComputePassDescriptor {
-        label: Some(label),
-        timestamp_writes: None,
-    });
 
     // Fetch the pipeline.
     let (
