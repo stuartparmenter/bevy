@@ -1,5 +1,5 @@
 import package::atmosphere::{
-    bindings::settings,
+    bindings::{settings, atmosphere, medium_density_lut, medium_sampler},
     functions::{
         sample_density_lut, get_local_r, max_atmosphere_distance,
         MIDPOINT_RATIO, ABSORPTION_DENSITY, SCATTERING_DENSITY
@@ -18,33 +18,53 @@ fn main(@builtin(global_invocation_id) idx: vec3<u32>) {
     // map UV coordinates to view height (r) and zenith cos angle (mu)
     let r_mu = transmittance_lut_uv_to_r_mu(uv);
 
-    // compute the optical depth from view height r to the top atmosphere boundary
+    // RGB optical depth → ballistic T; alpha = reducible Mie/haze OD (∫ g·σ_s dt).
     let optical_depth = ray_optical_depth(r_mu.x, r_mu.y, settings.transmittance_lut_samples);
-    let transmittance = exp(-optical_depth);
 
-    textureStore(transmittance_lut_out, idx.xy, vec4(transmittance, 1.0));
+    // Store optical depth (see `sample_optical_depth_lut`), kept finite: bilinear filtering turns
+    // an infinite or NaN texel into NaN in every lookup next to it. NaN fails the comparison.
+    let finite_depth = select(
+        vec3(MAX_OPTICAL_DEPTH),
+        optical_depth.rgb,
+        optical_depth.rgb < vec3(MAX_OPTICAL_DEPTH),
+    );
+    // τ_red ≤ τ in every channel, which keeps T · exp(τ_red) ≤ 1 once τ is clamped.
+    let finite_tau_red = select(
+        0.0,
+        min(optical_depth.a, min(finite_depth.r, min(finite_depth.g, finite_depth.b))),
+        optical_depth.a >= 0.0,
+    );
+    textureStore(transmittance_lut_out, idx.xy, vec4(finite_depth, finite_tau_red));
 }
 
-/// Compute the optical depth of the atmosphere from the ground to the top atmosphere boundary
-/// at a given view height (r) and zenith cos angle (mu)
-fn ray_optical_depth(r: f32, mu: f32, sample_count: u32) -> vec3<f32> {
-    let t_max = max_atmosphere_distance(r, mu);
-    var optical_depth = vec3<f32>(0.0f);
-    var prev_t = 0.0f;
+/// Largest optical depth the LUT stores; `exp(-64)` is negligible for any light.
+const MAX_OPTICAL_DEPTH: f32 = 64.0;
 
+/// Optical depth from (r, mu) to the top atmosphere boundary.
+/// .rgb = absorption + scattering (all terms); .a = Σ g·σ_s for Mie/haze only.
+fn ray_optical_depth(r: f32, mu: f32, sample_count: u32) -> vec4<f32> {
+    let t_max = max_atmosphere_distance(r, mu);
+    var optical_depth = vec4<f32>(0.0f);
+    // Quadratically spaced segments, sampled at their midpoints: the dense near-surface layers
+    // dominate grazing paths, and uniform steps (first sample ~0.3 * t_max / n away) skip them,
+    // overestimating low-sun transmittance by up to 2x (blue, 3 deg elevation).
     for (var i = 0u; i < sample_count; i++) {
-        let t_i = t_max * (f32(i) + MIDPOINT_RATIO) / f32(sample_count);
-        let dt = t_i - prev_t;
-        prev_t = t_i;
+        let u0 = f32(i) / f32(sample_count);
+        let u1 = f32(i + 1u) / f32(sample_count);
+        let t0 = t_max * u0 * u0;
+        let t1 = t_max * u1 * u1;
+        let t_i = 0.5 * (t0 + t1);
+        let dt = t1 - t0;
 
         let r_i = get_local_r(r, mu, t_i);
 
-        // PERF: A possible later optimization would be to sample at `component = 0.5`
-        // (getting the average of the two rows) and then multiplying by 2 to find the sum. 
-        let absorption = sample_density_lut(r_i, ABSORPTION_DENSITY);
-        let scattering = sample_density_lut(r_i, SCATTERING_DENSITY);
-        let extinction = absorption + scattering;
-        optical_depth += extinction * dt;
+        let normalized_altitude = (r_i - atmosphere.inner_radius) / (atmosphere.outer_radius - atmosphere.inner_radius);
+        let uv_abs = vec2(1.0 - normalized_altitude, ABSORPTION_DENSITY);
+        let uv_sca = vec2(1.0 - normalized_altitude, SCATTERING_DENSITY);
+        let absorption = textureSampleLevel(medium_density_lut, medium_sampler, uv_abs, 0.0).xyz;
+        let scattering_s = textureSampleLevel(medium_density_lut, medium_sampler, uv_sca, 0.0);
+        let extinction = absorption + scattering_s.xyz;
+        optical_depth += vec4(extinction * dt, scattering_s.a * dt);
     }
 
     return optical_depth;

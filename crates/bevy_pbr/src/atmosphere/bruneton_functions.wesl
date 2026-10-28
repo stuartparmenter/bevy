@@ -56,7 +56,7 @@
 import package::atmosphere::{
     types::Atmosphere,
     bindings::atmosphere,
-    functions::{get_local_r, sample_transmittance_lut},
+    functions::{get_local_r, sample_optical_depth_lut, sample_transmittance_lut_tau_red},
 };
 
 // Bruneton's paper calls the surface and exosphere "bottom radius" and "top radius".
@@ -147,14 +147,29 @@ fn sample_transmittance_lut_segment(r: f32, mu: f32, t: f32) -> vec3<f32> {
     let r_t = get_local_r(r, mu, t);
     let mu_t = clamp((r * mu + t) / r_t, -1.0, 1.0);
 
+    // The ratio of the two transmittances, as the difference of their optical depths.
     if ray_intersects_ground(r, mu) {
-        return min(
-            sample_transmittance_lut(r_t, -mu_t) / sample_transmittance_lut(r, -mu),
-            vec3(1.0)
-        );
+        return exp(-max(
+            sample_optical_depth_lut(r_t, -mu_t) - sample_optical_depth_lut(r, -mu),
+            vec3(0.0)
+        ));
     } else {
-        return min(
-            sample_transmittance_lut(r, mu) / sample_transmittance_lut(r_t, mu_t), vec3(1.0)
-        );
+        return exp(-max(
+            sample_optical_depth_lut(r, mu) - sample_optical_depth_lut(r_t, mu_t),
+            vec3(0.0)
+        ));
+    }
+}
+
+/// Segment reducible Mie/haze OD (same path as sample_transmittance_lut_segment).
+/// Similarity: T_sim = T_bal · exp(τ_red_seg) restores forward-scattered light from extended sources.
+fn sample_transmittance_lut_segment_tau_red(r: f32, mu: f32, t: f32) -> f32 {
+    let r_t = get_local_r(r, mu, t);
+    let mu_t = clamp((r * mu + t) / r_t, -1.0, 1.0);
+
+    if ray_intersects_ground(r, mu) {
+        return max(sample_transmittance_lut_tau_red(r_t, -mu_t) - sample_transmittance_lut_tau_red(r, -mu), 0.0);
+    } else {
+        return max(sample_transmittance_lut_tau_red(r, mu) - sample_transmittance_lut_tau_red(r_t, mu_t), 0.0);
     }
 }

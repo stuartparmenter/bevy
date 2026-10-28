@@ -8,6 +8,14 @@ struct Atmosphere {
     outer_radius: f32,
     /// Transform from world space to atmosphere space, inverse of the atmosphere entity's transform
     world_to_atmosphere: mat4x4<f32>,
+    // Inverse of `world_to_atmosphere`
+    atmosphere_to_world: mat4x4<f32>,
+}
+
+/// Per-view atmosphere data bound to PBR shading (`AtmosphereData` in `resources.rs`).
+struct AtmosphereData {
+    atmosphere: Atmosphere,
+    settings: AtmosphereSettings,
 }
 
 struct AtmosphereSettings {
@@ -23,6 +31,26 @@ struct AtmosphereSettings {
     aerial_view_lut_max_distance: f32,
     sky_max_samples: u32,
     rendering_method: u32,
+    shadows_enabled: u32,
+    cloud_shadow_map_size: vec2<u32>,
+    cloud_shadow_map_extent: f32,
+    cloud_shadow_map_samples: u32,
+    cloud_shadow_map_strength: f32,
+    cloud_shadow_map_spatial_filter_iterations: u32,
+    cloud_shadow_map_update_interleave: u32,
+    cloud_shadow_temporal_enabled: u32,
+    cloud_shadow_temporal_alpha: f32,
+    cloud_shadow_temporal_light_rotation_cut_deg: f32,
+    cloud_shadow_anchor_max_radius: f32,
+    cloud_thin_shadow_max_radius: f32,
+    cloud_max_steps: u32,
+    cloud_light_taps: u32,
+    cloud_max_distance: f32,
+    cloud_step_samples: u32,
+    cloud_max_render_size: vec2<u32>,
+    // Centre of the cloud shadow map (atmosphere space), with hysteresis (`mod.rs`
+    // cloud_shadow_anchor): fixed while the light turns, moved when the camera leaves it.
+    cloud_shadow_anchor: vec3<f32>,
 }
 
 /// "Atmosphere space" uses local up for the zenith so the horizon-detail

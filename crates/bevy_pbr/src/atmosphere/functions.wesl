@@ -17,6 +17,7 @@
 //!   to concentrate detail near the horizon
 
 import bevy_render::maths::{PI, HALF_PI, PI_2, fast_acos, fast_acos_4, fast_atan2, ray_sphere_intersect};
+import package::render::utils::interleaved_gradient_noise;
 
 import package::atmosphere::{
     types::Atmosphere,
@@ -24,10 +25,28 @@ import package::atmosphere::{
         atmosphere, settings, view, lights, transmittance_lut, atmosphere_lut_sampler,
         multiscattering_lut, sky_view_lut, aerial_view_lut, atmosphere_transforms,
         medium_density_lut, medium_scattering_lut, medium_sampler,
+        cloud_shadow_map, cloud_field_sdf,
     },
     bruneton_functions::{
         transmittance_lut_r_mu_to_uv, ray_intersects_ground,
         distance_to_top_atmosphere_boundary, distance_to_bottom_atmosphere_boundary
+    },
+    shadows::fetch_directional_shadow,
+};
+
+@if(CLOUDS_ENABLED)
+import package::atmosphere::{
+    bindings::stbn_texture,
+    clouds::{
+        get_cloud_coverage,
+        cloud_field_uvw,
+        get_cloud_medium_density,
+        sample_cloud_field_density_and_grad,
+        cloud_layer_segment, cloud_layer, get_cloud_medium_density_lod,
+        get_cloud_absorption_coeff,
+        get_cloud_scattering_coeff,
+        sample_cloud_contribution,
+        cloud_shadow_xy_to_uv, cloud_shadow_lod, pixel_angle, cloud_shadow_surface_footprint,
     },
 };
 @if(WORKING_COLOR_SPACE_REC2020)
@@ -47,6 +66,45 @@ const ROOT_2: f32 = 1.41421356;
 /// 1 meter
 const EPSILON: f32 = 1.0;
 const MIN_EXTINCTION: vec3<f32> = vec3(1e-12);
+
+/// Henyey-Greenstein phase function (normalized by 1/(4π)).
+fn hg_phase(cos_theta: f32, g: f32) -> f32 {
+    let gg = g * g;
+    // p(θ) = (1/4π) * (1 - g²) / (1 + g² - 2g*cos(θ))^(3/2)
+    return FRAC_4_PI * (1.0 - gg) / pow(max(1.0 + gg - 2.0 * g * cos_theta, 1e-6), 1.5);
+}
+
+/// Draine (2003, doi:10.1086/379118) phase: HG generalised by alpha (second moment).
+fn draine_phase(cos_theta: f32, g: f32, alpha: f32) -> f32 {
+    let gg = g * g;
+    let f = max(1.0 + gg - 2.0 * g * cos_theta, 1e-6);
+    return FRAC_4_PI * (1.0 - gg) * (1.0 + alpha * cos_theta * cos_theta)
+        / ((1.0 + alpha * (1.0 + 2.0 * gg) / 3.0) * f * sqrt(f));
+}
+
+/// Cloud droplet phase: Jendersie & d'Eon 2023 ("An Approximate Mie Scattering Function for Fog
+/// and Cloud Rendering", SIGGRAPH Talks; supplemental eq. 7-10, valid 5 <= d <= 50 um), the HG +
+/// Draine blend fitted to Mie for water droplets of diameter d. d = 20 um (effective radius 10 um,
+/// typical cumulus; also Blender Cycles' Mie default):
+///   g_HG = exp(-0.0990567 / (d - 1.67154))          = 0.99460
+///   g_D  = exp(-2.20679 / (d + 3.91029) - 0.428934) = 0.59382
+///   alpha = exp(3.62489 - 8.29288 / (d + 5.52825))  = 27.112
+///   w_D  = exp(-0.599085 / (d - 0.641583) - 0.665888) = 0.49821
+/// Mean cosine <cos> = 0.8793 (CLOUD_MIE_MEAN_COS).
+const CLOUD_MIE_G_HG: f32 = 0.99460;
+const CLOUD_MIE_G_D: f32 = 0.59382;
+const CLOUD_MIE_ALPHA: f32 = 27.112;
+const CLOUD_MIE_W_D: f32 = 0.49821;
+const CLOUD_MIE_MEAN_COS: f32 = 0.8793;
+fn cloud_mie_phase(cos_theta: f32) -> f32 {
+    return mix(hg_phase(cos_theta, CLOUD_MIE_G_HG),
+        draine_phase(cos_theta, CLOUD_MIE_G_D, CLOUD_MIE_ALPHA), CLOUD_MIE_W_D);
+}
+
+/// Dual-lobe HG phase (Frostbite-style): blend a forward and backward lobe.
+fn dual_lobe_hg_phase(cos_theta: f32, g_fwd: f32, g_bwd: f32, lobe_lerp: f32) -> f32 {
+    return mix(hg_phase(cos_theta, g_fwd), hg_phase(cos_theta, g_bwd), lobe_lerp);
+}
 
 /// During raymarching, each segment is sampled at a single point. This constant determines
 /// where in the segment that sample is taken (0.0 = start, 0.5 = middle, 1.0 = end).
@@ -127,21 +185,36 @@ fn sky_view_lut_uv_to_zenith_azimuth(r: f32, uv: vec2<f32>) -> vec2<f32> {
 
 // LUT SAMPLING
 
-fn sample_transmittance_lut(r: f32, mu: f32) -> vec3<f32> {
+/// Optical depth from radius `r` along zenith cosine `mu` to the top of the atmosphere, or to
+/// the ground. The transmittance LUT stores optical depth because the transmittance toward a sun
+/// below the horizon underflows f16.
+fn sample_optical_depth_lut(r: f32, mu: f32) -> vec3<f32> {
     let uv = transmittance_lut_r_mu_to_uv(atmosphere, r, mu);
     return textureSampleLevel(transmittance_lut, atmosphere_lut_sampler, uv, 0.0).rgb;
 }
 
+fn sample_transmittance_lut(r: f32, mu: f32) -> vec3<f32> {
+    return exp(-sample_optical_depth_lut(r, mu));
+}
+
+/// Reducible Mie/haze optical depth (∫ g·σ_s dt) from (r, mu) to the top of atmosphere.
+/// Packed in the transmittance LUT alpha; used for similarity-scaled AP: T_sim = T · exp(τ_red).
+fn sample_transmittance_lut_tau_red(r: f32, mu: f32) -> f32 {
+    let uv = transmittance_lut_r_mu_to_uv(atmosphere, r, mu);
+    return textureSampleLevel(transmittance_lut, atmosphere_lut_sampler, uv, 0.0).a;
+}
+
 fn sample_multiscattering_lut(r: f32, mu: f32) -> vec3<f32> {
     let uv = multiscattering_lut_r_mu_to_uv(r, mu);
-    return textureSampleLevel(multiscattering_lut, atmosphere_lut_sampler, uv, 0.0).rgb;
+    return exp(textureSampleLevel(multiscattering_lut, atmosphere_lut_sampler, uv, 0.0).rgb);
 }
 
 fn sample_sky_view_lut(r: f32, ray_dir_as: vec3<f32>) -> vec3<f32> {
     let mu = ray_dir_as.y;
     let azimuth = fast_atan2(ray_dir_as.x, -ray_dir_as.z);
     let uv = sky_view_lut_r_mu_azimuth_to_uv(r, mu, azimuth);
-    return textureSampleLevel(sky_view_lut, atmosphere_lut_sampler, uv, 0.0).rgb;
+    // The LUT is pre-exposed.
+    return textureSampleLevel(sky_view_lut, atmosphere_lut_sampler, uv, 0.0).rgb / view.exposure;
 }
 
 fn ndc_to_camera_dist(ndc: vec3<f32>) -> f32 {
@@ -158,20 +231,26 @@ fn ndc_to_camera_dist(ndc: vec3<f32>) -> f32 {
 fn sample_aerial_view_lut(uv: vec2<f32>, t: f32) -> vec3<f32> {
     let t_max = settings.aerial_view_lut_max_distance;
     let num_slices = f32(settings.aerial_view_lut_size.z);
+    // LUT depth is squared in normalized slice parameter u
+    let u = sqrt(saturate(t / t_max));
     // Each texel stores the value of the scattering integral over the whole slice,
     // which requires us to offset the w coordinate by half a slice. For
     // example, if we wanted the value of the integral at the boundary between slices,
     // we'd need to sample at the center of the previous slice, and vice-versa for
     // sampling in the center of a slice.
-    let uvw = vec3(uv, saturate(t / t_max - 0.5 / num_slices));
+    let uvw = vec3(uv, saturate(u - 0.5 / num_slices));
     let sample = textureSampleLevel(aerial_view_lut, atmosphere_lut_sampler, uvw, 0.0);
     // Since sampling anywhere between w=0 and w=t_slice will clamp to the first slice,
     // we need to do a linear step over the first slice towards zero at the camera's
     // position to recover the correct integral value.
-    let t_slice = t_max / num_slices;
-    let fade = saturate(t / t_slice);
-    // Recover the values from log space
-    return exp(sample.rgb) * fade;
+    // The first slice integrates exactly to its boundary u = 1 / num_slices (aerial_view_lut.wesl:
+    // segments end at each slice boundary), so the fade ends there too. The old endpoint (the
+    // last midpoint sample, from before that change) ended the fade early: near-camera haze was
+    // up to (n / (n - 1 + 0.3))^2 too strong for n samples per slice (audit 29).
+    let t_first_slice = t_max / (num_slices * num_slices);
+    let fade = saturate(t / t_first_slice);
+    // Recover the values from log space and undo the pre-exposure
+    return exp(sample.rgb) / view.exposure * fade;
 }
 
 // ATMOSPHERE SAMPLING
@@ -203,30 +282,404 @@ fn sample_scattering_lut(r: f32, neg_LdotV: f32) -> vec3<f32> {
     return textureSampleLevel(medium_scattering_lut, medium_sampler, uv, 0.0).xyz;
 }
 
+// No bindings: shared with PBR's mesh cloud shadows.
+struct LightBasis {
+    x: vec3<f32>,
+    y: vec3<f32>,
+};
+
+// No bindings: shared with PBR's mesh cloud shadows.
+fn safe_normalize(v: vec3<f32>) -> vec3<f32> {
+    let l2 = dot(v, v);
+    if (l2 <= 1e-12) {
+        return vec3(0.0, 1.0, 0.0);
+    }
+    return v * inverseSqrt(l2);
+}
+
+// No bindings: shared with PBR's mesh cloud shadows.
+fn build_light_basis(light_dir: vec3<f32>) -> LightBasis {
+    // Pick a vector not parallel to `light_dir`, then build an orthonormal basis.
+    // IMPORTANT: keep this selection stable; switching too early causes the basis to “flip”
+    // when the light gets moderately close to zenith, which looks like the shadow map drifts/rotates.
+    let world_up = vec3(0.0, 1.0, 0.0);
+    let a = select(world_up, vec3(1.0, 0.0, 0.0), abs(dot(light_dir, world_up)) > 0.999);
+    let x = safe_normalize(cross(a, light_dir));
+    let y = cross(light_dir, x);
+    return LightBasis(x, y);
+}
+
+/// Helper for cloud shadow PCF: evaluates transmittance from shadow map data.
+@if(CLOUDS_ENABLED)
+fn cloud_shadow_transmittance(data: vec3<f32>, d_sample: f32) -> f32 {
+    let front_depth = data.r * 1000.0;
+    let mean_ext = data.g;
+    let max_optical_depth = data.b;
+    let delta = max(0.0, d_sample - front_depth);
+    var tau = mean_ext * delta;
+    tau = min(tau, max_optical_depth);
+    return exp(-tau);
+}
+
+/// 1 below the thin (cirrus) layer's mid level, where its shadow (the map's alpha) applies.
+@if(CLOUDS_ENABLED)
+fn cloud_thin_shadow_weight(world_pos: vec3<f32>) -> f32 {
+    return f32(length(world_pos) < settings.cloud_thin_shadow_max_radius);
+}
+
+/// Ground illuminance variant: uses only the stored optical depth (B channel), ignoring front depth.
+@if(CLOUDS_ENABLED)
+fn cloud_shadow_optical_depth(data: vec3<f32>) -> f32 {
+    let optical_depth = data.b;
+    return exp(-optical_depth);
+}
+
+/// Unreal-style cloud shadow map evaluation.
+///
+/// The `cloud_shadow_map` stores:
+/// - R: front depth (meters) from the light-volume near plane
+/// - G: mean extinction (1/m)
+/// - B: max optical depth (unitless)
+///
+/// For a world-space sample point, we compute:
+///   tau = mean_ext * (d_sample - d_front), clamped by max_optical_depth
+///   T = exp(-tau)
+///
+/// When `use_optical_depth_only` is true (e.g. for ground illuminance), front depth is ignored
+/// and transmittance is computed from the stored optical depth only: T = exp(-optical_depth).
+@if(CLOUDS_ENABLED)
+/// Cloud transmittance toward the light for points outside the shadow-map volume (far,
+/// grazing-sun lookups). Returning 1 there lit the air under the cloud deck near the horizon
+/// (3-4x too bright at 3 deg sun). Short stratified density march along the light.
+/// 2 samples (4 -> 2: clouds_raymarch -18..-25 %, total -1.4 ms hero:35). All consumers (cloud
+/// pass, render_sky ground / far haze, LUTs) march the same mip-3 noise density: the coarse
+/// envelope left distant ground ~27 % too bright vs CLOUD_REFERENCE (hero:35).
+const CLOUD_FAR_SAMPLES: u32 = 2u;
+const CLOUD_FAR_MAX_M: f32 = 80000.0;
+const CLOUD_FAR_TAP_M: f32 = 1500.0;
+const CLOUD_FAR_LONG_SAMPLES: u32 = 16u;
+const CLOUD_FAR_GRAZING_MU: f32 = 0.2; // sun below ~11.5 deg
+@if(CLOUDS_ENABLED)
+fn cloud_far_transmittance(world_pos: vec3<f32>, direction_to_light: vec3<f32>, use_optical_depth_only: bool) -> f32 {
+    var od = 0.0;
+    @if(CLOUDS_ENABLED) {
+    let seg = cloud_layer_segment(world_pos, direction_to_light);
+    if (seg.z > 0.5) {
+        let t0 = max(seg.x, 0.0);
+        // Grazing sun: long paths through the layer need more taps, or distant cloud saw no
+        // occluder and lit up (sun:3 horizon specks).
+        let full = seg.y - t0;
+        var far_max = CLOUD_FAR_MAX_M;
+        var n_far = CLOUD_FAR_SAMPLES;
+        var far_mip = 3.0;
+        // ~1.5 km tap spacing (2 taps over a 10+ km grazing path skipped whole clouds).
+        if (dot(direction_to_light, normalize(world_pos)) < CLOUD_FAR_GRAZING_MU) {
+            n_far = u32(clamp(ceil(min(full, CLOUD_FAR_MAX_M) / CLOUD_FAR_TAP_M), f32(CLOUD_FAR_SAMPLES), f32(CLOUD_FAR_LONG_SAMPLES)));
+        }
+        let t1 = min(seg.y, t0 + far_max);
+        let dt = (t1 - t0) / f32(n_far);
+        let sigma_t = get_cloud_scattering_coeff() + get_cloud_absorption_coeff();
+        for (var i = 0u; i < n_far; i++) {
+            let q = world_pos + direction_to_light * (t0 + (f32(i) + 0.5) * dt);
+            od += get_cloud_medium_density_lod(length(q), q, far_mip) * sigma_t * dt;
+        }
+    }
+    }
+    od *= settings.cloud_shadow_map_strength;
+    if (use_optical_depth_only) {
+        return exp(-od);
+    }
+    return exp(-od);
+}
+
+/// Whether the cloud shadow map holds this light's shadows. The map is traced along the view's
+/// first directional light (`cloud_shadow_map.wesl`); any other light's lookup would read that
+/// light's optical depths in its own basis (a displaced, wrongly oriented shadow pattern), so
+/// its consumers march the cloud layer toward the light instead (`cloud_far_transmittance`).
+/// Parallel lights share the map.
+@if(CLOUDS_ENABLED)
+fn cloud_shadow_is_mapped_light(direction_to_light: vec3<f32>) -> bool {
+    return lights.n_directional_lights > 0u
+        && dot(direction_to_light, lights.directional_lights[0].direction_to_light) > 0.99999;
+}
+
+/// Light-space frame of the cloud shadow map (anchor and basis), for many lookups per invocation.
+@if(CLOUDS_ENABLED)
+struct CloudShadowFrame {
+    anchor: vec3<f32>,
+    bx: vec3<f32>,
+    by: vec3<f32>,
+    mapped: bool,
+}
+
+@if(CLOUDS_ENABLED)
+fn cloud_shadow_frame(direction_to_light: vec3<f32>) -> CloudShadowFrame {
+    let basis = build_light_basis(safe_normalize(-direction_to_light));
+    let anchor = settings.cloud_shadow_anchor;
+    return CloudShadowFrame(anchor, basis.x, basis.y, cloud_shadow_is_mapped_light(direction_to_light));
+}
+
+/// Shadow-map texture coordinate of a point below every cloud (ground), or -1 outside the map
+/// or for a light the map was not traced for.
+@if(CLOUDS_ENABLED)
+fn cloud_shadow_ground_uv(frame: CloudShadowFrame, world_pos: vec3<f32>) -> vec2<f32> {
+    let extent = settings.cloud_shadow_map_extent;
+    let rel = world_pos - frame.anchor;
+    let xy = vec2(dot(rel, frame.bx), dot(rel, frame.by));
+    if (!frame.mapped || extent <= 0.0 || any(abs(xy) > vec2(extent))) {
+        return vec2(-1.0);
+    }
+    return cloud_shadow_xy_to_uv(xy, extent);
+}
+
+/// Sun transmittance of a ground point: cubic B-spline filter (4x4 texels) of the per-texel
+/// transmittance. Cumulus shadows are nearly binary (tau ~ 50), and around the camera the warped
+/// map's texels are 100-200 m on the ground, so filtering only the 2x2 nearest texels (or the
+/// stored optical depth) drew the texel grid as staircase outlines (streaks at low sun). The
+/// B-spline is C2 over ~2 texels, comparable to real shadow-edge softness seen from altitude
+/// (cloud-edge diffuseness plus the sun's penumbra, 0.0093 x cloud height).
+@if(CLOUDS_ENABLED)
+fn sample_cloud_shadow_ground(world_pos: vec3<f32>, direction_to_light: vec3<f32>) -> f32 {
+    let frame = cloud_shadow_frame(direction_to_light);
+    let uv = cloud_shadow_ground_uv(frame, world_pos);
+    if (uv.x < 0.0) {
+        return cloud_far_transmittance(world_pos, direction_to_light, true);
+    }
+    // At the pixel's footprint on the ground (`cloud_shadow_mips.wesl`): far and grazing views
+    // read the level whose texels the pixel covers, interpolated between two levels so the
+    // level does not pop as the distance changes.
+    let to_point = world_pos - get_view_position();
+    let d = length(to_point);
+    let footprint = cloud_shadow_surface_footprint(
+        d, pixel_angle(view.clip_from_view, view.viewport.w), to_point / max(d, 1e-3),
+        normalize(world_pos), frame.bx, frame.by);
+    let levels = textureNumLevels(cloud_shadow_map);
+    let lod = cloud_shadow_lod(footprint, uv, settings.cloud_shadow_map_extent,
+        f32(settings.cloud_shadow_map_size.x), levels);
+    let m = u32(lod);
+    let t0 = cloud_shadow_ground_bspline(uv, m);
+    if (lod == f32(m) || m + 1u >= levels) {
+        return t0;
+    }
+    return mix(t0, cloud_shadow_ground_bspline(uv, m + 1u), lod - f32(m));
+}
+
+/// Cubic B-spline (4x4 texels) of the per-texel transmittance at mip `mip`.
+@if(CLOUDS_ENABLED)
+fn cloud_shadow_ground_bspline(uv: vec2<f32>, mip: u32) -> f32 {
+    let size = vec2<i32>(textureDimensions(cloud_shadow_map, mip));
+    let st = uv * vec2<f32>(size) - 0.5;
+    let i0 = vec2<i32>(floor(st)) - 1;
+    let f = st - floor(st);
+    // Uniform cubic B-spline weights for offsets -1, 0, 1, 2.
+    let wx = cubic_bspline_weights(f.x);
+    let wy = cubic_bspline_weights(f.y);
+    var t = 0.0;
+    for (var y = 0; y < 4; y++) {
+        var row = 0.0;
+        for (var x = 0; x < 4; x++) {
+            let c = clamp(i0 + vec2(x, y), vec2(0), size - 1);
+            let d = textureLoad(cloud_shadow_map, c, mip);
+            row += wx[x] * cloud_shadow_optical_depth(d.rgb) * exp(-d.a);
+        }
+        t += wy[y] * row;
+    }
+    return t;
+}
+
+fn cubic_bspline_weights(f: f32) -> vec4<f32> {
+    let f2 = f * f;
+    let f3 = f2 * f;
+    let w0 = (1.0 - f) * (1.0 - f) * (1.0 - f) / 6.0;
+    let w1 = (3.0 * f3 - 6.0 * f2 + 4.0) / 6.0;
+    let w2 = (-3.0 * f3 + 3.0 * f2 + 3.0 * f + 1.0) / 6.0;
+    return vec4(w0, w1, w2, f3 / 6.0);
+}
+
+@if(CLOUDS_ENABLED)
+fn sample_cloud_shadow_map(world_pos: vec3<f32>, direction_to_light: vec3<f32>, use_optical_depth_only: bool) -> f32 {
+
+    let extent = settings.cloud_shadow_map_extent;
+    // Keep consumer consistent with producer: half-depth is derived from extent (Unreal-style).
+    let half_depth = extent * 2.0;
+    if (extent <= 0.0 || half_depth <= 0.0) {
+        return 1.0;
+    }
+
+    // IMPORTANT: use the same trace direction as the compute pass:
+    // light -> surface (opposite of Bevy's `direction_to_light` which is surface -> light).
+    let trace_dir = safe_normalize(-direction_to_light);
+    let basis = build_light_basis(trace_dir);
+
+    // Anchor must match the compute shader's anchor to keep lookups stable.
+    let anchor = settings.cloud_shadow_anchor;
+    let rel = world_pos - anchor;
+
+    // Map world point to the orthographic light volume.
+    let x = dot(rel, basis.x);
+    let y = dot(rel, basis.y);
+    // Depth from near plane along light direction.
+    // Near plane is located at `anchor - light_dir * half_depth`.
+    let d_sample = dot(rel, trace_dir) + half_depth;
+    let max_t = 2.0 * half_depth;
+    let on_map = cloud_shadow_is_mapped_light(direction_to_light)
+        && abs(x) <= extent && abs(y) <= extent
+        && d_sample > 0.0 && d_sample < max_t;
+    if (on_map) {
+        return cloud_shadow_map_lookup(world_pos, vec2(x, y), d_sample, use_optical_depth_only);
+    }
+    // Off the map, or a light it was not traced for: the far-field march, from one call site.
+    // An early return per case inlined the march's density loop three times into every caller
+    // (register spills in the cloud pass, whose light loop calls this per sample).
+    return cloud_far_transmittance(world_pos, direction_to_light, use_optical_depth_only);
+}
+
+/// The cloud shadow map's transmittance at a point on the map: `xy` in the light frame,
+/// `d_sample` its depth from the map's near plane (`sample_cloud_shadow_map`).
+@if(CLOUDS_ENABLED)
+fn cloud_shadow_map_lookup(world_pos: vec3<f32>, xy: vec2<f32>, d_sample: f32, use_optical_depth_only: bool) -> f32 {
+    let extent = settings.cloud_shadow_map_extent;
+    let uv = cloud_shadow_xy_to_uv(xy, extent);
+    // Thin layers (alpha) shadow only points below them.
+    let thin = cloud_thin_shadow_weight(world_pos);
+    // The level at the pixel's footprint across the view at this point (`cloud_shadow_mips.wesl`;
+    // no surface: the footprint is d x the pixel angle).
+    let lod = cloud_shadow_lod(
+        distance(world_pos, get_view_position()) * pixel_angle(view.clip_from_view, view.viewport.w),
+        uv, extent, f32(settings.cloud_shadow_map_size.x), textureNumLevels(cloud_shadow_map));
+
+    @if(CLOUD_SHADOW_SIMPLE_SAMPLING) {
+    // Bilinear filter of the per-texel transmittance (4 loads), not of the stored data. Between
+    // a cloud texel and an empty one (front depth = far plane, 2 x half_depth) the interpolated
+    // front depth passes the sample within a few % of a texel, so a filtered fetch turned
+    // shadows into hard-edged texel staircases. Looking toward the sun, the haze march's lit
+    // length then jumped wherever a ray's shadow-map footprint passed a staircase corner: fixed
+    // terraces in the haze in front of backlit clouds and arcs across light shafts, nested
+    // around the sun and unaffected by the march jitter.
+    let mip = u32(round(lod));
+    let size = vec2<i32>(textureDimensions(cloud_shadow_map, mip));
+    let st = uv * vec2<f32>(size) - 0.5;
+    let i0 = vec2<i32>(floor(st));
+    let f = st - floor(st);
+    var t = 0.0;
+    for (var k = 0; k < 4; k++) {
+        let o = vec2(k & 1, k >> 1);
+        let q = textureLoad(cloud_shadow_map, clamp(i0 + o, vec2(0), size - 1), mip);
+        let w = select(1.0 - f.x, f.x, o.x == 1) * select(1.0 - f.y, f.y, o.y == 1);
+        let tq = select(cloud_shadow_transmittance(q.rgb, d_sample), cloud_shadow_optical_depth(q.rgb), use_optical_depth_only);
+        t += w * tq * exp(-thin * q.a);
+    }
+    return t;
+    } @else {
+    // 4-tap PCF (2x2 half-texel) to reduce aliasing and soften shadow edges.
+    // Samples are offset by ±0.25 texels so the 2x2 footprint covers the sampling area.
+    let size = vec2<f32>(settings.cloud_shadow_map_size);
+    let texel = exp2(lod) / max(size, vec2(1.0));
+    // LUT passes (AP froxels, sky-view) sample the map sparsely along each ray, so they use a
+    // wider 2x2 bilinear footprint (= 4x4-texel tent), UE5-style cloud shadow-map spatial filtering;
+    // otherwise the map's texel grid aliases into a checker in the far haze.
+    var o = 0.25 * texel;
+    @if(ATMOSPHERE_LUT_CLOUD_SHADOW) { o = 1.0 * texel; }
+
+    let q00 = textureSampleLevel(cloud_shadow_map, atmosphere_lut_sampler, uv + vec2(-o.x, -o.y), lod);
+    let q10 = textureSampleLevel(cloud_shadow_map, atmosphere_lut_sampler, uv + vec2(o.x, -o.y), lod);
+    let q01 = textureSampleLevel(cloud_shadow_map, atmosphere_lut_sampler, uv + vec2(-o.x, o.y), lod);
+    let q11 = textureSampleLevel(cloud_shadow_map, atmosphere_lut_sampler, uv + vec2(o.x, o.y), lod);
+    let d00 = q00.rgb;
+    let d10 = q10.rgb;
+    let d01 = q01.rgb;
+    let d11 = q11.rgb;
+    let thin_t = exp(-thin * vec4(q00.a, q10.a, q01.a, q11.a));
+
+    let t00 = select(cloud_shadow_transmittance(d00, d_sample), cloud_shadow_optical_depth(d00), use_optical_depth_only);
+    let t10 = select(cloud_shadow_transmittance(d10, d_sample), cloud_shadow_optical_depth(d10), use_optical_depth_only);
+    let t01 = select(cloud_shadow_transmittance(d01, d_sample), cloud_shadow_optical_depth(d01), use_optical_depth_only);
+    let t11 = select(cloud_shadow_transmittance(d11, d_sample), cloud_shadow_optical_depth(d11), use_optical_depth_only);
+
+    return dot(vec4(t00, t10, t01, t11), thin_t) * 0.25;
+    }
+}
+
 /// evaluates L_scat, equation 3 in the paper, which gives the total single-order scattering towards the view at a single point
-fn sample_local_inscattering(local_scattering: vec3<f32>, ray_dir: vec3<f32>, world_pos: vec3<f32>) -> vec3<f32> {
+fn sample_local_inscattering(local_scattering: vec3<f32>, ray_dir: vec3<f32>, world_pos: vec3<f32>, pixel_coords: vec2<f32>) -> vec3<f32> {
     let local_r = length(world_pos);
     let local_up = normalize(world_pos);
     var inscattering = vec3(0.0);
+    
+    
     for (var light_i: u32 = 0u; light_i < lights.n_directional_lights; light_i++) {
         let light = &lights.directional_lights[light_i];
 
         let mu_light = dot((*light).direction_to_light, local_up);
 
-        // -(L . V) == (L . -V). -V here is our ray direction, which points away from the view
-        // instead of towards it (as is the convention for V)
+        // NOTE ON SIGN CONVENTIONS:
+        // `ray_dir` points *away* from the camera (camera -> sample).
+        // `direction_to_light` (L) points from the sample *towards the light* (sample -> sun).
+        //
+        // Many texts define phase in terms of propagation directions ωi (sun -> sample) and ωo (sample -> camera),
+        // in which case: ωi = -L and ωo = -ray_dir, so:
+        //   cos(theta) = dot(ωi, ωo) = dot(-L, -ray_dir) = dot(L, ray_dir)
+        //
+        // So for our phase functions, the correct cosine is simply dot(L, ray_dir).
         let neg_LdotV = dot((*light).direction_to_light, ray_dir);
 
         let transmittance_to_light = sample_transmittance_lut(local_r, mu_light);
-        let shadow_factor = transmittance_to_light * f32(!ray_intersects_ground(local_r, mu_light));
-        let scattering_coeff = sample_scattering_lut(local_r, neg_LdotV);
+        var shadow_factor = transmittance_to_light * f32(!ray_intersects_ground(local_r, mu_light));
+        var scattering_coeff = sample_scattering_lut(local_r, neg_LdotV);
+        
+        var cloud_sun_t = 1.0;
+        @if(CLOUDS_ENABLED && !ATM_DBG_NOSHADOW) {
+        // Compute volumetric shadow from clouds via the cloud shadow map (stable at grazing angles).
+        cloud_sun_t = sample_cloud_shadow_map(world_pos, (*light).direction_to_light, false);
+        shadow_factor *= cloud_sun_t;
+        }
+
+        // With CLOUD_PASS (render_sky), clouds are integrated by the dedicated low-res
+        // `clouds_raymarch` pass and composited afterwards (the sky-view/aerial LUTs and the cloud
+        // pass must not add them again); only the env probe still
+        // integrates cloud media here.
+        @if(CLOUDS_ENABLED && ATMOSPHERE_ENV_PROBE) {
+        // Sample cloud *medium density* at this point (includes `cloud_layer.cloud_density`)
+        // so clouds respond consistently across scattering vs shadowing.
+        let cloud_density = get_cloud_medium_density(local_r, world_pos);
+        // NUBIS: Add volumetric cloud scattering with proper physical integration
+        // Clouds contribute to inscattering via Henyey-Greenstein phase function
+
+        // Cloud scattering coefficient: σ_s_cloud = density * scattering_coeff
+        // Using physically correct coefficients (units: m^-1 per unit density)
+        // Density is normalized [0, 1], coefficients represent actual physical values
+        // Water droplet clouds have scattering ~0.0008-0.001 m^-1 per unit density
+        let cloud_scattering_coeff = cloud_density * get_cloud_scattering_coeff();
+        
+        // Droplet Mie phase (same as the cloud pass). `neg_LdotV` here is dot(L, ray_dir); see
+        // sign convention note above.
+        let cos_theta = clamp(neg_LdotV, -1.0, 1.0);
+        let cloud_phase = cloud_mie_phase(cos_theta);
+        
+        // Add cloud scattering contribution: σ_s_cloud * p(θ)
+        scattering_coeff += cloud_scattering_coeff * cloud_phase;
+        }
+
+        // Sample directional light shadow map for volumetric shadow shafts.
+        // Use zero normal bias: unlike mesh shading there is no surface normal, and using
+        // `-ray_dir` (toward the camera) pushes samples along the view ray away from nearby
+        // occluders, which causes light leaks next to buildings and other low geometry.
+        var shadow_map_factor: f32 = 1.0;
+        // Pipelines without shadow map bindings (e.g. the clouds environment probe) set
+        // ATMOSPHERE_NO_SHADOW_MAPS to compile the shadow map lookup out.
+        @if(!ATMOSPHERE_NO_SHADOW_MAPS && !ATM_DBG_NOSHADOW) {
+            if (settings.shadows_enabled != 0u) {
+                shadow_map_factor = fetch_directional_shadow(light_i, vec4(world_pos, 1.0), vec3(0.0));
+            }
+        }
 
         // Transmittance from scattering event to light source
-        let scattering_factor = shadow_factor * scattering_coeff;
+        let scattering_factor = shadow_factor * shadow_map_factor * scattering_coeff;
 
         // Additive factor from the multiscattering LUT
         let psi_ms = sample_multiscattering_lut(local_r, mu_light);
-        let multiscattering_factor = psi_ms * local_scattering;
+        var multiscattering_factor = psi_ms * local_scattering;
+        @if(ATM_DBG_NOMS) { multiscattering_factor = vec3(0.0); }
 
         inscattering += light_color_rec709((*light).color) * (scattering_factor + multiscattering_factor);
     }
@@ -262,7 +715,8 @@ fn calculate_visible_sun_ratio(atmosphere: Atmosphere, r: f32, mu: f32, sun_angu
     // Invert the horizon angle calculation to fix shading direction
     let horizon_cos = -sqrt(1.0 - (inner_radius * inner_radius) / (r * r));
     let horizon_angle = fast_acos_4(horizon_cos);
-    let sun_zenith_angle = fast_acos_4(mu);
+    // A zenith light's `mu` can round past 1, where `fast_acos_4` is NaN.
+    let sun_zenith_angle = fast_acos_4(clamp(mu, -1.0, 1.0));
 
     // If sun is completely above horizon
     if sun_zenith_angle + sun_angular_size * 0.5 <= horizon_angle {
@@ -381,6 +835,32 @@ struct RaymarchSegment {
     end: f32,
 }
 
+// Inverse CDF mapping for cloud-aware global stratification.
+// Maps u in [0,1] to a distance t along the ray in [t_start, t_end],
+// given piecewise weights for pre/cloud/post segments.
+fn cloud_shadow_inv_cdf(
+    u: f32,
+    t_start: f32,
+    cloud_start: f32,
+    cloud_end: f32,
+    t_end: f32,
+    w_pre: f32,
+    w_cloud: f32,
+    w_post: f32,
+    w_sum: f32,
+) -> f32 {
+    let x = u * w_sum;
+    if (x < w_pre) {
+        return t_start + (select(0.0, x / w_pre, w_pre > 0.0)) * (cloud_start - t_start);
+    }
+    let x2 = x - w_pre;
+    if (x2 < w_cloud) {
+        return cloud_start + (select(0.0, x2 / w_cloud, w_cloud > 0.0)) * (cloud_end - cloud_start);
+    }
+    let x3 = x2 - w_cloud;
+    return cloud_end + (select(0.0, x3 / max(1e-6, w_post), w_post > 0.0)) * (t_end - cloud_end);
+}
+
 fn get_raymarch_segment(r: f32, mu: f32) -> RaymarchSegment {
     // Get both intersection points with atmosphere
     let atmosphere_intersections = ray_sphere_intersect(r, mu, atmosphere.outer_radius);
@@ -427,6 +907,9 @@ fn raymarch_atmosphere(
     let up = normalize(pos);
     let mu = dot(ray_dir, up);
 
+    // Convert UV to pixel coordinates for noise jittering
+    // Assuming viewport size from view uniform (typically available)
+    let pixel_coords = uv * view.viewport.zw;
     // Optimization: Reduce sample count at close proximity to the scene
     let sample_count = mix(1.0, f32(max_samples), saturate(t_max * 0.01));
 
@@ -446,17 +929,152 @@ fn raymarch_atmosphere(
         return result;
     }
 
-    var prev_t = t_start;
     var optical_depth = vec3(0.0);
-    for (var s = 0.0; s < sample_count; s += 1.0) {
-        // Linear distribution from atmosphere entry to exit/ground
-        let t_i = t_start + t_total * (s + MIDPOINT_RATIO) / sample_count;
-        let dt_i = (t_i - prev_t);
-        prev_t = t_i;
+
+    // Convert the sample count into a hard budget.
+    let sample_budget = max(1u, u32(sample_count));
+
+    @if(CLOUDS_ENABLED && ATMOSPHERE_ENV_PROBE) {
+    // Cloud-aware global stratification (no temporal noise):
+    // Instead of using separate per-segment grids (which can introduce visible boundaries),
+    // we stratify over [0,1] globally and map through a piecewise-linear CDF that allocates
+    // more samples to the cloud layer region.
+
+    let seg = cloud_layer_segment(pos, ray_dir);
+    // IMPORTANT:
+    // If the view ray does *not* intersect the cloud shell, we must still integrate the atmosphere.
+    // A previous version of this logic set all segment lengths to 0 when `has_cloud_layer == false`,
+    // which collapses the inverse CDF to a constant and yields dt==0 => no scattering (black sky).
+    let cloud_start_raw = clamp(seg.x, t_start, t_end);
+    let cloud_end_raw = clamp(seg.y, t_start, t_end);
+    let has_cloud_layer = (seg.z > 0.5) && (cloud_end_raw > cloud_start_raw);
+
+    // When there is no cloud segment, treat the entire raymarch segment as "outside".
+    let cloud_start = select(t_end, cloud_start_raw, has_cloud_layer);
+    let cloud_end = select(t_end, cloud_end_raw, has_cloud_layer);
+
+    let len_pre = max(0.0, cloud_start - t_start);
+    let len_cloud = max(0.0, cloud_end - cloud_start);
+    let len_post = max(0.0, t_end - cloud_end);
+
+    // Importance multiplier for the cloud layer segment.
+    // Higher => more samples in clouds, fewer outside, with *continuous* sampling across boundaries.
+    let cloud_importance = 16.0;
+
+    var w_pre = len_pre;
+    var w_cloud = len_cloud * cloud_importance;
+    var w_post = len_post;
+
+    let w_sum = max(1e-6, w_pre + w_cloud + w_post);
+
+    // Gradient scale factor (unit: meters) to turn |∇density| (1/m) into a dimensionless importance.
+    const GRAD_IMPORTANCE_M: f32 = 1500.0;
+    const CLOUD_MAX_SUBSTEPS: u32 = 2u;
+
+    // STBN: use different layer per frame for temporal stratification
+    let stbn_dims = textureDimensions(stbn_texture);
+    let stbn_use = all(stbn_dims > vec2(1u));
+    let stbn_layer = select(0, i32(view.frame_count % u32(textureNumLayers(stbn_texture))), stbn_use);
+    let stbn_px = vec2<i32>(floor(pixel_coords)) % vec2<i32>(stbn_dims);
+
+    var stop: bool = false;
+    for (var s: u32 = 0u; s < sample_budget; s += 1u) {
+        if (stop) { break; }
+
+        let u0 = f32(s) / f32(sample_budget);
+        let u1 = f32(s + 1u) / f32(sample_budget);
+        var j: f32;
+        if (stbn_use) {
+            let stbn_noise = textureLoad(stbn_texture, stbn_px, stbn_layer, 0);
+            j = fract(stbn_noise.r + f32(s) * 0.618033988749895);
+        } else {
+            j = interleaved_gradient_noise(pixel_coords, 500u + s);
+        }
+        let u = mix(u0, u1, j);
+
+        let t0 = cloud_shadow_inv_cdf(u0, t_start, cloud_start, cloud_end, t_end, w_pre, w_cloud, w_post, w_sum);
+        let t1 = cloud_shadow_inv_cdf(u1, t_start, cloud_start, cloud_end, t_end, w_pre, w_cloud, w_post, w_sum);
+        let dt = max(0.0, t1 - t0);
+        if (dt <= 0.0) { continue; }
+
+        let t = cloud_shadow_inv_cdf(u, t_start, cloud_start, cloud_end, t_end, w_pre, w_cloud, w_post, w_sum);
+        let sample_pos = pos + ray_dir * t;
+        let local_r = length(sample_pos);
+
+        // Inside-cloud substepping for sharp density transitions.
+        let in_cloud = has_cloud_layer && (t >= cloud_start) && (t < cloud_end);
+        var sub_steps: u32 = 1u;
+        if (in_cloud) {
+            let field = sample_cloud_field_density_and_grad(local_r, sample_pos);
+            let g = max(0.0, field.y * GRAD_IMPORTANCE_M);
+            sub_steps = min(CLOUD_MAX_SUBSTEPS, max(1u, u32(ceil(1.0 + g))));
+        }
+
+        let sub_dt = dt / f32(sub_steps);
+        for (var k: u32 = 0u; k < sub_steps; k += 1u) {
+            if (stop) { break; }
+            // Jitter within each sub-step using STBN for temporal stratification.
+            var j2: f32;
+            if (stbn_use) {
+                let stbn_noise2 = textureLoad(stbn_texture, stbn_px, stbn_layer, 0);
+                j2 = fract(stbn_noise2.g + f32(s * 8u + k) * 0.618033988749895);
+            } else {
+                j2 = interleaved_gradient_noise(pixel_coords, 2000u + s * 8u + k);
+            }
+            let sub_t = t0 + (f32(k) + clamp(j2, 0.05, 0.95)) * sub_dt;
+            let p = pos + ray_dir * sub_t;
+            let r_p = length(p);
+
+            let absorption = sample_density_lut(r_p, ABSORPTION_DENSITY);
+            let scattering = sample_density_lut(r_p, SCATTERING_DENSITY);
+            var extinction = absorption + scattering;
+
+            // Cloud extinction on the view ray.
+            let cloud_density = get_cloud_medium_density(r_p, p);
+            if (cloud_density > 0.0) {
+                let cloud_extinction = cloud_density * (get_cloud_scattering_coeff() + get_cloud_absorption_coeff());
+                extinction += vec3(cloud_extinction);
+            }
+
+            let sample_optical_depth = extinction * sub_dt;
+            optical_depth += sample_optical_depth;
+            let sample_transmittance = exp(-sample_optical_depth);
+
+            let inscattering = sample_local_inscattering(scattering, ray_dir, p, pixel_coords);
+            let s_int = (inscattering - inscattering * sample_transmittance) / max(extinction, MIN_EXTINCTION);
+            result.inscattering += result.transmittance * s_int;
+            result.transmittance *= sample_transmittance;
+
+            if all(result.transmittance < vec3(0.001)) {
+                stop = true;
+            }
+        }
+    }
+    } @else {
+    // Quadratically spaced segments with a jittered sample inside each one. Uniform steps
+    // (thousands of meters long on sky rays) skipped the dense near-surface Mie/haze layers and
+    // dropped the last segment, leaving the sky 2-3x too dark and blue-shifted.
+    let n_steps = max(1u, u32(sample_count));
+    // One IGN value per pixel (and frame, in screen passes), golden-ratio stratified across steps.
+    // Seeding IGN with the step index alone gave a fixed per-pixel pattern that TAA cannot average
+    // (dither visible in crepuscular rays, backlit:20).
+    // Screen passes vary it per frame (TAA / cloud reconstruction average it); the sky-view LUT
+    // has no temporal accumulation, so a per-frame jitter there flickered everything that samples
+    // the LUT (cloud ambient, ground skylight).
+    var jitter_frame = view.frame_count % 64u;
+    @if(SKY_VIEW_LUT_PASS) { jitter_frame = 0u; }
+    let jitter0 = interleaved_gradient_noise(pixel_coords, jitter_frame);
+    for (var s = 0u; s < n_steps; s += 1u) {
+        let jitter = fract(jitter0 + f32(s) * 0.618033988749895); // [0, 1]
+        let u0 = f32(s) / f32(n_steps);
+        let u1 = f32(s + 1u) / f32(n_steps);
+        let t0 = t_start + t_total * u0 * u0;
+        let t1 = t_start + t_total * u1 * u1;
+        let t_i = mix(t0, t1, jitter);
+        let dt_i = t1 - t0;
 
         let sample_pos = pos + ray_dir * t_i;
         let local_r = length(sample_pos);
-        let local_up = normalize(sample_pos);
 
         let absorption = sample_density_lut(local_r, ABSORPTION_DENSITY);
         let scattering = sample_density_lut(local_r, SCATTERING_DENSITY);
@@ -466,39 +1084,161 @@ fn raymarch_atmosphere(
         optical_depth += sample_optical_depth;
         let sample_transmittance = exp(-sample_optical_depth);
 
-        let inscattering = sample_local_inscattering(
-            scattering,
-            ray_dir,
-            sample_pos
-        );
-
+        let inscattering = sample_local_inscattering(scattering, ray_dir, sample_pos, pixel_coords);
         let s_int = (inscattering - inscattering * sample_transmittance) / max(extinction, MIN_EXTINCTION);
         result.inscattering += result.transmittance * s_int;
-
         result.transmittance *= sample_transmittance;
         if all(result.transmittance < vec3(0.001)) {
             break;
         }
     }
+    }
 
     // include reflected luminance from planet ground
     if ground && ray_intersects_ground(r, mu) {
+        // position on the sphere and get the sphere normal (up)
+        let sphere_point = pos + ray_dir * t_end;
+        let sphere_normal = normalize(sphere_point);
         for (var light_i: u32 = 0u; light_i < lights.n_directional_lights; light_i++) {
             let light = &lights.directional_lights[light_i];
             let light_dir = (*light).direction_to_light;
             let light_color = light_color_rec709((*light).color);
             let transmittance_to_ground = exp(-optical_depth);
-            // position on the sphere and get the sphere normal (up)
-            let sphere_point = pos + ray_dir * t_end;
-            let sphere_normal = normalize(sphere_point);
             let mu_light = dot(light_dir, sphere_normal);
             let transmittance_to_light = sample_transmittance_lut(atmosphere.inner_radius, mu_light);
-            let light_luminance = transmittance_to_light * max(mu_light, 0.0) * light_color;
+            var light_luminance = transmittance_to_light * max(mu_light, 0.0) * light_color;
+            @if(CLOUDS_ENABLED) {
+            light_luminance *= sample_cloud_shadow_ground(sphere_point, light_dir);
+            }
             // Normalized Lambert BRDF
             let ground_luminance = transmittance_to_ground * atmosphere.ground_albedo / PI;
             result.inscattering += ground_luminance * light_luminance;
         }
+        // Skylight on the ground (Lambert): dominant at low sun and missing before
+        // (ground was 3-50x too dark in blue at 3 deg sun elevation).
+        var e_sky = ground_sky_irradiance(sphere_point, pixel_coords);
+        // (Not in the sky-view LUT pass itself: it cannot read the LUT it writes.)
+        @if(CLOUDS_ENABLED && !SKY_VIEW_LUT_PASS) {
+            // The sky-view LUT has no clouds: per skylight direction, replace the clear sky by
+            // dimmer cloud bases using the cloud transmittance along it (floor = light the clouds
+            // scatter down).
+            e_sky = ground_sky_irradiance_clouds(sphere_point, pixel_coords);
+        }
+        result.inscattering += exp(-optical_depth) * atmosphere.ground_albedo / PI * e_sky;
     }
 
     return result;
+}
+
+/// Sky irradiance on a horizontal ground point: cosine-weighted directions (E = pi * mean(L)),
+/// each a short quadratically spaced single + LUT-multiple scattering march.
+@if(CLOUDS_ENABLED)
+fn ground_sky_irradiance_clouds(p: vec3<f32>, pixel_coords: vec2<f32>) -> vec3<f32> {
+    let n = normalize(p);
+    let tx = normalize(select(vec3(1.0, 0.0, 0.0), vec3(0.0, 0.0, 1.0), abs(n.x) > 0.9) - n * dot(n, select(vec3(1.0, 0.0, 0.0), vec3(0.0, 0.0, 1.0), abs(n.x) > 0.9)));
+    let ty = cross(n, tx);
+    let r_cam = length(get_view_position());
+    // Sunlight diffusely transmitted through a cloud of optical thickness tau (two-stream,
+    // g = 0.85): T_diff ~ 1 / (1 + 0.75 (1 - g) tau), seen from below as Lambertian radiance.
+    var e_top = vec3(0.0);
+    if (lights.n_directional_lights > 0u) {
+        let l = lights.directional_lights[0].direction_to_light;
+        let mu_l = dot(l, n);
+        e_top = lights.directional_lights[0].color.rgb * max(mu_l, 0.0)
+            * sample_transmittance_lut(cloud_layer.cloud_layer_end, mu_l) / PI;
+        // Diffuse transmission depends on the sun's incidence at the cloud top: Monte Carlo slab
+        // (conservative, cloud_mie_phase, validation/sky/slab_t_mie.py) fits
+        // T ~ (0.35 + 0.9 mu0) / (1 + 0.75 (1 - <cos>) tau) within ~6 % for tau >= 5 (two-stream
+        // similarity); at grazing sun (mu0 0.05) that is 0.4x the mu0-free form.
+        e_top *= 0.35 + 0.9 * max(mu_l, 0.0);
+    }
+    // Sky irradiance from the sky-view LUT over cosine-weighted directions, each occluded by the
+    // clouds along it: tilted independent column approximation (Varnai & Davies 1999), the cloud
+    // field's column optical depth where the direction crosses mid-layer, over mu. A single
+    // vertical exp(-1.66 tau) of the blurred column (UE5-style cloud AO) blacked out the sky
+    // under every cumulus out to the blur radius (exp of a blurred tau, not a blurred exp), a
+    // dark pattern on the ground that did not follow the sun; around a small cloud most of the
+    // sky is open. Occluded directions see the cloud base lit by diffusely transmitted sunlight
+    // (Lambertian, PI * L).
+    let h_mid = 0.5 * (cloud_layer.cloud_layer_start + cloud_layer.cloud_layer_end) - length(p);
+    // The directions are randomly rotated and stratified per pixel and frame (TAA averages them).
+    // A fixed set of 6 gave 6 shifted hard-edged copies of each cloud's occlusion, stacked into
+    // plateaus of constant brightness inside the shadows; each direction stands for a cone of
+    // the hemisphere, and the jitter integrates over it.
+    var j = interleaved_gradient_noise(pixel_coords, 3000u + view.frame_count % 64u);
+    @if(ATM_DBG_GROUND_SKY_FIXED) { j = 0.5; }
+    let phi0 = j * 6.2831853;
+    var sky = vec3(0.0);
+    for (var k = 0u; k < GROUND_SKY_DIRS; k++) {
+        let u = (f32(k) + fract(j * 7.0 + f32(k) * 0.618034)) / f32(GROUND_SKY_DIRS);
+        let phi = phi0 + f32(k) * 2.399963;
+        let horiz = tx * cos(phi) + ty * sin(phi);
+        let mu = sqrt(1.0 - u);
+        let d = normalize(n * mu + horiz * sqrt(u));
+        let tau = cloud_column_march_optical_depth(p + horiz * (max(h_mid, 0.0) * sqrt(u) / mu));
+        let t_cloud = exp(-tau / mu);
+        sky += sample_sky_view_lut(r_cam, direction_world_to_atmosphere(d)) * t_cloud
+            + (1.0 - t_cloud) * e_top / (1.0 + 0.75 * (1.0 - CLOUD_MIE_MEAN_COS) * tau);
+    }
+    return sky * (PI / f32(GROUND_SKY_DIRS));
+}
+
+/// Column optical depth above a ground point from a short vertical march through the cloud layer
+/// (cloud_far_transmittance: ~2 coarse samples for a vertical path), the same everywhere. The
+/// cloud field's column (inside +-12 km only, blurred over ~750 m) and a fallback to the column
+/// straight above the pixel outside it lit the shadowed ground differently on either side of the
+/// field's edge (a dark/light shadow junction along a square).
+@if(CLOUDS_ENABLED)
+fn cloud_column_march_optical_depth(p: vec3<f32>) -> f32 {
+    return -log(max(cloud_far_transmittance(p, normalize(p), true), 1e-6));
+}
+
+const GROUND_SKY_DIRS: u32 = 6u;
+const GROUND_SKY_STEPS: u32 = 6u;
+fn ground_sky_irradiance(p: vec3<f32>, pixel_coords: vec2<f32>) -> vec3<f32> {
+    let n = normalize(p);
+    let r = length(p);
+    let tx = normalize(select(vec3(1.0, 0.0, 0.0), vec3(0.0, 0.0, 1.0), abs(n.x) > 0.9) - n * dot(n, select(vec3(1.0, 0.0, 0.0), vec3(0.0, 0.0, 1.0), abs(n.x) > 0.9)));
+    let ty = cross(n, tx);
+    var sum = vec3(0.0);
+    @if(!SKY_VIEW_LUT_PASS) {
+    // Cheap path: 8 fetches of this frame's sky-view LUT (sky as seen from the camera, a good
+    // proxy for nearby ground). The 64-sample march below cost 3-5 ms of render_sky.
+    let r_cam = length(get_view_position());
+    for (var k = 0u; k < GROUND_SKY_DIRS; k++) {
+        let u = (f32(k) + 0.5) / f32(GROUND_SKY_DIRS);
+        let phi = f32(k) * 2.399963;
+        let st = sqrt(u);
+        let ct = sqrt(1.0 - u);
+        let d = normalize(n * ct + (tx * cos(phi) + ty * sin(phi)) * st);
+        sum += sample_sky_view_lut(r_cam, direction_world_to_atmosphere(d));
+    }
+    return PI * sum / f32(GROUND_SKY_DIRS);
+    }
+    for (var k = 0u; k < GROUND_SKY_DIRS; k++) {
+        let u = (f32(k) + 0.5) / f32(GROUND_SKY_DIRS);
+        let phi = f32(k) * 2.399963; // golden angle
+        let st = sqrt(u);
+        let ct = sqrt(1.0 - u);
+        let d = normalize(n * ct + (tx * cos(phi) + ty * sin(phi)) * st);
+        let t_end = distance_to_top_atmosphere_boundary(atmosphere, r, ct);
+        var tr = vec3(1.0);
+        var l = vec3(0.0);
+        for (var i = 0u; i < GROUND_SKY_STEPS; i++) {
+            let ua = f32(i) / f32(GROUND_SKY_STEPS);
+            let ub = f32(i + 1u) / f32(GROUND_SKY_STEPS);
+            let ta = t_end * ua * ua;
+            let tb = t_end * ub * ub;
+            let q = p + d * (0.5 * (ta + tb));
+            let rq = length(q);
+            let scattering = sample_density_lut(rq, SCATTERING_DENSITY);
+            let extinction = sample_density_lut(rq, ABSORPTION_DENSITY) + scattering;
+            let st_i = exp(-extinction * (tb - ta));
+            let ins = sample_local_inscattering(scattering, d, q, pixel_coords);
+            l += tr * (ins - ins * st_i) / max(extinction, MIN_EXTINCTION);
+            tr *= st_i;
+        }
+        sum += l;
+    }
+    return PI * sum / f32(GROUND_SKY_DIRS);
 }
