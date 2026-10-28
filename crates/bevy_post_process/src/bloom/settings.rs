@@ -8,6 +8,8 @@ use bevy_ecs::{
 use bevy_math::{AspectRatio, URect, UVec4, Vec2, Vec4};
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
 use bevy_render::{extract_component::ExtractComponent, sync_component::SyncComponent, RenderApp};
+use bevy_utils::once;
+use tracing::warn;
 
 /// Applies a bloom effect to an HDR-enabled 2d or 3d camera.
 ///
@@ -23,7 +25,7 @@ use bevy_render::{extract_component::ExtractComponent, sync_component::SyncCompo
 /// Bloom is best used alongside a tonemapping function that desaturates bright colors,
 /// such as [`bevy_core_pipeline::tonemapping::Tonemapping::TonyMcMapface`].
 ///
-/// Bevy's implementation uses a parametric curve to blend between a set of
+/// By default, Bevy's implementation uses a parametric curve to blend between a set of
 /// blurred (lower frequency) images generated from the camera's view.
 /// See <https://starlederer.github.io/bloom/> for a visualization of the parametric curve
 /// used in Bevy as well as a visualization of the curve's respective scattering profile.
@@ -115,12 +117,17 @@ pub struct Bloom {
 
     /// Maximum size of each dimension for the largest mipchain texture used in downscaling/upscaling.
     /// Only tweak if you are seeing visual artifacts.
+    ///
+    /// The size of [`BloomScatterModel::Gt7Glare`] glare is tuned for the default of 512.
     pub max_mip_dimension: u32,
 
     /// Amount to stretch the bloom on each axis. Artistic control, can be used to emulate
     /// anamorphic blur by using a large x-value. For large values, you may need to increase
     /// [`Bloom::max_mip_dimension`] to reduce sampling artifacts.
     pub scale: Vec2,
+
+    /// How the blurred images are weighted (default: [`BloomScatterModel::Aesthetic`]).
+    pub scatter: BloomScatterModel,
 }
 
 impl Bloom {
@@ -141,6 +148,15 @@ impl Bloom {
         composite_mode: BloomCompositeMode::EnergyConserving,
         max_mip_dimension: Self::DEFAULT_MAX_MIP_DIMENSION,
         scale: Vec2::ONE,
+        scatter: BloomScatterModel::Aesthetic,
+    };
+
+    /// A preset that uses [`BloomScatterModel::Gt7Glare`] at f/5.6.
+    pub const GT7_GLARE: Self = Self {
+        scatter: BloomScatterModel::Gt7Glare {
+            f_number: super::glare::DEFAULT_F_NUMBER,
+        },
+        ..Self::NATURAL
     };
 
     /// Emulates the look of stylized anamorphic bloom, stretched horizontally.
@@ -164,6 +180,7 @@ impl Bloom {
         composite_mode: BloomCompositeMode::Additive,
         max_mip_dimension: Self::DEFAULT_MAX_MIP_DIMENSION,
         scale: Vec2::ONE,
+        scatter: BloomScatterModel::Aesthetic,
     };
 
     /// A preset that applies a very strong bloom, and blurs the whole screen.
@@ -179,6 +196,7 @@ impl Bloom {
         composite_mode: BloomCompositeMode::EnergyConserving,
         max_mip_dimension: Self::DEFAULT_MAX_MIP_DIMENSION,
         scale: Vec2::ONE,
+        scatter: BloomScatterModel::Aesthetic,
     };
 }
 
@@ -186,6 +204,29 @@ impl Default for Bloom {
     fn default() -> Self {
         Self::NATURAL
     }
+}
+
+/// Selects how [`Bloom`] weights its blurred images.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Reflect)]
+#[reflect(Debug, Default, Clone, PartialEq)]
+pub enum BloomScatterModel {
+    /// The parametric curve shaped by [`Bloom::low_frequency_boost`],
+    /// [`Bloom::low_frequency_boost_curvature`] and [`Bloom::high_pass_frequency`].
+    #[default]
+    Aesthetic,
+
+    /// Lens glare in the style of Gran Turismo 7. Use it for a photographic look that you
+    /// control with a lens aperture instead of curve settings.
+    ///
+    /// The weights come from the diffraction pattern of a circular aperture, averaged over
+    /// visible wavelengths. [`Bloom::intensity`] is the fraction of light scattered out of the
+    /// sharp image. The curve settings and the [`Bloom::prefilter`] threshold are ignored, and
+    /// the composite mode is always [`BloomCompositeMode::EnergyConserving`].
+    Gt7Glare {
+        /// The aperture f-number, clamped to `[1.0, 22.0]`. NaN uses f/5.6. Low values keep the
+        /// glare tight around bright lights. High values spread it into a wide, soft glow.
+        f_number: f32,
+    },
 }
 
 /// Applies a threshold filter to the input image to extract the brightest
@@ -239,6 +280,19 @@ impl ExtractComponent<RenderApp> for Bloom {
             (Some(URect { min: origin, .. }), Some(size), Some(target_size), true)
                 if size.x != 0 && size.y != 0 =>
             {
+                let mut bloom = bloom.clone();
+                if matches!(bloom.scatter, BloomScatterModel::Gt7Glare { .. })
+                    && (bloom.composite_mode != BloomCompositeMode::EnergyConserving
+                        || bloom.prefilter.threshold > 0.0)
+                {
+                    once!(warn!(
+                        "Bloom with BloomScatterModel::Gt7Glare ignores the prefilter threshold \
+                        and always uses BloomCompositeMode::EnergyConserving"
+                    ));
+                    bloom.composite_mode = BloomCompositeMode::EnergyConserving;
+                    bloom.prefilter.threshold = 0.0;
+                }
+
                 let threshold = bloom.prefilter.threshold;
                 let threshold_softness = bloom.prefilter.threshold_softness;
                 let knee = threshold * threshold_softness.clamp(0.0, 1.0);
@@ -259,7 +313,7 @@ impl ExtractComponent<RenderApp> for Bloom {
                     scale: bloom.scale,
                 };
 
-                Some((bloom.clone(), uniform))
+                Some((bloom, uniform))
             }
             _ => None,
         }
