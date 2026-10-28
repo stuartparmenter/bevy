@@ -5,7 +5,7 @@ use crate::{
     LinearSampler, ScatteringMediumSampler, ShadowSamplers, ViewShadowBindings,
 };
 use bevy_asset::{load_embedded_asset, AssetId, Handle};
-use bevy_camera::{Camera, Camera3d};
+use bevy_camera::{Camera, Camera3d, MainPassResolutionOverride};
 use bevy_core_pipeline::FullscreenShader;
 use bevy_derive::Deref;
 use bevy_diagnostic::FrameCount;
@@ -837,6 +837,7 @@ pub(super) fn prepare_clouds_temporal_params(
             Option<&GpuCloudLayers>,
             Option<&bevy_render::camera::TemporalJitter>,
             Option<&ExtractedCamera>,
+            Option<&MainPassResolutionOverride>,
         ),
         With<ExtractedAtmosphere>,
     >,
@@ -848,7 +849,9 @@ pub(super) fn prepare_clouds_temporal_params(
     mut commands: Commands,
 ) {
     let mut seen = HashMap::default();
-    for (entity, view, textures, cloud_layer, temporal_jitter, camera) in &views {
+    for (entity, view, textures, cloud_layer, temporal_jitter, camera, resolution_override) in
+        &views
+    {
         let offset = cloud_layer.map_or(Vec3::ZERO, |c| c.noise_offset);
         // Thin-layer pixels reproject with the lowest thin layer's motion.
         let cirrus_offset = cloud_layer
@@ -861,11 +864,11 @@ pub(super) fn prepare_clouds_temporal_params(
         let exposure = camera.map_or(1.0, |c| c.exposure);
         let clip_from_world = match temporal_jitter {
             Some(jitter) => {
+                // The jitter is in render pixels, like the view uniform's (`prepare_view_uniforms`).
+                let render_size = resolution_override
+                    .map_or(UVec2::new(view.viewport.z, view.viewport.w), |size| **size);
                 let mut clip_from_view = view.clip_from_view;
-                jitter.jitter_projection(
-                    &mut clip_from_view,
-                    UVec2::new(view.viewport.z, view.viewport.w).as_vec2(),
-                );
+                jitter.jitter_projection(&mut clip_from_view, render_size.as_vec2());
                 clip_from_view * view.world_from_view.to_matrix().inverse()
             }
             None => view.clip_from_world.unwrap_or_else(|| {
@@ -1587,6 +1590,7 @@ pub(super) fn prepare_atmosphere_textures(
             &ExtractedView,
             &GpuAtmosphereSettings,
             Option<&ExtractedCamera>,
+            Option<&MainPassResolutionOverride>,
             bevy_ecs::query::Has<GpuCloudLayers>,
         ),
         With<ExtractedAtmosphere>,
@@ -1603,7 +1607,7 @@ pub(super) fn prepare_atmosphere_textures(
     // 5). A texture is only reallocated when its descriptor changes, and a reallocation is a
     // new texture id, which the history validity checks compare.
     let mut seen: HashMap<RetainedViewEntity, ViewTextureStore> = HashMap::default();
-    for (entity, view, lut_settings, camera, has_clouds) in &views {
+    for (entity, view, lut_settings, camera, resolution_override, has_clouds) in &views {
         let mut textures = store.remove(&view.retained_view_entity).unwrap_or_default();
         textures.device = Some(render_device.clone());
         // Views without cloud layers bind 1x1 placeholders for every cloud texture (their
@@ -1838,12 +1842,14 @@ pub(super) fn prepare_atmosphere_textures(
             view_formats: &[],
         });
 
-        // Half-resolution cloud raymarch targets (design.md §1.2).
-        let full_size = camera
-            .and_then(|camera| camera.physical_viewport_size)
+        // Half-resolution cloud raymarch targets (design.md §1.2), relative to the main pass's
+        // render resolution (below the output resolution under an upscaler such as DLSS).
+        let render_size = resolution_override
+            .map(|size| **size)
+            .or(camera.and_then(|camera| camera.physical_viewport_size))
             .filter(|_| has_clouds)
             .unwrap_or(UVec2::ONE);
-        let clouds_size = cloud_render_size(full_size, lut_settings.cloud_max_render_size);
+        let clouds_size = cloud_render_size(render_size, lut_settings.cloud_max_render_size);
         let trace_size = (clouds_size + UVec2::ONE) / 2;
         let clouds_texture =
             |label: &'static str, format: TextureFormat, size: UVec2, copy: TextureUsages| {
