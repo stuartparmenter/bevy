@@ -34,7 +34,7 @@ import bevy_render::maths::{E, powsafe};
 @if(ENVIRONMENT_MAP) import package::light_probe::environment_map;
 
 @if(TONEMAP_IN_SHADER) import bevy_core_pipeline::tonemapping::{
-    tone_mapping, screen_space_dither, working_color_to_rec709
+    tone_mapping_working_color, screen_space_dither
 };
 
 
@@ -996,10 +996,7 @@ fn main_pass_post_lighting_processing(
     }
 
 @if(TONEMAP_IN_SHADER) {
-    output_color = tone_mapping(
-        working_color_to_rec709(output_color),
-        view_bindings::view.color_grading,
-    );
+    output_color = tone_mapping_working_color(output_color, view_bindings::view.color_grading);
 @if(DEBAND_DITHER) {
     var output_rgb = output_color.rgb;
     output_rgb = powsafe(output_rgb, 1.0 / 2.2);

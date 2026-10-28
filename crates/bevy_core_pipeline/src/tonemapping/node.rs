@@ -1,8 +1,11 @@
-use crate::tonemapping::{TonemappingLuts, TonemappingPipeline, ViewTonemappingPipeline};
+use crate::tonemapping::{
+    Gt7ParamsUniform, TonemappingLuts, TonemappingPipeline, ViewTonemappingPipeline,
+};
 
 use bevy_ecs::{entity::EntityHashMap, prelude::*};
 use bevy_render::{
     diagnostic::RecordDiagnostics,
+    extract_component::{ComponentUniforms, DynamicUniformIndex},
     render_asset::RenderAssets,
     render_resource::{
         BindGroup, BindGroupEntries, BufferId, LoadOp, Operations, PipelineCache,
@@ -30,18 +33,22 @@ pub fn tonemapping(
         &ViewUniformOffset,
         &ViewTarget,
         &ViewTonemappingPipeline,
+        Option<&DynamicUniformIndex<Gt7ParamsUniform>>,
     )>,
     pipeline_cache: Res<PipelineCache>,
     tonemapping_pipeline: Res<TonemappingPipeline>,
     gpu_images: Res<RenderAssets<GpuImage>>,
     fallback_image: Res<FallbackImage>,
     view_uniforms: Res<ViewUniforms>,
+    gt7_params_uniforms: Res<ComponentUniforms<Gt7ParamsUniform>>,
     tonemapping_luts: Res<TonemappingLuts>,
     pass_views: Query<(), With<ViewTonemappingPipeline>>,
     mut cache: Local<EntityHashMap<CachedTonemappingBindGroup>>,
+    mut gt7_params_cache: Local<Option<(BufferId, BindGroup)>>,
     mut ctx: RenderContext,
 ) {
-    let (view_entity, view_uniform_offset, target, view_tonemapping_pipeline) = view.into_inner();
+    let (view_entity, view_uniform_offset, target, view_tonemapping_pipeline, gt7_params_index) =
+        view.into_inner();
 
     // Views that run this pass always have an `Rgba16Float` main texture.
     debug_assert_eq!(target.main_texture_format(), TextureFormat::Rgba16Float);
@@ -53,6 +60,28 @@ pub fn tonemapping(
     let Some(pipeline) = pipeline_cache.get_render_pipeline(view_tonemapping_pipeline.pipeline_id)
     else {
         return;
+    };
+
+    let gt7_params = if view_tonemapping_pipeline.method == Tonemapping::GranTurismo7 {
+        let (Some(buffer), Some(index)) = (gt7_params_uniforms.buffer(), gt7_params_index) else {
+            return;
+        };
+        if gt7_params_cache
+            .as_ref()
+            .is_none_or(|(id, _)| *id != buffer.id())
+        {
+            let bind_group = ctx.render_device().create_bind_group(
+                "tonemapping_gt7_params_bind_group",
+                &pipeline_cache.get_bind_group_layout(&tonemapping_pipeline.gt7_params_bind_group),
+                &BindGroupEntries::single(gt7_params_uniforms.uniforms()),
+            );
+            *gt7_params_cache = Some((buffer.id(), bind_group));
+        }
+        gt7_params_cache
+            .as_ref()
+            .map(|(_, bind_group)| (bind_group, index.index()))
+    } else {
+        None
     };
 
     let view_uniforms_buffer = &view_uniforms.uniforms;
@@ -128,6 +157,9 @@ pub fn tonemapping(
 
         render_pass.set_pipeline(pipeline);
         render_pass.set_bind_group(0, bind_group, &[view_uniform_offset.offset]);
+        if let Some((bind_group, offset)) = gt7_params {
+            render_pass.set_bind_group(1, bind_group, &[offset]);
+        }
         render_pass.draw(0..3, 0..1);
     }
 

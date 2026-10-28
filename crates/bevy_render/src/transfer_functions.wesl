@@ -24,6 +24,14 @@ fn pq_inverse_eotf_from_nits(nits: vec3<f32>) -> vec3<f32> {
     return exp2(PQ_M2 * (log2(PQ_C1 + PQ_C2 * ym) - log2(1.0 + PQ_C3 * ym)));
 }
 
+/// The inverse of `pq_inverse_eotf_from_nits`. The signal is clamped to
+/// `[0, 1]`, so the result is at most 10000 nits.
+fn pq_eotf_to_nits(signal: vec3<f32>) -> vec3<f32> {
+    let e = pow(clamp(signal, vec3(0.0), vec3(1.0)), vec3(1.0 / PQ_M2));
+    let y = max(e - PQ_C1, vec3(0.0)) / (PQ_C2 - PQ_C3 * e);
+    return pow(y, vec3(1.0 / PQ_M1)) * PQ_MAX_LUMINANCE_NITS;
+}
+
 /// The sRGB OETF continued above `1.0` and mirrored below `0.0`.
 fn srgb_oetf_extended(rgb: vec3<f32>) -> vec3<f32> {
     return sign(rgb) * linear_to_srgb(abs(rgb));

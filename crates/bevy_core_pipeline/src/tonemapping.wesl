@@ -11,6 +11,10 @@ import package::tonemapping::lut_bindings::{
 
 @if(WORKING_COLOR_SPACE_REC2020)
 import bevy_render::working_color_space::REC2020_TO_REC709;
+@if(TONEMAP_METHOD_GRAN_TURISMO_7)
+import bevy_render::working_color_space::REC709_TO_REC2020;
+@if(TONEMAP_METHOD_GRAN_TURISMO_7)
+import package::tonemapping::gt7::tone_mapping_gran_turismo_7;
 
 /// Half the size of the crossfade region between shadows and midtones and
 /// between midtones and highlights. This value, 0.1, corresponds to 10% of the
@@ -373,19 +377,22 @@ fn sectional_color_grading(
     return max(color, vec3(0.0));
 }
 
-/// Converts a working color space color to the Rec.709 that `tone_mapping`
-/// takes.
-fn working_color_to_rec709(color: vec4<f32>) -> vec4<f32> {
-@if(WORKING_COLOR_SPACE_REC2020) {
-    return vec4(REC2020_TO_REC709 * color.rgb, color.a);
+/// Tonemaps a working color space color.
+fn tone_mapping_working_color(in: vec4<f32>, color_grading: ColorGrading) -> vec4<f32> {
+@if(WORKING_COLOR_SPACE_REC2020 && TONEMAP_METHOD_GRAN_TURISMO_7) {
+    // Gran Turismo 7 takes Rec.2020, so colors outside Rec.709 keep their saturation.
+    let color = tone_mapping_gran_turismo_7(pre_tonemapping_grading(in.rgb, color_grading));
+    return vec4(saturation(color, color_grading.post_saturation), in.a);
+} @elif(WORKING_COLOR_SPACE_REC2020) {
+    return tone_mapping(vec4(REC2020_TO_REC709 * in.rgb, in.a), color_grading);
 } @else {
-    return color;
+    return tone_mapping(in, color_grading);
 }
 }
 
-/// Tonemaps a linear Rec.709 color.
-fn tone_mapping(in: vec4<f32>, in_color_grading: ColorGrading) -> vec4<f32> {
-    var color = in.rgb;
+/// The color grading that comes before the tone curve.
+fn pre_tonemapping_grading(in: vec3<f32>, in_color_grading: ColorGrading) -> vec3<f32> {
+    var color = in;
     // Under Rec.2020, `Linear` keeps colors outside Rec.709 as negative values.
 @if(!WORKING_COLOR_SPACE_REC2020 || !TONEMAP_METHOD_LINEAR)
     color = max(color, vec3(0.0));
@@ -416,6 +423,13 @@ fn tone_mapping(in: vec4<f32>, in_color_grading: ColorGrading) -> vec4<f32> {
     color = color * powsafe(vec3(2.0), color_grading.exposure);
 }
 
+    return color;
+}
+
+/// Tonemaps a linear Rec.709 color.
+fn tone_mapping(in: vec4<f32>, color_grading: ColorGrading) -> vec4<f32> {
+    var color = pre_tonemapping_grading(in.rgb, color_grading);
+
     // tone_mapping
 @if(TONEMAP_METHOD_LINEAR) {
     color = color;
@@ -436,6 +450,8 @@ fn tone_mapping(in: vec4<f32>, in_color_grading: ColorGrading) -> vec4<f32> {
     color = sample_blender_filmic_lut(color.rgb);
 } @elif(TONEMAP_METHOD_PBR_NEUTRAL) {
     color = tonemapping_pbr_neutral(color.rgb);
+} @elif(TONEMAP_METHOD_GRAN_TURISMO_7) {
+    color = tone_mapping_gran_turismo_7(REC709_TO_REC2020 * color);
 }
 
     // Perceptual post tonemapping grading

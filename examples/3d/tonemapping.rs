@@ -312,6 +312,8 @@ fn toggle_tonemapping_method(
         **tonemapping = Tonemapping::BlenderFilmic;
     } else if keys.just_pressed(KeyCode::Digit9) {
         **tonemapping = Tonemapping::KhronosPbrNeutral;
+    } else if keys.just_pressed(KeyCode::Digit0) {
+        **tonemapping = Tonemapping::GranTurismo7;
     }
 
     **color_grading = (*per_method_settings
@@ -507,6 +509,14 @@ fn update_ui(
             ""
         }
     ));
+    text.push_str(&format!(
+        "(0) {} Gran Turismo 7\n",
+        if tonemapping == Tonemapping::GranTurismo7 {
+            ">"
+        } else {
+            ""
+        }
+    ));
 
     text.push_str("\n\nColor Grading:\n");
     text.push_str("(arrow keys)\n");
@@ -599,6 +609,7 @@ impl Default for PerMethodSettings {
             Tonemapping::TonyMcMapface,
             Tonemapping::BlenderFilmic,
             Tonemapping::KhronosPbrNeutral,
+            Tonemapping::GranTurismo7,
         ] {
             settings.insert(
                 method,

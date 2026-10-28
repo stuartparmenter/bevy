@@ -634,6 +634,7 @@ bitflags::bitflags! {
         const TONEMAP_METHOD_TONY_MC_MAPFACE    = 6 << Self::TONEMAP_METHOD_SHIFT_BITS;
         const TONEMAP_METHOD_BLENDER_FILMIC     = 7 << Self::TONEMAP_METHOD_SHIFT_BITS;
         const TONEMAP_METHOD_PBR_NEUTRAL        = 8 << Self::TONEMAP_METHOD_SHIFT_BITS;
+        const TONEMAP_METHOD_GRAN_TURISMO_7     = 9 << Self::TONEMAP_METHOD_SHIFT_BITS;
     }
 }
 
@@ -832,6 +833,9 @@ impl SpecializedMeshPipeline for Mesh2dPipeline {
                 }
                 Mesh2dPipelineKey::TONEMAP_METHOD_PBR_NEUTRAL => {
                     shader_defs.push("TONEMAP_METHOD_PBR_NEUTRAL".into());
+                }
+                Mesh2dPipelineKey::TONEMAP_METHOD_GRAN_TURISMO_7 => {
+                    shader_defs.push("TONEMAP_METHOD_GRAN_TURISMO_7".into());
                 }
                 _ => {}
             }

@@ -7,10 +7,10 @@ use bevy_ecs::prelude::*;
 use bevy_image::{CompressedImageFormats, Image, ImageSampler, ImageType};
 #[cfg(not(feature = "tonemapping_luts"))]
 use bevy_log::error;
-use bevy_log::warn;
+use bevy_log::{warn, warn_once};
 use bevy_render::{
     camera::ExtractedCamera,
-    extract_component::ExtractComponentPlugin,
+    extract_component::{ExtractComponentPlugin, UniformComponentPlugin},
     extract_resource::{ExtractResource, ExtractResourcePlugin},
     render_asset::RenderAssets,
     render_resource::{
@@ -19,16 +19,22 @@ use bevy_render::{
     },
     renderer::RenderDevice,
     texture::{FallbackImage, GpuImage},
-    view::{ColorGrading, ExtractedView, ResolvedCompositingSpace, ViewTarget, ViewUniform},
+    view::{
+        prepare_view_targets, ColorGrading, ExtractedView, ResolvedCompositingSpace,
+        ViewDisplayTarget, ViewTarget, ViewUniform,
+    },
     GpuResourceAppExt, Render, RenderApp, RenderStartup, RenderSystems,
 };
 use bevy_shader::{load_shader_library, Shader, ShaderDefVal};
 use bitflags::bitflags;
 
+mod gt7;
 mod node;
 
 pub use bevy_render::view::{DebandDither, Tonemapping};
 use bevy_utils::default;
+pub use gt7::GranTurismo7Params;
+use gt7::Gt7ParamsUniform;
 pub use node::tonemapping;
 
 use crate::FullscreenShader;
@@ -47,6 +53,7 @@ pub struct TonemappingPlugin;
 impl Plugin for TonemappingPlugin {
     fn build(&self, app: &mut App) {
         load_shader_library!(app, "lut_bindings.wesl");
+        load_shader_library!(app, "gt7.wesl");
 
         embedded_asset!(app, "tonemapping_frag.wesl");
 
@@ -89,6 +96,8 @@ impl Plugin for TonemappingPlugin {
         app.add_plugins((
             ExtractComponentPlugin::<Tonemapping>::default(),
             ExtractComponentPlugin::<DebandDither>::default(),
+            ExtractComponentPlugin::<GranTurismo7Params>::default(),
+            UniformComponentPlugin::<Gt7ParamsUniform>::default(),
         ));
 
         app.add_systems(PostUpdate, check_tonemapping_none);
@@ -101,11 +110,18 @@ impl Plugin for TonemappingPlugin {
             .add_systems(RenderStartup, init_tonemapping_pipeline)
             .add_systems(
                 Render,
-                // `block_on_render_pipeline` mutates `PipelineCache`, which conflicts
-                // with every other system that uses the cache. Their order doesn't matter.
-                prepare_view_tonemapping_pipelines
-                    .in_set(RenderSystems::Prepare)
-                    .ambiguous_with_all(),
+                (
+                    // `block_on_render_pipeline` mutates `PipelineCache`, which conflicts
+                    // with every other system that uses the cache. Their order doesn't matter.
+                    prepare_view_tonemapping_pipelines
+                        .in_set(RenderSystems::Prepare)
+                        .ambiguous_with_all(),
+                    // `prepare_view_targets` runs after each view's display target is
+                    // resolved for this frame.
+                    resolve_view_tonemapping
+                        .in_set(RenderSystems::PrepareViews)
+                        .after(prepare_view_targets),
+                ),
             );
     }
 }
@@ -153,6 +169,8 @@ pub fn check_tonemapping_none(
 #[derive(Resource)]
 pub struct TonemappingPipeline {
     texture_bind_group: BindGroupLayoutDescriptor,
+    /// The Gran Turismo 7 parameters.
+    gt7_params_bind_group: BindGroupLayoutDescriptor,
     sampler: Sampler,
     fullscreen_shader: FullscreenShader,
     fragment_shader: Handle<Shader>,
@@ -275,10 +293,18 @@ impl SpecializedRenderPipeline for TonemappingPipeline {
                 shader_defs.push("TONEMAP_METHOD_BLENDER_FILMIC".into());
             }
             Tonemapping::KhronosPbrNeutral => shader_defs.push("TONEMAP_METHOD_PBR_NEUTRAL".into()),
+            Tonemapping::GranTurismo7 => {
+                shader_defs.push("TONEMAP_METHOD_GRAN_TURISMO_7".into());
+                shader_defs.push("GT7_PARAMS_UNIFORM".into());
+            }
+        }
+        let mut layout = vec![self.texture_bind_group.clone()];
+        if key.tonemapping == Tonemapping::GranTurismo7 {
+            layout.push(self.gt7_params_bind_group.clone());
         }
         RenderPipelineDescriptor {
             label: Some("tonemapping pipeline".into()),
-            layout: vec![self.texture_bind_group.clone()],
+            layout,
             vertex: self.fullscreen_shader.to_vertex_state(),
             fragment: Some(FragmentState {
                 shader: self.fragment_shader.clone(),
@@ -317,15 +343,70 @@ pub fn init_tonemapping_pipeline(
 
     let tonemap_texture_bind_group =
         BindGroupLayoutDescriptor::new("tonemapping_hdr_texture_bind_group_layout", &entries);
+    let gt7_params_bind_group = BindGroupLayoutDescriptor::new(
+        "tonemapping_gt7_params_bind_group_layout",
+        &BindGroupLayoutEntries::single(
+            ShaderStages::FRAGMENT,
+            uniform_buffer::<Gt7ParamsUniform>(true),
+        ),
+    );
 
     let sampler = render_device.create_sampler(&SamplerDescriptor::default());
 
     commands.insert_resource(TonemappingPipeline {
         texture_bind_group: tonemap_texture_bind_group,
+        gt7_params_bind_group,
         sampler,
         fullscreen_shader: fullscreen_shader.clone(),
         fragment_shader: load_embedded_asset!(asset_server.as_ref(), "tonemapping_frag.wesl"),
     });
+}
+
+/// Replaces a method that limits output to SDR with [`Tonemapping::GranTurismo7`] on an
+/// HDR display target, so that the output can use the display's range. Gives each view
+/// that runs Gran Turismo 7 in the tonemapping pass its [`Gt7ParamsUniform`].
+fn resolve_view_tonemapping(
+    mut commands: Commands,
+    mut views: Query<(
+        Entity,
+        &ExtractedCamera,
+        &ViewDisplayTarget,
+        Option<&mut Tonemapping>,
+        Option<&GranTurismo7Params>,
+        Option<&Gt7ParamsUniform>,
+    )>,
+) {
+    for (entity, camera, display_target, tonemapping, params, existing_uniform) in &mut views {
+        let mut method = Tonemapping::None;
+        if let Some(mut tonemapping) = tonemapping {
+            let sdr_only = !matches!(
+                *tonemapping,
+                Tonemapping::None | Tonemapping::Linear | Tonemapping::GranTurismo7
+            );
+            // Extraction overwrites this every frame, so it reverts on an SDR target.
+            if sdr_only && display_target.is_hdr() {
+                warn_once!(
+                    "A camera uses `Tonemapping::{:?}`, which limits output to SDR, on an HDR \
+                    display target. It uses `Tonemapping::GranTurismo7` instead. Set that \
+                    method on the camera to silence this warning.",
+                    *tonemapping
+                );
+                *tonemapping = Tonemapping::GranTurismo7;
+            }
+            method = *tonemapping;
+        }
+
+        if camera.runs_tonemapping_pass && method == Tonemapping::GranTurismo7 {
+            let uniform =
+                Gt7ParamsUniform::new(display_target, &params.copied().unwrap_or_default());
+            if existing_uniform != Some(&uniform) {
+                commands.entity(entity).insert(uniform);
+            }
+        } else if existing_uniform.is_some() {
+            // Render world entities persist across frames.
+            commands.entity(entity).remove::<Gt7ParamsUniform>();
+        }
+    }
 }
 
 /// A view's specialized tonemapping pipeline and the method it runs.
@@ -441,7 +522,8 @@ pub fn get_lut_bindings<'a>(
         | Tonemapping::AcesFitted
         | Tonemapping::AgX
         | Tonemapping::KhronosPbrNeutral
-        | Tonemapping::SomewhatBoringDisplayTransform => &tonemapping_luts.agx,
+        | Tonemapping::SomewhatBoringDisplayTransform
+        | Tonemapping::GranTurismo7 => &tonemapping_luts.agx,
         Tonemapping::TonyMcMapface => &tonemapping_luts.tony_mc_mapface,
         Tonemapping::BlenderFilmic => &tonemapping_luts.blender_filmic,
     };

@@ -111,6 +111,7 @@ bitflags::bitflags! {
         const TONEMAP_METHOD_TONY_MC_MAPFACE    = 6 << Self::TONEMAP_METHOD_SHIFT_BITS;
         const TONEMAP_METHOD_BLENDER_FILMIC     = 7 << Self::TONEMAP_METHOD_SHIFT_BITS;
         const TONEMAP_METHOD_PBR_NEUTRAL        = 8 << Self::TONEMAP_METHOD_SHIFT_BITS;
+        const TONEMAP_METHOD_GRAN_TURISMO_7     = 9 << Self::TONEMAP_METHOD_SHIFT_BITS;
 
     }
 }
@@ -179,6 +180,7 @@ impl SpritePipelineKey {
             Tonemapping::TonyMcMapface => Self::TONEMAP_METHOD_TONY_MC_MAPFACE,
             Tonemapping::BlenderFilmic => Self::TONEMAP_METHOD_BLENDER_FILMIC,
             Tonemapping::KhronosPbrNeutral => Self::TONEMAP_METHOD_PBR_NEUTRAL,
+            Tonemapping::GranTurismo7 => Self::TONEMAP_METHOD_GRAN_TURISMO_7,
         }
     }
 }
@@ -224,6 +226,8 @@ impl SpecializedRenderPipeline for SpritePipeline {
                 shader_defs.push("TONEMAP_METHOD_TONY_MC_MAPFACE".into());
             } else if method == SpritePipelineKey::TONEMAP_METHOD_PBR_NEUTRAL {
                 shader_defs.push("TONEMAP_METHOD_PBR_NEUTRAL".into());
+            } else if method == SpritePipelineKey::TONEMAP_METHOD_GRAN_TURISMO_7 {
+                shader_defs.push("TONEMAP_METHOD_GRAN_TURISMO_7".into());
             }
 
             // Debanding is tied to tonemapping in the shader, cannot run without it.

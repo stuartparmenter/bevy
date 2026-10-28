@@ -352,6 +352,15 @@ pub enum Tonemapping {
     /// Designed for e-commerce to faithfully reproduce the colors of brand's logos when used with low brightness grayscale lighting.
     /// See [the KhronosGroup spec](https://github.com/KhronosGroup/ToneMapping/tree/main/PBR_Neutral) for more information.
     KhronosPbrNeutral,
+    /// The method from Gran Turismo 7, by Polyphony Digital, published with the SIGGRAPH 2025
+    /// course "Physically Based Tone Mapping in Gran Turismo 7".
+    /// Blends a per-channel filmic curve with a hue-preserving curve in `ICtCp`, and
+    /// desaturates colors near peak brightness.
+    /// Works for both SDR and HDR displays. On an HDR display target, the curve uses the
+    /// display's peak luminance and output can go above paper white.
+    /// Under a Rec.2020 working color space, it keeps colors outside Rec.709.
+    /// Tune it per camera with `GranTurismo7Params` in `bevy_core_pipeline`.
+    GranTurismo7,
 }
 
 impl Tonemapping {
