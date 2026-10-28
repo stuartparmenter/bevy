@@ -3,14 +3,13 @@ use bevy_app::prelude::*;
 use bevy_camera::CameraOutputMode;
 use bevy_color::RgbPrimaries;
 use bevy_ecs::prelude::*;
-use bevy_math::Mat3;
 use bevy_render::{
     camera::ExtractedCamera,
     render_resource::*,
+    transfer_functions::gamut_matrix,
     view::{ResolvedCompositingSpace, ViewDisplayTarget, ViewTarget},
     Render, RenderApp, RenderStartup, RenderSystems,
 };
-use bevy_window::SurfaceColorSpace;
 
 mod node;
 
@@ -114,7 +113,7 @@ fn prepare_view_upscaling_pipelines(
         };
 
         let uniform = DisplayTargetUniform {
-            gamut: gamut_matrix(display_target.color_space),
+            gamut: gamut_matrix(RgbPrimaries::BT709, display_target.color_space.primaries()),
             paper_white_nits: display_target.paper_white_nits,
         };
         if display_target_uniform != Some(&uniform) {
@@ -132,15 +131,5 @@ fn prepare_view_upscaling_pipelines(
                 .entity(entity)
                 .insert(ViewUpscalingPipeline(pipeline, key));
         }
-    }
-}
-
-/// The matrix that converts linear BT.709 to the primaries of `color_space`.
-fn gamut_matrix(color_space: SurfaceColorSpace) -> Mat3 {
-    // `matrix_to` between equal primaries is not exactly identity.
-    if color_space.primaries() == RgbPrimaries::BT709 {
-        Mat3::IDENTITY
-    } else {
-        RgbPrimaries::BT709.matrix_to(color_space.primaries())
     }
 }

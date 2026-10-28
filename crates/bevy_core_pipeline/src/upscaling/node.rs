@@ -1,9 +1,9 @@
 use crate::{
     blit::{BlitPipeline, DisplayTargetUniform},
-    upscaling::{gamut_matrix, ViewUpscalingPipeline},
+    upscaling::ViewUpscalingPipeline,
 };
 use bevy_camera::{CameraOutputMode, ClearColor, ClearColorConfig};
-use bevy_color::LinearRgba;
+use bevy_color::{LinearRgba, RgbPrimaries};
 use bevy_ecs::prelude::*;
 use bevy_math::Vec3;
 use bevy_render::{
@@ -14,7 +14,7 @@ use bevy_render::{
         BindGroup, BindGroupEntries, BufferId, PipelineCache, RenderPassDescriptor, TextureViewId,
     },
     renderer::{RenderContext, ViewQuery},
-    transfer_functions::{pq_inverse_eotf_from_nits, srgb_oetf_extended},
+    transfer_functions::{gamut_matrix, pq_inverse_eotf_from_nits, srgb_oetf_extended},
     view::{ViewDisplayTarget, ViewTarget},
 };
 use bevy_window::{ResolvedDisplayTarget, TransferFunction, SCRGB_REFERENCE_WHITE_NITS};
@@ -157,7 +157,8 @@ fn encode_clear_color(color: LinearRgba, display_target: &ResolvedDisplayTarget)
     if !color_space.is_hdr() {
         return color;
     }
-    let rgb = gamut_matrix(color_space) * Vec3::new(color.red, color.green, color.blue);
+    let gamut = gamut_matrix(RgbPrimaries::BT709, color_space.primaries());
+    let rgb = gamut * Vec3::new(color.red, color.green, color.blue);
     let paper_white = display_target.paper_white_nits;
     let rgb = if color_space.transfer_function() == TransferFunction::Pq {
         (rgb * paper_white).map(pq_inverse_eotf_from_nits)

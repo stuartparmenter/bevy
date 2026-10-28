@@ -2023,6 +2023,16 @@ impl Image {
                     (a as f64 / u32::MAX as f64) as f32,
                 ))
             }
+            TextureFormat::Rgb10a2Unorm => {
+                let packed = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                let channel = |shift: u32| ((packed >> shift) & 0x3ff) as f32 / 1023.0;
+                Ok(Color::linear_rgba(
+                    channel(0),
+                    channel(10),
+                    channel(20),
+                    (packed >> 30) as f32 / 3.0,
+                ))
+            }
             // assume R-only texture format means grayscale (linear)
             // copy value to all of RGB in Color
             TextureFormat::R8Unorm | TextureFormat::R8Uint => {
@@ -2156,6 +2166,15 @@ impl Image {
                 bytes[4..8].copy_from_slice(&u32::to_le_bytes(g));
                 bytes[8..12].copy_from_slice(&u32::to_le_bytes(b));
                 bytes[12..16].copy_from_slice(&u32::to_le_bytes(a));
+            }
+            TextureFormat::Rgb10a2Unorm => {
+                let [r, g, b, a] = LinearRgba::from(color).to_f32_array();
+                let unorm = |value: f32, max: f32| ops::round(value.clamp(0.0, 1.0) * max) as u32;
+                let packed = unorm(r, 1023.0)
+                    | (unorm(g, 1023.0) << 10)
+                    | (unorm(b, 1023.0) << 20)
+                    | (unorm(a, 3.0) << 30);
+                bytes[0..4].copy_from_slice(&u32::to_le_bytes(packed));
             }
             TextureFormat::R8Unorm | TextureFormat::R8Uint => {
                 // Convert to grayscale with minimal loss if color is already gray

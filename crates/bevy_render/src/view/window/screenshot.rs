@@ -1,4 +1,5 @@
 use crate::{
+    camera::ExtractedCamera,
     gpu_readback,
     render_asset::RenderAssets,
     render_resource::{
@@ -8,9 +9,10 @@ use crate::{
     renderer::RenderDevice,
     sync_world::MainEntity,
     texture::{GpuImage, ManualTextureViews, OutputColorAttachment},
+    transfer_functions::{gamut_matrix, pq_eotf_to_nits, srgb_eotf_extended},
     view::{
         prepare_view_attachments, prepare_view_targets, ExtractedWindow, SurfaceData,
-        ViewTargetAttachments,
+        ViewDisplayTarget, ViewTargetAttachments,
     },
     ExtractSchedule, GpuResourceAppExt, MainWorld, Render, RenderApp, RenderStartup, RenderSystems,
 };
@@ -18,13 +20,13 @@ use alloc::{borrow::Cow, sync::Arc};
 use bevy_app::{First, Plugin, Update};
 use bevy_asset::{embedded_asset, load_embedded_asset, AssetServer, Handle, RenderAssetUsages};
 use bevy_camera::{ManualTextureViewHandle, NormalizedRenderTarget, RenderTarget};
-use bevy_color::{ColorToPacked, LinearRgba, Srgba};
+use bevy_color::{ColorToPacked, LinearRgba, RgbPrimaries, Srgba};
 use bevy_derive::{Deref, DerefMut};
 use bevy_ecs::{
     entity::EntityHashMap, message::message_update_system, prelude::*, system::SystemState,
 };
 use bevy_image::{Image, TextureFormatPixelInfo, ToExtents};
-use bevy_log::{error, info, warn};
+use bevy_log::{error, info, warn, warn_once};
 use bevy_material::{
     bind_group_layout_entries::{binding_types::texture_2d, BindGroupLayoutEntries},
     descriptor::{
@@ -32,13 +34,16 @@ use bevy_material::{
         VertexState,
     },
 };
+use bevy_math::Vec3;
 use bevy_platform::collections::HashSet;
 use bevy_reflect::Reflect;
 use bevy_shader::Shader;
 use bevy_tasks::AsyncComputeTaskPool;
 use bevy_utils::default;
-use bevy_window::{PrimaryWindow, WindowRef};
-use core::ops::Deref;
+use bevy_window::{
+    PrimaryWindow, ResolvedDisplayTarget, TransferFunction, WindowRef, SCRGB_REFERENCE_WHITE_NITS,
+};
+use core::{convert::identity, ops::Deref};
 use std::{
     path::Path,
     sync::{
@@ -67,6 +72,11 @@ pub struct ScreenshotCaptured {
 ///
 /// Note that the screenshot entity will be despawned after the screenshot is captured and the
 /// observer is triggered.
+///
+/// When the target uses an HDR [`SurfaceColorSpace`](bevy_window::SurfaceColorSpace), the
+/// screenshot is decoded to linear BT.709 in `Rgba32Float`, where `1.0` is paper white. Save it
+/// to `.exr` or `.hdr` with [`save_to_disk`] to keep values above `1.0`. A target format that
+/// cannot be decoded keeps the encoded signal.
 ///
 /// # Usage
 ///
@@ -120,6 +130,7 @@ struct ScreenshotPreparedState {
     pub bind_group: BindGroup,
     pub pipeline_id: CachedRenderPipelineId,
     pub size: Extent3d,
+    pub display_target: ResolvedDisplayTarget,
 }
 
 #[derive(Resource, Deref, DerefMut)]
@@ -330,9 +341,21 @@ fn prepare_screenshots(
     images: Res<RenderAssets<GpuImage>>,
     manual_texture_views: Res<ManualTextureViews>,
     mut view_target_attachments: ResMut<ViewTargetAttachments>,
+    views: Query<(&ExtractedCamera, &ViewDisplayTarget)>,
 ) {
     prepared.clear();
     for (entity, target) in targets.iter() {
+        // All cameras on a target have the same `ViewDisplayTarget`.
+        let display_target = views
+            .iter()
+            .find(|(camera, _)| {
+                camera
+                    .target
+                    .as_ref()
+                    .is_some_and(|t| same_target(t, target))
+            })
+            .map(|(_, view_display_target)| view_display_target.0)
+            .unwrap_or_default();
         match target {
             NormalizedRenderTarget::Window(window) => {
                 let window = window.entity();
@@ -356,6 +379,7 @@ fn prepare_screenshots(
                     &screenshot_pipeline,
                     &pipeline_cache,
                     &mut pipelines,
+                    display_target,
                 );
                 prepared.insert(*entity, state);
                 view_target_attachments.insert(
@@ -376,6 +400,7 @@ fn prepare_screenshots(
                     &screenshot_pipeline,
                     &pipeline_cache,
                     &mut pipelines,
+                    display_target,
                 );
                 prepared.insert(*entity, state);
                 view_target_attachments.insert(
@@ -400,6 +425,7 @@ fn prepare_screenshots(
                     &screenshot_pipeline,
                     &pipeline_cache,
                     &mut pipelines,
+                    display_target,
                 );
                 prepared.insert(*entity, state);
                 view_target_attachments.insert(
@@ -421,6 +447,7 @@ fn prepare_screenshot_state(
     pipeline: &ScreenshotToScreenPipeline,
     pipeline_cache: &PipelineCache,
     pipelines: &mut SpecializedRenderPipelines<ScreenshotToScreenPipeline>,
+    display_target: ResolvedDisplayTarget,
 ) -> (TextureView, ScreenshotPreparedState) {
     let texture = render_device.create_texture(&wgpu::TextureDescriptor {
         label: Some("screenshot-capture-rendertarget"),
@@ -456,6 +483,7 @@ fn prepare_screenshot_state(
             bind_group,
             pipeline_id,
             size,
+            display_target,
         },
     )
 }
@@ -710,6 +738,7 @@ pub(crate) fn collect_screenshots(world: &mut World) {
             continue;
         };
         let buffer = prepared.buffer.clone();
+        let display_target = prepared.display_target;
 
         let finish = async move {
             let (tx, rx) = async_channel::bounded(1);
@@ -744,24 +773,79 @@ pub(crate) fn collect_screenshots(world: &mut World) {
                 result.truncate(initial_row_bytes * height as usize);
             }
 
-            if let Err(e) = sender.send((
-                entity,
-                Image::new(
-                    Extent3d {
-                        width,
-                        height,
-                        depth_or_array_layers: 1,
-                    },
-                    wgpu::TextureDimension::D2,
-                    result,
-                    texture_format,
-                    RenderAssetUsages::MAIN_WORLD,
-                ),
-            )) {
+            let mut image = Image::new(
+                Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                wgpu::TextureDimension::D2,
+                result,
+                texture_format,
+                RenderAssetUsages::MAIN_WORLD,
+            );
+            if display_target.color_space.is_hdr() {
+                image = decode_hdr_screenshot(image, &display_target);
+            }
+
+            if let Err(e) = sender.send((entity, image)) {
                 error!("Failed to send screenshot: {}", e);
             }
         };
 
         AsyncComputeTaskPool::get().spawn(finish).detach();
     }
+}
+
+/// Whether `a` and `b` are the same target, ignoring an image's scale factor.
+fn same_target(a: &NormalizedRenderTarget, b: &NormalizedRenderTarget) -> bool {
+    match (a, b) {
+        (NormalizedRenderTarget::Image(a), NormalizedRenderTarget::Image(b)) => {
+            a.handle == b.handle
+        }
+        _ => a == b,
+    }
+}
+
+/// Decodes a capture of an HDR target from the signal for `display_target` to
+/// linear BT.709 in `Rgba32Float`, where `1.0` is paper white.
+///
+/// A capture in a format with no CPU decode is returned as is, with a warning.
+fn decode_hdr_screenshot(image: Image, display_target: &ResolvedDisplayTarget) -> Image {
+    if let Err(err) = image.get_color_at(0, 0) {
+        warn_once!("Cannot decode HDR screenshot, keeping the encoded signal: {err}");
+        return image;
+    }
+    let color_space = display_target.color_space;
+    let (eotf, nits_per_unit): (fn(f32) -> f32, f32) = match color_space.transfer_function() {
+        TransferFunction::Pq => (pq_eotf_to_nits, 1.0),
+        TransferFunction::ExtendedSrgb => (srgb_eotf_extended, SCRGB_REFERENCE_WHITE_NITS),
+        TransferFunction::Linear => (identity, SCRGB_REFERENCE_WHITE_NITS),
+        TransferFunction::Srgb => return image,
+    };
+    let paper_white = display_target.paper_white_nits;
+    let gamut = gamut_matrix(color_space.primaries(), RgbPrimaries::BT709);
+
+    let size = image.texture_descriptor.size;
+    let mut decoded = Vec::with_capacity((size.width * size.height) as usize * 16);
+    for y in 0..size.height {
+        for x in 0..size.width {
+            // sRGB formats read back without the GPU's sRGB curve.
+            let signal = image.get_color_at(x, y).unwrap().to_linear();
+            let rgb = gamut
+                * Vec3::new(signal.red, signal.green, signal.blue)
+                    .map(|s| eotf(s) * nits_per_unit / paper_white);
+            for value in [rgb.x, rgb.y, rgb.z, signal.alpha] {
+                decoded.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+    }
+
+    Image::new(
+        size,
+        wgpu::TextureDimension::D2,
+        decoded,
+        TextureFormat::Rgba32Float,
+        RenderAssetUsages::MAIN_WORLD,
+    )
 }

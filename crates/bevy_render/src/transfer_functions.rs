@@ -1,7 +1,8 @@
-//! Transfer functions that encode linear light, matching `transfer_functions.wesl`.
+//! Transfer functions that encode linear light, matching `transfer_functions.wesl`,
+//! and their inverses.
 
-use bevy_color::Srgba;
-use bevy_math::ops;
+use bevy_color::{RgbPrimaries, Srgba};
+use bevy_math::{ops, Mat3};
 use bevy_window::MAX_LUMINANCE_NITS;
 
 const PQ_M1: f32 = 2610.0 / 16384.0;
@@ -25,4 +26,29 @@ pub fn pq_inverse_eotf_from_nits(nits: f32) -> f32 {
 /// sRGB color spaces use.
 pub fn srgb_oetf_extended(linear: f32) -> f32 {
     Srgba::gamma_function_inverse(linear.abs()).copysign(linear)
+}
+
+/// The inverse of [`pq_inverse_eotf_from_nits`]: a PQ signal to absolute
+/// luminance in nits.
+///
+/// The signal is clamped to `0.0..=1.0`, so the result is at most 10000 nits.
+pub(crate) fn pq_eotf_to_nits(signal: f32) -> f32 {
+    let e = ops::powf(signal.clamp(0.0, 1.0), 1.0 / PQ_M2);
+    let y = (e - PQ_C1).max(0.0) / (PQ_C2 - PQ_C3 * e);
+    ops::powf(y, 1.0 / PQ_M1) * MAX_LUMINANCE_NITS
+}
+
+/// The inverse of [`srgb_oetf_extended`].
+pub(crate) fn srgb_eotf_extended(signal: f32) -> f32 {
+    Srgba::gamma_function(signal.abs()).copysign(signal)
+}
+
+/// The matrix that converts linear RGB in the `from` primaries to the `to` primaries.
+pub fn gamut_matrix(from: RgbPrimaries, to: RgbPrimaries) -> Mat3 {
+    // `matrix_to` between equal primaries is not exactly identity.
+    if from == to {
+        Mat3::IDENTITY
+    } else {
+        from.matrix_to(to)
+    }
 }
