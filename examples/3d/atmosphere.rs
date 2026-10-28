@@ -59,8 +59,10 @@ use bevy::{
         diagnostic::RenderDiagnosticsPlugin,
         render_resource::{AsBindGroup, ShaderType},
         view::screenshot::{save_to_disk, Screenshot},
+        RenderPlugin, WorkingColorSpace,
     },
     shader::ShaderRef,
+    window::DisplayTarget,
 };
 
 #[derive(Resource)]
@@ -135,6 +137,16 @@ fn main() {
                     },
                     ..default()
                 }),
+                // Uses HDR output when the display supports it.
+                primary_display_target: Some(DisplayTarget {
+                    hdr: true,
+                    ..default()
+                }),
+                ..default()
+            })
+            // Lights and blends in Rec.2020, so wide-gamut displays show more saturated colors.
+            .set(RenderPlugin {
+                working_color_space: WorkingColorSpace::Rec2020,
                 ..default()
             }),
             #[cfg(feature = "free_camera")]
@@ -921,12 +933,11 @@ fn setup_camera_fog(
         // (the one recommended for use with this feature) is
         // quite bright, so raising the exposure compensation helps
         // bring the scene to a nicer brightness range.
-        Exposure { ev100: 13.0 },
-        // Tonemapper chosen just because it looked good with the scene, any
-        // tonemapper would be fine :)
-        Tonemapping::AcesFitted,
-        // Bloom gives the sun a much more natural look.
-        Bloom::NATURAL,
+        Exposure { ev100: 14.5 },
+        // Fits its curve to the display's peak luminance on HDR displays.
+        Tonemapping::GranTurismo7,
+        // Glare from the sun through a camera aperture.
+        Bloom::GT7_GLARE,
         // Left-drag looks around; right-drag is the time-of-day slider (`sun_drag`).
         #[cfg(feature = "free_camera")]
         FreeCamera {
