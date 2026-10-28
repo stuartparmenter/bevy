@@ -436,6 +436,11 @@ fn resolve_view_tonemapping(
 #[derive(Component)]
 pub struct ViewExposureTexture(pub TextureView);
 
+/// Marks a render world view whose white balance is adjusted on the GPU, so the tonemapping pass
+/// applies white balance even when the view's [`ColorGrading`] has none.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct ExternalWhiteBalance;
+
 /// A view's specialized tonemapping pipeline and the method it runs.
 #[derive(Component)]
 pub struct ViewTonemappingPipeline {
@@ -447,6 +452,7 @@ pub struct ViewTonemappingPipeline {
 /// Picks the pipeline flags for a view's color grading and compositing space.
 fn tonemapping_key_flags(
     color_grading: &ColorGrading,
+    external_white_balance: bool,
     compositing_space: Option<CompositingSpace>,
 ) -> TonemappingPipelineKeyFlags {
     // As an optimization, we omit parts of the shader that are unneeded.
@@ -457,7 +463,9 @@ fn tonemapping_key_flags(
     );
     flags.set(
         TonemappingPipelineKeyFlags::WHITE_BALANCE,
-        color_grading.global.temperature != 0.0 || color_grading.global.tint != 0.0,
+        color_grading.global.temperature != 0.0
+            || color_grading.global.tint != 0.0
+            || external_white_balance,
     );
     flags.set(
         TonemappingPipelineKeyFlags::SECTIONAL_COLOR_GRADING,
@@ -491,12 +499,21 @@ pub fn prepare_view_tonemapping_pipelines(
             Option<&DebandDither>,
             Option<&ViewTonemappingPipeline>,
             &ExtractedCamera,
+            Has<ExternalWhiteBalance>,
         ),
         With<ViewTarget>,
     >,
 ) {
-    for (entity, view, resolved_space, tonemapping, dither, existing_pipeline, camera) in
-        view_targets.iter()
+    for (
+        entity,
+        view,
+        resolved_space,
+        tonemapping,
+        dither,
+        existing_pipeline,
+        camera,
+        external_white_balance,
+    ) in view_targets.iter()
     {
         let method = *tonemapping.unwrap_or(&Tonemapping::None);
 
@@ -511,6 +528,7 @@ pub fn prepare_view_tonemapping_pipelines(
 
         let flags = tonemapping_key_flags(
             &view.color_grading,
+            external_white_balance,
             ResolvedCompositingSpace::space(resolved_space),
         );
 
@@ -625,7 +643,7 @@ mod tests {
     #[test]
     fn compositing_space_sets_exactly_its_flag() {
         let flags_for = |space: Option<CompositingSpace>| {
-            tonemapping_key_flags(&ColorGrading::default(), space)
+            tonemapping_key_flags(&ColorGrading::default(), false, space)
         };
         assert_eq!(
             flags_for(Some(CompositingSpace::Srgb)),

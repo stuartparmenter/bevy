@@ -132,6 +132,7 @@ mod tests {
         Some(GpuAutoExposureState {
             ev100,
             initialized: 1,
+            ..Default::default()
         })
     }
 

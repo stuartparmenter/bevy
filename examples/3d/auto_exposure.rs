@@ -10,13 +10,17 @@
 //! | `C`                | Toggle Compensation Curve              |
 //! | `M`                | Toggle Metering Mask                   |
 //! | `V`                | Visualize Metering Mask                |
+//! | `P`                | Toggle Physiological Adaptation        |
+//! | `B`                | Toggle Auto White Balance              |
+//! | `L`                | Toggle Warm Light                      |
 
 use bevy::{
     curve::cubic_splines::LinearSpline,
     light::Skybox,
     math::vec2,
     post_process::auto_exposure::{
-        AutoExposure, AutoExposureCompensationCurve, AutoExposurePlugin,
+        AutoExposure, AutoExposureCompensationCurve, AutoExposurePlugin, AutoWhiteBalance,
+        PhysiologicalAdaptation,
     },
     prelude::*,
     shape::Plane3d,
@@ -113,6 +117,7 @@ fn setup(
             ..default()
         },
         Transform::from_xyz(0.0, 0.0, 0.0),
+        ExampleLight,
     ));
 
     commands.spawn((
@@ -129,7 +134,7 @@ fn setup(
 
     let text_font = TextFont::default();
 
-    commands.spawn((Text::new("Left / Right - Rotate Camera\nC - Toggle Compensation Curve\nM - Toggle Metering Mask\nV - Visualize Metering Mask"),
+    commands.spawn((Text::new("Left / Right - Rotate Camera\nC - Toggle Compensation Curve\nM - Toggle Metering Mask\nV - Visualize Metering Mask\nP - Toggle Physiological Adaptation\nB - Toggle Auto White Balance\nL - Toggle Warm Light"),
             text_font.clone(), Node {
             position_type: PositionType::Absolute,
             top: px(12),
@@ -154,6 +159,9 @@ fn setup(
 #[derive(Component)]
 struct ExampleDisplay;
 
+#[derive(Component)]
+struct ExampleLight;
+
 #[derive(Resource)]
 struct ExampleResources {
     basic_compensation_curve: Handle<AutoExposureCompensationCurve>,
@@ -161,14 +169,25 @@ struct ExampleResources {
 }
 
 fn example_control_system(
-    camera: Single<(&mut Transform, &mut AutoExposure), With<Camera3d>>,
+    mut commands: Commands,
+    camera: Single<
+        (
+            Entity,
+            &mut Transform,
+            &mut AutoExposure,
+            Has<AutoWhiteBalance>,
+        ),
+        With<Camera3d>,
+    >,
+    mut light: Single<&mut PointLight, With<ExampleLight>>,
     mut display: Single<&mut Text, With<ExampleDisplay>>,
     mut mask_image: Single<&mut Node, With<ImageNode>>,
     time: Res<Time>,
     input: Res<ButtonInput<KeyCode>>,
     resources: Res<ExampleResources>,
 ) {
-    let (mut camera_transform, mut auto_exposure) = camera.into_inner();
+    let (camera_entity, mut camera_transform, mut auto_exposure, auto_white_balance) =
+        camera.into_inner();
 
     let rotation = if input.pressed(KeyCode::ArrowLeft) {
         time.delta_secs()
@@ -198,6 +217,41 @@ fn example_control_system(
             };
     }
 
+    if input.just_pressed(KeyCode::KeyP) {
+        auto_exposure.physiological = match auto_exposure.physiological {
+            Some(_) => None,
+            // The defaults take minutes, like human eyes. These are fast enough to see when
+            // turning the camera.
+            None => Some(PhysiologicalAdaptation {
+                speed_brighten: 0.4,
+                speed_darken: 0.1,
+                bound_brighten: 2.0,
+                bound_darken: 1.0,
+            }),
+        };
+    }
+
+    if input.just_pressed(KeyCode::KeyB) {
+        if auto_white_balance {
+            commands.entity(camera_entity).remove::<AutoWhiteBalance>();
+        } else {
+            // Faster than the default, so the change is easy to see when toggling the warm light.
+            commands.entity(camera_entity).insert(AutoWhiteBalance {
+                speed: 2.0,
+                ..default()
+            });
+        }
+    }
+
+    let warm_light = Color::srgb(1.0, 0.6, 0.3);
+    if input.just_pressed(KeyCode::KeyL) {
+        light.color = if light.color == warm_light {
+            Color::WHITE
+        } else {
+            warm_light
+        };
+    }
+
     mask_image.display = if input.pressed(KeyCode::KeyV) {
         Display::Flex
     } else {
@@ -205,7 +259,7 @@ fn example_control_system(
     };
 
     display.0 = format!(
-        "Compensation Curve: {}\nMetering Mask: {}",
+        "Compensation Curve: {}\nMetering Mask: {}\nPhysiological Adaptation: {}\nAuto White Balance: {}\nLight: {}",
         if auto_exposure.compensation_curve == resources.basic_compensation_curve {
             "Enabled"
         } else {
@@ -215,6 +269,21 @@ fn example_control_system(
             "Enabled"
         } else {
             "Disabled"
+        },
+        if auto_exposure.physiological.is_some() {
+            "Enabled"
+        } else {
+            "Disabled"
+        },
+        if auto_white_balance {
+            "Enabled"
+        } else {
+            "Disabled"
+        },
+        if light.color == warm_light {
+            "Warm"
+        } else {
+            "White"
         },
     );
 }

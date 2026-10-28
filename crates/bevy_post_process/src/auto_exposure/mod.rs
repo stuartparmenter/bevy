@@ -20,6 +20,7 @@ mod compensation_curve;
 mod pipeline;
 mod readback;
 mod settings;
+mod white_balance;
 
 use buffers::{
     apply_pre_exposure, extract_auto_exposure, prepare_buffers, AutoExposureBuffers,
@@ -29,7 +30,8 @@ pub use compensation_curve::{AutoExposureCompensationCurve, AutoExposureCompensa
 use pipeline::{
     AutoExposurePass, AutoExposurePipeline, AutoExposureUniform, ViewAutoExposurePipeline,
 };
-pub use settings::{AutoExposure, AutoExposureState};
+pub use settings::{AutoExposure, AutoExposureState, PhysiologicalAdaptation};
+pub use white_balance::AutoWhiteBalance;
 
 use crate::auto_exposure::{
     compensation_curve::GpuAutoExposureCompensationCurve, pipeline::init_auto_exposure_pipeline,
@@ -39,9 +41,9 @@ use bevy_core_pipeline::{
     tonemapping::tonemapping,
 };
 
-/// Plugin for the auto exposure feature.
+/// Plugin for auto exposure and auto white balance.
 ///
-/// See [`AutoExposure`] for more details.
+/// See [`AutoExposure`] and [`AutoWhiteBalance`] for more details.
 pub struct AutoExposurePlugin;
 
 #[derive(Resource)]
@@ -61,7 +63,10 @@ impl Plugin for AutoExposurePlugin {
             .insert(&Handle::default(), AutoExposureCompensationCurve::default())
             .unwrap();
 
-        app.add_plugins(ExtractComponentPlugin::<AutoExposure>::default());
+        app.add_plugins((
+            ExtractComponentPlugin::<AutoExposure>::default(),
+            ExtractComponentPlugin::<AutoWhiteBalance>::default(),
+        ));
 
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;

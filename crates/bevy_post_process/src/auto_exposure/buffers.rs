@@ -19,7 +19,8 @@ use tracing::warn;
 use super::{
     pipeline::{AutoExposureUniform, GpuAutoExposureState},
     readback::StateReadback,
-    AutoExposure, AutoExposureState,
+    settings::PhysiologicalAdaptation,
+    AutoExposure, AutoExposureState, AutoWhiteBalance,
 };
 
 /// Returns the correction limits, or the defaults if either value is invalid.
@@ -71,6 +72,7 @@ type AutoExposureCameras = QueryState<(
     &'static mut AutoExposure,
     Option<&'static Exposure>,
     &'static mut AutoExposureState,
+    Option<&'static AutoWhiteBalance>,
 )>;
 
 /// Extracts every camera with auto exposure, clears its [`AutoExposure::reset`], and sets its
@@ -87,7 +89,9 @@ pub(super) fn extract_auto_exposure(
     let cameras = cameras.get_or_insert_with(|| main_world.query());
 
     extracted.views.clear();
-    for (entity, mut auto_exposure, exposure, mut state) in cameras.iter_mut(&mut main_world) {
+    for (entity, mut auto_exposure, exposure, mut state, white_balance) in
+        cameras.iter_mut(&mut main_world)
+    {
         let reset = auto_exposure.reset;
         if reset {
             auto_exposure.bypass_change_detection().reset = false;
@@ -103,16 +107,29 @@ pub(super) fn extract_auto_exposure(
         let camera_ev100 = exposure.copied().unwrap_or_default().ev100;
         extracted.views.push(ExtractedAutoExposureView {
             entity,
-            settings: uniform(&auto_exposure, camera_ev100, delta_time),
+            settings: uniform(&auto_exposure, white_balance, camera_ev100, delta_time),
             pre_exposure_ev100: ev100.filter(|_| auto_exposure.pre_exposure),
             reset,
         });
     }
 }
 
-fn uniform(settings: &AutoExposure, camera_ev100: f32, delta_time: f32) -> AutoExposureUniform {
+fn uniform(
+    settings: &AutoExposure,
+    white_balance: Option<&AutoWhiteBalance>,
+    camera_ev100: f32,
+    delta_time: f32,
+) -> AutoExposureUniform {
     let (correction_min, correction_max) = correction_bounds(settings);
     let (min_ev100, max_ev100) = (*settings.range.start(), *settings.range.end());
+    let physiological = settings
+        .physiological
+        .as_ref()
+        .map(PhysiologicalAdaptation::sanitized);
+    let long_term = physiological.unwrap_or_default();
+    let white_balance = white_balance.map(AutoWhiteBalance::sanitized);
+    let (white_balance_speed, virtual_light_luminance) =
+        white_balance.map_or((0.0, 0.0), |w| (w.speed, w.virtual_light_luminance));
     AutoExposureUniform {
         min_ev100,
         inv_ev100_range: 1.0 / (max_ev100 - min_ev100),
@@ -126,6 +143,14 @@ fn uniform(settings: &AutoExposure, camera_ev100: f32, delta_time: f32) -> AutoE
         correction_max,
         camera_ev100,
         delta_time,
+        long_term_speed_brighten: long_term.speed_brighten,
+        long_term_speed_darken: long_term.speed_darken,
+        long_term_bound_brighten: long_term.bound_brighten,
+        long_term_bound_darken: long_term.bound_darken,
+        physiological: physiological.is_some().into(),
+        white_balance_speed,
+        virtual_light_luminance,
+        white_balance: white_balance.is_some().into(),
         // Set by the auto exposure pass.
         pipelines_ready: 0,
     }

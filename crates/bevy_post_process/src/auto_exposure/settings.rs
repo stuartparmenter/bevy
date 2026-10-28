@@ -7,7 +7,8 @@ use bevy_ecs::{prelude::Component, reflect::ReflectComponent};
 use bevy_image::Image;
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
 use bevy_render::{extract_component::ExtractComponent, RenderApp};
-use bevy_utils::default;
+use bevy_utils::{default, once};
+use tracing::warn;
 
 /// Component that enables auto exposure for an HDR-enabled 2d or 3d camera.
 ///
@@ -152,8 +153,17 @@ pub struct AutoExposure {
     /// The default value is `true`.
     pub pre_exposure: bool,
 
+    /// Adapts to large changes in brightness slowly, like human vision, on top of the adaptation
+    /// set by [`speed_brighten`](Self::speed_brighten) and [`speed_darken`](Self::speed_darken).
+    /// See [`PhysiologicalAdaptation`].
+    ///
+    /// The default value is `None`.
+    pub physiological: Option<PhysiologicalAdaptation>,
+
     /// Set to true to jump the adapted exposure to the metered target this frame instead of
-    /// adapting toward it, such as at a camera cut.
+    /// adapting toward it, such as at a camera cut. This also restarts the
+    /// [physiological](Self::physiological) adaptation and
+    /// [`AutoWhiteBalance`](super::AutoWhiteBalance).
     ///
     /// It is set back to false when the camera is extracted.
     pub reset: bool,
@@ -183,7 +193,90 @@ impl Default for AutoExposure {
             compensation_curve: default(),
             correction_range: f32::MIN..=f32::MAX,
             pre_exposure: true,
+            physiological: None,
             reset: false,
         }
+    }
+}
+
+/// Settings for [`AutoExposure::physiological`], which adapts the exposure to large changes in
+/// brightness slowly, like human vision.
+///
+/// Eyes adapt to a few stops of change within seconds, and to the rest over minutes. A long-term
+/// adaptation follows the scene at the slower speeds set here, and the adapted exposure
+/// stays within [`bound_brighten`](Self::bound_brighten) and [`bound_darken`](Self::bound_darken)
+/// stops of it. So a bright scene after a long time in the dark stays overexposed until the
+/// long-term adaptation catches up.
+///
+/// This is the two-stage model of "Physically Based Tone Mapping in Gran Turismo 7"
+/// (SIGGRAPH 2025).
+///
+/// Speeds and bounds must be finite and not negative. Invalid values are replaced by their
+/// defaults with a one-time warning.
+#[derive(Clone, Copy, Debug, PartialEq, Reflect)]
+#[reflect(Default, Clone, Debug, PartialEq)]
+pub struct PhysiologicalAdaptation {
+    /// The speed at which the long-term adaptation follows a brighter scene, in F-stops per
+    /// second of real time.
+    ///
+    /// The default value is 0.05, which takes about 4 minutes for 12 stops.
+    pub speed_brighten: f32,
+
+    /// The speed at which the long-term adaptation follows a darker scene, in F-stops per second
+    /// of real time.
+    ///
+    /// The default value is 0.01, which takes about 20 minutes for 12 stops.
+    pub speed_darken: f32,
+
+    /// How many stops above the long-term adaptation the exposure can adapt to a brighter scene.
+    ///
+    /// The default value is 3.0.
+    pub bound_brighten: f32,
+
+    /// How many stops below the long-term adaptation the exposure can adapt to a darker scene.
+    ///
+    /// The default value is 2.0.
+    pub bound_darken: f32,
+}
+
+impl Default for PhysiologicalAdaptation {
+    fn default() -> Self {
+        Self {
+            speed_brighten: 0.05,
+            speed_darken: 0.01,
+            bound_brighten: 3.0,
+            bound_darken: 2.0,
+        }
+    }
+}
+
+impl PhysiologicalAdaptation {
+    /// Returns these settings with each invalid value replaced by its default.
+    pub(super) fn sanitized(&self) -> Self {
+        let default = Self::default();
+        let mut invalid = false;
+        let sanitized = Self {
+            speed_brighten: or_default(self.speed_brighten, default.speed_brighten, &mut invalid),
+            speed_darken: or_default(self.speed_darken, default.speed_darken, &mut invalid),
+            bound_brighten: or_default(self.bound_brighten, default.bound_brighten, &mut invalid),
+            bound_darken: or_default(self.bound_darken, default.bound_darken, &mut invalid),
+        };
+        if invalid {
+            once!(warn!(
+                "PhysiologicalAdaptation speeds and bounds must be finite and not negative; using the defaults for invalid values"
+            ));
+        }
+        sanitized
+    }
+}
+
+/// Returns `value` if it is finite and not negative. Otherwise sets `invalid` and returns
+/// `default`.
+pub(super) fn or_default(value: f32, default: f32, invalid: &mut bool) -> f32 {
+    if value.is_finite() && value >= 0.0 {
+        value
+    } else {
+        *invalid = true;
+        default
     }
 }
