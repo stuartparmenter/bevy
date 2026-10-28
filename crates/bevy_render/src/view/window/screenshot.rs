@@ -53,12 +53,17 @@ use std::{
 };
 use wgpu::{CommandEncoder, Extent3d, TextureFormat};
 
+#[cfg(feature = "png")]
+mod hdr_png;
+
 #[derive(EntityEvent, Reflect, Deref, DerefMut, Debug)]
 #[reflect(Debug, Event)]
 pub struct ScreenshotCaptured {
     pub entity: Entity,
     #[deref]
     pub image: Image,
+    /// The luminance in nits of `1.0` in `image`, for a screenshot decoded from an HDR target.
+    pub paper_white_nits: Option<f32>,
 }
 
 /// A component that signals to the renderer to capture a screenshot this frame.
@@ -75,8 +80,8 @@ pub struct ScreenshotCaptured {
 ///
 /// When the target uses an HDR [`SurfaceColorSpace`](bevy_window::SurfaceColorSpace), the
 /// screenshot is decoded to linear BT.709 in `Rgba32Float`, where `1.0` is paper white. Save it
-/// to `.exr` or `.hdr` with [`save_to_disk`] to keep values above `1.0`. A target format that
-/// cannot be decoded keeps the encoded signal.
+/// to `.png`, `.exr` or `.hdr` with [`save_to_disk`] to keep values above `1.0`. A target format
+/// that cannot be decoded keeps the encoded signal.
 ///
 /// # Usage
 ///
@@ -134,7 +139,7 @@ struct ScreenshotPreparedState {
 }
 
 #[derive(Resource, Deref, DerefMut)]
-pub struct CapturedScreenshots(pub Arc<Mutex<Receiver<(Entity, Image)>>>);
+pub struct CapturedScreenshots(pub Arc<Mutex<Receiver<ScreenshotCaptured>>>);
 
 #[derive(Resource, Deref, DerefMut, Default)]
 struct RenderScreenshotTargets(EntityHashMap<NormalizedRenderTarget>);
@@ -143,7 +148,7 @@ struct RenderScreenshotTargets(EntityHashMap<NormalizedRenderTarget>);
 struct RenderScreenshotsPrepared(EntityHashMap<ScreenshotPreparedState>);
 
 #[derive(Resource, Deref, DerefMut)]
-struct RenderScreenshotsSender(Sender<(Entity, Image)>);
+struct RenderScreenshotsSender(Sender<ScreenshotCaptured>);
 
 /// Saves the captured screenshot to disk at the provided path.
 ///
@@ -151,16 +156,40 @@ struct RenderScreenshotsSender(Sender<(Entity, Image)>);
 /// supports. A screenshot of an `Rgba16Float` or `Rgba32Float` render target,
 /// for example an `Hdr` camera rendering to an `Image`, holds values outside
 /// `0..=1`. Those are kept in `.exr` and `.hdr`. Any other format clips to
-/// `0..=1` and converts to 8-bit sRGB, with a warning. `.exr` needs the `exr`
-/// cargo feature.
+/// `0..=1` and converts to 8-bit sRGB, with a warning.
+///
+/// A screenshot of a target with an HDR [`SurfaceColorSpace`](bevy_window::SurfaceColorSpace)
+/// also keeps its range in `.png`. It saves as a 16-bit PNG with the PQ transfer function, which
+/// HDR-capable viewers show as HDR.
+///
+/// `.png` and `.exr` need the cargo features of the same name.
 pub fn save_to_disk(path: impl AsRef<Path>) -> impl FnMut(On<ScreenshotCaptured>) {
     let path = path.as_ref().to_owned();
     move |screenshot_captured| {
         use image::{DynamicImage, ImageFormat};
 
         let img = screenshot_captured.image.clone();
+        let format = ImageFormat::from_path(&path);
+
+        #[cfg(feature = "png")]
+        if let Some(paper_white_nits) = screenshot_captured.paper_white_nits
+            && matches!(format, Ok(ImageFormat::Png))
+        {
+            let path = path.clone();
+            // Compressing a large 16-bit PNG takes too long for the main thread.
+            AsyncComputeTaskPool::get()
+                .spawn(async move {
+                    match hdr_png::encode(&img, paper_white_nits) {
+                        Ok(bytes) => write_screenshot(&path, &bytes),
+                        Err(e) => error!("Cannot encode HDR screenshot: {e}"),
+                    }
+                })
+                .detach();
+            return;
+        }
+
         match img.try_into_dynamic() {
-            Ok(dyn_img) => match ImageFormat::from_path(&path) {
+            Ok(dyn_img) => match format {
                 Ok(format) => {
                     let is_float = matches!(
                         dyn_img,
@@ -218,42 +247,11 @@ pub fn save_to_disk(path: impl AsRef<Path>) -> impl FnMut(On<ScreenshotCaptured>
 
                     #[cfg(target_arch = "wasm32")]
                     {
-                        let save_screenshot = || {
-                            use image::EncodableLayout;
-                            use wasm_bindgen::{JsCast, JsValue};
-
-                            let mut image_buffer = std::io::Cursor::new(Vec::new());
-                            img.write_to(&mut image_buffer, format)
-                                .map_err(|e| JsValue::from_str(&format!("{e}")))?;
-
-                            let parts = js_sys::Array::of1(
-                                &js_sys::Uint8Array::new_from_slice(
-                                    image_buffer.into_inner().as_bytes(),
-                                )
-                                .into(),
-                            );
-                            let blob = web_sys::Blob::new_with_u8_array_sequence(&parts)?;
-                            let url = web_sys::Url::create_object_url_with_blob(&blob)?;
-                            let window = web_sys::window().unwrap();
-                            let document = window.document().unwrap();
-                            let link = document.create_element("a")?;
-                            link.set_attribute("href", &url)?;
-                            link.set_attribute(
-                                "download",
-                                path.file_name()
-                                    .and_then(|filename| filename.to_str())
-                                    .ok_or_else(|| JsValue::from_str("Invalid filename"))?,
-                            )?;
-                            let html_element = link.dyn_into::<web_sys::HtmlElement>()?;
-                            html_element.click();
-                            web_sys::Url::revoke_object_url(&url)?;
-                            Ok::<(), JsValue>(())
-                        };
-
-                        match (save_screenshot)() {
-                            Ok(_) => info!("Screenshot saved to {}", path.display()),
-                            Err(e) => error!("Cannot save screenshot, error: {e:?}"),
-                        };
+                        let mut image_buffer = std::io::Cursor::new(Vec::new());
+                        match img.write_to(&mut image_buffer, format) {
+                            Ok(()) => write_screenshot(&path, image_buffer.get_ref()),
+                            Err(e) => error!("Cannot save screenshot, error: {e}"),
+                        }
                     }
                 }
                 Err(e) => error!("Cannot save screenshot, requested format not recognized: {e}"),
@@ -261,6 +259,44 @@ pub fn save_to_disk(path: impl AsRef<Path>) -> impl FnMut(On<ScreenshotCaptured>
             Err(e) => error!("Cannot save screenshot, screen format cannot be understood: {e}"),
         }
     }
+}
+
+#[cfg(any(feature = "png", target_arch = "wasm32"))]
+fn write_screenshot(path: &Path, bytes: &[u8]) {
+    #[cfg(not(target_arch = "wasm32"))]
+    match std::fs::write(path, bytes) {
+        Ok(()) => info!("Screenshot saved to {}", path.display()),
+        Err(e) => error!("Cannot save screenshot, IO error: {e}"),
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    match download_screenshot(path, bytes) {
+        Ok(()) => info!("Screenshot saved to {}", path.display()),
+        Err(e) => error!("Cannot save screenshot, error: {e:?}"),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn download_screenshot(path: &Path, bytes: &[u8]) -> Result<(), wasm_bindgen::JsValue> {
+    use wasm_bindgen::{JsCast, JsValue};
+
+    let parts = js_sys::Array::of1(&js_sys::Uint8Array::new_from_slice(bytes).into());
+    let blob = web_sys::Blob::new_with_u8_array_sequence(&parts)?;
+    let url = web_sys::Url::create_object_url_with_blob(&blob)?;
+    let window = web_sys::window().unwrap();
+    let document = window.document().unwrap();
+    let link = document.create_element("a")?;
+    link.set_attribute("href", &url)?;
+    link.set_attribute(
+        "download",
+        path.file_name()
+            .and_then(|filename| filename.to_str())
+            .ok_or_else(|| JsValue::from_str("Invalid filename"))?,
+    )?;
+    let html_element = link.dyn_into::<web_sys::HtmlElement>()?;
+    html_element.click();
+    web_sys::Url::revoke_object_url(&url)?;
+    Ok(())
 }
 
 fn clear_screenshots(mut commands: Commands) {
@@ -272,9 +308,9 @@ pub fn trigger_screenshots(
     captured_screenshots: ResMut<CapturedScreenshots>,
 ) {
     let captured_screenshots = captured_screenshots.lock().unwrap();
-    while let Ok((entity, image)) = captured_screenshots.try_recv() {
-        commands.entity(entity).insert(Captured);
-        commands.trigger(ScreenshotCaptured { image, entity });
+    while let Ok(screenshot_captured) = captured_screenshots.try_recv() {
+        commands.entity(screenshot_captured.entity).insert(Captured);
+        commands.trigger(screenshot_captured);
     }
 }
 
@@ -784,11 +820,19 @@ pub(crate) fn collect_screenshots(world: &mut World) {
                 texture_format,
                 RenderAssetUsages::MAIN_WORLD,
             );
-            if display_target.color_space.is_hdr() {
-                image = decode_hdr_screenshot(image, &display_target);
+            let mut paper_white_nits = None;
+            if display_target.color_space.is_hdr()
+                && let Some(decoded) = decode_hdr_screenshot(&image, &display_target)
+            {
+                image = decoded;
+                paper_white_nits = Some(display_target.paper_white_nits);
             }
 
-            if let Err(e) = sender.send((entity, image)) {
+            if let Err(e) = sender.send(ScreenshotCaptured {
+                entity,
+                image,
+                paper_white_nits,
+            }) {
                 error!("Failed to send screenshot: {}", e);
             }
         };
@@ -810,18 +854,18 @@ fn same_target(a: &NormalizedRenderTarget, b: &NormalizedRenderTarget) -> bool {
 /// Decodes a capture of an HDR target from the signal for `display_target` to
 /// linear BT.709 in `Rgba32Float`, where `1.0` is paper white.
 ///
-/// A capture in a format with no CPU decode is returned as is, with a warning.
-fn decode_hdr_screenshot(image: Image, display_target: &ResolvedDisplayTarget) -> Image {
+/// Returns `None`, with a warning, for a capture in a format with no CPU decode.
+fn decode_hdr_screenshot(image: &Image, display_target: &ResolvedDisplayTarget) -> Option<Image> {
     if let Err(err) = image.get_color_at(0, 0) {
         warn_once!("Cannot decode HDR screenshot, keeping the encoded signal: {err}");
-        return image;
+        return None;
     }
     let color_space = display_target.color_space;
     let (eotf, nits_per_unit): (fn(f32) -> f32, f32) = match color_space.transfer_function() {
         TransferFunction::Pq => (pq_eotf_to_nits, 1.0),
         TransferFunction::ExtendedSrgb => (srgb_eotf_extended, SCRGB_REFERENCE_WHITE_NITS),
         TransferFunction::Linear => (identity, SCRGB_REFERENCE_WHITE_NITS),
-        TransferFunction::Srgb => return image,
+        TransferFunction::Srgb => return None,
     };
     let paper_white = display_target.paper_white_nits;
     let gamut = gamut_matrix(color_space.primaries(), RgbPrimaries::BT709);
@@ -841,11 +885,11 @@ fn decode_hdr_screenshot(image: Image, display_target: &ResolvedDisplayTarget) -
         }
     }
 
-    Image::new(
+    Some(Image::new(
         size,
         wgpu::TextureDimension::D2,
         decoded,
         TextureFormat::Rgba32Float,
         RenderAssetUsages::MAIN_WORLD,
-    )
+    ))
 }

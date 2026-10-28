@@ -39,6 +39,8 @@ type_label_buffers = []
 debug = ["type_label_buffers", "bevy_utils/debug"]
 ## Adds serialization support through `serde`.
 serialize = ["bevy_mesh/serialize"]
+## Saves screenshots of HDR targets as HDR PNGs.
+png = ["image/png", "dep:png"]
 
 reflect_auto_register = ["bevy_app/reflect_auto_register"]
 reflect_functions = ["bevy_app/reflect_functions"]
@@ -81,6 +83,7 @@ bevy_platform = { path = "../bevy_platform", version = "0.20.0-dev", default-fea
 
 # rendering
 image = { version = "0.25.2", default-features = false }
+png = { version = "0.18.0", optional = true }
 
 # misc
 # `fragile-send-sync-non-atomic-wasm` feature means we can't use Wasm threads for rendering
