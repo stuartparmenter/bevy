@@ -26,6 +26,7 @@ fn presample_light_tiles(@builtin(workgroup_id) workgroup_id: vec3<u32>, @builti
 }
 
 fn pack_resolved_light_sample(sample: ResolvedLightSample) -> ResolvedLightSamplePacked {
+    // The sign bit marks a directional sample, as -0.0 for one with zero inverse pdf.
     let inverse_pdf = sample.inverse_pdf * select(1.0, -1.0, sample.world_position.w == 0.0);
     return ResolvedLightSamplePacked(
         vec4(
@@ -46,7 +47,7 @@ fn unpack_resolved_light_sample(packed: ResolvedLightSamplePacked, exposure: f32
     let inverse_pdf = bitcast<f32>(packed.b.y);
     let cone = packed.b.w;
     return ResolvedLightSample(
-        vec4(bitcast<vec3<f32>>(packed.a.xyz), select(1.0, 0.0, inverse_pdf < 0.0)),
+        vec4(bitcast<vec3<f32>>(packed.a.xyz), select(1.0, 0.0, (packed.b.y >> 31u) != 0u)),
         octahedral_decode(unpack2x16unorm(packed.a.w)),
         (exp2(rgb9e5_to_vec3_(packed.b.x)) - 1.0) / exposure,
         abs(inverse_pdf),

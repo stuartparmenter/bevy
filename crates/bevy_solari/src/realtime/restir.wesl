@@ -143,6 +143,9 @@ fn load_temporal_reservoir(pixel_id: vec2<u32>, depth: f32, world_position: vec3
             temporal.reservoir.sample_point_barycentrics,
         );
         let sample_point = resolve_sample_point(instance_id, temporal.reservoir.sample_point_triangle_id, barycentrics);
+        if sample_point.degenerate {
+            return empty_neighbor_info();
+        }
         // Preserve the stored position and normal-mapped normal when the anchor has not moved.
         // The tolerance accounts for differences between ray-hit and interpolated positions.
         let anchor_delta = sample_point.world_position - temporal.reservoir.sample_point_world_position;

@@ -3,7 +3,7 @@
 import bevy_render::maths::affine3_to_square;
 import package::scene::bindings::{geometry_ids, transforms, previous_frame_transforms,
     previous_frame_instance_id_translations, INSTANCE_NOT_PRESENT_THIS_FRAME,
-    load_vertices, transform_positions};
+    load_vertices, transform_positions, triangle_degenerate};
 
 enable wgpu_ray_query;
 
@@ -39,12 +39,9 @@ fn resolve_triangle_anchor(instance_id: u32, primitive_id: u32, barycentrics: ve
     }
     let vertices = load_vertices(geometry, primitive_id);
     let points = transform_positions(affine3_to_square(transform), vertices);
+    if triangle_degenerate(points) { return anchor; }
     // Edge form avoids summing three large world positions.
     let position = points[0] + (points[1] - points[0]) * barycentrics.x + (points[2] - points[0]) * barycentrics.y;
-    let cross_normal = cross(points[1] - points[0], points[2] - points[0]);
-    let normal_length_squared = dot(cross_normal, cross_normal);
-    if !(normal_length_squared > 1e-20) || !(normal_length_squared < 1e30)
-        || !all(abs(position) < vec3<f32>(1e30)) { return anchor; }
-    let normal = cross_normal * inverseSqrt(normal_length_squared);
+    let normal = normalize(cross(points[1] - points[0], points[2] - points[0]));
     return TriangleAnchor(true, position, normal);
 }

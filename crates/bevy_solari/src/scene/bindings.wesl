@@ -314,6 +314,8 @@ struct ResolvedRayHitFull {
     triangle_count: u32,
     material: ResolvedMaterial,
     double_sided: bool,
+    /// See `triangle_degenerate`.
+    degenerate: bool,
 }
 
 fn resolve_material(material: Material, uv: vec2<f32>) -> ResolvedMaterial {
@@ -479,9 +481,25 @@ fn transform_positions(transform: mat4x4<f32>, vertices: array<Vertex, 3>) -> ar
     );
 }
 
+/// Below this squared sine of the angle between a triangle's edges at its first vertex, the
+/// triangle has zero area relative to its size.
+const DEGENERATE_TRIANGLE_SINE_SQUARED = 1e-12;
+
+/// Whether a triangle has no surface: zero area relative to its edge lengths, or a non-finite
+/// vertex.
+fn triangle_degenerate(world_vertices: array<vec3<f32>, 3>) -> bool {
+    let edge0 = world_vertices[1] - world_vertices[0];
+    let edge1 = world_vertices[2] - world_vertices[0];
+    let normal = cross(edge0, edge1);
+    // The positive comparison also fails for NaN and infinite vertices.
+    return !(dot(normal, normal) > DEGENERATE_TRIANGLE_SINE_SQUARED * dot(edge0, edge0) * dot(edge1, edge1));
+}
+
 struct ResolvedSamplePoint {
     world_position: vec3<f32>,
     world_normal: vec3<f32>,
+    /// See `triangle_degenerate`.
+    degenerate: bool,
 }
 
 /// Resolves a geometry anchor using current transforms and vertices.
@@ -498,7 +516,7 @@ fn resolve_sample_point(instance_id: u32, triangle_id: u32, barycentrics: vec3<f
     let determinant = dot(transform_3x3[0], cofactor[0]);
     let determinant_sign = select(sign(determinant), 1.0, determinant == 0.0);
     let world_normal = normalize(determinant_sign * (cofactor * local_normal));
-    return ResolvedSamplePoint(world_position, world_normal);
+    return ResolvedSamplePoint(world_position, world_normal, triangle_degenerate(world_vertices));
 }
 
 fn resolve_triangle_data_full(instance_id: u32, triangle_id: u32, barycentrics: vec3<f32>) -> ResolvedRayHitFull {
@@ -552,8 +570,9 @@ fn resolve_triangle_data_full(instance_id: u32, triangle_id: u32, barycentrics: 
         world_normal = normalize(Nt.x * T + Nt.y * B + Nt.z * N);
     }
 
-    let triangle_edge0 = world_vertices[0] - world_vertices[1];
-    let triangle_edge1 = world_vertices[0] - world_vertices[2];
+    // The edges `triangle_degenerate` takes, so the two share the cross product.
+    let triangle_edge0 = world_vertices[1] - world_vertices[0];
+    let triangle_edge1 = world_vertices[2] - world_vertices[0];
     let triangle_area = length(cross(triangle_edge0, triangle_edge1)) / 2.0;
 
     let resolved_material = resolve_material(material, uv);
@@ -569,5 +588,6 @@ fn resolve_triangle_data_full(instance_id: u32, triangle_id: u32, barycentrics: 
         instance_geometry_ids.triangle_count,
         resolved_material,
         (material.flags & MATERIAL_FLAG_DOUBLE_SIDED) != 0u,
+        triangle_degenerate(world_vertices),
     );
 }

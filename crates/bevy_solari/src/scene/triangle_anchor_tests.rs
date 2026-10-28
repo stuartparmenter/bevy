@@ -45,12 +45,22 @@ fn resolve(
     if !(u >= -1e-5 && v >= -1e-5 && u <= 1.00001 && v <= 1.00001 && u + v <= 1.00001) {
         return None;
     }
-    Some(
-        triangle[0]
-            + (triangle[1] - triangle[0]) * u
-            + (triangle[2] - triangle[0]) * v
-            + translation,
-    )
+    let points = triangle.map(|p| p + translation);
+    if degenerate(points) {
+        return None;
+    }
+    Some(points[0] + (points[1] - points[0]) * u + (points[2] - points[0]) * v)
+}
+
+/// `DEGENERATE_TRIANGLE_SINE_SQUARED` in `bindings.wesl`.
+const DEGENERATE_TRIANGLE_SINE_SQUARED: f32 = 1e-12;
+
+/// `triangle_degenerate` in `bindings.wesl`.
+fn degenerate([a, b, c]: [Vec3; 3]) -> bool {
+    let (edge0, edge1) = (b - a, c - a);
+    let normal = edge0.cross(edge1);
+    let floor = DEGENERATE_TRIANGLE_SINE_SQUARED * edge0.length_squared() * edge1.length_squared();
+    normal.length_squared().partial_cmp(&floor) != Some(core::cmp::Ordering::Greater)
 }
 
 fn moving_triangle() -> Instance {
@@ -128,9 +138,11 @@ fn anchor_rejects_a_missing_triangle() {
 #[test]
 fn previous_anchor_does_not_follow_a_neighbor_triangle_or_current_vertices() {
     let mut instance = moving_triangle();
-    instance
-        .previous
-        .push([Vec3::splat(80.0), Vec3::splat(81.0), Vec3::splat(82.0)]);
+    instance.previous.push([
+        Vec3::splat(80.0),
+        Vec3::new(81.0, 80.0, 80.0),
+        Vec3::new(80.0, 81.0, 80.0),
+    ]);
     let expected = Vec3::new(10.25, 20.5, 30.0);
     let mut instances = [instance];
     assert_eq!(resolve(anchor(0), true, &[0], &instances), Some(expected));
@@ -195,6 +207,33 @@ fn current_anchor_does_not_require_previous_frame_data() {
         Some(Vec3::new(100.25, 200.5, 301.0))
     );
     assert_eq!(resolve(anchor(0), true, &[0], &instances), None);
+}
+
+#[test]
+fn anchor_rejects_a_collapsed_or_non_finite_triangle() {
+    let mut instance = moving_triangle();
+    // A producer hides a triangle by collapsing it in place.
+    instance.current[0] = [Vec3::new(3.0, 4.0, 5.0); 3];
+    instance.previous[0][1] = Vec3::new(f32::NAN, 0.0, 0.0);
+    let instances = [instance];
+    assert_eq!(resolve(anchor(0), false, &[], &instances), None);
+    assert_eq!(resolve(anchor(0), true, &[0], &instances), None);
+}
+
+#[test]
+fn degenerate_triangles_are_zero_area_relative_to_their_size() {
+    let triangle = [Vec3::ZERO, Vec3::X, Vec3::Y];
+    for scale in [1e-4, 1.0, 1e4] {
+        assert!(!degenerate(triangle.map(|p| p * scale)), "{scale}");
+    }
+    // A sliver a thousandth as wide as it is long is a surface; collinear vertices are not.
+    let sliver = Vec3::new(1.0, 1e-3, 0.0);
+    assert!(!degenerate([Vec3::ZERO, Vec3::X, sliver]));
+    assert!(degenerate([Vec3::ZERO, Vec3::X, Vec3::X * 2.0]));
+    assert!(degenerate([Vec3::splat(7.0); 3]));
+    assert!(degenerate([Vec3::ZERO, Vec3::ZERO, Vec3::X]));
+    let infinite = Vec3::new(f32::INFINITY, 0.0, 0.0);
+    assert!(degenerate([Vec3::ZERO, Vec3::X, infinite]));
 }
 
 /// The vertices are f32, so the reference is those exact inputs evaluated in f64.

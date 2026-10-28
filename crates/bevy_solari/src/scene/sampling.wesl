@@ -269,18 +269,21 @@ fn resolve_light_sample(light_sample: LightSample, light_source: LightSource) ->
         );
     } else {
         let triangle_count = emissive_mesh_triangle_count(light_source);
-        var triangle_id = light_sample.light_id & 0xFFFFu;
+        let triangle_id = light_sample.light_id & 0xFFFFu;
         // Temporal reuse translates light IDs, but a light may now have fewer triangles.
-        // Keep the fetch in bounds and give stale samples zero radiance.
-        let stale_triangle = triangle_id >= triangle_count;
-        triangle_id = min(triangle_id, triangle_count - 1u);
+        if triangle_id >= triangle_count {
+            return absent_light_sample();
+        }
         let barycentrics = triangle_barycentrics(light_sample.seed);
         let triangle_data = resolve_triangle_data_full(light_source.id, triangle_id, barycentrics);
+        if triangle_data.degenerate {
+            return absent_light_sample();
+        }
 
         return ResolvedLightSample(
             vec4(triangle_data.world_position, 1.0),
             triangle_data.world_normal,
-            select(triangle_data.material.emissive.rgb, vec3(0.0), stale_triangle),
+            triangle_data.material.emissive.rgb,
             f32(triangle_count) * triangle_data.triangle_area,
             triangle_data.world_normal,
             NO_EMISSION_CONE,
@@ -289,6 +292,23 @@ fn resolve_light_sample(light_sample: LightSample, light_source: LightSource) ->
             true,
         );
     }
+}
+
+/// A light sample that reaches no receiver: zero radiance from a fixed direction, finite for
+/// every ray origin.
+fn absent_light_sample() -> ResolvedLightSample {
+    let direction_to_light = vec3(0.0, 1.0, 0.0);
+    return ResolvedLightSample(
+        vec4(direction_to_light, 0.0),
+        -direction_to_light,
+        vec3(0.0),
+        0.0,
+        -direction_to_light,
+        NO_EMISSION_CONE,
+        NO_EMISSION_CONE,
+        1.0,
+        false,
+    );
 }
 
 /// Shades every kind of light with the same formula:

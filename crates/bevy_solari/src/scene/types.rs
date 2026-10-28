@@ -81,7 +81,8 @@ pub enum RaytracingGeometryUpdateMode {
 /// vertex positions in place each frame. Replace the index buffer when triangle
 /// topology changes so Solari discards temporal triangle anchors. If triangle
 /// identities change within existing buffers, update
-/// [`RaytracingGeometryTopologyGeneration`] instead.
+/// [`RaytracingGeometryTopologyGeneration`] instead, or collapse the triangles as
+/// it describes.
 ///
 /// Add [`RaytracingGeometryPreviousVertices`] to provide deformation motion history.
 /// Otherwise, previous positions use the current vertices with the previous transform.
@@ -124,6 +125,12 @@ pub struct RaytracingGeometryPreviousVertices(pub Buffer);
 /// compacting a procedural mesh). This discards temporal geometry anchors while
 /// keeping buffer allocations and BLAS allocations intact. Ordinary deformation
 /// with stable triangle identities must leave the generation unchanged.
+///
+/// Temporal path history anchored on a triangle with zero area (such as all three
+/// vertices at one point), or with a non-finite vertex, drops, and light samples on
+/// it carry no radiance. Collapse a triangle to hide it without changing the
+/// generation: once it has been collapsed for a frame, its index can take a
+/// different surface.
 ///
 /// Absence is equivalent to generation zero. This does not request a BLAS rebuild;
 /// use [`RaytracingGeometryUpdateMode::RebuildEveryFrame`] for changing geometry.
