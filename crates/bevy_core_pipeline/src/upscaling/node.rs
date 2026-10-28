@@ -99,7 +99,7 @@ pub fn upscaling(
         return;
     };
 
-    let display_target_bind_group = if upscaling_target.1.display_color_space.is_hdr() {
+    let display_target_bind_group = if upscaling_target.1.uses_display_target() {
         let (Some(index), Some(buffer), Some(binding)) = (
             display_target_index,
             display_target_uniforms.buffer(),

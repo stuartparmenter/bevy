@@ -45,8 +45,8 @@ pub struct BlitPipeline {
     pub(crate) display_target_layout: BindGroupLayoutDescriptor,
 }
 
-/// The gamut conversion and paper white a view's upscaling blit encodes HDR
-/// output with.
+/// The conversion to the display's primaries and the paper white that a view's
+/// upscaling blit uses. SDR output ignores paper white.
 #[derive(Component, ShaderType, Clone, Copy, PartialEq)]
 pub struct DisplayTargetUniform {
     pub(crate) gamut: Mat3,
@@ -114,9 +114,17 @@ pub struct BlitPipelineKey {
     pub source_space: Option<CompositingSpace>,
     /// The color space to encode for. [`SurfaceColorSpace::Srgb`] writes linear color.
     pub display_color_space: SurfaceColorSpace,
-    /// Whether the source texture holds linear Rec.2020 color instead of Rec.709. Only SDR
-    /// color spaces use it. HDR ones take the conversion from [`DisplayTargetUniform`].
-    pub source_rec2020: bool,
+    /// Whether the source texture can hold colors outside the primaries of
+    /// `display_color_space`. The blit then compresses them into those primaries instead of
+    /// clipping them, which also shifts the most saturated colors inside them.
+    pub gamut_compression: bool,
+}
+
+impl BlitPipelineKey {
+    /// Whether the pipeline binds a [`DisplayTargetUniform`] as group 1.
+    pub(crate) fn uses_display_target(&self) -> bool {
+        self.display_color_space.is_hdr() || self.gamut_compression
+    }
 }
 
 impl SpecializedRenderPipeline for BlitPipeline {
@@ -131,8 +139,12 @@ impl SpecializedRenderPipeline for BlitPipeline {
         }
 
         let mut layout = vec![self.layout.clone()];
-        if key.source_rec2020 {
-            shader_defs.push("GAMUT_REC2020_TO_REC709".into());
+        if key.uses_display_target() {
+            shader_defs.push("DISPLAY_TARGET_UNIFORM".into());
+            layout.push(self.display_target_layout.clone());
+        }
+        if key.gamut_compression {
+            shader_defs.push("GAMUT_COMPRESSION".into());
         }
         if key.display_color_space.is_hdr() {
             shader_defs.push("DISPLAY_ENCODE".into());
@@ -143,7 +155,6 @@ impl SpecializedRenderPipeline for BlitPipeline {
                 }
                 TransferFunction::Linear | TransferFunction::Srgb => {}
             }
-            layout.push(self.display_target_layout.clone());
         }
 
         RenderPipelineDescriptor {

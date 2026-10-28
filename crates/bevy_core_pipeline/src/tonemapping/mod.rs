@@ -23,9 +23,10 @@ use bevy_render::{
         prepare_view_targets, ColorGrading, ExtractedView, ResolvedCompositingSpace,
         ViewDisplayTarget, ViewTarget, ViewUniform,
     },
-    GpuResourceAppExt, Render, RenderApp, RenderStartup, RenderSystems,
+    GpuResourceAppExt, Render, RenderApp, RenderStartup, RenderSystems, WorkingColorSpace,
 };
 use bevy_shader::{load_shader_library, Shader, ShaderDefVal};
+use bevy_window::ResolvedDisplayTarget;
 use bitflags::bitflags;
 
 mod gt7;
@@ -360,6 +361,24 @@ pub fn init_tonemapping_pipeline(
         fullscreen_shader: fullscreen_shader.clone(),
         fragment_shader: load_embedded_asset!(asset_server.as_ref(), "tonemapping_frag.wesl"),
     });
+}
+
+/// Whether the tonemapping pass can output colors outside Rec.709 for this camera. They
+/// are negative Rec.709 values.
+pub(crate) fn outputs_wide_gamut(
+    camera: &ExtractedCamera,
+    tonemapping: Option<&Tonemapping>,
+    display_target: &ResolvedDisplayTarget,
+    working_color_space: WorkingColorSpace,
+) -> bool {
+    camera.runs_tonemapping_pass
+        && match tonemapping {
+            // It shapes each channel in Rec.2020 under either working color space, and
+            // clamps only on SDR targets.
+            Some(Tonemapping::GranTurismo7) => display_target.color_space.is_hdr(),
+            Some(Tonemapping::Linear) => working_color_space == WorkingColorSpace::Rec2020,
+            _ => false,
+        }
 }
 
 /// Replaces a method that limits output to SDR with [`Tonemapping::GranTurismo7`] on an

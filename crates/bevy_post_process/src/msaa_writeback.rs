@@ -123,7 +123,7 @@ fn prepare_msaa_writeback_pipelines(
                 blend_state: None,
                 source_space: None,
                 display_color_space: SurfaceColorSpace::Srgb,
-                source_rec2020: false,
+                gamut_compression: false,
             };
 
             let pipeline = pipelines.specialize(&pipeline_cache, &blit_pipeline, key);

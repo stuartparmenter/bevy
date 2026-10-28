@@ -1,4 +1,7 @@
-use crate::blit::{BlitPipeline, BlitPipelineKey, DisplayTargetUniform};
+use crate::{
+    blit::{BlitPipeline, BlitPipelineKey, DisplayTargetUniform},
+    tonemapping::outputs_wide_gamut,
+};
 use bevy_app::prelude::*;
 use bevy_camera::CameraOutputMode;
 use bevy_color::RgbPrimaries;
@@ -7,7 +10,7 @@ use bevy_render::{
     camera::ExtractedCamera,
     render_resource::*,
     transfer_functions::gamut_matrix,
-    view::{ResolvedCompositingSpace, ViewDisplayTarget, ViewTarget},
+    view::{ResolvedCompositingSpace, Tonemapping, ViewDisplayTarget, ViewTarget},
     Render, RenderApp, RenderStartup, RenderSystems, WorkingColorSpace,
 };
 
@@ -60,6 +63,7 @@ fn prepare_view_upscaling_pipelines(
         Entity,
         &ViewTarget,
         Option<&ExtractedCamera>,
+        Option<&Tonemapping>,
         Option<&ViewUpscalingPipeline>,
         Option<&ResolvedCompositingSpace>,
         Option<&ViewDisplayTarget>,
@@ -70,6 +74,7 @@ fn prepare_view_upscaling_pipelines(
         entity,
         view_target,
         camera,
+        tonemapping,
         maybe_pipeline,
         resolved_space,
         display_target,
@@ -109,20 +114,25 @@ fn prepare_view_upscaling_pipelines(
         // working color space.
         let source_rec2020 = *working_color_space == WorkingColorSpace::Rec2020
             && camera.is_some_and(|camera| !camera.tonemaps());
+        let source_primaries = if source_rec2020 {
+            RgbPrimaries::BT2020
+        } else {
+            RgbPrimaries::BT709
+        };
+        let wide_source = source_rec2020
+            || camera.is_some_and(|camera| {
+                outputs_wide_gamut(camera, tonemapping, &display_target, *working_color_space)
+            });
         let key = BlitPipelineKey {
             target_format,
             blend_state,
             samples: 1,
             source_space: ResolvedCompositingSpace::space(resolved_space),
             display_color_space: display_target.color_space,
-            source_rec2020: source_rec2020 && !display_target.color_space.is_hdr(),
+            gamut_compression: wide_source
+                && display_target.color_space.primaries() != RgbPrimaries::BT2020,
         };
 
-        let source_primaries = if source_rec2020 {
-            RgbPrimaries::BT2020
-        } else {
-            RgbPrimaries::BT709
-        };
         let uniform = DisplayTargetUniform {
             gamut: gamut_matrix(source_primaries, display_target.color_space.primaries()),
             paper_white_nits: display_target.paper_white_nits,
