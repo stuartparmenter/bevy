@@ -7,6 +7,8 @@ import bevy_render::maths::PI;
 
 @if(TONEMAP_IN_SHADER)
 import bevy_core_pipeline::tonemapping::tone_mapping;
+@if(WORKING_COLOR_SPACE_REC2020 && !TONEMAP_IN_SHADER)
+import bevy_render::working_color_space::rec709_to_rec2020;
 
 /// Sweep across hues on y axis with value from 0.0 to +15EV across x axis
 /// quantized into 24 steps for both axis.
@@ -57,5 +59,9 @@ fn fragment(
     var color = vec4(out, 1.0);
     @if(TONEMAP_IN_SHADER)
     color = tone_mapping(color, mesh_view_bindings::view.color_grading);
+    // The pattern is Rec.709. Without tonemapping in this shader, the output is in the
+    // working color space.
+    @if(WORKING_COLOR_SPACE_REC2020 && !TONEMAP_IN_SHADER)
+    color = rec709_to_rec2020(color);
     return color;
 }

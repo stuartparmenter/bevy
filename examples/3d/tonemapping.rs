@@ -13,6 +13,10 @@ use bevy::{
         view::{ColorGrading, ColorGradingGlobal, ColorGradingSection},
     },
     shader::ShaderRef,
+    window::{
+        DisplayTarget, PrimaryWindow, ResolvedDisplayTarget, SurfaceColorSpace,
+        WindowSurfaceColorSpaces,
+    },
 };
 use std::f32::consts::PI;
 
@@ -52,6 +56,7 @@ fn main() {
                 resize_image,
                 toggle_scene,
                 toggle_tonemapping_method,
+                cycle_color_space,
                 update_color_grading_settings,
                 update_ui,
             ),
@@ -324,6 +329,28 @@ fn toggle_tonemapping_method(
     .clone();
 }
 
+/// Cycles the window's color space through the one Bevy picks and each HDR color space the
+/// surface supports.
+fn cycle_color_space(
+    keys: Res<ButtonInput<KeyCode>>,
+    window: Single<(&mut DisplayTarget, Option<&WindowSurfaceColorSpaces>), With<PrimaryWindow>>,
+) {
+    if !keys.just_pressed(KeyCode::KeyO) {
+        return;
+    }
+    let (mut display_target, surface) = window.into_inner();
+    let mut hdr_color_spaces = surface
+        .into_iter()
+        .flat_map(|surface| surface.supported.iter())
+        .filter(SurfaceColorSpace::is_hdr);
+    display_target.color_space_override = match display_target.color_space_override {
+        None => hdr_color_spaces.next(),
+        Some(current) => hdr_color_spaces
+            .skip_while(|color_space| *color_space != current)
+            .nth(1),
+    };
+}
+
 #[derive(Resource)]
 struct SelectedParameter {
     value: i32,
@@ -397,6 +424,7 @@ fn update_color_grading_settings(
 fn update_ui(
     mut text_query: Single<&mut Text, Without<SceneNumber>>,
     settings: Single<(&Tonemapping, &ColorGrading)>,
+    window: Single<(&DisplayTarget, Option<&ResolvedDisplayTarget>), With<PrimaryWindow>>,
     current_scene: Res<CurrentScene>,
     selected_parameter: Res<SelectedParameter>,
     mut hide_ui: Local<bool>,
@@ -421,7 +449,17 @@ fn update_ui(
     let mut text = String::with_capacity(text_query.len());
 
     let scn = current_scene.0;
-    text.push_str("(H) Hide UI\n\n");
+    let (display_target, resolved) = *window;
+    text.push_str("(H) Hide UI\n");
+    text.push_str(&format!(
+        "(O) Color space: {} (output: {:?})\n\n",
+        display_target
+            .color_space_override
+            .map_or("None".to_string(), |color_space| format!("{color_space:?}")),
+        resolved
+            .map(|resolved| resolved.color_space)
+            .unwrap_or_default(),
+    ));
     text.push_str("Test Scene: \n");
     text.push_str(&format!(
         "(Q) {} Basic Scene\n",

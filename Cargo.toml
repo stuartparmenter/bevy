@@ -1496,6 +1496,17 @@ category = "3D Rendering"
 wasm = true
 
 [[example]]
+name = "hdr_calibration"
+path = "examples/3d/hdr_calibration.rs"
+doc-scrape-examples = true
+
+[package.metadata.example.hdr_calibration]
+name = "HDR Calibration"
+description = "Calibration patterns for the luminance of an HDR display"
+category = "3D Rendering"
+wasm = true
+
+[[example]]
 name = "orthographic"
 path = "examples/3d/orthographic.rs"
 doc-scrape-examples = true
