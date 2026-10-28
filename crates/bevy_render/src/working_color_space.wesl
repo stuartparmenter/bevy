@@ -1,0 +1,20 @@
+//! Matrices between linear Rec.709 and the Rec.2020 working color space, both
+//! D65. Shaders that compose Rec.709 colors convert them under the
+//! `WORKING_COLOR_SPACE_REC2020` shader def.
+
+const REC709_TO_REC2020 = mat3x3<f32>(
+    0.627403895934699, 0.06909728935823199, 0.016391438875150228,
+    0.32928303837788375, 0.919540395075459, 0.08801330787722578,
+    0.043313065687417246, 0.011362315566309154, 0.895595253247624,
+);
+
+const REC2020_TO_REC709 = mat3x3<f32>(
+    1.6604910021084347, -0.12455047452159052, -0.01815076335490522,
+    -0.5876411387885496, 1.1328998971259598, -0.10057889800800739,
+    -0.07284986331988484, -0.008349422604369487, 1.1187296613629125,
+);
+
+/// Converts a linear Rec.709 color to Rec.2020. Alpha is unchanged.
+fn rec709_to_rec2020(color: vec4<f32>) -> vec4<f32> {
+    return vec4(REC709_TO_REC2020 * color.rgb, color.a);
+}

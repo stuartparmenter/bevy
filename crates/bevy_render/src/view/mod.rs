@@ -29,7 +29,7 @@ use crate::{
         CachedTexture, ColorAttachment, DepthStencilAttachment, GpuImage, ManualTextureViews,
         OutputColorAttachment, TextureCache,
     },
-    GpuResourceAppExt, Render, RenderApp, RenderSystems,
+    GpuResourceAppExt, Render, RenderApp, RenderSystems, WorkingColorSpace,
 };
 use alloc::sync::{Arc, Weak};
 use bevy_app::{App, Plugin};
@@ -301,7 +301,9 @@ pub enum Tonemapping {
     /// Bypass tonemapping. No color grading, exposure, or dither applies.
     None,
     /// Identity tone curve. [`ColorGrading`], exposure, and [`DebandDither`]
-    /// still apply. The output is unbounded display-linear.
+    /// still apply. The output is unbounded display-linear. Under
+    /// [`WorkingColorSpace::Rec2020`] with default grading, colors outside the
+    /// Rec.709 gamut stay as negative values.
     Linear,
     /// Suffers from lots hue shifting, brights don't desaturate naturally.
     /// Bright primaries and secondaries don't desaturate at all.
@@ -1403,6 +1405,7 @@ fn main_texture_key(camera: &ExtractedCamera, view: &ExtractedView, msaa: Msaa) 
 pub fn prepare_view_targets(
     mut commands: Commands,
     clear_color_global: Res<ClearColor>,
+    working_color_space: Res<WorkingColorSpace>,
     render_device: Res<RenderDevice>,
     mut texture_cache: ResMut<TextureCache>,
     cameras: Query<(
@@ -1447,11 +1450,16 @@ pub fn prepare_view_targets(
 
         let main_texture_format = view.target_format;
 
-        let clear_color = match camera.clear_color {
+        let mut clear_color = match camera.clear_color {
             ClearColorConfig::Custom(color) => Some(color),
             ClearColorConfig::None => None,
             _ => Some(clear_color_global.0),
         };
+        // A camera that tonemaps in its shaders holds Rec.709 colors.
+        if *working_color_space == WorkingColorSpace::Rec2020 && !camera.tonemap_in_shader {
+            clear_color =
+                clear_color.map(|color| working_color_space.convert_rec709(color.into()).into());
+        }
 
         // Convert clear color to the format expected by the main texture
         let resolved_space = ResolvedCompositingSpace::space(resolved_space);

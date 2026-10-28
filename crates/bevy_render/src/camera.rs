@@ -486,6 +486,13 @@ pub struct ExtractedCamera {
     pub runs_tonemapping_pass: bool,
 }
 
+impl ExtractedCamera {
+    /// Whether the camera tonemaps, in the tonemapping pass or in its shaders.
+    pub fn tonemaps(&self) -> bool {
+        self.runs_tonemapping_pass || self.tonemap_in_shader
+    }
+}
+
 pub fn extract_cameras(
     mut commands: Commands,
     mut main_pass_formats: ResMut<CameraMainPassTextureFormats>,

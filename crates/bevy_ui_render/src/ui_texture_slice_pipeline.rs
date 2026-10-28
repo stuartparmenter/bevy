@@ -16,13 +16,14 @@ use bevy_math::{Affine2, FloatOrd, Rect, Vec2};
 use bevy_mesh::VertexBufferLayout;
 use bevy_platform::collections::HashMap;
 use bevy_render::{
+    camera::ExtractedCamera,
     render_asset::RenderAssets,
     render_phase::*,
     render_resource::{binding_types::uniform_buffer, *},
     renderer::{RenderDevice, RenderQueue},
     texture::GpuImage,
     view::*,
-    Extract, ExtractSchedule, Render, RenderSystems,
+    Extract, ExtractSchedule, Render, RenderSystems, WorkingColorSpace,
 };
 use bevy_render::{sync_world::MainEntity, GpuResourceAppExt, RenderStartup};
 use bevy_shader::Shader;
@@ -419,7 +420,15 @@ pub fn queue_ui_slices(
     ui_slicer_pipeline: Res<UiTextureSlicePipeline>,
     mut pipelines: ResMut<SpecializedRenderPipelines<UiTextureSlicePipeline>>,
     mut transparent_render_phases: ResMut<ViewSortedRenderPhases<TransparentUi>>,
-    render_views: Query<(&UiCameraView, Option<&ResolvedCompositingSpace>), With<ExtractedView>>,
+    working_color_space: Res<WorkingColorSpace>,
+    render_views: Query<
+        (
+            &UiCameraView,
+            Option<&ResolvedCompositingSpace>,
+            Option<&ExtractedCamera>,
+        ),
+        With<ExtractedView>,
+    >,
     camera_views: Query<&ExtractedView>,
     pipeline_cache: Res<PipelineCache>,
     draw_functions: Res<DrawFunctions<TransparentUi>>,
@@ -431,7 +440,7 @@ pub fn queue_ui_slices(
     for (main_entity, (extracted_camera_entity, subslices)) in extracted_ui_slicers.slices.iter() {
         if current_camera_entity != *extracted_camera_entity {
             current_phase = render_views.get(*extracted_camera_entity).ok().and_then(
-                |(default_camera_view, resolved_space)| {
+                |(default_camera_view, resolved_space, camera)| {
                     camera_views
                         .get(default_camera_view.0)
                         .ok()
@@ -444,8 +453,10 @@ pub fn queue_ui_slices(
                                         &ui_slicer_pipeline,
                                         UiTextureSlicePipelineKey {
                                             target_format: view.target_format,
-                                            writer_encode: UiWriterEncodeKey::from_resolved_space(
+                                            writer_encode: UiWriterEncodeKey::new(
                                                 resolved_space,
+                                                camera,
+                                                *working_color_space,
                                             ),
                                         },
                                     );

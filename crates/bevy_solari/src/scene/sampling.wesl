@@ -1,6 +1,8 @@
 import bevy_pbr::render::pbr_lighting::D_GGX;
 import bevy_pbr::render::utils::{rand_vec2f, rand_u, rand_range_u, sample_uniform_sphere};
 import bevy_render::maths::{PI_2, orthonormalize};
+@if(WORKING_COLOR_SPACE_REC2020)
+import bevy_render::working_color_space::REC709_TO_REC2020;
 import package::scene::bindings::{trace_ray, trace_ray_previous_frame, RAY_T_MIN, RAY_T_MAX, light_sources, directional_lights, point_lights, rect_lights, environment_map, environment_map_sampler, environment_map_light, LightSource, light_source_kind, emissive_mesh_triangle_count, LIGHT_SOURCE_KIND_EMISSIVE_MESH, LIGHT_SOURCE_KIND_DIRECTIONAL, LIGHT_SOURCE_KIND_POINT, LIGHT_SOURCE_KIND_RECT, resolve_triangle_data_full, ResolvedRayHitFull, MIRROR_ROUGHNESS_THRESHOLD};
 
 enable wgpu_ray_query;
@@ -160,7 +162,10 @@ fn sample_environment_map_light(world_direction: vec3<f32>) -> vec3<f32> {
     sample_direction.z = -sample_direction.z;
 
     // Hardcoded to sample mip 0 (unfiltered radiance)
-    return textureSampleLevel(environment_map, environment_map_sampler, sample_direction, 0.0).rgb * environment_map_light.intensity;
+    var radiance = textureSampleLevel(environment_map, environment_map_sampler, sample_direction, 0.0).rgb * environment_map_light.intensity;
+@if(WORKING_COLOR_SPACE_REC2020)
+    radiance = REC709_TO_REC2020 * radiance;
+    return radiance;
 }
 
 fn generate_random_light_sample(rng: ptr<function, u32>) -> GenerateRandomLightSampleResult {

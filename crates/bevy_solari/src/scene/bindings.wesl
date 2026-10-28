@@ -1,5 +1,7 @@
 import bevy_pbr::render::pbr_functions::calculate_tbn_mikktspace;
 import bevy_render::maths::affine3_to_square;
+@if(WORKING_COLOR_SPACE_REC2020)
+import bevy_render::working_color_space::REC709_TO_REC2020;
 
 enable wgpu_ray_query;
 enable wgpu_binding_array;
@@ -219,6 +221,10 @@ fn resolve_material(material: Material, uv: vec2<f32>) -> ResolvedMaterial {
     if material.emissive_texture_id != TEXTURE_MAP_NONE {
         m.emissive *= sample_texture(material.emissive_texture_id, uv).rgb;
     }
+@if(WORKING_COLOR_SPACE_REC2020) {
+    m.base_color = REC709_TO_REC2020 * m.base_color;
+    m.emissive = REC709_TO_REC2020 * m.emissive;
+}
     m.alpha_masked_out = alpha < material.alpha_cutoff;
     if m.alpha_masked_out {
         m.emissive = vec3(0.0);

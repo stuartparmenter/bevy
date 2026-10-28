@@ -12,6 +12,8 @@ import bevy_render::maths::PI;
 
 @if(TONEMAP_IN_SHADER)
 import bevy_core_pipeline::tonemapping::approximate_inverse_tone_mapping;
+@if(TONEMAP_IN_SHADER && WORKING_COLOR_SPACE_REC2020)
+import bevy_render::working_color_space::rec709_to_rec2020;
 
 @if (VIEW_TRANSMISSION_TEXTURE) {
 
@@ -125,6 +127,8 @@ fn fetch_transmissive_background_non_rough(offset_position: vec2<f32>, frag_coor
 
     @if(TONEMAP_IN_SHADER)
     background_color = approximate_inverse_tone_mapping(background_color, view_bindings::view.color_grading);
+    @if(TONEMAP_IN_SHADER && WORKING_COLOR_SPACE_REC2020)
+    background_color = rec709_to_rec2020(background_color);
 
     return background_color;
 }
@@ -233,6 +237,8 @@ fn fetch_transmissive_background(offset_position: vec2<f32>, frag_coord: vec3<f3
 
     @if(TONEMAP_IN_SHADER)
     result = approximate_inverse_tone_mapping(result, view_bindings::view.color_grading);
+    @if(TONEMAP_IN_SHADER && WORKING_COLOR_SPACE_REC2020)
+    result = rec709_to_rec2020(result);
 
     return result;
 }

@@ -5,6 +5,7 @@
 };
 @if(WIREFRAME_WIDE) import bevy_render::maths::affine3_to_square;
 @if(!WIREFRAME_WIDE) import package::render::forward_io::VertexOutput;
+import bevy_render::writer_encode::writer_encode;
 
 @if(WIREFRAME_WIDE) {
 struct Immediates {
@@ -232,15 +233,16 @@ fn fragment(in: WireframeVertexOutput) -> @location(0) vec4<f32> {
 
     let half_width = effective_width * 0.5;
 
+    let color = writer_encode(immediates.color);
     let alpha = (1.0 - smoothstep(half_width, half_width + smoothing, d))
               * alpha_scale
-              * immediates.color.a;
+              * color.a;
 
     if alpha < 0.01 {
         discard;
     }
 
-    return vec4<f32>(immediates.color.rgb, alpha);
+    return vec4<f32>(color.rgb, alpha);
 }
 }
 
@@ -255,6 +257,6 @@ var<immediate> immediates: Immediates;
 
 @fragment
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
-    return immediates.color;
+    return writer_encode(immediates.color);
 }
 }

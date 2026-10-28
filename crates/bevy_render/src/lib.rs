@@ -95,6 +95,7 @@ pub mod texture;
 pub mod transfer_functions;
 pub mod uniform;
 pub mod view;
+mod working_color_space;
 
 /// The render prelude.
 ///
@@ -110,6 +111,7 @@ pub use bevy_extract::{
     extract_param::Extract,
     extract_plugin::{ExtractSchedule, MainWorld},
 };
+pub use working_color_space::WorkingColorSpace;
 
 use crate::{
     camera::CameraPlugin,
@@ -160,6 +162,8 @@ use std::sync::Mutex;
 #[derive(Default)]
 pub struct RenderPlugin {
     pub render_creation: RenderCreation,
+    /// The color space the renderer lights and blends in.
+    pub working_color_space: WorkingColorSpace,
     /// If `true`, disables asynchronous pipeline compilation.
     /// This has no effect on macOS, Wasm, iOS, or without the `multi_threaded` feature.
     pub synchronous_pipeline_compilation: bool,
@@ -391,6 +395,7 @@ impl Plugin for RenderPlugin {
         load_shader_library!(app, "color_operations.wesl");
         load_shader_library!(app, "writer_encode.wesl");
         load_shader_library!(app, "transfer_functions.wesl");
+        load_shader_library!(app, "working_color_space.wesl");
         load_shader_library!(app, "bindless.wesl");
 
         if insert_future_resources(&self.render_creation, app.world_mut()) {
@@ -431,6 +436,7 @@ impl Plugin for RenderPlugin {
         app.init_resource::<RenderAssetBytesPerFrame>()
             .init_resource::<RenderErrorHandler>();
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+            render_app.insert_resource(self.working_color_space);
             render_app.init_resource::<RenderScheduleOrder>();
             render_app.init_resource::<RenderAssetBytesPerFrameLimiter>();
             render_app.init_gpu_resource::<renderer::PendingCommandBuffers>();
@@ -505,6 +511,7 @@ impl Plugin for RenderPlugin {
                 main.world_mut(),
                 render.world_mut(),
                 self.synchronous_pipeline_compilation,
+                self.working_color_space,
             );
         }
     }

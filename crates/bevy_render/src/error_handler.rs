@@ -13,7 +13,7 @@ use crate::{
     render_resource::PipelineCache,
     renderer::{wgpu_wrapper, RenderDevice},
     settings::RenderCreation,
-    FutureRenderResources, RenderStartup,
+    FutureRenderResources, RenderStartup, WorkingColorSpace,
 };
 
 /// Resource to indicate renderer behavior upon error.
@@ -219,10 +219,12 @@ pub(crate) fn update_state(main_world: &mut World, render_world: &mut World) {
                 let synchronous_pipeline_compilation = render_world
                     .resource::<PipelineCache>()
                     .synchronous_pipeline_compilation;
+                let working_color_space = *render_world.resource::<WorkingColorSpace>();
                 render_resources.unpack_into(
                     main_world,
                     render_world,
                     synchronous_pipeline_compilation,
+                    working_color_space,
                 );
                 render_world.insert_resource(RenderState::Initializing);
             }

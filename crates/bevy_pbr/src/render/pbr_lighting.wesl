@@ -39,6 +39,8 @@ import package::{
     atmosphere::bruneton_functions::transmittance_lut_r_mu_to_uv,
 };
 import bevy_render::maths::{PI, orthonormalize, quat_rotate};
+@if(ATMOSPHERE && WORKING_COLOR_SPACE_REC2020)
+import bevy_render::working_color_space::{REC709_TO_REC2020, REC2020_TO_REC709};
 
 const LAYER_BASE: u32 = 0;
 const LAYER_CLEARCOAT: u32 = 1;
@@ -939,7 +941,10 @@ color *= (*light).color.rgb * texture_sample;
     let transmittance = sample_transmittance_lut(r, mu_light);
     let sun_visibility = calculate_visible_sun_ratio(atmosphere, r, mu_light, (*light).sun_disk_angular_size);
 
-    // Apply atmospheric effects
+    // Apply atmospheric effects. The transmittance is a Rec.709 filter.
+@if(WORKING_COLOR_SPACE_REC2020)
+    color = REC709_TO_REC2020 * (transmittance * sun_visibility * (REC2020_TO_REC709 * color));
+@else
     color *= transmittance * sun_visibility;
 }
 

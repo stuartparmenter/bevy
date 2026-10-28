@@ -38,7 +38,7 @@ use bevy_render::{
     sync_world::RenderEntity,
     texture::GpuImage,
     view::{ExtractedView, Msaa, ViewDepthStencilTexture, ViewTarget},
-    Extract,
+    Extract, WorkingColorSpace,
 };
 use bevy_shader::Shader;
 use bevy_transform::components::GlobalTransform;
@@ -636,6 +636,7 @@ pub fn prepare_volumetric_fog_uniforms(
     fog_volumes: Query<(Entity, &FogVolume, &GlobalTransform)>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
+    working_color_space: Res<WorkingColorSpace>,
     mut local_from_world_matrices: Local<Vec<Affine3A>>,
 ) {
     // Do this up front to avoid O(n^2) matrix inversion.
@@ -684,9 +685,15 @@ pub fn prepare_volumetric_fog_uniforms(
                 clip_from_local: hull_clip_from_local,
                 uvw_from_world: UVW_FROM_LOCAL * *local_from_world,
                 far_planes: get_far_planes(&view_from_local),
-                fog_color: fog_volume.fog_color.to_linear().to_vec3(),
-                light_tint: fog_volume.light_tint.to_linear().to_vec3(),
-                ambient_color: volumetric_fog.ambient_color.to_linear().to_vec3(),
+                fog_color: working_color_space
+                    .convert_rec709(fog_volume.fog_color.to_linear())
+                    .to_vec3(),
+                light_tint: working_color_space
+                    .convert_rec709(fog_volume.light_tint.to_linear())
+                    .to_vec3(),
+                ambient_color: working_color_space
+                    .convert_rec709(volumetric_fog.ambient_color.to_linear())
+                    .to_vec3(),
                 ambient_intensity: volumetric_fog.ambient_intensity,
                 step_count: volumetric_fog.step_count,
                 bounding_radius,

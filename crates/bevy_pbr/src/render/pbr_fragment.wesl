@@ -1,4 +1,6 @@
 import bevy_render::bindless::{bindless_samplers_filtering, bindless_textures_2d};
+@if(WORKING_COLOR_SPACE_REC2020)
+import bevy_render::working_color_space::{REC709_TO_REC2020, rec709_to_rec2020};
 
 import package::{
     render::{
@@ -692,6 +694,17 @@ pbr_input.material.uv_transform = uv_transform;
         pbr_input.lightmap_light = lightmap(in.uv_b, lightmap_exposure, in.instance_index);
 }
     }
+
+    // Material colors and lightmaps are Rec.709. Converting after the texture
+    // multiplies keeps tinting the same as under Rec.709.
+@if(WORKING_COLOR_SPACE_REC2020) {
+    pbr_input.material.base_color = rec709_to_rec2020(pbr_input.material.base_color);
+    pbr_input.material.emissive = rec709_to_rec2020(pbr_input.material.emissive);
+    pbr_input.material.attenuation_color =
+        rec709_to_rec2020(pbr_input.material.attenuation_color);
+    @if(LIGHTMAP)
+    pbr_input.lightmap_light = REC709_TO_REC2020 * pbr_input.lightmap_light;
+}
 
     return pbr_input;
 }

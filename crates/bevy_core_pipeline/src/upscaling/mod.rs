@@ -8,7 +8,7 @@ use bevy_render::{
     render_resource::*,
     transfer_functions::gamut_matrix,
     view::{ResolvedCompositingSpace, ViewDisplayTarget, ViewTarget},
-    Render, RenderApp, RenderStartup, RenderSystems,
+    Render, RenderApp, RenderStartup, RenderSystems, WorkingColorSpace,
 };
 
 mod node;
@@ -55,6 +55,7 @@ fn prepare_view_upscaling_pipelines(
     mut pipeline_cache: ResMut<PipelineCache>,
     mut pipelines: ResMut<SpecializedRenderPipelines<BlitPipeline>>,
     blit_pipeline: Res<BlitPipeline>,
+    working_color_space: Res<WorkingColorSpace>,
     view_targets: Query<(
         Entity,
         &ViewTarget,
@@ -104,16 +105,26 @@ fn prepare_view_upscaling_pipelines(
         };
 
         let display_target = display_target.map(|target| target.0).unwrap_or_default();
+        // Tonemapping outputs Rec.709, so only a camera without it keeps the
+        // working color space.
+        let source_rec2020 = *working_color_space == WorkingColorSpace::Rec2020
+            && camera.is_some_and(|camera| !camera.tonemaps());
         let key = BlitPipelineKey {
             target_format,
             blend_state,
             samples: 1,
             source_space: ResolvedCompositingSpace::space(resolved_space),
             display_color_space: display_target.color_space,
+            source_rec2020: source_rec2020 && !display_target.color_space.is_hdr(),
         };
 
+        let source_primaries = if source_rec2020 {
+            RgbPrimaries::BT2020
+        } else {
+            RgbPrimaries::BT709
+        };
         let uniform = DisplayTargetUniform {
-            gamut: gamut_matrix(RgbPrimaries::BT709, display_target.color_space.primaries()),
+            gamut: gamut_matrix(source_primaries, display_target.color_space.primaries()),
             paper_white_nits: display_target.paper_white_nits,
         };
         if display_target_uniform != Some(&uniform) {

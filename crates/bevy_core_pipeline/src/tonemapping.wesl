@@ -9,6 +9,9 @@ import package::tonemapping::lut_bindings::{
     dt_lut_sampler,
 };
 
+@if(WORKING_COLOR_SPACE_REC2020)
+import bevy_render::working_color_space::REC2020_TO_REC709;
+
 /// Half the size of the crossfade region between shadows and midtones and
 /// between midtones and highlights. This value, 0.1, corresponds to 10% of the
 /// gamut on either side of the cutoff point.
@@ -370,8 +373,22 @@ fn sectional_color_grading(
     return max(color, vec3(0.0));
 }
 
+/// Converts a working color space color to the Rec.709 that `tone_mapping`
+/// takes.
+fn working_color_to_rec709(color: vec4<f32>) -> vec4<f32> {
+@if(WORKING_COLOR_SPACE_REC2020) {
+    return vec4(REC2020_TO_REC709 * color.rgb, color.a);
+} @else {
+    return color;
+}
+}
+
+/// Tonemaps a linear Rec.709 color.
 fn tone_mapping(in: vec4<f32>, in_color_grading: ColorGrading) -> vec4<f32> {
-    var color = max(in.rgb, vec3(0.0));
+    var color = in.rgb;
+    // Under Rec.2020, `Linear` keeps colors outside Rec.709 as negative values.
+@if(!WORKING_COLOR_SPACE_REC2020 || !TONEMAP_METHOD_LINEAR)
+    color = max(color, vec3(0.0));
     var color_grading = in_color_grading;   // So we can take pointers to it.
 
     // Rotate hue if needed, by converting to and from HSV. Remember that hue is

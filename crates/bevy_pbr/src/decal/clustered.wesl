@@ -33,6 +33,8 @@ import package::render::pbr_functions;
 import package::render::pbr_types::PbrInput;
 import package::render::utils::porter_duff_over;
 import bevy_render::maths;
+@if(WORKING_COLOR_SPACE_REC2020)
+import bevy_render::working_color_space::rec709_to_rec2020;
 
 @if(MESHLET_MESH_MATERIAL_PASS) import package::meshlet::visibility_buffer_resolve::VertexOutput;
 @elif(PREPASS_PIPELINE) import package::prepass::io::VertexOutput;
@@ -219,6 +221,9 @@ fn apply_decals(pbr_input: ptr<function, PbrInput>) {
             }
 
             // Apply base color with the standard OVER compositing operator.
+@if(WORKING_COLOR_SPACE_REC2020)
+            base_color = porter_duff_over(base_color, rec709_to_rec2020(decal_base_color));
+@else
             base_color = porter_duff_over(base_color, decal_base_color);
         }
 
@@ -244,6 +249,9 @@ fn apply_decals(pbr_input: ptr<function, PbrInput>) {
                 iterator.uv,
                 0.0
             );
+@if(WORKING_COLOR_SPACE_REC2020)
+            emissive += vec4(rec709_to_rec2020(decal_emissive).rgb, 0.0);
+@else
             emissive += vec4(decal_emissive.rgb, 0.0);
         }
     }

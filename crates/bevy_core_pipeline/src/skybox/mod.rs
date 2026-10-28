@@ -12,6 +12,7 @@ use bevy_light::Skybox;
 use bevy_log::warn_once;
 use bevy_math::Mat4;
 use bevy_render::{
+    camera::ExtractedCamera,
     extract_component::{ComponentUniforms, DynamicUniformIndex, UniformComponentPlugin},
     render_asset::RenderAssets,
     render_resource::{
@@ -24,6 +25,7 @@ use bevy_render::{
     texture::GpuImage,
     view::{ExtractedView, Msaa, ViewUniform, ViewUniforms},
     Extract, ExtractSchedule, GpuResourceAppExt, Render, RenderApp, RenderStartup, RenderSystems,
+    WorkingColorSpace,
 };
 use bevy_shader::Shader;
 use bevy_transform::components::Transform;
@@ -141,6 +143,7 @@ struct SkyboxPipelineKey {
     target_format: TextureFormat,
     samples: u32,
     depth_format: TextureFormat,
+    output_working_color_space: bool,
 }
 
 impl SpecializedRenderPipeline for SkyboxPipeline {
@@ -177,6 +180,11 @@ impl SpecializedRenderPipeline for SkyboxPipeline {
             },
             fragment: Some(FragmentState {
                 shader: self.shader.clone(),
+                shader_defs: if key.output_working_color_space {
+                    vec!["OUTPUT_WORKING_COLOR_SPACE".into()]
+                } else {
+                    Vec::new()
+                },
                 targets: vec![Some(ColorTargetState {
                     format: key.target_format,
                     // BlendState::REPLACE is not needed here, and None will be potentially much faster in some cases.
@@ -198,9 +206,10 @@ fn prepare_skybox_pipelines(
     pipeline_cache: Res<PipelineCache>,
     mut pipelines: ResMut<SpecializedRenderPipelines<SkyboxPipeline>>,
     pipeline: Res<SkyboxPipeline>,
-    cameras: Query<(Entity, &ExtractedView, &Msaa), With<Skybox>>,
+    working_color_space: Res<WorkingColorSpace>,
+    cameras: Query<(Entity, &ExtractedView, &Msaa, Option<&ExtractedCamera>), With<Skybox>>,
 ) {
-    for (entity, view, msaa) in &cameras {
+    for (entity, view, msaa, camera) in &cameras {
         let pipeline_id = pipelines.specialize(
             &pipeline_cache,
             &pipeline,
@@ -208,6 +217,9 @@ fn prepare_skybox_pipelines(
                 target_format: view.target_format,
                 samples: msaa.samples(),
                 depth_format: CORE_3D_DEPTH_FORMAT,
+                // A camera that tonemaps in its shaders holds Rec.709 colors.
+                output_working_color_space: *working_color_space == WorkingColorSpace::Rec2020
+                    && !camera.is_some_and(|camera| camera.tonemap_in_shader),
             },
         );
 

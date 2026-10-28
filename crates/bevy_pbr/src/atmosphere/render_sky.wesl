@@ -11,6 +11,8 @@ import package::atmosphere::{
 };
 
 import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput;
+@if(WORKING_COLOR_SPACE_REC2020)
+import bevy_render::working_color_space::REC709_TO_REC2020;
 
 @if(DUAL_SOURCE_BLENDING)
 enable dual_source_blending;
@@ -71,10 +73,16 @@ fn main(in: FullscreenVertexOutput) -> RenderSkyOutput {
     // exposure compensation
     inscattering *= view.exposure;
     
+    let mean_transmittance = (transmittance.r + transmittance.g + transmittance.b) / 3.0;
+    // The atmosphere renders in Rec.709. Converting the transmittance like a color is exact
+    // for a gray background.
+@if(WORKING_COLOR_SPACE_REC2020) {
+    inscattering = REC709_TO_REC2020 * inscattering;
+    transmittance = REC709_TO_REC2020 * transmittance;
+}
+
     @if(DUAL_SOURCE_BLENDING)
     return RenderSkyOutput(vec4(inscattering, 0.0), vec4(transmittance, 1.0));
-    @if(!DUAL_SOURCE_BLENDING)
-    let mean_transmittance = (transmittance.r + transmittance.g + transmittance.b) / 3.0;
     @if(!DUAL_SOURCE_BLENDING)
     return RenderSkyOutput(vec4(inscattering, mean_transmittance));
     

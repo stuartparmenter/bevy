@@ -30,6 +30,8 @@ import package::atmosphere::{
         distance_to_top_atmosphere_boundary, distance_to_bottom_atmosphere_boundary
     },
 };
+@if(WORKING_COLOR_SPACE_REC2020)
+import bevy_render::working_color_space::REC2020_TO_REC709;
 
 // CONSTANTS
 /// 1 / π
@@ -51,6 +53,15 @@ const MIN_EXTINCTION: vec3<f32> = vec3(1e-12);
 /// We use 0.3 to sample closer to the start of each segment, which better approximates
 /// the exponential falloff of atmospheric density.
 const MIDPOINT_RATIO: f32 = 0.3;
+
+/// A light color in Rec.709, the space the atmosphere renders in.
+fn light_color_rec709(color: vec4<f32>) -> vec3<f32> {
+@if(WORKING_COLOR_SPACE_REC2020) {
+    return REC2020_TO_REC709 * color.rgb;
+} @else {
+    return color.rgb;
+}
+}
 
 // LUT UV PARAMETERIZATIONS
 
@@ -217,7 +228,7 @@ fn sample_local_inscattering(local_scattering: vec3<f32>, ray_dir: vec3<f32>, wo
         let psi_ms = sample_multiscattering_lut(local_r, mu_light);
         let multiscattering_factor = psi_ms * local_scattering;
 
-        inscattering += (*light).color.rgb * (scattering_factor + multiscattering_factor);
+        inscattering += light_color_rec709((*light).color) * (scattering_factor + multiscattering_factor);
     }
     return inscattering;
 }
@@ -239,7 +250,7 @@ fn sample_sun_radiance(ray_dir_ws: vec3<f32>) -> vec3<f32> {
         if sun_angular_size > 0.0 && sun_intensity > 0.0 {
             let factor = 1 - smoothstep(sun_angular_size * 0.5 - w, sun_angular_size * 0.5 + w, angle_to_sun);
             let sun_solid_angle = (sun_angular_size * sun_angular_size) * 0.25 * PI;
-            sun_radiance += ((*light).color.rgb / sun_solid_angle) * sun_intensity * factor * shadow_factor;
+            sun_radiance += (light_color_rec709((*light).color) / sun_solid_angle) * sun_intensity * factor * shadow_factor;
         }
     }
     return sun_radiance;
@@ -475,7 +486,7 @@ fn raymarch_atmosphere(
         for (var light_i: u32 = 0u; light_i < lights.n_directional_lights; light_i++) {
             let light = &lights.directional_lights[light_i];
             let light_dir = (*light).direction_to_light;
-            let light_color = (*light).color.rgb;
+            let light_color = light_color_rec709((*light).color);
             let transmittance_to_ground = exp(-optical_depth);
             // position on the sphere and get the sphere normal (up)
             let sphere_point = pos + ray_dir * t_end;

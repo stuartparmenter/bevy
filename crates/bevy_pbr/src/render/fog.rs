@@ -7,7 +7,7 @@ use bevy_render::{
     render_resource::{DynamicUniformBuffer, ShaderType},
     renderer::{RenderDevice, RenderQueue},
     view::ExtractedView,
-    GpuResourceAppExt, Render, RenderApp, RenderSystems,
+    GpuResourceAppExt, Render, RenderApp, RenderSystems, WorkingColorSpace,
 };
 use bevy_shader::load_shader_library;
 
@@ -53,6 +53,7 @@ pub fn prepare_fog(
     render_queue: Res<RenderQueue>,
     mut fog_meta: ResMut<FogMeta>,
     views: Query<(Entity, &DistanceFog), With<ExtractedView>>,
+    working_color_space: Res<WorkingColorSpace>,
 ) {
     let views_iter = views.iter();
     let view_count = views_iter.len();
@@ -63,31 +64,34 @@ pub fn prepare_fog(
         return;
     };
     for (entity, fog) in views_iter {
+        let base_color = working_color_space
+            .convert_rec709(LinearRgba::from(fog.color))
+            .to_vec4();
+        let directional_light_color = working_color_space
+            .convert_rec709(LinearRgba::from(fog.directional_light_color))
+            .to_vec4();
         let gpu_fog = {
             match &fog.falloff {
                 FogFalloff::Linear { start, end } => GpuFog {
                     mode: GPU_FOG_MODE_LINEAR,
-                    base_color: LinearRgba::from(fog.color).to_vec4(),
-                    directional_light_color: LinearRgba::from(fog.directional_light_color)
-                        .to_vec4(),
+                    base_color,
+                    directional_light_color,
                     directional_light_exponent: fog.directional_light_exponent,
                     be: Vec3::new(*start, *end, 0.0),
                     ..Default::default()
                 },
                 FogFalloff::Exponential { density } => GpuFog {
                     mode: GPU_FOG_MODE_EXPONENTIAL,
-                    base_color: LinearRgba::from(fog.color).to_vec4(),
-                    directional_light_color: LinearRgba::from(fog.directional_light_color)
-                        .to_vec4(),
+                    base_color,
+                    directional_light_color,
                     directional_light_exponent: fog.directional_light_exponent,
                     be: Vec3::new(*density, 0.0, 0.0),
                     ..Default::default()
                 },
                 FogFalloff::ExponentialSquared { density } => GpuFog {
                     mode: GPU_FOG_MODE_EXPONENTIAL_SQUARED,
-                    base_color: LinearRgba::from(fog.color).to_vec4(),
-                    directional_light_color: LinearRgba::from(fog.directional_light_color)
-                        .to_vec4(),
+                    base_color,
+                    directional_light_color,
                     directional_light_exponent: fog.directional_light_exponent,
                     be: Vec3::new(*density, 0.0, 0.0),
                     ..Default::default()
@@ -97,9 +101,8 @@ pub fn prepare_fog(
                     inscattering,
                 } => GpuFog {
                     mode: GPU_FOG_MODE_ATMOSPHERIC,
-                    base_color: LinearRgba::from(fog.color).to_vec4(),
-                    directional_light_color: LinearRgba::from(fog.directional_light_color)
-                        .to_vec4(),
+                    base_color,
+                    directional_light_color,
                     directional_light_exponent: fog.directional_light_exponent,
                     be: *extinction,
                     bi: *inscattering,

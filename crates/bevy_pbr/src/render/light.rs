@@ -65,7 +65,7 @@ use bevy_render::{
     renderer::{RenderContext, RenderDevice, RenderQueue, ViewQuery},
     texture::*,
     view::ExtractedView,
-    Extract,
+    Extract, WorkingColorSpace,
 };
 use bevy_shape::{HalfSpace, ViewFrustum};
 use bevy_transform::{components::GlobalTransform, prelude::Transform};
@@ -431,6 +431,7 @@ pub fn extract_lights(
     mut all_lights_found: Local<EntityHashSet>,
     mut rect_light_missing_luts_warning_emitted: Local<bool>,
     system_change_tick: SystemChangeTick,
+    working_color_space: Res<WorkingColorSpace>,
 ) {
     let mapper = &visibility_extraction_system_param.mapper;
 
@@ -554,7 +555,7 @@ pub fn extract_lights(
 
         let mut entity_commands = commands.entity(render_entity);
         let extracted_point_light = ExtractedPointLight {
-            color: point_light.color.into(),
+            color: working_color_space.convert_rec709(point_light.color.into()),
             // NOTE: Map from luminous power in lumens to luminous intensity in lumens per steradian
             // for a point light. See https://google.github.io/filament/Filament.md.html#mjx-eqn-pointLightLuminousPower
             // for details.
@@ -690,7 +691,7 @@ pub fn extract_lights(
 
         let mut entity_commands = commands.entity(render_entity);
         let extracted_spot_light = ExtractedPointLight {
-            color: spot_light.color.into(),
+            color: working_color_space.convert_rec709(spot_light.color.into()),
             // NOTE: Map from luminous power in lumens to luminous intensity in lumens per steradian
             // for a point light. See https://google.github.io/filament/Filament.md.html#mjx-eqn-pointLightLuminousPower
             // for details.
@@ -851,7 +852,7 @@ pub fn extract_lights(
         }
 
         let extracted_directional_light = ExtractedDirectionalLight {
-            color: directional_light.color.into(),
+            color: working_color_space.convert_rec709(directional_light.color.into()),
             illuminance: directional_light.illuminance,
             transform: *transform,
             volumetric: volumetric_light.is_some(),
@@ -909,7 +910,7 @@ pub fn extract_lights(
             .expect("RectLight entity wasn't synced.");
         entity_commands.insert((
             ExtractedRectLight {
-                color: rect_light.color.into(),
+                color: working_color_space.convert_rec709(rect_light.color.into()),
                 intensity: rect_light.intensity
                     / (effective_width * effective_height * core::f32::consts::PI),
                 width: effective_width,
@@ -1101,7 +1102,7 @@ pub fn prepare_lights(
         Query<(Entity, &MainEntity, &ExtractedRectLight, &RenderLayers)>,
         Query<&mut DirectionalLightViewEntities>,
     ),
-    sorted_cameras: Res<SortedCameras>,
+    (sorted_cameras, working_color_space): (Res<SortedCameras>, Res<WorkingColorSpace>),
     (gpu_preprocessing_support, decals): (
         Res<GpuPreprocessingSupport>,
         Option<Res<RenderClusteredDecals>>,
@@ -1841,8 +1842,11 @@ pub fn prepare_lights(
 
         let mut gpu_lights = GpuLights {
             directional_lights: gpu_directional_lights,
-            ambient_color: Vec4::from_slice(&LinearRgba::from(ambient_light.color).to_f32_array())
-                * ambient_light.brightness,
+            ambient_color: Vec4::from_slice(
+                &working_color_space
+                    .convert_rec709(LinearRgba::from(ambient_light.color))
+                    .to_f32_array(),
+            ) * ambient_light.brightness,
             cluster_factors: Vec4::new(
                 clusters.dimensions.x as f32 / extracted_view.viewport.z as f32,
                 clusters.dimensions.y as f32 / extracted_view.viewport.w as f32,

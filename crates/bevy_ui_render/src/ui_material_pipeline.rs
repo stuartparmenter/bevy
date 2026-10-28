@@ -15,6 +15,7 @@ use bevy_mesh::VertexBufferLayout;
 use bevy_render::material_bind_groups::FallbackBuffer;
 use bevy_render::storage::GpuShaderBuffer;
 use bevy_render::{
+    camera::ExtractedCamera,
     globals::{GlobalsBuffer, GlobalsUniform},
     render_asset::{PrepareAssetError, RenderAsset, RenderAssetPlugin, RenderAssets},
     render_phase::*,
@@ -22,7 +23,7 @@ use bevy_render::{
     renderer::{RenderDevice, RenderQueue},
     sync_world::MainEntity,
     view::*,
-    Extract, ExtractSchedule, Render, RenderSystems,
+    Extract, ExtractSchedule, Render, RenderSystems, WorkingColorSpace,
 };
 use bevy_render::{GpuResourceAppExt, RenderApp, RenderStartup};
 use bevy_shader::{load_shader_library, Shader, ShaderRef};
@@ -679,7 +680,15 @@ pub fn queue_ui_material_nodes<M: UiMaterial>(
     pipeline_cache: Res<PipelineCache>,
     render_materials: Res<RenderAssets<PreparedUiMaterial<M>>>,
     mut transparent_render_phases: ResMut<ViewSortedRenderPhases<TransparentUi>>,
-    render_views: Query<(&UiCameraView, Option<&ResolvedCompositingSpace>), With<ExtractedView>>,
+    working_color_space: Res<WorkingColorSpace>,
+    render_views: Query<
+        (
+            &UiCameraView,
+            Option<&ResolvedCompositingSpace>,
+            Option<&ExtractedCamera>,
+        ),
+        With<ExtractedView>,
+    >,
     camera_views: Query<&ExtractedView>,
 ) where
     M::Data: PartialEq + Eq + Hash + Clone,
@@ -693,7 +702,7 @@ pub fn queue_ui_material_nodes<M: UiMaterial>(
     {
         if current_camera_entity != *extracted_camera_entity {
             current_phase = render_views.get(*extracted_camera_entity).ok().and_then(
-                |(default_camera_view, resolved_space)| {
+                |(default_camera_view, resolved_space, camera)| {
                     camera_views
                         .get(default_camera_view.0)
                         .ok()
@@ -703,7 +712,11 @@ pub fn queue_ui_material_nodes<M: UiMaterial>(
                                 .map(|transparent_phase| {
                                     (
                                         view.target_format,
-                                        UiWriterEncodeKey::from_resolved_space(resolved_space),
+                                        UiWriterEncodeKey::new(
+                                            resolved_space,
+                                            camera,
+                                            *working_color_space,
+                                        ),
                                         transparent_phase,
                                     )
                                 })
@@ -779,6 +792,7 @@ mod tests {
             bind_group_data: (),
             writer_encode: UiWriterEncodeKey {
                 compositing_space: Some(CompositingSpace::Oklab),
+                ..Default::default()
             },
         });
 

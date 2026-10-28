@@ -2,7 +2,7 @@ use crate::{
     error_handler::DeviceErrorHandler,
     render_resource::PipelineCache,
     renderer::{self, RenderAdapter, RenderAdapterInfo, RenderDevice, RenderInstance, RenderQueue},
-    FutureRenderResources,
+    FutureRenderResources, WorkingColorSpace,
 };
 use alloc::borrow::Cow;
 use bevy_ecs::world::World;
@@ -186,6 +186,7 @@ impl RenderResources {
         main_world: &mut World,
         render_world: &mut World,
         synchronous_pipeline_compilation: bool,
+        working_color_space: WorkingColorSpace,
     ) {
         let RenderResources(device, queue, adapter_info, render_adapter, instance, ..) = self;
 
@@ -206,10 +207,14 @@ impl RenderResources {
         }
 
         render_world.insert_resource(instance);
-        render_world.insert_resource(PipelineCache::new(
-            device.clone(),
-            synchronous_pipeline_compilation,
-        ));
+        let mut pipeline_cache =
+            PipelineCache::new(device.clone(), synchronous_pipeline_compilation);
+        if working_color_space == WorkingColorSpace::Rec2020 {
+            pipeline_cache
+                .global_shader_defs
+                .push("WORKING_COLOR_SPACE_REC2020".into());
+        }
+        render_world.insert_resource(pipeline_cache);
         render_world.insert_resource(DeviceErrorHandler::new(&device));
         render_world.insert_resource(device);
         render_world.insert_resource(queue);

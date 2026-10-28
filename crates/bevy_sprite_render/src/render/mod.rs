@@ -188,6 +188,10 @@ impl SpecializedRenderPipeline for SpritePipeline {
 
     fn specialize(&self, key: Self::Key) -> RenderPipelineDescriptor {
         let mut shader_defs = Vec::new();
+        // A camera that tonemaps in its shaders holds Rec.709 colors.
+        if !key.contains(SpritePipelineKey::TONEMAP_IN_SHADER) {
+            shader_defs.push("OUTPUT_WORKING_COLOR_SPACE".into());
+        }
         if key.contains(SpritePipelineKey::TONEMAP_IN_SHADER) {
             shader_defs.push("TONEMAP_IN_SHADER".into());
             shader_defs.push(ShaderDefVal::UInt(

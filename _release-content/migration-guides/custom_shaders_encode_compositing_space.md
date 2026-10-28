@@ -21,5 +21,6 @@ are now `COMPOSITING_SPACE_SRGB` and `COMPOSITING_SPACE_OKLAB`.
 
 `UiMaterialKey`, `UiPipelineKey`, `BoxShadowPipelineKey`, `UiTextureSlicePipelineKey`,
 and `UiGradientPipelineKey` have a new `writer_encode: UiWriterEncodeKey` field. Code
-that constructs these keys must set it, with `UiWriterEncodeKey::from_resolved_space`
-from the view's `Option<&ResolvedCompositingSpace>`.
+that constructs these keys must set it with `UiWriterEncodeKey::new`. Pass it the view's
+`Option<&ResolvedCompositingSpace>` and `Option<&ExtractedCamera>`, and the
+`WorkingColorSpace` resource.

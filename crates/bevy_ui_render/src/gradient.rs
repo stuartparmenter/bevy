@@ -23,11 +23,12 @@ use bevy_math::{
 use bevy_math::{Affine2, Vec2Swizzles};
 use bevy_mesh::VertexBufferLayout;
 use bevy_render::{
+    camera::ExtractedCamera,
     render_phase::*,
     render_resource::{binding_types::uniform_buffer, *},
     renderer::{RenderDevice, RenderQueue},
     view::*,
-    Extract, ExtractSchedule, Render, RenderSystems,
+    Extract, ExtractSchedule, Render, RenderSystems, WorkingColorSpace,
 };
 use bevy_render::{GpuResourceAppExt, RenderStartup};
 use bevy_shader::Shader;
@@ -711,11 +712,13 @@ pub fn queue_gradient(
     gradients_pipeline: Res<GradientPipeline>,
     mut pipelines: ResMut<SpecializedRenderPipelines<GradientPipeline>>,
     mut transparent_render_phases: ResMut<ViewSortedRenderPhases<TransparentUi>>,
+    working_color_space: Res<WorkingColorSpace>,
     render_views: Query<
         (
             &UiCameraView,
             Option<&UiAntiAlias>,
             Option<&ResolvedCompositingSpace>,
+            Option<&ExtractedCamera>,
         ),
         With<ExtractedView>,
     >,
@@ -731,7 +734,7 @@ pub fn queue_gradient(
     {
         if current_camera_entity != *extracted_camera_entity {
             current_phase = render_views.get(*extracted_camera_entity).ok().and_then(
-                |(default_camera_view, ui_anti_alias, resolved_space)| {
+                |(default_camera_view, ui_anti_alias, resolved_space, camera)| {
                     camera_views
                         .get(default_camera_view.0)
                         .ok()
@@ -741,7 +744,11 @@ pub fn queue_gradient(
                                 .map(|transparent_phase| {
                                     (
                                         view.target_format,
-                                        UiWriterEncodeKey::from_resolved_space(resolved_space),
+                                        UiWriterEncodeKey::new(
+                                            resolved_space,
+                                            camera,
+                                            *working_color_space,
+                                        ),
                                         ui_anti_alias,
                                         transparent_phase,
                                     )

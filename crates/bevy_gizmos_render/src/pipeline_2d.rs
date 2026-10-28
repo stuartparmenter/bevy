@@ -17,6 +17,7 @@ use bevy_ecs::{
 };
 use bevy_math::FloatOrd;
 use bevy_render::{
+    camera::ExtractedCamera,
     render_asset::{prepare_assets, RenderAssets},
     render_phase::{
         AddRenderCommand, DrawFunctions, PhaseItemExtraIndex, SetItemPipeline,
@@ -24,7 +25,7 @@ use bevy_render::{
     },
     render_resource::*,
     view::{ExtractedView, Msaa, ResolvedCompositingSpace},
-    Render, RenderApp, RenderSystems,
+    Render, RenderApp, RenderSystems, WorkingColorSpace,
 };
 use bevy_render::{GpuResourceAppExt, RenderStartup};
 use bevy_shader::Shader;
@@ -98,6 +99,7 @@ fn init_line_gizmo_pipelines(
 #[derive(PartialEq, Eq, Hash, Clone)]
 struct LineGizmoPipelineKey {
     mesh_key: Mesh2dPipelineKey,
+    output_working_color_space: bool,
     strip: bool,
     line_style: GizmoLineStyle,
 }
@@ -112,6 +114,9 @@ impl SpecializedRenderPipeline for LineGizmoPipeline {
             #[cfg(all(feature = "webgl", target_arch = "wasm32", not(feature = "webgpu")))]
             "SIXTEEN_BYTE_ALIGNMENT".into(),
         ];
+        if key.output_working_color_space {
+            shader_defs.push("OUTPUT_WORKING_COLOR_SPACE".into());
+        }
         key.mesh_key.push_compositing_space_defs(&mut shader_defs);
 
         let layout = vec![
@@ -182,6 +187,7 @@ struct LineJointGizmoPipeline {
 #[derive(PartialEq, Eq, Hash, Clone)]
 struct LineJointGizmoPipelineKey {
     mesh_key: Mesh2dPipelineKey,
+    output_working_color_space: bool,
     joints: GizmoLineJoint,
 }
 
@@ -195,6 +201,9 @@ impl SpecializedRenderPipeline for LineJointGizmoPipeline {
             #[cfg(all(feature = "webgl", target_arch = "wasm32", not(feature = "webgpu")))]
             "SIXTEEN_BYTE_ALIGNMENT".into(),
         ];
+        if key.output_working_color_space {
+            shader_defs.push("OUTPUT_WORKING_COLOR_SPACE".into());
+        }
         key.mesh_key.push_compositing_space_defs(&mut shader_defs);
 
         let layout = vec![
@@ -291,10 +300,12 @@ fn queue_line_and_joint_gizmos_2d(
     mut transparent_render_phases: ResMut<ViewSortedRenderPhases<Transparent2d>>,
     views: Query<(
         &ExtractedView,
+        Option<&ExtractedCamera>,
         &Msaa,
         Option<&RenderLayers>,
         Option<&ResolvedCompositingSpace>,
     )>,
+    working_color_space: Res<WorkingColorSpace>,
 ) {
     let draw_function = draw_functions.read().get_id::<DrawLineGizmo2d>().unwrap();
     let draw_line_function_strip = draw_functions
@@ -306,7 +317,7 @@ fn queue_line_and_joint_gizmos_2d(
         .get_id::<DrawLineJointGizmo2d>()
         .unwrap();
 
-    for (view, msaa, render_layers, resolved_space) in &views {
+    for (view, camera, msaa, render_layers, resolved_space) in &views {
         let Some(transparent_phase) = transparent_render_phases.get_mut(&view.retained_view_entity)
         else {
             continue;
@@ -317,6 +328,9 @@ fn queue_line_and_joint_gizmos_2d(
             | Mesh2dPipelineKey::from_compositing_space(ResolvedCompositingSpace::space(
                 resolved_space,
             ));
+        // A camera that tonemaps in its shaders holds Rec.709 colors.
+        let output_working_color_space = *working_color_space == WorkingColorSpace::Rec2020
+            && !camera.is_some_and(|camera| camera.tonemap_in_shader);
 
         let render_layers = render_layers.unwrap_or_default();
         for (entity, config) in &line_gizmos {
@@ -335,6 +349,7 @@ fn queue_line_and_joint_gizmos_2d(
                     &line_gizmo_pipeline,
                     LineGizmoPipelineKey {
                         mesh_key,
+                        output_working_color_space,
                         strip: false,
                         line_style: config.line_style,
                     },
@@ -357,6 +372,7 @@ fn queue_line_and_joint_gizmos_2d(
                     &line_gizmo_pipeline,
                     LineGizmoPipelineKey {
                         mesh_key,
+                        output_working_color_space,
                         strip: true,
                         line_style: config.line_style,
                     },
@@ -383,6 +399,7 @@ fn queue_line_and_joint_gizmos_2d(
                 &line_joint_gizmo_pipeline,
                 LineJointGizmoPipelineKey {
                     mesh_key,
+                    output_working_color_space,
                     joints: config.line_joints,
                 },
             );

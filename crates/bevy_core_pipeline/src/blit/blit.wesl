@@ -1,6 +1,7 @@
 import package::fullscreen_vertex_shader::FullscreenVertexOutput;
 @if(SRGB_TO_LINEAR) import bevy_render::color_operations::srgb_to_linear;
 @if(OKLAB_TO_LINEAR) import bevy_render::color_operations::oklab_to_linear_rgb;
+@if(GAMUT_REC2020_TO_REC709) import bevy_render::working_color_space::REC2020_TO_REC709;
 @if(DISPLAY_ENCODE) import bevy_render::transfer_functions::{scrgb_encode, pq_inverse_eotf_from_nits, srgb_oetf_extended};
 
 @if(DISPLAY_ENCODE)
@@ -21,6 +22,8 @@ fn fs_main(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     color = vec4(srgb_to_linear(color.rgb), color.a);
     @if(OKLAB_TO_LINEAR)
     color = vec4(oklab_to_linear_rgb(color.rgb), color.a);
+    @if(GAMUT_REC2020_TO_REC709)
+    color = vec4(max(REC2020_TO_REC709 * color.rgb, vec3(0.0)), color.a);
 @if(DISPLAY_ENCODE) {
     var rgb = display_target.gamut * color.rgb;
 

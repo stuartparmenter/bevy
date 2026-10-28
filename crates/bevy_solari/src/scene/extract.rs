@@ -19,7 +19,7 @@ use bevy_light::{
 use bevy_math::{ops::cos, Quat, Vec3};
 use bevy_pbr::{MeshMaterial3d, PreviousGlobalTransform, StandardMaterial};
 use bevy_platform::collections::HashMap;
-use bevy_render::{sync_world::RenderEntity, Extract};
+use bevy_render::{sync_world::RenderEntity, Extract, WorkingColorSpace};
 use bevy_transform::components::GlobalTransform;
 use bevy_utils::once;
 use tracing::warn;
@@ -261,6 +261,7 @@ pub fn extract_raytracing_directional_lights(
     mut removed_sun_disks: Extract<RemovedComponents<SunDisk>>,
     render_entities: Extract<Query<RenderEntity>>,
     mut commands: Commands,
+    working_color_space: Res<WorkingColorSpace>,
 ) {
     // Process removed components before changes, that way it properly handles same-frame removal->insertion
     for main_entity in removed_directional_lights.read() {
@@ -288,7 +289,9 @@ pub fn extract_raytracing_directional_lights(
 
         entity_commands.insert(ExtractedRaytracingDirectionalLight {
             direction_to_light: transform.back().into(),
-            illuminance: LinearRgba::from(directional_light.color).to_vec3()
+            illuminance: working_color_space
+                .convert_rec709(LinearRgba::from(directional_light.color))
+                .to_vec3()
                 * directional_light.illuminance,
             sun_disk_angular_size: sun_disk.unwrap_or_default().angular_size,
         });
@@ -301,6 +304,7 @@ pub fn extract_raytracing_point_lights(
     mut removed_point_lights: Extract<RemovedComponents<PointLight>>,
     render_entities: Extract<Query<RenderEntity>>,
     mut commands: Commands,
+    working_color_space: Res<WorkingColorSpace>,
 ) {
     // Process removed components before changes, that way it properly handles same-frame removal->insertion
     for main_entity in removed_point_lights.read() {
@@ -322,7 +326,10 @@ pub fn extract_raytracing_point_lights(
             position: transform.translation(),
             radius: point_light.radius,
             // Map from luminous power in lumens to luminous intensity in candela
-            intensity: LinearRgba::from(point_light.color).to_vec3() * point_light.intensity
+            intensity: working_color_space
+                .convert_rec709(LinearRgba::from(point_light.color))
+                .to_vec3()
+                * point_light.intensity
                 / (4.0 * PI),
         });
     }
@@ -334,6 +341,7 @@ pub fn extract_raytracing_spot_lights(
     mut removed_spot_lights: Extract<RemovedComponents<SpotLight>>,
     render_entities: Extract<Query<RenderEntity>>,
     mut commands: Commands,
+    working_color_space: Res<WorkingColorSpace>,
 ) {
     // Process removed components before changes, that way it properly handles same-frame removal->insertion
     for main_entity in removed_spot_lights.read() {
@@ -357,7 +365,10 @@ pub fn extract_raytracing_spot_lights(
         entity_commands.insert(ExtractedRaytracingSpotLight {
             position: transform.translation(),
             radius: spot_light.radius,
-            intensity: LinearRgba::from(spot_light.color).to_vec3() * spot_light.intensity
+            intensity: working_color_space
+                .convert_rec709(LinearRgba::from(spot_light.color))
+                .to_vec3()
+                * spot_light.intensity
                 / (4.0 * PI),
             axis: transform.forward().into(),
             cos_inner: cos(inner_angle),
@@ -372,6 +383,7 @@ pub fn extract_raytracing_rect_lights(
     mut removed_rect_lights: Extract<RemovedComponents<RectLight>>,
     render_entities: Extract<Query<RenderEntity>>,
     mut commands: Commands,
+    working_color_space: Res<WorkingColorSpace>,
 ) {
     // Process removed components before changes, that way it properly handles same-frame removal->insertion
     for main_entity in removed_rect_lights.read() {
@@ -400,7 +412,10 @@ pub fn extract_raytracing_rect_lights(
             edge_y,
             area,
             // Map from luminous power in lumens to luminance
-            radiance: LinearRgba::from(rect_light.color).to_vec3() * rect_light.intensity
+            radiance: working_color_space
+                .convert_rec709(LinearRgba::from(rect_light.color))
+                .to_vec3()
+                * rect_light.intensity
                 / (area * PI),
         });
     }

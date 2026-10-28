@@ -1,5 +1,6 @@
 import bevy_render::view::View;
 import bevy_pbr::render::utils::coords_to_viewport_uv;
+import bevy_render::writer_encode::writer_encode;
 
 struct SkyboxUniforms {
 	brightness: f32,
@@ -78,5 +79,5 @@ fn skybox_fragment(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // Cube maps are left-handed so we negate the z coordinate.
     let out = textureSample(skybox, skybox_sampler, ray_direction * vec3(1.0, 1.0, -1.0));
-    return vec4(out.rgb * uniforms.brightness, out.a);
+    return writer_encode(vec4(out.rgb * uniforms.brightness, out.a));
 }

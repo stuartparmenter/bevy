@@ -749,6 +749,13 @@ impl SpecializedMeshPipeline for Wireframe3dPipeline {
         layout: &MeshVertexBufferLayoutRef,
     ) -> Result<RenderPipelineDescriptor, SpecializedMeshPipelineError> {
         let mut descriptor = self.mesh_pipeline.specialize(key.mesh_key, layout)?;
+        // A camera that tonemaps in its shaders holds Rec.709 colors.
+        if !key.mesh_key.contains(MeshPipelineKey::TONEMAP_IN_SHADER) {
+            let fragment = descriptor.fragment.as_mut().unwrap();
+            fragment
+                .shader_defs
+                .push("OUTPUT_WORKING_COLOR_SPACE".into());
+        }
 
         if key.xray_mode {
             descriptor.primitive.cull_mode = None;

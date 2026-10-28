@@ -6,6 +6,8 @@ import package::render::mesh_view_bindings::{
     light_probes,
 };
 import package::render::clustered_forward::ClusterableObjectIndexRanges;
+@if(WORKING_COLOR_SPACE_REC2020)
+import bevy_render::working_color_space::REC709_TO_REC2020;
 
 @if(LIGHTMAP) import package::render::mesh_view_types::LIGHT_PROBE_FLAG_AFFECTS_LIGHTMAPPED_MESH_DIFFUSE;
 
@@ -80,5 +82,7 @@ fn irradiance_volume_light(
         total_irradiance /= total_weight;
     }
 
+@if(WORKING_COLOR_SPACE_REC2020)
+    total_irradiance = REC709_TO_REC2020 * total_irradiance;
     return total_irradiance;
 }

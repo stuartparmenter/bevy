@@ -734,6 +734,10 @@ impl SpecializedMeshPipeline for Mesh2dPipeline {
     ) -> Result<RenderPipelineDescriptor, SpecializedMeshPipelineError> {
         let mut shader_defs = Vec::new();
         let mut vertex_attributes = Vec::new();
+        // A camera that tonemaps in its shaders holds Rec.709 colors.
+        if !key.contains(Mesh2dPipelineKey::TONEMAP_IN_SHADER) {
+            shader_defs.push("OUTPUT_WORKING_COLOR_SPACE".into());
+        }
 
         if layout.0.contains(Mesh::ATTRIBUTE_POSITION) {
             shader_defs.push("VERTEX_POSITIONS".into());

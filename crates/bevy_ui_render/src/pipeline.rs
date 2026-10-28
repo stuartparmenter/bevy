@@ -3,11 +3,13 @@ use bevy_camera::CompositingSpace;
 use bevy_ecs::prelude::*;
 use bevy_mesh::VertexBufferLayout;
 use bevy_render::{
+    camera::ExtractedCamera,
     render_resource::{
         binding_types::{sampler, texture_2d, uniform_buffer},
         *,
     },
     view::{ResolvedCompositingSpace, ViewUniform},
+    WorkingColorSpace,
 };
 use bevy_shader::{Shader, ShaderDefVal};
 use bevy_utils::default;
@@ -22,19 +24,31 @@ pub struct UiWriterEncodeKey {
     /// The view's resolved [`CompositingSpace`]. Linear views leave this
     /// `None`, since linear output needs no encode.
     pub compositing_space: Option<CompositingSpace>,
+    /// Whether the view's main texture holds working color space values when UI draws,
+    /// because the camera doesn't tonemap.
+    pub output_working_color_space: bool,
 }
 
 impl UiWriterEncodeKey {
-    /// Builds the key from a view's [`ResolvedCompositingSpace`].
-    pub fn from_resolved_space(resolved: Option<&ResolvedCompositingSpace>) -> Self {
+    /// Builds the key from a camera view's [`ResolvedCompositingSpace`] and [`ExtractedCamera`].
+    pub fn new(
+        resolved: Option<&ResolvedCompositingSpace>,
+        camera: Option<&ExtractedCamera>,
+        working_color_space: WorkingColorSpace,
+    ) -> Self {
         Self {
             compositing_space: ResolvedCompositingSpace::space(resolved)
                 .filter(|space| !space.is_linear()),
+            output_working_color_space: working_color_space == WorkingColorSpace::Rec2020
+                && camera.is_some_and(|camera| !camera.tonemaps()),
         }
     }
 
-    /// Appends the shader defs for the compositing space.
+    /// Appends the shader defs for the compositing space and working color space.
     pub fn push_shader_defs(&self, shader_defs: &mut Vec<ShaderDefVal>) {
+        if self.output_working_color_space {
+            shader_defs.push("OUTPUT_WORKING_COLOR_SPACE".into());
+        }
         match self.compositing_space {
             Some(CompositingSpace::Srgb) => shader_defs.push("COMPOSITING_SPACE_SRGB".into()),
             Some(CompositingSpace::Oklab) => shader_defs.push("COMPOSITING_SPACE_OKLAB".into()),

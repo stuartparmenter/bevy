@@ -150,6 +150,12 @@ impl Specializer<RenderPipeline> for LineGizmoPipelineSpecializer {
         if key.perspective {
             fragment.shader_defs.push("PERSPECTIVE".into());
         }
+        // A camera that tonemaps in its shaders holds Rec.709 colors.
+        if !key.view_key.contains(MeshPipelineKey::TONEMAP_IN_SHADER) {
+            fragment
+                .shader_defs
+                .push("OUTPUT_WORKING_COLOR_SPACE".into());
+        }
 
         let format = key.view_key.target_format();
 
@@ -200,6 +206,9 @@ impl SpecializedRenderPipeline for LineJointGizmoPipeline {
 
         if key.perspective {
             shader_defs.push("PERSPECTIVE".into());
+        }
+        if !key.view_key.contains(MeshPipelineKey::TONEMAP_IN_SHADER) {
+            shader_defs.push("OUTPUT_WORKING_COLOR_SPACE".into());
         }
 
         let format = key.view_key.target_format();

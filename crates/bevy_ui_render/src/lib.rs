@@ -52,6 +52,7 @@ use bevy_ecs::system::SystemParam;
 use bevy_image::{prelude::*, TRANSPARENT_IMAGE_HANDLE};
 use bevy_math::{proj, Affine2, FloatOrd, Rect, UVec4, Vec2};
 use bevy_render::{
+    camera::ExtractedCamera,
     render_asset::RenderAssets,
     render_phase::{
         sort_phase_system, AddRenderCommand, DrawFunctions, PhaseItem, PhaseItemExtraIndex,
@@ -63,6 +64,7 @@ use bevy_render::{
     texture::GpuImage,
     view::{ExtractedView, ResolvedCompositingSpace, RetainedViewEntity, ViewUniforms},
     Extract, ExtractSchedule, GpuResourceAppExt, Render, RenderApp, RenderStartup, RenderSystems,
+    WorkingColorSpace,
 };
 use bevy_sprite::BorderRect;
 #[cfg(feature = "bevy_ui_debug")]
@@ -2208,11 +2210,13 @@ pub fn queue_uinodes(
     ui_pipeline: Res<UiPipeline>,
     mut pipelines: ResMut<SpecializedRenderPipelines<UiPipeline>>,
     mut transparent_render_phases: ResMut<ViewSortedRenderPhases<TransparentUi>>,
+    working_color_space: Res<WorkingColorSpace>,
     render_views: Query<
         (
             &UiCameraView,
             Option<&UiAntiAlias>,
             Option<&ResolvedCompositingSpace>,
+            Option<&ExtractedCamera>,
         ),
         With<ExtractedView>,
     >,
@@ -2229,7 +2233,7 @@ pub fn queue_uinodes(
     {
         if current_camera_entity != *extracted_camera_entity {
             current_phase = render_views.get(*extracted_camera_entity).ok().and_then(
-                |(default_camera_view, ui_anti_alias, resolved_space)| {
+                |(default_camera_view, ui_anti_alias, resolved_space, camera)| {
                     camera_views
                         .get(default_camera_view.0)
                         .ok()
@@ -2246,8 +2250,10 @@ pub fn queue_uinodes(
                                                 ui_anti_alias,
                                                 None | Some(UiAntiAlias::On)
                                             ),
-                                            writer_encode: UiWriterEncodeKey::from_resolved_space(
+                                            writer_encode: UiWriterEncodeKey::new(
                                                 resolved_space,
+                                                camera,
+                                                *working_color_space,
                                             ),
                                         },
                                     );
