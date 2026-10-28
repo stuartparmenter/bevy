@@ -4,6 +4,7 @@
 //! - Scene: `ATMOSPHERE_VIEW=hero|sun|up|under|backlit`, `ATMOSPHERE_CAM`, `ATMOSPHERE_SUN_ELEV_DEG`,
 //!   `ATMOSPHERE_SUNSET`, `ATMOSPHERE_TERRAIN`, `ATMOSPHERE_NO_CLOUDS`, `ATMOSPHERE_NO_CIRRUS`,
 //!   `ATMOSPHERE_NO_CUMULUS` (cirrus only), `ATMOSPHERE_WIND=slow|opposing`, `ATMOSPHERE_NO_TAA`,
+//!   `ATMOSPHERE_NO_DLSS` (TAA instead of DLSS in `dlss` builds),
 //!   `ATMOSPHERE_MESH_PLANE`, `ATMOSPHERE_MSAA=2|4|8`, `ATMOSPHERE_WINDOW=w,h`,
 //!   `ATMOSPHERE_CLOUD_QUALITY=low|medium|high|cinematic`, `ATMOSPHERE_SECOND_THIN=1` (cirrostratus layer),
 //!   `ATMOSPHERE_INFLUENCE=hole|coast` (a world-anchored clear region; a maritime/continental coast), `ATMOSPHERE_CLOUD_STEP_SAMPLES=<n>`,
@@ -65,6 +66,11 @@ use bevy::{
     window::DisplayTarget,
 };
 
+#[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
+use bevy::anti_alias::dlss::{
+    Dlss, DlssProjectId, DlssSuperResolutionFeature, DlssSuperResolutionSupported,
+};
+
 #[derive(Resource)]
 struct GameState {
     paused: bool,
@@ -88,6 +94,11 @@ struct AtmospherePresets {
 
 fn main() {
     let mut app = App::new();
+    // DLSS needs a project id before `DefaultPlugins`.
+    #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
+    app.insert_resource(DlssProjectId(bevy_asset::uuid::uuid!(
+        "c3a7f2e1-5b84-4d6a-9e0f-2b1d8c4a6f37" // Don't copy paste this - generate your own UUID!
+    )));
     // Continuous mode waits for the OS redraw callback, which macOS stops delivering for occluded
     // windows (the app then freezes in the background). In background test runs drive updates
     // from the event loop instead (reactive with ~0 wait => ControlFlow::Poll).
@@ -720,6 +731,9 @@ fn setup_camera_fog(
     mut scattering_mediums: ResMut<Assets<ScatteringMedium>>,
     mut images: ResMut<Assets<Image>>,
     asset_server: Res<AssetServer>,
+    #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))] dlss_supported: Option<
+        Res<DlssSuperResolutionSupported>,
+    >,
 ) {
     // `ATMOSPHERE_BACKGROUND=1`: render the camera into an offscreen image of the window's size
     // instead of the window. macOS stops redraws/drawables for occluded windows, so a
@@ -1023,10 +1037,21 @@ fn setup_camera_fog(
             ..default()
         });
     }
-    // `ATMOSPHERE_NO_TAA`: no TAA (and so no jitter), to look at the clouds' and haze's own
-    // temporal filters alone.
+    // DLSS Super Resolution replaces TAA when the app is built with the `dlss` feature and the
+    // GPU supports it; `ATMOSPHERE_NO_DLSS` falls back to TAA.
+    #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
+    let dlss = dlss_supported.is_some() && std::env::var("ATMOSPHERE_NO_DLSS").is_err();
+    #[cfg(any(not(feature = "dlss"), feature = "force_disable_dlss"))]
+    let dlss = false;
+    // `ATMOSPHERE_NO_TAA`: no TAA or DLSS (and so no jitter), to look at the clouds' and haze's
+    // own temporal filters alone.
     if std::env::var("ATMOSPHERE_NO_TAA").is_err() {
-        camera.insert(TemporalAntiAliasing::default());
+        if dlss {
+            #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
+            camera.insert(Dlss::<DlssSuperResolutionFeature>::default());
+        } else {
+            camera.insert(TemporalAntiAliasing::default());
+        }
     }
     // `ATMOSPHERE_IBL=1`: the atmosphere drives reflections and ambient lighting (IBL) for this
     // view (off by default while debugging the clouds).
