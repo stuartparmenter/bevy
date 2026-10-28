@@ -16,7 +16,7 @@ use bevy_render::{
     },
     renderer::RenderDevice,
     sync_component::SyncComponent,
-    view::ExtractedView,
+    view::{ExtractedView, ViewDisplayTarget},
     Render, RenderApp, RenderStartup, RenderSystems,
 };
 
@@ -190,6 +190,7 @@ pub fn init_cas_pipeline(
 pub struct CasPipelineKey {
     target_format: TextureFormat,
     denoise: bool,
+    hdr_display_target: bool,
 }
 
 pub struct CasPipelineSpecializer;
@@ -206,6 +207,10 @@ impl Specializer<RenderPipeline> for CasPipelineSpecializer {
 
         if key.denoise {
             fragment.shader_defs.push("RCAS_DENOISE".into());
+        }
+
+        if key.hdr_display_target {
+            fragment.shader_defs.push("HDR_DISPLAY_TARGET".into());
         }
 
         fragment.set_target(
@@ -225,22 +230,20 @@ fn prepare_cas_pipelines(
     mut commands: Commands,
     pipeline_cache: Res<PipelineCache>,
     mut sharpening_pipeline: ResMut<CasPipeline>,
-    cameras: Query<
-        (Entity, &ExtractedView, &DenoiseCas),
-        Or<(Added<CasUniform>, Changed<DenoiseCas>)>,
-    >,
+    cameras: Query<(Entity, &ExtractedView, &DenoiseCas, &ViewDisplayTarget)>,
     mut removals: RemovedComponents<CasUniform>,
 ) -> Result<(), BevyError> {
     for entity in removals.read() {
         commands.entity(entity).remove::<ViewCasPipeline>();
     }
 
-    for (entity, view, denoise_cas) in &cameras {
+    for (entity, view, denoise_cas, display_target) in &cameras {
         let pipeline_id = sharpening_pipeline.variants.specialize(
             &pipeline_cache,
             CasPipelineKey {
                 denoise: denoise_cas.0,
                 target_format: view.target_format,
+                hdr_display_target: display_target.is_hdr(),
             },
         )?;
 

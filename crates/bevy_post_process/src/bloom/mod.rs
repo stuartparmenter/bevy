@@ -18,7 +18,7 @@ use bevy_core_pipeline::{
     tonemapping::tonemapping,
 };
 use bevy_ecs::prelude::*;
-use bevy_math::{ops, UVec2};
+use bevy_math::{ops, AspectRatio, UVec2, UVec4, Vec4};
 use bevy_render::{
     camera::ExtractedCamera,
     diagnostic::RecordDiagnostics,
@@ -28,7 +28,7 @@ use bevy_render::{
     render_resource::*,
     renderer::{RenderContext, RenderDevice, ViewQuery},
     texture::{CachedTexture, TextureCache},
-    view::ViewTarget,
+    view::{ExtractedView, ViewDisplayTarget, ViewTarget},
     GpuResourceAppExt, Render, RenderApp, RenderStartup, RenderSystems,
 };
 use downsampling_pipeline::{
@@ -39,7 +39,15 @@ use upsampling_pipeline::{
     prepare_upsampling_pipeline, BloomUpsamplingPipeline, UpsamplingPipelineIds,
 };
 
-const BLOOM_TEXTURE_FORMAT: TextureFormat = TextureFormat::Rg11b10Ufloat;
+fn bloom_texture_format(display_target: &ViewDisplayTarget) -> TextureFormat {
+    // Tonemapping for an HDR display leaves bright regions uncompressed, so the
+    // low precision of `Rg11b10Ufloat` shows as banding there.
+    if display_target.is_hdr() {
+        TextureFormat::Rgba16Float
+    } else {
+        TextureFormat::Rg11b10Ufloat
+    }
+}
 
 #[derive(Default)]
 pub struct BloomPlugin;
@@ -69,6 +77,9 @@ impl Plugin for BloomPlugin {
             .add_systems(
                 Render,
                 (
+                    prepare_bloom_uniforms
+                        .in_set(RenderSystems::Prepare)
+                        .before(RenderSystems::PrepareResources),
                     prepare_downsampling_pipeline.in_set(RenderSystems::Prepare),
                     prepare_upsampling_pipeline.in_set(RenderSystems::Prepare),
                     prepare_bloom_textures.in_set(RenderSystems::PrepareResources),
@@ -315,13 +326,52 @@ impl BloomTexture {
     }
 }
 
+fn prepare_bloom_uniforms(
+    mut commands: Commands,
+    views: Query<(
+        Entity,
+        &Bloom,
+        &ExtractedCamera,
+        &ExtractedView,
+        &ViewDisplayTarget,
+    )>,
+) {
+    let uniforms = views
+        .iter()
+        .filter_map(|(entity, bloom, camera, view, display_target)| {
+            let target_size = camera.physical_target_size?;
+            let threshold = bloom
+                .prefilter
+                .resolve_threshold(display_target.paper_white_nits);
+            let knee = threshold * bloom.prefilter.threshold_softness.clamp(0.0, 1.0);
+            let uniform = BloomUniforms {
+                threshold_precomputations: Vec4::new(
+                    threshold,
+                    threshold - knee,
+                    2.0 * knee,
+                    0.25 / (knee + 0.00001),
+                ),
+                viewport: view.viewport.as_vec4()
+                    / UVec4::new(target_size.x, target_size.y, target_size.x, target_size.y)
+                        .as_vec4(),
+                aspect: AspectRatio::try_from_pixels(view.viewport.z, view.viewport.w)
+                    .expect("Valid screen size values for Bloom settings")
+                    .ratio(),
+                scale: bloom.scale,
+            };
+            Some((entity, uniform))
+        })
+        .collect::<Vec<_>>();
+    commands.try_insert_batch(uniforms);
+}
+
 fn prepare_bloom_textures(
     mut commands: Commands,
     mut texture_cache: ResMut<TextureCache>,
     render_device: Res<RenderDevice>,
-    views: Query<(Entity, &ExtractedCamera, &Bloom)>,
+    views: Query<(Entity, &ExtractedCamera, &Bloom, &ViewDisplayTarget)>,
 ) {
-    for (entity, camera, bloom) in &views {
+    for (entity, camera, bloom, display_target) in &views {
         if let Some(viewport) = camera.physical_viewport_size {
             // How many times we can halve the resolution minus one so we don't go unnecessarily low
             let mip_count = bloom.max_mip_dimension.ilog2().max(2) - 1;
@@ -341,7 +391,7 @@ fn prepare_bloom_textures(
                 mip_level_count: mip_count,
                 sample_count: 1,
                 dimension: TextureDimension::D2,
-                format: BLOOM_TEXTURE_FORMAT,
+                format: bloom_texture_format(display_target),
                 usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             };

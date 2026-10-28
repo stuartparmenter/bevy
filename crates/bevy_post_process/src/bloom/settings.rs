@@ -5,7 +5,7 @@ use bevy_ecs::{
     query::{QueryItem, With},
     reflect::ReflectComponent,
 };
-use bevy_math::{AspectRatio, URect, UVec4, Vec2, Vec4};
+use bevy_math::Vec2;
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
 use bevy_render::{extract_component::ExtractComponent, sync_component::SyncComponent, RenderApp};
 use bevy_utils::once;
@@ -143,6 +143,7 @@ impl Bloom {
         high_pass_frequency: 1.0,
         prefilter: BloomPrefilter {
             threshold: 0.0,
+            threshold_nits: None,
             threshold_softness: 0.0,
         },
         composite_mode: BloomCompositeMode::EnergyConserving,
@@ -175,6 +176,7 @@ impl Bloom {
         high_pass_frequency: 1.0,
         prefilter: BloomPrefilter {
             threshold: 0.6,
+            threshold_nits: None,
             threshold_softness: 0.2,
         },
         composite_mode: BloomCompositeMode::Additive,
@@ -191,6 +193,7 @@ impl Bloom {
         high_pass_frequency: 1.0 / 3.0,
         prefilter: BloomPrefilter {
             threshold: 0.0,
+            threshold_nits: None,
             threshold_softness: 0.0,
         },
         composite_mode: BloomCompositeMode::EnergyConserving,
@@ -245,6 +248,14 @@ pub struct BloomPrefilter {
     /// RGB values under the threshold curve will not contribute to the effect.
     pub threshold: f32,
 
+    /// Baseline of the threshold curve in nits (default: `None`).
+    ///
+    /// Use it instead of [`threshold`](Self::threshold) to keep the cutoff at the same
+    /// brightness when the display's paper white changes. When set, the threshold is
+    /// `threshold_nits` divided by the paper white of the camera's display target, in nits.
+    /// `Some(0.0)` or less turns the threshold off.
+    pub threshold_nits: Option<f32>,
+
     /// Controls how much to blend between the thresholded and non-thresholded colors (default: 0.0).
     ///
     /// 0.0 = Abrupt threshold, no blending
@@ -252,6 +263,23 @@ pub struct BloomPrefilter {
     ///
     /// Values outside of the range [0.0, 1.0] will be clamped.
     pub threshold_softness: f32,
+}
+
+impl BloomPrefilter {
+    pub(super) fn is_active(&self) -> bool {
+        match self.threshold_nits {
+            Some(nits) => nits > 0.0,
+            None => self.threshold > 0.0,
+        }
+    }
+
+    /// Returns the threshold in the units of [`threshold`](Self::threshold).
+    pub(super) fn resolve_threshold(&self, paper_white_nits: f32) -> f32 {
+        match self.threshold_nits {
+            Some(nits) => (nits / paper_white_nits).max(0.0),
+            None => self.threshold,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Reflect, PartialEq, Eq, Hash, Copy)]
@@ -268,54 +296,31 @@ impl SyncComponent<RenderApp> for Bloom {
 impl ExtractComponent<RenderApp> for Bloom {
     type QueryData = (&'static Self, &'static Camera);
     type QueryFilter = With<Hdr>;
-    type Out = (Self, BloomUniforms);
+    type Out = Self;
 
     fn extract_component((bloom, camera): QueryItem<'_, '_, Self::QueryData>) -> Option<Self::Out> {
-        match (
-            camera.physical_viewport_rect(),
-            camera.physical_viewport_size(),
-            camera.physical_target_size(),
-            camera.is_active,
-        ) {
-            (Some(URect { min: origin, .. }), Some(size), Some(target_size), true)
-                if size.x != 0 && size.y != 0 =>
-            {
-                let mut bloom = bloom.clone();
-                if matches!(bloom.scatter, BloomScatterModel::Gt7Glare { .. })
-                    && (bloom.composite_mode != BloomCompositeMode::EnergyConserving
-                        || bloom.prefilter.threshold > 0.0)
-                {
-                    once!(warn!(
-                        "Bloom with BloomScatterModel::Gt7Glare ignores the prefilter threshold \
-                        and always uses BloomCompositeMode::EnergyConserving"
-                    ));
-                    bloom.composite_mode = BloomCompositeMode::EnergyConserving;
-                    bloom.prefilter.threshold = 0.0;
-                }
-
-                let threshold = bloom.prefilter.threshold;
-                let threshold_softness = bloom.prefilter.threshold_softness;
-                let knee = threshold * threshold_softness.clamp(0.0, 1.0);
-
-                let uniform = BloomUniforms {
-                    threshold_precomputations: Vec4::new(
-                        threshold,
-                        threshold - knee,
-                        2.0 * knee,
-                        0.25 / (knee + 0.00001),
-                    ),
-                    viewport: UVec4::new(origin.x, origin.y, size.x, size.y).as_vec4()
-                        / UVec4::new(target_size.x, target_size.y, target_size.x, target_size.y)
-                            .as_vec4(),
-                    aspect: AspectRatio::try_from_pixels(size.x, size.y)
-                        .expect("Valid screen size values for Bloom settings")
-                        .ratio(),
-                    scale: bloom.scale,
-                };
-
-                Some((bloom, uniform))
-            }
-            _ => None,
+        if !camera.is_active
+            || camera.physical_target_size().is_none()
+            || !camera
+                .physical_viewport_size()
+                .is_some_and(|size| size.x != 0 && size.y != 0)
+        {
+            return None;
         }
+
+        let mut bloom = bloom.clone();
+        if matches!(bloom.scatter, BloomScatterModel::Gt7Glare { .. })
+            && (bloom.composite_mode != BloomCompositeMode::EnergyConserving
+                || bloom.prefilter.is_active())
+        {
+            once!(warn!(
+                "Bloom with BloomScatterModel::Gt7Glare ignores the prefilter threshold \
+                and always uses BloomCompositeMode::EnergyConserving"
+            ));
+            bloom.composite_mode = BloomCompositeMode::EnergyConserving;
+            bloom.prefilter.threshold = 0.0;
+            bloom.prefilter.threshold_nits = None;
+        }
+        Some(bloom)
     }
 }

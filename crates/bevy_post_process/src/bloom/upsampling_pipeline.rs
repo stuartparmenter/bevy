@@ -1,7 +1,7 @@
 use bevy_core_pipeline::FullscreenShader;
 
 use super::{
-    downsampling_pipeline::BloomUniforms, Bloom, BloomCompositeMode, BLOOM_TEXTURE_FORMAT,
+    bloom_texture_format, downsampling_pipeline::BloomUniforms, Bloom, BloomCompositeMode,
 };
 use bevy_asset::{load_embedded_asset, AssetServer, Handle};
 use bevy_ecs::{
@@ -14,7 +14,7 @@ use bevy_render::{
         binding_types::{sampler, texture_2d, uniform_buffer},
         *,
     },
-    view::ExtractedView,
+    view::{ExtractedView, ViewDisplayTarget},
 };
 use bevy_shader::Shader;
 use bevy_utils::default;
@@ -134,15 +134,15 @@ pub fn prepare_upsampling_pipeline(
     pipeline_cache: Res<PipelineCache>,
     mut pipelines: ResMut<SpecializedRenderPipelines<BloomUpsamplingPipeline>>,
     pipeline: Res<BloomUpsamplingPipeline>,
-    views: Query<(&ExtractedView, Entity, &Bloom)>,
+    views: Query<(&ExtractedView, Entity, &Bloom, &ViewDisplayTarget)>,
 ) {
-    for (view, entity, bloom) in &views {
+    for (view, entity, bloom, display_target) in &views {
         let pipeline_id = pipelines.specialize(
             &pipeline_cache,
             &pipeline,
             BloomUpsamplingPipelineKeys {
                 composite_mode: bloom.composite_mode,
-                target_format: BLOOM_TEXTURE_FORMAT,
+                target_format: bloom_texture_format(display_target),
             },
         );
 

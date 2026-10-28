@@ -556,6 +556,13 @@ fn neighborhood_blending_vertex_main(@builtin(vertex_index) vertex_index: u32)
 // Edge Detection Pixel Shaders (First Pass)
 
 @if(SMAA_EDGE_DETECTION)
+fn edge_luma(rgb: vec3<f32>) -> f32 {
+    // SMAA_THRESHOLD assumes luma in 0 to 1. Main textures with HDR values go
+    // outside it.
+    return saturate(dot(rgb, vec3(0.2126, 0.7152, 0.0722)));
+}
+
+@if(SMAA_EDGE_DETECTION)
 
 /// Luma Edge Detection
 ///
@@ -568,11 +575,10 @@ fn luma_edge_detection_fragment_main(in: EdgeDetectionVaryings) -> @location(0) 
     let threshold = vec2(SMAA_THRESHOLD);
 
     // Calculate luma:
-    let weights = vec3(0.2126, 0.7152, 0.0722);
-    let L = dot(textureSample(color_texture, color_sampler, in.tex_coord).rgb, weights);
+    let L = edge_luma(textureSample(color_texture, color_sampler, in.tex_coord).rgb);
 
-    let Lleft = dot(textureSample(color_texture, color_sampler, in.offset_0.xy).rgb, weights);
-    let Ltop  = dot(textureSample(color_texture, color_sampler, in.offset_0.zw).rgb, weights);
+    let Lleft = edge_luma(textureSample(color_texture, color_sampler, in.offset_0.xy).rgb);
+    let Ltop  = edge_luma(textureSample(color_texture, color_sampler, in.offset_0.zw).rgb);
 
     // We do the usual threshold:
     var delta: vec4<f32> = vec4(abs(L - vec2(Lleft, Ltop)), 0.0, 0.0);
@@ -584,16 +590,16 @@ fn luma_edge_detection_fragment_main(in: EdgeDetectionVaryings) -> @location(0) 
     }
 
     // Calculate right and bottom deltas:
-    let Lright  = dot(textureSample(color_texture, color_sampler, in.offset_1.xy).rgb, weights);
-    let Lbottom = dot(textureSample(color_texture, color_sampler, in.offset_1.zw).rgb, weights);
+    let Lright  = edge_luma(textureSample(color_texture, color_sampler, in.offset_1.xy).rgb);
+    let Lbottom = edge_luma(textureSample(color_texture, color_sampler, in.offset_1.zw).rgb);
     delta = vec4(delta.xy, abs(L - vec2(Lright, Lbottom)));
 
     // Calculate the maximum delta in the direct neighborhood:
     var max_delta = max(delta.xy, delta.zw);
 
     // Calculate left-left and top-top deltas:
-    let Lleftleft = dot(textureSample(color_texture, color_sampler, in.offset_2.xy).rgb, weights);
-    let Ltoptop   = dot(textureSample(color_texture, color_sampler, in.offset_2.zw).rgb, weights);
+    let Lleftleft = edge_luma(textureSample(color_texture, color_sampler, in.offset_2.xy).rgb);
+    let Ltoptop   = edge_luma(textureSample(color_texture, color_sampler, in.offset_2.zw).rgb);
     delta = vec4(delta.xy, abs(vec2(Lleft, Ltop) - vec2(Lleftleft, Ltoptop)));
 
     // Calculate the final maximum delta:

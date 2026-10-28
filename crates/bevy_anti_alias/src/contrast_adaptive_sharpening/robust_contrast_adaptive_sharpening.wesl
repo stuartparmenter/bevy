@@ -32,6 +32,24 @@ const FSR_RCAS_LIMIT = 0.1875;
 // -4.0 instead of -1.0 to avoid issues with MSAA.
 const peakC = vec2<f32>(10.0, -40.0);
 
+// On HDR display targets, RCAS runs on colors compressed into -1 to 1, following
+// AMD's guidance for RCAS on HDR input. The curve keeps the sign of negative
+// channels. A ring with mixed signs in a channel sets the lobe to 0, so those
+// pixels are not sharpened.
+fn range_compress(c: vec4<f32>) -> vec4<f32> {
+@if(HDR_DISPLAY_TARGET) {
+    return vec4<f32>(c.rgb / (1.0 + abs(c.rgb)), c.a);
+} @else {
+    return c;
+}
+}
+
+@if(HDR_DISPLAY_TARGET)
+fn range_decompress(c: vec3<f32>) -> vec3<f32> {
+    // The floor at 1 / 65504, the f16 maximum, keeps the result finite.
+    return c / max(1.0 - abs(c), vec3<f32>(1.0 / 65504.0));
+}
+
 /// Robust Contrast Adaptive Sharpening (RCAS)
 /// Based on the following implementation:
 /// https://github.com/GPUOpen-Effects/FidelityFX-FSR2/blob/ea97a113b0f9cadf519fbcff315cc539915a3acd/src/ffx-fsr2-api/shaders/ffx_fsr1.h#L672
@@ -55,19 +73,19 @@ const peakC = vec2<f32>(10.0, -40.0);
 ///  0.25  -1  0.25
 ///       0.25
 /// This is used as a noise detection filter, to reduce the effect of RCAS on grain, and focus on real edges.
-/// The CAS node runs after tonemapping, so the input will be in the range of 0 to 1.
+/// The CAS node runs after tonemapping, so on SDR display targets the input is in the range of 0 to 1.
 @fragment
 fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     // Algorithm uses minimal 3x3 pixel neighborhood.
     //    b
     //  d e f
     //    h
-    let b = textureSample(screenTexture, samp, in.uv, vec2<i32>(0, -1)).rgb;
-    let d = textureSample(screenTexture, samp, in.uv, vec2<i32>(-1, 0)).rgb;
+    let b = range_compress(textureSample(screenTexture, samp, in.uv, vec2<i32>(0, -1))).rgb;
+    let d = range_compress(textureSample(screenTexture, samp, in.uv, vec2<i32>(-1, 0))).rgb;
     // We need the alpha value of the pixel we're working on for the output
-    let e = textureSample(screenTexture, samp, in.uv).rgba;
-    let f = textureSample(screenTexture, samp, in.uv, vec2<i32>(1, 0)).rgb;
-    let h = textureSample(screenTexture, samp, in.uv, vec2<i32>(0, 1)).rgb;
+    let e = range_compress(textureSample(screenTexture, samp, in.uv));
+    let f = range_compress(textureSample(screenTexture, samp, in.uv, vec2<i32>(1, 0))).rgb;
+    let h = range_compress(textureSample(screenTexture, samp, in.uv, vec2<i32>(0, 1))).rgb;
     // Min and max of ring.
     let mn4 = min(min(b, d), min(f, h));
     let mx4 = max(max(b, d), max(f, h));
@@ -91,5 +109,17 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     // Apply noise removal.
     lobe *= noise;
 }
-    return vec4<f32>((lobe * b + lobe * d + lobe * f + lobe * h + e.rgb) / (4.0 * lobe + 1.0), e.w);
+    let sharpened = (lobe * b + lobe * d + lobe * f + lobe * h + e.rgb) / (4.0 * lobe + 1.0);
+@if(HDR_DISPLAY_TARGET) {
+    // Decompression magnifies overshoot near -1 and 1. Limit the result to the
+    // range of the taps, widened to 0. A positive channel may also reach paper
+    // white (0.5 compressed), as on SDR. The bounds keep the sign of the taps
+    // and stay inside -1 to 1.
+    let lower = min(min(mn4, e.rgb), vec3<f32>(0.0));
+    let tap_max = max(mx4, e.rgb);
+    let upper = select(vec3<f32>(0.0), max(tap_max, vec3<f32>(0.5)), tap_max > vec3<f32>(0.0));
+    return vec4<f32>(range_decompress(clamp(sharpened, lower, upper)), e.w);
+} @else {
+    return vec4<f32>(sharpened, e.w);
+}
 }

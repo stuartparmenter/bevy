@@ -63,7 +63,9 @@ fn rgb2luma(rgb: vec3<f32>) -> f32 {
     // root of a dot product that goes negative on Oklab's signed chroma.
     return saturate(rgb.x);
 } @else {
-    return sqrt(dot(rgb, vec3<f32>(0.299, 0.587, 0.114)));
+    // The thresholds assume luma in 0 to 1. Main textures with HDR values go
+    // outside it.
+    return sqrt(saturate(dot(rgb, vec3<f32>(0.299, 0.587, 0.114))));
 }
 }
 
