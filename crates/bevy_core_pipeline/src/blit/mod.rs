@@ -42,14 +42,14 @@ pub struct BlitPipeline {
     pub sampler: Sampler,
     pub fullscreen_shader: FullscreenShader,
     pub fragment_shader: Handle<Shader>,
-    pub(crate) display_target_layout: BindGroupLayoutDescriptor,
+    pub display_target_layout: BindGroupLayoutDescriptor,
 }
 
 /// The gamut matrix and paper white used to encode a view's HDR output.
 #[derive(Component, ShaderType, Clone, Copy, PartialEq)]
 pub struct DisplayTargetUniform {
-    pub(crate) gamut: Mat3,
-    pub(crate) paper_white_nits: f32,
+    pub gamut: Mat3,
+    pub paper_white_nits: f32,
 }
 
 pub fn init_blit_pipeline(

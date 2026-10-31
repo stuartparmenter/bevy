@@ -523,8 +523,9 @@ pub fn extract_cameras(
     visibility_extraction_system_param: VisibilityExtractionSystemParam,
     extracted_swap_chains: Query<(MainEntity, &ExtractedWindow)>,
     mut active_cameras_per_target: Local<HashMap<NormalizedRenderTarget, usize>>,
-    // Each HDR render target, with a camera to name in the warning and
-    // whether any of its cameras tonemaps.
+    // For the warning at the end of this system about HDR render targets
+    // without tonemapping. Maps each HDR render target to a camera to name in
+    // the warning and whether any camera on that target tonemaps.
     mut hdr_targets: Local<HashMap<NormalizedRenderTarget, (Entity, bool)>>,
 ) {
     main_pass_formats.clear();

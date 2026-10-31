@@ -21,17 +21,21 @@ fn fs_main(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     color = vec4(srgb_to_linear(color.rgb), color.a);
     @if(OKLAB_TO_LINEAR)
     color = vec4(oklab_to_linear_rgb(color.rgb), color.a);
+
 @if(DISPLAY_ENCODE) {
     var rgb = display_target.gamut * color.rgb;
-
     let paper_white = display_target.paper_white_nits;
+
     @if(DISPLAY_TRANSFER_PQ)
     rgb = pq_inverse_eotf_from_nits(rgb * paper_white);
     @else
     rgb = scrgb_encode(rgb, paper_white);
+
     @if(DISPLAY_TRANSFER_EXTENDED_SRGB)
     rgb = srgb_oetf_extended(rgb);
+
     color = vec4(rgb, color.a);
 }
+
     return color;
 }
