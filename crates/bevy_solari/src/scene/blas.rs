@@ -4,7 +4,7 @@ use bevy_ecs::{
     resource::Resource,
     system::{Res, ResMut},
 };
-use bevy_mesh::{Indices, Mesh, MeshRaytracingFlags};
+use bevy_mesh::{Mesh, MeshRaytracingFlags};
 use bevy_platform::collections::HashMap;
 use bevy_render::{
     diagnostic::{DiagnosticsRecorder, RecordDiagnostics},
@@ -54,19 +54,8 @@ impl BlasManager {
             .is_some_and(|mesh| !mesh.requires.contains(key.opacity.flag()))
     }
 
-    fn require(
-        &mut self,
-        mesh: AssetId<Mesh>,
-        flags: MeshRaytracingFlags,
-        index_format: IndexFormat,
-    ) {
-        let blas = self.blas.entry(mesh).or_default();
-        blas.requires = flags;
-        blas.index_format = index_format;
-    }
-
-    pub fn index_format(&self, mesh: &AssetId<Mesh>) -> Option<IndexFormat> {
-        self.blas.get(mesh).map(|blas| blas.index_format)
+    fn require(&mut self, mesh: AssetId<Mesh>, flags: MeshRaytracingFlags) {
+        self.blas.entry(mesh).or_default().requires = flags;
     }
 
     pub fn changed_meshes(&self) -> &[AssetId<Mesh>] {
@@ -109,7 +98,6 @@ impl BlasManager {
 
 struct MeshBlas {
     requires: MeshRaytracingFlags,
-    index_format: IndexFormat,
     opaque: Option<Blas>,
     non_opaque: Option<Blas>,
 }
@@ -118,7 +106,6 @@ impl Default for MeshBlas {
     fn default() -> Self {
         Self {
             requires: MeshRaytracingFlags::empty(),
-            index_format: IndexFormat::Uint32,
             opaque: None,
             non_opaque: None,
         }
@@ -204,8 +191,8 @@ pub fn prepare_raytracing_blas(
 
     // Record which BLAS added or changed meshes declare, even if none
     for (asset_id, mesh) in &extracted_meshes.extracted {
-        if let Some(index_format) = raytracing_index_format(mesh) {
-            blas_manager.require(*asset_id, mesh.raytracing, index_format);
+        if is_mesh_raytracing_compatible(mesh) {
+            blas_manager.require(*asset_id, mesh.raytracing);
         }
     }
 
@@ -213,16 +200,15 @@ pub fn prepare_raytracing_blas(
     let blas_resources = extracted_meshes
         .extracted
         .iter()
-        .filter_map(|(asset_id, mesh)| Some((*asset_id, mesh, raytracing_index_format(mesh)?)))
-        .flat_map(|(asset_id, mesh, index_format)| {
+        .filter(|(_, mesh)| is_mesh_raytracing_compatible(mesh))
+        .flat_map(|(asset_id, mesh)| {
+            let index_format = IndexFormat::from(mesh.indices().unwrap());
             BlasOpacity::declared(mesh.raytracing).map(move |opacity| {
-                (
-                    BlasKey {
-                        mesh: asset_id,
-                        opacity,
-                    },
-                    index_format,
-                )
+                let key = BlasKey {
+                    mesh: *asset_id,
+                    opacity,
+                };
+                (key, index_format)
             })
         })
         .map(|(key, index_format)| {
@@ -369,9 +355,7 @@ fn allocate_blas(
     (blas, blas_size)
 }
 
-/// The index format of a raytracing compatible mesh, or `None` if the mesh is not raytracing
-/// compatible.
-fn raytracing_index_format(mesh: &Mesh) -> Option<IndexFormat> {
+fn is_mesh_raytracing_compatible(mesh: &Mesh) -> bool {
     let triangle_list = mesh.primitive_topology() == PrimitiveTopology::TriangleList;
     let vertex_attributes = mesh
         .attributes()
@@ -382,11 +366,6 @@ fn raytracing_index_format(mesh: &Mesh) -> Option<IndexFormat> {
             (Mesh::ATTRIBUTE_UV_0.id, Mesh::ATTRIBUTE_UV_0.format),
             (Mesh::ATTRIBUTE_TANGENT.id, Mesh::ATTRIBUTE_TANGENT.format),
         ]);
-    if !(triangle_list && vertex_attributes) {
-        return None;
-    }
-    match mesh.indices()? {
-        Indices::U16(_) => Some(IndexFormat::Uint16),
-        Indices::U32(_) => Some(IndexFormat::Uint32),
-    }
+    let indexed = mesh.indices().is_some();
+    triangle_list && vertex_attributes && indexed
 }

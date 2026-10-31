@@ -16,7 +16,8 @@ use bevy_pbr::{MeshMaterial3d, PreviousGlobalTransform, StandardMaterial};
 use bevy_platform::collections::HashMap;
 use bevy_render::{
     impl_atomic_pod,
-    mesh::allocator::MeshAllocator,
+    mesh::{allocator::MeshAllocator, RenderMesh},
+    render_asset::RenderAssets,
     render_resource::{
         AtomicPod, AtomicSparseBufferVec, Buffer, BufferId, BufferUsages, IndexFormat,
     },
@@ -173,6 +174,7 @@ pub struct InstanceInputs<'a> {
     pub assets: &'a AssetState,
     pub blas_manager: &'a BlasManager,
     pub mesh_allocator: &'a MeshAllocator,
+    pub render_meshes: &'a RenderAssets<RenderMesh>,
 }
 
 fn unlink<K: Eq + Hash>(map: &mut HashMap<K, EntityHashSet>, key: &K, entity: Entity) {
@@ -356,7 +358,10 @@ impl InstanceState {
         ) = (
             inputs.mesh_allocator.mesh_vertex_slice(&instance.mesh),
             inputs.mesh_allocator.mesh_index_slice(&instance.mesh),
-            inputs.blas_manager.index_format(&instance.mesh),
+            inputs
+                .render_meshes
+                .get(instance.mesh)
+                .and_then(RenderMesh::index_format),
             material_slot,
             blas_address,
         )
