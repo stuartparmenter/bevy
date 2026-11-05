@@ -116,13 +116,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>, app_status: Res
     ));
 
     commands.spawn((
-        Mesh3d(
-            asset_server.add(
-                Mesh::from(Sphere::new(0.1))
-                    .with_generated_tangents()
-                    .unwrap(),
-            ),
-        ),
+        Mesh3d(asset_server.add(Sphere::new(0.1).mesh().uv(32, 18))),
         MeshMaterial3d(asset_server.add(StandardMaterial {
             base_color: palettes::tailwind::GRAY_300.into(),
             anisotropy_rotation: 0.5,

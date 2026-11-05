@@ -165,6 +165,9 @@ impl SphereMeshBuilder {
     /// Creates a UV sphere [`Mesh`] with the given number of
     /// longitudinal sectors and latitudinal stacks, aka horizontal and vertical resolution.
     ///
+    /// Includes analytic tangents following lines of latitude, continuous across the
+    /// longitude seam away from the poles.
+    ///
     /// A good default is `32` sectors and `18` stacks.
     #[expect(
         clippy::explicit_counter_loop,
@@ -179,10 +182,11 @@ impl SphereMeshBuilder {
         let sector_step = 2. * PI / sectors_f32;
         let stack_step = PI / stacks_f32;
 
-        let n_vertices = (stacks * sectors) as usize;
+        let n_vertices = ((stacks + 1) * (sectors + 1)) as usize;
         let mut vertices: Vec<[f32; 3]> = Vec::with_capacity(n_vertices);
         let mut normals: Vec<[f32; 3]> = Vec::with_capacity(n_vertices);
         let mut uvs: Vec<[f32; 2]> = Vec::with_capacity(n_vertices);
+        let mut tangents: Vec<[f32; 4]> = Vec::with_capacity(n_vertices);
         let mut indices: Vec<u32> = Vec::with_capacity(n_vertices * 2 * 3);
 
         for i in 0..stacks + 1 {
@@ -192,12 +196,14 @@ impl SphereMeshBuilder {
 
             for j in 0..sectors + 1 {
                 let sector_angle = (j as f32) * sector_step;
-                let x = xy * ops::cos(sector_angle);
-                let y = xy * ops::sin(sector_angle);
+                let (sin, cos) = ops::sin_cos(sector_angle);
+                let x = xy * cos;
+                let y = xy * sin;
 
                 vertices.push([x, y, z]);
                 normals.push([x * length_inv, y * length_inv, z * length_inv]);
                 uvs.push([(j as f32) / sectors_f32, (i as f32) / stacks_f32]);
+                tangents.push([-sin, cos, 0.0, 1.0]);
             }
         }
 
@@ -233,6 +239,7 @@ impl SphereMeshBuilder {
         .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, vertices)
         .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
         .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_TANGENT, tangents)
     }
 }
 
