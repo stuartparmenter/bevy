@@ -6,7 +6,7 @@ use bevy::{
     diagnostic::{Diagnostic, DiagnosticPath, DiagnosticsStore},
     image::{ImageAddressMode, ImageLoaderSettings},
     math::ops,
-    mesh::{Indices, VertexAttributeValues},
+    mesh::{Indices, TangentAlgorithm, VertexAttributeValues},
     prelude::*,
     render::{diagnostic::RenderDiagnosticsPlugin, render_resource::TextureUsages},
     solari::{
@@ -138,7 +138,9 @@ enum ControlRow {
 struct PerformanceText;
 
 fn raytraced(mesh: impl Into<Mesh>) -> Mesh {
-    mesh.into().with_generated_tangents().unwrap()
+    mesh.into()
+        .with_computed_tangents(TangentAlgorithm::Mikktspace)
+        .unwrap()
 }
 
 fn setup(
@@ -280,7 +282,7 @@ fn add_raytracing_meshes_on_scene_load(
                 );
             }
             if !mesh.contains_attribute(Mesh::ATTRIBUTE_TANGENT) {
-                mesh.generate_tangents().unwrap();
+                mesh.compute_tangents(TangentAlgorithm::Mikktspace).unwrap();
             }
             if mesh.contains_attribute(Mesh::ATTRIBUTE_UV_1) {
                 mesh.remove_attribute(Mesh::ATTRIBUTE_UV_1);

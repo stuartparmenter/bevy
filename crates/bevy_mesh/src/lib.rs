@@ -13,6 +13,8 @@ mod mikktspace;
 pub mod morph;
 pub mod primitives;
 pub mod skinning;
+#[cfg(feature = "bevy_mikktspace")]
+mod tangent;
 mod vertex;
 use bevy_app::{App, Plugin, PostUpdate};
 use bevy_asset::{AssetApp, AssetEventSystems};
@@ -21,9 +23,9 @@ use bitflags::bitflags;
 pub use components::*;
 pub use index::*;
 pub use mesh::*;
-#[cfg(feature = "bevy_mikktspace")]
-pub use mikktspace::*;
 pub use primitives::*;
+#[cfg(feature = "bevy_mikktspace")]
+pub use tangent::*;
 pub use vertex::*;
 use wgpu_types::IndexFormat;
 pub use wgpu_types::VertexFormat;

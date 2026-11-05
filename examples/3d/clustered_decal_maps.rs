@@ -10,6 +10,7 @@ use bevy::{
     feathers::{dark_theme::create_dark_theme, theme::UiTheme, FeathersPlugins},
     image::ImageLoaderSettings,
     light::ClusteredDecal,
+    mesh::TangentAlgorithm,
     prelude::*,
     ui_widgets::{radio_self_update, ValueChange},
 };
@@ -200,7 +201,7 @@ fn spawn_plane_mesh(
         .build()
         .with_duplicated_vertices()
         .with_computed_flat_normals()
-        .with_generated_tangents()
+        .with_computed_tangents(TangentAlgorithm::Mikktspace)
         .unwrap(),
     );
 
