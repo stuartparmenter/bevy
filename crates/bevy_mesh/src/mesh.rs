@@ -2193,7 +2193,6 @@ impl Mesh {
     /// [`Mesh::ATTRIBUTE_NORMAL`] and [`Mesh::ATTRIBUTE_UV_0`] attributes.
     /// Vertices shared by corners with different tangents are split, copying all
     /// attributes and morph target deltas. Indices may be promoted from `u16` to `u32`.
-    #[cfg(any(feature = "bevy_mikktspace", feature = "meshopt"))]
     pub fn compute_tangents(
         &mut self,
         algorithm: super::TangentAlgorithm,
@@ -2254,7 +2253,6 @@ impl Mesh {
         Ok(())
     }
 
-    #[cfg(any(feature = "bevy_mikktspace", feature = "meshopt"))]
     fn duplicate_tangent_seam_vertices(
         &mut self,
         vertex_count: usize,
@@ -2311,7 +2309,6 @@ impl Mesh {
     /// Consumes the mesh and returns it with [`Mesh::ATTRIBUTE_TANGENT`] computed.
     ///
     /// See [`Mesh::compute_tangents`].
-    #[cfg(any(feature = "bevy_mikktspace", feature = "meshopt"))]
     pub fn with_computed_tangents(
         mut self,
         algorithm: super::TangentAlgorithm,

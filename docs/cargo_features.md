@@ -94,7 +94,7 @@ This is the complete `bevy` cargo feature list, without "profiles" or "collectio
 |bevy_log|Enable integration with `tracing` and `log`|
 |bevy_material|Provides materials.|
 |bevy_mesh|Provides a mesh format and some primitive meshing routines.|
-|bevy_mikktspace|Provides vertex tangent generation for use with bevy_mesh.|
+|bevy_mikktspace|Provides MikkTSpace vertex tangent generation for use with bevy_mesh.|
 |bevy_pbr|Adds PBR rendering|
 |bevy_picking|Provides picking functionality without any backend|
 |bevy_post_process|Provides post process effects such as depth of field, bloom, chromatic aberration.|

@@ -5,6 +5,7 @@ extern crate core;
 
 mod components;
 mod conversions;
+mod gram_schmidt;
 mod index;
 mod mesh;
 #[cfg(feature = "meshopt")]
@@ -15,7 +16,6 @@ mod mikktspace;
 pub mod morph;
 pub mod primitives;
 pub mod skinning;
-#[cfg(any(feature = "bevy_mikktspace", feature = "meshopt"))]
 mod tangent;
 mod vertex;
 use bevy_app::{App, Plugin, PostUpdate};
@@ -26,7 +26,6 @@ pub use components::*;
 pub use index::*;
 pub use mesh::*;
 pub use primitives::*;
-#[cfg(any(feature = "bevy_mikktspace", feature = "meshopt"))]
 pub use tangent::*;
 pub use vertex::*;
 use wgpu_types::IndexFormat;
