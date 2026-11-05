@@ -373,6 +373,9 @@ bevy_mesh = ["bevy_internal/bevy_mesh"]
 # Provides vertex tangent generation for use with bevy_mesh.
 bevy_mikktspace = ["bevy_internal/bevy_mikktspace"]
 
+# Adds meshoptimizer tangent algorithms. Requires a C++ compiler.
+meshopt = ["bevy_internal/meshopt"]
+
 # Provides camera and visibility types, as well as culling primitives.
 bevy_camera = ["bevy_internal/bevy_camera"]
 
