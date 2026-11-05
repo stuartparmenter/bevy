@@ -54,8 +54,7 @@ impl bevy_mikktspace::Geometry for MikktspaceGeometryHelper<'_> {
         face: usize,
         vert: usize,
     ) {
-        let idx = self.index(face, vert);
-        self.tangents[idx] = tangent_space.unwrap_or_default().tangent_encoded();
+        self.tangents[face * 3 + vert] = tangent_space.unwrap_or_default().tangent_encoded();
     }
 }
 
@@ -70,8 +69,14 @@ pub enum GenerateTangentsError {
     MissingVertexAttribute(&'static str),
     #[error("the '{0}' vertex attribute should have {1:?} format")]
     InvalidVertexAttributeFormat(&'static str, VertexFormat),
+    #[error("the '{0}' vertex attribute has fewer values than there are positions")]
+    InvalidVertexAttributeLength(&'static str),
+    #[error("index {0} is out of bounds for {1} vertices")]
+    InvalidIndex(usize, usize),
     #[error("mesh not suitable for tangent generation")]
     MikktspaceError(#[from] bevy_mikktspace::GenerateTangentSpaceError),
+    #[error("morph target data does not contain a whole number of targets")]
+    InvalidMorphTargetLength,
     #[error("Mesh access error: {0}")]
     MeshAccessError(#[from] MeshAccessError),
 }
@@ -113,20 +118,50 @@ pub(crate) fn generate_tangents_for_mesh(
     };
 
     let len = positions.len();
-    let tangents = vec![[0., 0., 0., 0.]; len];
+    // Extra attribute values and an incomplete trailing triangle are ignored.
+    if normals.len() < len {
+        return Err(GenerateTangentsError::InvalidVertexAttributeLength(
+            Mesh::ATTRIBUTE_NORMAL.name,
+        ));
+    }
+    if uvs.len() < len {
+        return Err(GenerateTangentsError::InvalidVertexAttributeLength(
+            Mesh::ATTRIBUTE_UV_0.name,
+        ));
+    }
+    let indices = mesh.try_indices_option()?;
+    let corner_count = indices.map_or(len, Indices::len) / 3 * 3;
+    if let Some(indices) = indices
+        && let Some(index) = indices
+            .iter()
+            .take(corner_count)
+            .find(|&index| index >= len)
+    {
+        return Err(GenerateTangentsError::InvalidIndex(index, len));
+    }
+    let mut tangents = generate_tangents_rust(indices, positions, normals, uvs)?;
+
+    // Bevy uses the opposite bitangent sign convention.
+    for tangent in &mut tangents {
+        tangent[3] = -tangent[3];
+    }
+    Ok(tangents)
+}
+
+fn generate_tangents_rust(
+    indices: Option<&Indices>,
+    positions: &Vec<[f32; 3]>,
+    normals: &Vec<[f32; 3]>,
+    uvs: &Vec<[f32; 2]>,
+) -> Result<Vec<[f32; 4]>, GenerateTangentsError> {
     let mut mikktspace_mesh = MikktspaceGeometryHelper {
-        indices: mesh.try_indices_option()?,
+        indices,
         positions,
         normals,
         uvs,
-        tangents,
+        tangents: vec![[0.; 4]; indices.map_or(positions.len(), Indices::len) / 3 * 3],
     };
     bevy_mikktspace::generate_tangents(&mut mikktspace_mesh)?;
-
-    // mikktspace seems to assume left-handedness so we can flip the sign to correct for this
-    for tangent in &mut mikktspace_mesh.tangents {
-        tangent[3] = -tangent[3];
-    }
 
     Ok(mikktspace_mesh.tangents)
 }
