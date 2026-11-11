@@ -2981,32 +2981,40 @@ pub fn per_view_shadow_pass<const IS_LATE: bool>(
             continue;
         };
 
-        // Make sure to build indirect parameters here, as the normal
-        // `*_prepass_build_indirect_parameters` functions only run for root
-        // views, and this shadow view isn't a root view.
+        // Make sure to build indirect parameters here, as
+        // `early_gpu_preprocess` and `late_gpu_preprocess` only build them for
+        // root views, and this shadow view isn't a root view.
         if has_preprocess_bind_groups
             && !has_skip_gpu_preprocess
             && !has_no_indirect_drawing
             && let (Some(preprocess_pipelines), Some(build_indirect_parameters_metadata)) =
                 (&preprocess_pipelines, &build_indirect_parameters_metadata)
         {
+            let (label, phase_pipelines) = if IS_LATE {
+                (
+                    "late_view_shadow_indirect_parameters_building",
+                    &preprocess_pipelines.late_phase,
+                )
+            } else {
+                (
+                    "early_view_shadow_indirect_parameters_building",
+                    &preprocess_pipelines.early_phase,
+                )
+            };
+            let mut compute_pass =
+                ctx.command_encoder()
+                    .begin_compute_pass(&ComputePassDescriptor {
+                        label: Some(label),
+                        timestamp_writes: None,
+                    });
             run_build_indirect_parameters(
-                &mut ctx,
+                &mut compute_pass,
                 extracted_light_view.retained_view_entity,
                 build_indirect_params_bind_groups.as_deref(),
                 &pipeline_cache,
                 indirect_parameters_buffers.as_deref(),
                 build_indirect_parameters_metadata,
-                if IS_LATE {
-                    &preprocess_pipelines.late_phase
-                } else {
-                    &preprocess_pipelines.early_phase
-                },
-                if IS_LATE {
-                    "late_view_shadow_indirect_parameters_building"
-                } else {
-                    "early_view_shadow_indirect_parameters_building"
-                },
+                phase_pipelines,
             );
         }
 
